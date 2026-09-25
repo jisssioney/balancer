@@ -159,6 +159,19 @@ latency=耗时；无可用项则 R、backend=null、latency=0。结果键序
 op,cid,state,backend,latency,remaps。fx 完成后按归属 id 追加一次等价
 mr 度量（见请求度量段），结果项本身不变。fs O(1)，fx 仍为 O(BV)。
 
+批量故障登记与快照：fb 键集 op,items；items 为数组，每项键集
+id,k,a,z,v，k ∈ D/F/S，a,z,v ∈ [0,10^9] 非 bool 整数且 a<z，D 须
+v=0、F/S 须 v>0（同 fs 单项规则）。id 须为现存后端且批内互异；非法
+键、容器、重复 id、类型或范围报 INPUT/2（先于存在性判定），未知 id 报
+BACKEND/3，失败批次原子回滚。items 按后端加入序规范化后一次替换全部
+fs 登记，未列后端一律清除，空数组清空；计划重报幂等，返回键序 op,ok，
+ok=true。fq 键集 op,now，now 为非负非 bool 整数，共用时钟且不倒退；
+返回键序 op,faults,down,slow：faults 按加入序列已登记后端，每项键序
+id,k,a,z,v,effect，effect ∈ N/D/S——窗口外为 N，窗口内 D 取 D，F 按
+((now-a)//v)%2=0 取 D 否则 N，S 取 S；down、slow 分别计 D、S 项数。
+fb 与 fs 同源（fs 仍可改单项），remove/ci 仍清除全部登记；fx/fr 与 mg
+观察相同结果，旧输出、度量不变。fb/fq 时间 O(B+T)、额外空间 O(T)。
+
 故障重试：fr 键集 op,cid,flow,key,timeout,max,now，cid/flow/key 同
 fx，timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数，now 纳入
 共用非递减时钟。自 key 哈希点按 fx 顺序遍历不同后端至多 max 个（环同
@@ -623,7 +636,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og",
         "mr", "mg",
         "ce", "ci",
-        "fs", "fx", "fr",
+        "fs", "fb", "fq", "fx", "fr",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -934,6 +947,46 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("fs", parse_backend_id(raw_op["id"]), k, a, z, v)
 
+    if name == "fb":
+        if keys != {"op", "items"}:
+            fail(EXIT_INPUT, "INPUT")
+        raw_items = raw_op["items"]
+        # items 必须为数组（list，tuple 不可能来自 JSON）。
+        if not isinstance(raw_items, list):
+            fail(EXIT_INPUT, "INPUT")
+        planned = {}
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {
+                "id", "k", "a", "z", "v",
+            }:
+                fail(EXIT_INPUT, "INPUT")
+            k = item["k"]
+            if k not in ("D", "F", "S"):
+                fail(EXIT_INPUT, "INPUT")
+            a = parse_fault_num(item["a"])
+            z = parse_fault_num(item["z"])
+            v = parse_fault_num(item["v"])
+            if not a < z:
+                fail(EXIT_INPUT, "INPUT")
+            # D（全挂）须 v=0；F（抖动）/S（慢响应）须 v>0。
+            if k == "D":
+                if v != 0:
+                    fail(EXIT_INPUT, "INPUT")
+            elif v == 0:
+                fail(EXIT_INPUT, "INPUT")
+            item_id = parse_backend_id(item["id"])
+            if item_id in planned:
+                # 批内 id 互异：重复报 INPUT，先于执行期的存在性判定。
+                fail(EXIT_INPUT, "INPUT")
+            planned[item_id] = (k, a, z, v)
+        # 存在性（未知 id 报 BACKEND）在执行期判定，以便先收集完计划。
+        return ("fb", planned)
+
+    if name == "fq":
+        if keys != {"op", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fq", parse_now(raw_op["now"]))
+
     if name == "fx":
         if keys != {"op", "cid", "flow", "key", "timeout", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1219,13 +1272,25 @@ def run(raw):
             return ((now - a) // v) % 2 == 0
         return False
 
+    def fault_effect(fault, now):
+        """fq 快照效果 effect ∈ N/D/S：窗口（[a,z)）外为 N；窗口内 D 恒为
+        D，F 于 ((now-a)//v)%2=0 相位为 D 否则 N，S 恒为 S。"""
+        k, a, z, v = fault
+        if not a <= now < z:
+            return "N"
+        if k == "D":
+            return "D"
+        if k == "F":
+            return "D" if ((now - a) // v) % 2 == 0 else "N"
+        return "S"
+
     for raw_op in ops:
         op = parse_op(raw_op)
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
-            "ci", "fx", "fr", "tk", "tg", "tx", "route",
+            "ci", "fq", "fx", "fr", "tk", "tg", "tx", "route",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -2121,6 +2186,51 @@ def run(raw):
             # 同参重报幂等（不改登记），异参覆盖；均返回 ok。
             record["fault"] = (k, a, z, v)
             results.append({"op": "fs", "ok": True})
+
+        elif op[0] == "fb":
+            _, planned = op
+            # 未知 id 报 BACKEND，先于任何写入以保证失败批次原子回滚。
+            for item_id in planned:
+                if item_id not in backends:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 一次替换全部 fs 登记：按后端加入序遍历，先清空所有后端（含
+            # 未列者），再写入计划项；空数组即清空。计划即最终状态，重报
+            # 幂等。O(B+T) 时间、O(T) 额外空间。
+            for record in backends.values():
+                record["fault"] = None
+            for item_id, fault in planned.items():
+                backends[item_id]["fault"] = fault
+            results.append({"op": "fb", "ok": True})
+
+        elif op[0] == "fq":
+            _, now = op
+            # 按加入序列已登记后端；fault 与 fs/fb 同源，fx/fr/mg 观察同果。
+            faults = []
+            down = 0
+            slow = 0
+            for item_id, record in backends.items():
+                fault = record["fault"]
+                if fault is None:
+                    continue
+                effect = fault_effect(fault, now)
+                if effect == "D":
+                    down += 1
+                elif effect == "S":
+                    slow += 1
+                k, a, z, v = fault
+                faults.append(
+                    {
+                        "id": item_id,
+                        "k": k,
+                        "a": a,
+                        "z": z,
+                        "v": v,
+                        "effect": effect,
+                    }
+                )
+            results.append(
+                {"op": "fq", "faults": faults, "down": down, "slow": slow}
+            )
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
