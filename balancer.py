@@ -187,6 +187,17 @@ backend 成功为 id 否则 null。未配环或环内无候选报 STATE/4 且先
 尝试 ok=true，ms 为该次耗时，首项的 retries/remaps 记总值、余项为 0。
 fr 时空 O(BV)；record/replay 照常覆盖 fr，其余契约不变。
 
+滞回背压：bp 键集 op,low,high（均 [0,10^6] 非 bool 整数且
+low<high≤os.q；非法键集、类型、范围或阈值关系报 INPUT），未 os 报
+STATE。首配或异参重配按当前队长 >=high 置 P 否则 N，同参幂等且不改
+状态；返回 op,ok。bq 键集仅 op，未 bp 报 STATE；返回键序
+op,state,queued,low,high,available，state ∈ N/P，available=os.q-queued。
+启用后 oa 可立即接纳时仍按原规则扣令牌建连；本应排队时 P 态报
+OVERLOAD/7 且无变更，N 态照常入队，队长达到 high 即转 P；队满仍
+OVERLOAD/7。ot 照常先过期再从队首接纳，处理完若 P 且队长 ≤low 则转
+N，否则不变。ci 成功后取消 bp；ce 格式不变。bp/bq 及 oa 新增判定
+O(1)，ot 仍 O(q)，额外空间 O(1)。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，不进入
 ce/ci；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -378,6 +389,17 @@ def parse_queue_param(value):
         not isinstance(value, int)
         or isinstance(value, bool)
         or not 1 <= value <= 10 ** 6
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_bp_threshold(value):
+    # bp 的 low/high ∈ [0, 10^6]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= 10 ** 6
     ):
         fail(EXIT_INPUT, "INPUT")
     return value
@@ -634,6 +656,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og",
+        "bp", "bq",
         "mr", "mg",
         "ce", "ci",
         "fs", "fx", "fr",
@@ -903,6 +926,21 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("og",)
 
+    if name == "bp":
+        if keys != {"op", "low", "high"}:
+            fail(EXIT_INPUT, "INPUT")
+        low = parse_bp_threshold(raw_op["low"])
+        high = parse_bp_threshold(raw_op["high"])
+        if not low < high:
+            # 阈值关系 low<high；high≤os.q 在执行期判定（依赖 os）。
+            fail(EXIT_INPUT, "INPUT")
+        return ("bp", low, high)
+
+    if name == "bq":
+        if keys != {"op"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("bq",)
+
     if name == "mr":
         if keys != {"op", "id", "ok", "ms", "retries", "remaps", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1115,6 +1153,11 @@ def run(raw):
     # 容量上限 q；bc/cc/sc 为入队请求的三项令牌成本。
     queue_cfg = None
     wait_queue = deque()
+    # 滞回背压：bp_cfg 未 bp 时为 None，否则为 (low, high)；bp_state ∈ N/P
+    # （N 正常入队、P 拒绝新排队）。仅 oa 入队使队长达到 high 时转 P，仅
+    # ot 处理完且队长 ≤low 时由 P 转 N；ci 成功后取消 bp。
+    bp_cfg = None
+    bp_state = "N"
     # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
     # 不进入 ce/ci，异值重配报 STATE。
     ttl_cfg = None
@@ -1904,11 +1947,17 @@ def run(raw):
                     {"op": "oa", "cid": cid, "state": "A", "backend": backend_id}
                 )
             else:
+                if bp_cfg is not None and bp_state == "P":
+                    # 滞回按下：本应排队的请求直接拒绝，无任何变更。
+                    fail(EXIT_OVERLOAD, "OVERLOAD")
                 if len(wait_queue) >= queue_cfg[1]:
                     # FIFO 已满，尾拒绝。
                     fail(EXIT_OVERLOAD, "OVERLOAD")
                 # 三项成本随请求入队，ot 重试时按此成本扣减。
                 wait_queue.append((cid, flow, c, s, key, bc, cc, sc, now))
+                if bp_cfg is not None and len(wait_queue) >= bp_cfg[1]:
+                    # 队长达到 high 即转 P。
+                    bp_state = "P"
                 results.append(
                     {"op": "oa", "cid": cid, "state": "Q", "backend": None}
                 )
@@ -1944,6 +1993,9 @@ def run(raw):
                     # 阻塞（含路由不可用）：连同该项整体放回队首后停止。
                     wait_queue.appendleft(item)
                     break
+            if bp_cfg is not None and bp_state == "P" and len(wait_queue) <= bp_cfg[0]:
+                # 处理完若 P 且队长 ≤low 则转 N，否则不变。
+                bp_state = "N"
             results.append(
                 {"op": "ot", "expired": expired, "admitted": admitted}
             )
@@ -1953,6 +2005,38 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             results.append(
                 {"op": "og", "queue": [item[0] for item in wait_queue]}
+            )
+
+        elif op[0] == "bp":
+            _, low, high = op
+            if queue_cfg is None:
+                # 未 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            if high > queue_cfg[1]:
+                # 阈值关系 high≤os.q 在执行期判定。
+                fail(EXIT_INPUT, "INPUT")
+            params = (low, high)
+            if bp_cfg != params:
+                # 首配或异参重配：按当前队长 >=high 置 P，否则 N。
+                bp_cfg = params
+                bp_state = "P" if len(wait_queue) >= high else "N"
+            # 同参幂等，不改状态。
+            results.append({"op": "bp", "ok": True})
+
+        elif op[0] == "bq":
+            if bp_cfg is None:
+                # 未 bp 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            queued = len(wait_queue)
+            results.append(
+                {
+                    "op": "bq",
+                    "state": bp_state,
+                    "queued": queued,
+                    "low": bp_cfg[0],
+                    "high": bp_cfg[1],
+                    "available": queue_cfg[1] - queued,
+                }
             )
 
         elif op[0] == "mr":
@@ -2162,6 +2246,9 @@ def run(raw):
             ring_vnodes = config["vnodes"]
             queue_cfg = config["overload"]
             wait_queue = deque()
+            # 热加载成功后取消滞回背压配置。
+            bp_cfg = None
+            bp_state = "N"
             sticky_map = {}
             results.append({"op": "ci", "ok": True})
 
