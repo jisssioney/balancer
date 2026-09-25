@@ -105,6 +105,22 @@ remaps,removed：window=now//60，concurrency 为活动连接数，latency 为�
 非 C），否则 null；查询时已跨入新窗（含从未 mr）按零计且不改存储。remove 后
 重加统计归零。mr/mg 均 O(1)，空间 O(B)。
 
+显式时钟故障演练：fs 键集 op,id,k,a,z,v，五整数均为 [0,10^9] 非 bool；
+k 仅 D/F/S，a<z，D 须 v=0，F/S 须 v>0。同参幂等、异参覆盖，remove/ci
+清除，返回 op,ok=true。fx 键集 op,cid,flow,key,timeout,now，cid/flow/key
+沿用 open/route，timeout/now 为 [0,10^9] 非 bool 整数，now 纳入共用非递减
+时钟；未 chash 报 STATE/4。环沿用 route 且仅含健康、熔断 C、排空 A 后端；
+自 key 哈希点沿环遍历，同一后端的多个虚拟节点只计一次，按首次遇到序取不同
+后端。a≤now<z 时 D 不可用，F 于 ((now-a)//v)%2=0 时不可用（否则耗时 0
+可用），S 可用且耗时 v；窗口外一律耗时 0、可用。fx 不读写粘性映射。跳过
+窗口内 D/F 时 remaps 加 1，环外（不入环）的故障后端不计。首个可用且耗时
+≤timeout 则按 open 建连（opened_at=now）、state=A；该候选耗时超限则不建连，
+state=R、backend 为该 id、latency 为其耗时；遍历中无可用候选（全部跳过或环
+空）则 R、backend=null、latency=0。结果键序
+op,cid,state,backend,latency,remaps。非法键集/类型/范围/编码/时钟倒退报
+INPUT/2；fs 未知 id 报 BACKEND/3；建连时重复 cid 报 CONNECTION/5。整批
+原子，仅标准库；fs O(1)，fx 时空 O(BV)。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload}：version=1；backends 按加入序，
 项 {id,weight,d,fail,success,circuit,drain}，circuit=null 或 {n,m,r,w,q}，
@@ -498,6 +514,7 @@ def parse_op(raw_op):
         "ls", "la", "lg",
         "os", "oa", "ot", "og",
         "mr", "mg",
+        "fs", "fx",
         "ce", "ci",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -754,6 +771,40 @@ def parse_op(raw_op):
             parse_metric_num(raw_op["now"]),
         )
 
+    if name == "fs":
+        if keys != {"op", "id", "k", "a", "z", "v"}:
+            fail(EXIT_INPUT, "INPUT")
+        kind = raw_op["k"]
+        # k 仅 D/F/S 字符串。
+        if kind not in ("D", "F", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        a = parse_metric_num(raw_op["a"])
+        z = parse_metric_num(raw_op["z"])
+        v = parse_metric_num(raw_op["v"])
+        # a<z；D 须 v=0，F/S 须 v>0。
+        if a >= z or (kind == "D" and v != 0) or (kind in ("F", "S") and v <= 0):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "fs",
+            parse_backend_id(raw_op["id"]),
+            kind,
+            a,
+            z,
+            v,
+        )
+
+    if name == "fx":
+        if keys != {"op", "cid", "flow", "key", "timeout", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "fx",
+            parse_cid(raw_op["cid"]),
+            parse_flow(raw_op["flow"]),
+            parse_key(raw_op["key"]),
+            parse_metric_num(raw_op["timeout"]),
+            parse_metric_num(raw_op["now"]),
+        )
+
     if name in ("ce", "ci"):
         if name == "ce":
             if keys != {"op"}:
@@ -921,7 +972,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
-            "ci",
+            "fx", "ci",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -986,6 +1037,8 @@ def run(raw):
                 # 度量：None 表示从未 mr；否则 (window, requests, errors,
                 # retries, remaps, [五个延迟桶])，仅保留当前 60 秒窗。
                 "metrics": None,
+                # 显式时钟故障演练：fs 登记的 (k, a, z, v) 列表；remove/ci 清除。
+                "faults": [],
             }
             results.append({"op": "add", "ok": True})
 
@@ -1627,6 +1680,108 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "fs":
+            _, backend_id, kind, a, z, v = op
+            record = backends.get(backend_id)
+            if record is None:
+                # fs 未知 id 报 BACKEND，先于任何状态判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            schedule = (kind, a, z, v)
+            faults = record["faults"]
+            if schedule not in faults:
+                # 异参覆盖：只保留与本次不同的其它故障（同类型至多一条），
+                # 同参重报幂等。
+                faults[:] = [item for item in faults if item[0] != kind]
+                faults.append(schedule)
+            results.append({"op": "fs", "ok": True})
+
+        elif op[0] == "fx":
+            _, cid, flow, key, timeout, now = op
+            # 未 chash 报 STATE（环沿用 route）。
+            if ring_vnodes is None:
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            chosen = None
+            remaps = 0
+            if tokens:
+                digests = [token[0] for token in tokens]
+                key_hash = int.from_bytes(
+                    hashlib.sha256(key.encode("utf-8")).digest(), "big"
+                )
+                start = bisect.bisect_left(digests, key_hash)
+                # 自 key 哈希点沿环遍历，同一后端的多个虚拟节点只计一次，按
+                # 首次遇到序取不同后端；环满一圈即止。
+                ordered_ids = []
+                seen = set()
+                for step in range(len(tokens)):
+                    backend_id = tokens[(start + step) % len(tokens)][3]
+                    if backend_id not in seen:
+                        seen.add(backend_id)
+                        ordered_ids.append(backend_id)
+                for backend_id in ordered_ids:
+                    latency = 0
+                    available = True
+                    for fkind, fa, fz, fv in backends[backend_id]["faults"]:
+                        if fa <= now < fz:
+                            if fkind == "D":
+                                available = False
+                            elif fkind == "F":
+                                if ((now - fa) // fv) % 2 == 0:
+                                    available = False
+                            else:  # S：可用但耗时 v（多条取最慢）。
+                                if fv > latency:
+                                    latency = fv
+                    if not available:
+                        # 遍历到的均为环内后端；窗口内 D/F 被跳过计一次 remaps，
+                        # 环外（不入环）故障后端根本不会遍历到，故不计。
+                        remaps += 1
+                        continue
+                    # 首个可用候选：耗时 ≤timeout 建连，否则即定 R（不再下探）。
+                    chosen = (backend_id, latency)
+                    break
+            if chosen is not None and chosen[1] <= timeout:
+                backend_id, latency = chosen
+                if cid in connections:
+                    # 建连时重复 cid 报 CONNECTION。
+                    fail(EXIT_CONNECTION, "CONNECTION")
+                backends[backend_id]["conns"] += 1
+                connections[cid] = [backend_id, flow, now]
+                results.append(
+                    {
+                        "op": "fx",
+                        "cid": cid,
+                        "state": "A",
+                        "backend": backend_id,
+                        "latency": latency,
+                        "remaps": remaps,
+                    }
+                )
+            elif chosen is not None:
+                backend_id, latency = chosen
+                # 超限不建连。
+                results.append(
+                    {
+                        "op": "fx",
+                        "cid": cid,
+                        "state": "R",
+                        "backend": backend_id,
+                        "latency": latency,
+                        "remaps": remaps,
+                    }
+                )
+            else:
+                # 环空或候选全部被跳过：无可用项。
+                results.append(
+                    {
+                        "op": "fx",
+                        "cid": cid,
+                        "state": "R",
+                        "backend": None,
+                        "latency": 0,
+                        "remaps": remaps,
+                    }
+                )
+
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
             exported_backends = []
@@ -1747,6 +1902,8 @@ def run(raw):
                     # 热加载不携带历史写操作形状。
                     "last_op": None,
                     "metrics": None,
+                    # ci 重建默认运行态，故障登记一并清除。
+                    "faults": [],
                 }
 
             new_backends = {}
