@@ -161,6 +161,18 @@ backend 成功为 id 否则 null。未配环或环内无候选报 STATE/4 且先
 尝试 ok=true，ms 为该次耗时，首项的 retries/remaps 记总值、余项为 0。
 fr 时空 O(BV)；record/replay 照常覆盖 fr，其余契约不变。
 
+连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
+空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，不进入
+ce/ci；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
+tk 键集 op,cid,now：未到期（now < last+ttl）才置 last=now，返回 op,ok；
+未知 cid 或命中已到期 cid 报 CONNECTION。tg 键集 op,cid,now，返回键序
+op,cid,backend,state,opened,last,deadline：deadline=last+ttl，state 为
+A（now<deadline）或 E，查询不删除。tx 键集 op,now：按建连顺序删除全部
+到期连接并递减后端并发，排空 D 后端末连消失则转 X、end=now；返回
+op,expired（cid 数组）。tk/tg/tx 的 now 纳入共用非递减时钟；未 ts 调用
+tk/tg/tx 报 STATE。close 与 dg 强关同样清理连接的空闲状态。ts/tk/tg 为
+O(1)，tx 为 O(C)，额外空间 O(C)。
+
 确定性操作记录：record 把原始 stdin 字节作为全新 run 输入执行，无论底层
 成功或按既有错误失败，均退出 0、stderr 为空，stdout 输出一行紧凑 JSON
 记录，键序 version,stdin,exit,stdout,stderr：version=1（非 bool 整数），
@@ -408,6 +420,17 @@ def parse_drain_timeout(value):
     return value
 
 
+def parse_idle_ttl(value):
+    # 连接空闲时限 ttl ∈ [1, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def build_ring(backends, vnodes):
     """按 (摘要, 加入顺序, i) 升序返回 healthy、熔断闭合且 A 态后端的令牌环。"""
     tokens = []
@@ -576,6 +599,7 @@ def parse_op(raw_op):
         "mr", "mg",
         "ce", "ci",
         "fs", "fx", "fr",
+        "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -913,6 +937,21 @@ def parse_op(raw_op):
         config = parse_config(raw_op["config"])
         return ("ci", config, raw_op["now"])
 
+    if name == "ts":
+        if keys != {"op", "ttl"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ts", parse_idle_ttl(raw_op["ttl"]))
+
+    if name in ("tk", "tg"):
+        if keys != {"op", "cid", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (name, parse_cid(raw_op["cid"]), parse_now(raw_op["now"]))
+
+    if name == "tx":
+        if keys != {"op", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("tx", parse_now(raw_op["now"]))
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -968,7 +1007,9 @@ def run(raw):
     # state ∈ A/D/X（可用/排空/已摘除），start/end/deadline 为本次摘除
     # 的三个时刻（未开始为 None），forced 为 dg 强关的连接数。
     backends = {}
-    # 活动连接：cid -> [backend_id, flow, opened_at]；关闭即删除，cid 可复用。
+    # 活动连接：cid -> [backend_id, flow, opened_at, last]；关闭即删除，cid
+    # 可复用。last 为最近活动时刻（建连时置 opened_at，tk 未到期时置 now），
+    # 供 ts/tk/tg/tx 的空闲超时判定；dict 保序即建连顺序。
     connections = {}
     # 一致性哈希：ring_vnodes 未 chash 时为 None；sticky 映射 key -> backend_id，
     # 只在目标不可用时依环改写（不迁回），增删后端或改 vnodes 均不动它。
@@ -983,6 +1024,9 @@ def run(raw):
     # 容量上限 q；bc/cc/sc 为入队请求的三项令牌成本。
     queue_cfg = None
     wait_queue = deque()
+    # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
+    # 不进入 ce/ci，异值重配报 STATE。
+    ttl_cfg = None
     last_now = None
     results = []
 
@@ -1054,7 +1098,7 @@ def run(raw):
         for bucket, cost in chosen:
             bucket["t"] -= cost
         record["conns"] += 1
-        connections[cid] = [backend_id, flow, now]
+        connections[cid] = [backend_id, flow, now, now]
         return "admit", backend_id
 
     def try_admit(cid, flow, c, s, key, costs, now):
@@ -1107,7 +1151,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
-            "ci", "fx", "fr",
+            "ci", "fx", "fr", "tk", "tg", "tx",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -1235,7 +1279,7 @@ def run(raw):
             if cid in connections:
                 fail(EXIT_CONNECTION, "CONNECTION")
             backends[chosen_id]["conns"] += 1
-            connections[cid] = [chosen_id, flow, now]
+            connections[cid] = [chosen_id, flow, now, now]
             results.append({"op": "open", "cid": cid, "backend": chosen_id})
 
         elif op[0] == "close":
@@ -2025,7 +2069,7 @@ def run(raw):
             if state == "A":
                 # 按 open 建连（opened_at=now）。
                 backends[chosen_id]["conns"] += 1
-                connections[cid] = [chosen_id, flow, now]
+                connections[cid] = [chosen_id, flow, now, now]
             results.append(
                 {
                     "op": "fx",
@@ -2106,7 +2150,7 @@ def run(raw):
             if state == "A":
                 # 成功按 open 建连（opened_at=now）；耗尽拒绝不建连。
                 backends[chosen_id]["conns"] += 1
-                connections[cid] = [chosen_id, flow, now]
+                connections[cid] = [chosen_id, flow, now, now]
             results.append(
                 {
                     "op": "fr",
@@ -2132,6 +2176,69 @@ def run(raw):
                     attempt_retries,
                     now,
                 )
+
+        elif op[0] == "ts":
+            _, ttl = op
+            if ttl_cfg is None:
+                # 首配作用于既有与后续连接（既有连接的 last 即其 opened_at）。
+                ttl_cfg = ttl
+            elif ttl_cfg != ttl:
+                # 异值重配报 STATE；同值幂等。
+                fail(EXIT_STATE, "STATE")
+            results.append({"op": "ts", "ok": True})
+
+        elif op[0] == "tk":
+            _, cid, now = op
+            if ttl_cfg is None:
+                fail(EXIT_STATE, "STATE")
+            connection = connections.get(cid)
+            if connection is None:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            if now >= connection[3] + ttl_cfg:
+                # 命中已到期连接同样报 CONNECTION，不刷新 last。
+                fail(EXIT_CONNECTION, "CONNECTION")
+            connection[3] = now
+            results.append({"op": "tk", "ok": True})
+
+        elif op[0] == "tg":
+            _, cid, now = op
+            if ttl_cfg is None:
+                fail(EXIT_STATE, "STATE")
+            connection = connections.get(cid)
+            if connection is None:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            deadline = connection[3] + ttl_cfg
+            # 查询不删除：到期仅表现为 state=E。
+            results.append(
+                {
+                    "op": "tg",
+                    "cid": cid,
+                    "backend": connection[0],
+                    "state": "A" if now < deadline else "E",
+                    "opened": connection[2],
+                    "last": connection[3],
+                    "deadline": deadline,
+                }
+            )
+
+        elif op[0] == "tx":
+            _, now = op
+            if ttl_cfg is None:
+                fail(EXIT_STATE, "STATE")
+            # 按建连顺序（dict 保序）删除全部到期连接并递减后端并发。
+            expired = []
+            for cid, connection in list(connections.items()):
+                if now >= connection[3] + ttl_cfg:
+                    expired.append(cid)
+                    del connections[cid]
+                    record = backends[connection[0]]
+                    record["conns"] -= 1
+                    drain = record["drain"]
+                    if drain["state"] == "D" and record["conns"] == 0:
+                        # 排空中末连消失即转 X，end 取本次 tx 的 now。
+                        drain["state"] = "X"
+                        drain["end"] = now
+            results.append({"op": "tx", "expired": expired})
 
         else:  # get
             _, cid = op
