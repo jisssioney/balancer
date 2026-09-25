@@ -280,6 +280,20 @@ backend 成功为 id 否则 null。未配环或环内无候选报 STATE/4 且先
 尝试 ok=true，ms 为该次耗时，首项的 retries/remaps 记总值、余项为 0。
 fr 时空 O(BV)；record/replay 照常覆盖 fr，其余契约不变。
 
+故障演练统计：fx/fr 访问环内后端时，按 fq 在当前 now 的 effect 与登记种类
+D/F/S 记账（环外不计，同一请求同一后端至多一次，各计数封顶 10^18）：effect
+为 D 或 S 时该种类 affected 加 1 并武装恢复基线，effect 为 N 不记 affected；
+effect D 失败（D 登记窗口内或 F 故障相位被跳过/失败）或 S 耗时 v>timeout 时
+该种类 rejected 加 1；fx 跳过不可用 D/F 后端时为其 remaps 加 1；fr 某尝试
+失败之后确有下一尝试时，为失败后端的 retries、remaps 各加 1。同一登记被观察
+为受影响后，首次再观察为 N 时在该种类的 recovered 加 1；连续 N 不重复，再受
+影响方可再计。fs/fb 异参替换或移除只清恢复判定基线、不清计数，同参不清；
+remove 后重加及 ci 成功清零统计与基线。fm 精确键集 op,id（id 沿用既有校验，
+fm 只读、不带 now），结果键序 op,id,D,F,S，D/F/S 各为键序
+affected,rejected,retries,remaps,recovered 的非负整数对象；非法键集或 id 判
+INPUT/2，未知 id 判 BACKEND/3。记账与 fm 均 O(1)，空间 O(B)；失败批次回滚
+统计与恢复状态；record/replay 逐字节覆盖 fm，调度、指标与其余子命令行为不变。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -904,7 +918,7 @@ def parse_op(raw_op):
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
-        "hm",
+        "hm", "fm",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -1330,6 +1344,13 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("hm", parse_backend_id(raw_op["id"]))
 
+    if name == "fm":
+        # 故障演练统计查询：精确键集 op,id，只读、不带 now；非法键集或 id
+        # 在解析期判 INPUT，未知 id 在执行期判 BACKEND。
+        if keys != {"op", "id"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fm", parse_backend_id(raw_op["id"]))
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1626,6 +1647,20 @@ def run(raw):
             return ((now - a) // v) % 2 == 0
         return False
 
+    def fault_effect(record, now):
+        """fq 的 effect 判定：窗口 [a,z) 外为 N，窗口内 D 为 D、F 按
+        ((now-a)//v)%2=0 取 D 否则 N、S 取 S；未登记为 N。fx/fr 记账与
+        fq 同源，统一由此计算。"""
+        fault = record["fault"]
+        if fault is None or not fault[1] <= now < fault[2]:
+            return "N"
+        k, a, _, v = fault
+        if k == "D":
+            return "D"
+        if k == "F":
+            return "D" if ((now - a) // v) % 2 == 0 else "N"
+        return "S"
+
     def removed_reason(record, now):
         """ms/mg 共用的 removed 优先级：drain（D/X）> health（unhealthy）>
         circuit（熔断非 C）> fault（D 窗口内或 F 故障相位），否则 null。"""
@@ -1672,6 +1707,24 @@ def run(raw):
         counts = backends[chosen_id]["pick_counts"]
         counts["total"] = min(METRIC_CAP, counts["total"] + 1)
         counts[category] = min(METRIC_CAP, counts[category] + 1)
+
+    def drill_bump(record, kind, field, amount=1):
+        """故障演练统计某种类某计数累加，封顶 10^18（O(1)）。"""
+        counts = record["drill_counts"][kind]
+        counts[field] = min(METRIC_CAP, counts[field] + amount)
+
+    def drill_observe(record, kind, effect):
+        """fx/fr 观察一次环内后端的受影响/恢复判定：effect 为 D 或 S 时该
+        种类 affected 加 1 并武装恢复基线（同请求同后端至多调用一次）；effect
+        为 N 且基线已武装时 recovered 加 1 并解除基线，连续 N 不重复。effect
+        的 N/D/S 与登记种类 D/F/S 交叉按 effect 归类（D 含 F 故障相位）。"""
+        if effect == "N":
+            if record["drill_armed"][kind]:
+                record["drill_armed"][kind] = False
+                drill_bump(record, kind, "recovered")
+            return
+        drill_bump(record, kind, "affected")
+        record["drill_armed"][kind] = True
 
     for raw_op in ops:
         op = parse_op(raw_op)
@@ -1759,6 +1812,20 @@ def run(raw):
                 # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
                 # ci 成功即清空。
                 "samples": {},
+                # 故障演练统计（fm）：按登记种类 D/F/S 各记 affected/
+                # rejected/retries/remaps/recovered 五计数，各封顶 10^18；
+                # remove 后重加、ci 成功即清零。
+                "drill_counts": {
+                    kind: {
+                        "affected": 0, "rejected": 0, "retries": 0,
+                        "remaps": 0, "recovered": 0,
+                    }
+                    for kind in ("D", "F", "S")
+                },
+                # 恢复判定基线：种类 -> bool（该种类最近一次受影响后是否尚未
+                # 观察到 N）；仅受影响武装，N 观察计数后解除；fs/fb 异参替换
+                # 或移除只清基线，同参不清。
+                "drill_armed": {"D": False, "F": False, "S": False},
             }
             results.append({"op": "add", "ok": True})
 
@@ -2849,6 +2916,15 @@ def run(raw):
                     },
                     # ci 成功清空采样历史，默认运行态为空。
                     "samples": {},
+                    # ci 成功清零故障演练统计与恢复基线，默认全 0/未武装。
+                    "drill_counts": {
+                        kind: {
+                            "affected": 0, "rejected": 0, "retries": 0,
+                            "remaps": 0, "recovered": 0,
+                        }
+                        for kind in ("D", "F", "S")
+                    },
+                    "drill_armed": {"D": False, "F": False, "S": False},
                     # 热加载以默认运行态重建，不携带故障演练。
                     "fault": None,
                 }
@@ -2892,8 +2968,12 @@ def run(raw):
             record = backends.get(backend_id)
             if record is None:
                 fail(EXIT_BACKEND, "BACKEND")
-            # 同参重报幂等（不改登记），异参覆盖；均返回 ok。
-            record["fault"] = (k, a, z, v)
+            new_fault = (k, a, z, v)
+            # 同参重报幂等：登记、计数与恢复基线均不动；异参替换只清恢复判定
+            # 基线（不清统计），fm 累计按登记身份重新判定。
+            if record["fault"] != new_fault:
+                record["fault"] = new_fault
+                record["drill_armed"] = {"D": False, "F": False, "S": False}
             results.append({"op": "fs", "ok": True})
 
         elif op[0] == "fb":
@@ -2903,9 +2983,14 @@ def run(raw):
                 if item_id not in backends:
                     fail(EXIT_BACKEND, "BACKEND")
             # 与 fs 同源：按后端加入序一次替换全部登记（未列入的清除），
-            # 空计划即清空；整体替换使同计划重报天然幂等。
+            # 空计划即清空；整体替换使同计划重报天然幂等。异参替换或移除只
+            # 清恢复判定基线、不清计数；登记逐元组比较，同参（含无登记后端
+            # 仍无登记）不清基线。
             for backend_id, record in backends.items():
-                record["fault"] = plan.get(backend_id)
+                new_fault = plan.get(backend_id)
+                if record["fault"] != new_fault:
+                    record["fault"] = new_fault
+                    record["drill_armed"] = {"D": False, "F": False, "S": False}
             results.append({"op": "fb", "ok": True})
 
         elif op[0] == "fq":
@@ -2970,6 +3055,36 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "fm":
+            # 故障演练统计只读查询：未知 id 报 BACKEND；不改变任何计数或恢复
+            # 基线，失败批次天然回滚。结果键序 op,id,D,F,S，D/F/S 各为键序
+            # affected,rejected,retries,remaps,recovered 的非负整数对象。
+            _, backend_id = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            drill = record["drill_counts"]
+
+            def drill_view(kind):
+                counts = drill[kind]
+                return {
+                    "affected": counts["affected"],
+                    "rejected": counts["rejected"],
+                    "retries": counts["retries"],
+                    "remaps": counts["remaps"],
+                    "recovered": counts["recovered"],
+                }
+
+            results.append(
+                {
+                    "op": "fm",
+                    "id": backend_id,
+                    "D": drill_view("D"),
+                    "F": drill_view("F"),
+                    "S": drill_view("S"),
+                }
+            )
+
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
             if ring_vnodes is None:
@@ -3000,7 +3115,15 @@ def run(raw):
                     seen.add(backend_id)
                     if first_id is None:
                         first_id = backend_id
-                    fault = backends[backend_id]["fault"]
+                    record = backends[backend_id]
+                    fault = record["fault"]
+                    # 记账与 fq 同源：每个环内不同后端至多观察一次，按登记种类
+                    # 归桶，effect 为 D/S 记 affected、为 N 判恢复；无登记（恒
+                    # N 且基线已清）不记账。调度判定保持原样，仅多读一次 fault。
+                    kind = fault[0] if fault is not None else None
+                    effect = fault_effect(record, now)
+                    if kind is not None:
+                        drill_observe(record, kind, effect)
                     cost = 0
                     unavailable = False
                     if fault is not None and fault[1] <= now < fault[2]:
@@ -3013,14 +3136,21 @@ def run(raw):
                         else:  # S：可用但耗时 v。
                             cost = v
                     if unavailable:
-                        # 跳过 D/F 计一次 remap；环外后端不计。
+                        # 跳过 D/F 计一次 remap；环外后端不计。effect 为 D 的
+                        # 失败同时在该登记种类记 rejected。
                         remaps += 1
+                        if kind is not None:
+                            drill_bump(record, kind, "remaps")
+                            drill_bump(record, kind, "rejected")
                         continue
                     # 首个可用后端即终止遍历：耗时超限则不建连。
                     chosen_id = backend_id
                     latency = cost
                     if cost <= timeout:
                         state = "A"
+                    elif kind is not None:
+                        # S 耗时 v>timeout：该种类 rejected 加 1（不建连）。
+                        drill_bump(record, kind, "rejected")
                     break
             if state == "A":
                 # 按 open 建连（opened_at=now）。
@@ -3076,7 +3206,14 @@ def run(raw):
                 if backend_id in seen:
                     continue
                 seen.add(backend_id)
-                fault = backends[backend_id]["fault"]
+                record = backends[backend_id]
+                fault = record["fault"]
+                # 记账与 fq 同源：每个尝试后端（环内不同后端）至多观察一次，
+                # 按登记种类归桶：effect D/S 记 affected、N 判恢复。
+                kind = fault[0] if fault is not None else None
+                effect = fault_effect(record, now)
+                if kind is not None:
+                    drill_observe(record, kind, effect)
                 cost = 0
                 unavailable = False
                 if fault is not None and fault[1] <= now < fault[2]:
@@ -3089,10 +3226,17 @@ def run(raw):
                     else:  # S：可用，基础耗时 v。
                         cost = v
                 if unavailable:
+                    # effect D 的失败尝试（D 窗口内或 F 故障相位）记 rejected；
+                    # 是否有下一尝试的 retries/remaps 在尝试序列确定后统一记。
+                    if kind is not None:
+                        drill_bump(record, kind, "rejected")
                     attempts_made.append((backend_id, 0))
                     continue
                 if cost > timeout:
-                    # S 且 v>timeout：本尝试失败，耗时按 timeout 计后重试。
+                    # S 且 v>timeout：本尝试失败，耗时按 timeout 计后重试；
+                    # 该 S 种类记 rejected。
+                    if kind is not None:
+                        drill_bump(record, kind, "rejected")
                     attempts_made.append((backend_id, timeout))
                     continue
                 # 首个成功尝试即终止：耗时 v 或 0。
@@ -3100,6 +3244,14 @@ def run(raw):
                 chosen_id = backend_id
                 state = "A"
                 break
+            # 某次尝试失败之后确有下一尝试（序列中除末次外的各项均为失败项）
+            # 时，为失败后端的 retries、remaps 各加 1；末次失败致整体拒绝时
+            # 再无下一尝试，不计。
+            for failed_id, _ in attempts_made[:-1]:
+                failed_fault = backends[failed_id]["fault"]
+                if failed_fault is not None:
+                    drill_bump(backends[failed_id], failed_fault[0], "retries")
+                    drill_bump(backends[failed_id], failed_fault[0], "remaps")
             attempts = len(attempts_made)
             retries = max(attempts - 1, 0)
             latency = sum(cost for _, cost in attempts_made)
