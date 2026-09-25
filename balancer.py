@@ -50,6 +50,19 @@ SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，摘要按 256 位大端无符号�
 不小于它的令牌，越界回绕；首见 key 建立映射，目标 healthy 时命中
 （sticky），增删后端或改 vnodes 不迁移，目标不可用时依环迁移且不迁回
 （remapped）。route 不改连接数；未 chash 或无 healthy 后端时报 STATE。
+
+优雅摘除：ds 键集 op,id,t（t ∈ [1,10^9] 非 bool 整数）登记排空时限，
+同值幂等，D 时改值报 STATE，否则覆盖。dr/du/dg 键集 op,id,now，now
+为非负非 bool 整数，纳入共用非递减时钟。已 ds 的 A 执行 dr：start=now、
+deadline=now+t、forced=0，有连接转 D，无连接转 X 且 end=now；D/X 再
+dr 幂等。D 不参与 pick、open 与新 route 映射，连接仍可 close，原粘性
+route 仍命中；最后连接关闭即转 X，end=close.now。dg 在 D 且
+now>=deadline 时强关其全部连接，forced=关闭数，转 X，end=deadline；
+X 的旧粘性按原环迁移。du 转 A，取消 D 时 end=now，不恢复已强关连接，
+调度仍要求健康且熔断为 C，慢启动不重置。ds/dr/du 返回 op,ok；dg 返回
+op,id,state,connections,start,end,deadline,forced，state ∈ A/D/X
+（可用/排空/已摘除），未开始时三时间为 null。未知 id 报 BACKEND，
+未 ds 的 dr/du/dg 报 STATE。
 """
 
 import bisect
@@ -182,11 +195,31 @@ def circuit_closed(record):
     return circuit is None or circuit["state"] == "C"
 
 
+def drain_available(record):
+    """仅 A（可用）态后端参与 pick/open 与新的 route 映射。"""
+    return record["drain"]["state"] == "A"
+
+
+def parse_drain_timeout(value):
+    # 排空时限 t ∈ [1, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def build_ring(backends, vnodes):
-    """按 (摘要, 加入顺序, i) 升序返回 healthy 且熔断闭合后端的令牌环。"""
+    """按 (摘要, 加入顺序, i) 升序返回 healthy、熔断闭合且 A 态后端的令牌环。"""
     tokens = []
     for join_index, (backend_id, record) in enumerate(backends.items()):
-        if not record["healthy"] or not circuit_closed(record):
+        if (
+            not record["healthy"]
+            or not circuit_closed(record)
+            or not drain_available(record)
+        ):
             continue
         encoded = encode_backend_id(backend_id)
         for i in range(vnodes):
@@ -227,7 +260,7 @@ def parse_op(raw_op):
     if name not in (
         "add", "remove", "pick", "open", "close", "get",
         "hset", "probe", "hget", "chash", "route", "ws", "wg",
-        "cs", "cr", "cg",
+        "cs", "cr", "cg", "ds", "dr", "du", "dg",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -371,6 +404,20 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("cg", parse_backend_id(raw_op["id"]), parse_now(raw_op["now"]))
 
+    if name == "ds":
+        if keys != {"op", "id", "t"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "ds",
+            parse_backend_id(raw_op["id"]),
+            parse_drain_timeout(raw_op["t"]),
+        )
+
+    if name in ("dr", "du", "dg"):
+        if keys != {"op", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (name, parse_backend_id(raw_op["id"]), parse_now(raw_op["now"]))
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -421,7 +468,10 @@ def run():
     # 熔断器状态（未配为 None，remove 后重加即回到未配）：params 为
     # (n, m, r, w, q)，state ∈ C/O/H，window 为 C 态最近 n 次报告的
     # deque，next 为 O 态恢复时刻，used 为 H 态已报告数，cr_now/cr_ok
-    # 为最近一次生效的 cr（用于幂等重报判定）。
+    # 为最近一次生效的 cr（用于幂等重报判定）。drain 为优雅摘除状态：
+    # t 为 ds 登记的排空时限（未 ds 为 None，remove 后重加即回到未配），
+    # state ∈ A/D/X（可用/排空/已摘除），start/end/deadline 为本次摘除
+    # 的三个时刻（未开始为 None），forced 为 dg 强关的连接数。
     backends = {}
     # 活动连接：cid -> [backend_id, flow, opened_at]；关闭即删除，cid 可复用。
     connections = {}
@@ -435,7 +485,10 @@ def run():
     for raw_op in ops:
         op = parse_op(raw_op)
 
-        if op[0] in ("open", "close", "probe", "add", "ws", "wg", "cr", "cg"):
+        if op[0] in (
+            "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
+            "dr", "du", "dg",
+        ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
             if now is not None:
@@ -487,6 +540,14 @@ def run():
                 "warm_start": warm_start,
                 "warm_end": warm_end,
                 "circuit": None,
+                "drain": {
+                    "t": None,
+                    "state": "A",
+                    "start": None,
+                    "end": None,
+                    "deadline": None,
+                    "forced": 0,
+                },
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
             }
             results.append({"op": "add", "ok": True})
@@ -502,14 +563,18 @@ def run():
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
-            # 只在 healthy 且熔断闭合的池内平滑加权：以最近时钟时刻的当前
-            # 有效权重（百分制整数）累加，累加与总权重扣减都忽略不健康
-            # 或熔断非 C 的后端。
+            # 只在 healthy 且熔断闭合的可用（A）池内平滑加权：以最近时钟时刻
+            # 的当前有效权重（百分制整数）累加，累加与总权重扣减都忽略不健
+            # 康、熔断非 C 或排空中/已摘除的后端。
             chosen_id = None
             chosen_current = None
             healthy_total = 0
             for backend_id, record in backends.items():
-                if not record["healthy"] or not circuit_closed(record):
+                if (
+                    not record["healthy"]
+                    or not circuit_closed(record)
+                    or not drain_available(record)
+                ):
                     continue
                 weight = effective_weight(record, last_now)
                 record["current"] += weight
@@ -528,7 +593,11 @@ def run():
             chosen_id = None
             chosen_key = None
             for backend_id, record in backends.items():
-                if not record["healthy"] or not circuit_closed(record):
+                if (
+                    not record["healthy"]
+                    or not circuit_closed(record)
+                    or not drain_available(record)
+                ):
                     continue
                 # 连接数升序、有效权重降序、加入顺序（dict 遍历序）。
                 key = (record["conns"], -effective_weight(record, now))
@@ -544,12 +613,18 @@ def run():
             results.append({"op": "open", "cid": cid, "backend": chosen_id})
 
         elif op[0] == "close":
-            _, cid, _now = op
+            _, cid, now = op
             connection = connections.get(cid)
             if connection is None:
                 fail(EXIT_CONNECTION, "CONNECTION")
-            backends[connection[0]]["conns"] -= 1
+            record = backends[connection[0]]
+            record["conns"] -= 1
             del connections[cid]
+            drain = record["drain"]
+            if drain["state"] == "D" and record["conns"] == 0:
+                # 排空中最后连接关闭即转 X，end 取本次 close 的 now。
+                drain["state"] = "X"
+                drain["end"] = now
             results.append({"op": "close", "ok": True})
 
         elif op[0] == "hset":
@@ -710,8 +785,10 @@ def run():
                     record is not None
                     and record["healthy"]
                     and circuit_closed(record)
+                    and record["drain"]["state"] != "X"
                 ):
-                    # 健康且熔断闭合的旧映射命中，无需动环。
+                    # 健康、熔断闭合并未摘除（A 或排空中 D）的旧映射命中，
+                    # 无需动环。
                     results.append(
                         {
                             "op": "route",
@@ -842,6 +919,90 @@ def run():
                     "reason": None if state == "C" else "rate",
                     "next": circuit["next"] if state == "O" else None,
                     "used": circuit["used"] if state == "H" else 0,
+                }
+            )
+
+        elif op[0] == "ds":
+            _, backend_id, t = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            drain = record["drain"]
+            if drain["t"] == t:
+                # 同值幂等，任意状态下都不改配置。
+                results.append({"op": "ds", "ok": True})
+                continue
+            if drain["state"] == "D":
+                # 排空中改值报 STATE。
+                fail(EXIT_STATE, "STATE")
+            drain["t"] = t
+            results.append({"op": "ds", "ok": True})
+
+        elif op[0] == "dr":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            drain = record["drain"]
+            if drain["t"] is None:
+                fail(EXIT_STATE, "STATE")
+            if drain["state"] == "A":
+                # 开启新一轮摘除：start/deadline/forced 复位，end 待迁移时填。
+                drain["start"] = now
+                drain["deadline"] = now + drain["t"]
+                drain["forced"] = 0
+                drain["end"] = None
+                if record["conns"] > 0:
+                    drain["state"] = "D"
+                else:
+                    drain["state"] = "X"
+                    drain["end"] = now
+            # D/X 再 dr 幂等，不改状态。
+            results.append({"op": "dr", "ok": True})
+
+        elif op[0] == "du":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            drain = record["drain"]
+            if drain["t"] is None:
+                fail(EXIT_STATE, "STATE")
+            if drain["state"] == "D":
+                # 取消排空记 end=now；已强关的连接不恢复，慢启动不重置。
+                drain["end"] = now
+            drain["state"] = "A"
+            results.append({"op": "du", "ok": True})
+
+        elif op[0] == "dg":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            drain = record["drain"]
+            if drain["t"] is None:
+                fail(EXIT_STATE, "STATE")
+            if drain["state"] == "D" and now >= drain["deadline"]:
+                # 到期强关该后端全部连接（O(C)），转 X，end=deadline。
+                forced = 0
+                for cid, connection in list(connections.items()):
+                    if connection[0] == backend_id:
+                        del connections[cid]
+                        forced += 1
+                record["conns"] = 0
+                drain["forced"] = forced
+                drain["state"] = "X"
+                drain["end"] = drain["deadline"]
+            results.append(
+                {
+                    "op": "dg",
+                    "id": backend_id,
+                    "state": drain["state"],
+                    "connections": record["conns"],
+                    "start": drain["start"],
+                    "end": drain["end"],
+                    "deadline": drain["deadline"],
+                    "forced": drain["forced"],
                 }
             )
 
