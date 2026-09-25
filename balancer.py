@@ -63,6 +63,20 @@ X 的旧粘性按原环迁移。du 转 A，取消 D 时 end=now，不恢复已�
 op,id,state,connections,start,end,deadline,forced，state ∈ A/D/X
 （可用/排空/已摘除），未开始时三时间为 null。未知 id 报 BACKEND，
 未 ds 的 dr/du/dg 报 STATE。
+
+令牌桶：ls 键集 op,scope,id,r,b,now，scope ∈ B/C/S（后端/客户端/
+服务类），id/c/s/key 均为非空 UTF-8 串，r,b ∈ [1,10^9] 非 bool 整数，
+now ≥ 0 纳入共用非递减时钟；B 桶的 id 须为现存后端，否则 BACKEND。
+桶以 (scope,id) 唯一，新桶满令牌起步，同 (r,b,now) 重报幂等（不补充
+不推进时钟），其余 ls 一律重配置并置 t=b、at=now；remove 同步删除其
+B 桶。la 键集 op,c,s,key,now：先按原 route 语义选后端（含粘性建立
+与迁移，未配环或无可选后端报 STATE），再检查该后端 B 桶、客户端 C 桶
+（以 c 标识）、服务类 S 桶（以 s 标识），未配置即不限制。各在配桶先
+作 t=min(b,t+(now-at)*r)、at=now，均有 t>=1 才各减 1，否则 RATE/6
+（无 stdout、整批原子）；成功返回键序 op,backend,ok，ok=true。
+lg 键集 op,scope,id,now，按同样规则补充但不消费，查未配置桶报 STATE；
+返回键序 op,scope,id,r,b,t,at，值均为整数。ls 返回 op,ok。桶操作
+O(1)，la 继承 route 的复杂度上界，空间 O(B+K)。
 """
 
 import bisect
@@ -75,6 +89,7 @@ EXIT_INPUT = 2
 EXIT_BACKEND = 3
 EXIT_STATE = 4
 EXIT_CONNECTION = 5
+EXIT_RATE = 6
 
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
@@ -132,6 +147,28 @@ def parse_threshold(value):
         not isinstance(value, int)
         or isinstance(value, bool)
         or not 1 <= value <= 100
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_rate(value):
+    # 令牌桶速率 r ∈ [1, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_burst(value):
+    # 令牌桶容量 b ∈ [1, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
     ):
         fail(EXIT_INPUT, "INPUT")
     return value
@@ -261,6 +298,7 @@ def parse_op(raw_op):
         "add", "remove", "pick", "open", "close", "get",
         "hset", "probe", "hget", "chash", "route", "ws", "wg",
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
+        "ls", "la", "lg",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -418,6 +456,45 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return (name, parse_backend_id(raw_op["id"]), parse_now(raw_op["now"]))
 
+    if name == "ls":
+        if keys != {"op", "scope", "id", "r", "b", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        scope = raw_op["scope"]
+        if scope not in ("B", "C", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "ls",
+            scope,
+            parse_key(raw_op["id"]),
+            parse_rate(raw_op["r"]),
+            parse_burst(raw_op["b"]),
+            parse_now(raw_op["now"]),
+        )
+
+    if name == "la":
+        if keys != {"op", "c", "s", "key", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "la",
+            parse_key(raw_op["c"]),
+            parse_key(raw_op["s"]),
+            parse_key(raw_op["key"]),
+            parse_now(raw_op["now"]),
+        )
+
+    if name == "lg":
+        if keys != {"op", "scope", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        scope = raw_op["scope"]
+        if scope not in ("B", "C", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "lg",
+            scope,
+            parse_key(raw_op["id"]),
+            parse_now(raw_op["now"]),
+        )
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -479,15 +556,56 @@ def run():
     # 只在目标不可用时依环改写（不迁回），增删后端或改 vnodes 均不动它。
     ring_vnodes = None
     sticky_map = {}
+    # 令牌桶以 (scope, id) 唯一：scope ∈ B/C/S（后端/客户端/服务类）。
+    # B 桶 id 必须是现存后端；remove 即删。每桶 r/b 为速率与容量，t/at
+    # 为当前令牌与最近补充时刻，last 为最近一次 ls 的 (r,b,now) 用于重报。
+    buckets = {}
     last_now = None
     results = []
+
+    def select_route(key):
+        """按原 route 语义选后端：首见建立粘性映射，目标不可用依环迁移且不
+        迁回；返回 (backend_id, sticky, remapped)，未配环或无可选后端报 STATE。"""
+        if ring_vnodes is None:
+            fail(EXIT_STATE, "STATE")
+        mapped = sticky_map.get(key)
+        if mapped is not None:
+            record = backends.get(mapped)
+            if (
+                record is not None
+                and record["healthy"]
+                and circuit_closed(record)
+                and record["drain"]["state"] != "X"
+            ):
+                return mapped, True, False
+        tokens = build_ring(backends, ring_vnodes)
+        if not tokens:
+            fail(EXIT_STATE, "STATE")
+        digests = [token[0] for token in tokens]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash)
+        if index == len(tokens):
+            index = 0  # 越界回绕到环首
+        chosen_id = tokens[index][3]
+        remapped = mapped is not None
+        sticky_map[key] = chosen_id
+        return chosen_id, False, remapped
+
+    def refill(bucket, now):
+        # 先按时间差补充至容量上限，再推进时钟。
+        bucket["t"] = min(
+            bucket["b"], bucket["t"] + (now - bucket["at"]) * bucket["r"]
+        )
+        bucket["at"] = now
 
     for raw_op in ops:
         op = parse_op(raw_op)
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg",
+            "dr", "du", "dg", "ls", "la", "lg",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -560,6 +678,7 @@ def run():
             if record["conns"] > 0:
                 fail(EXIT_STATE, "STATE")
             del backends[backend_id]
+            buckets.pop(("B", backend_id), None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -776,48 +895,13 @@ def run():
 
         elif op[0] == "route":
             _, key = op
-            if ring_vnodes is None:
-                fail(EXIT_STATE, "STATE")
-            mapped = sticky_map.get(key)
-            if mapped is not None:
-                record = backends.get(mapped)
-                if (
-                    record is not None
-                    and record["healthy"]
-                    and circuit_closed(record)
-                    and record["drain"]["state"] != "X"
-                ):
-                    # 健康、熔断闭合并未摘除（A 或排空中 D）的旧映射命中，
-                    # 无需动环。
-                    results.append(
-                        {
-                            "op": "route",
-                            "key": key,
-                            "backend": mapped,
-                            "sticky": True,
-                            "remapped": False,
-                        }
-                    )
-                    continue
-            tokens = build_ring(backends, ring_vnodes)
-            if not tokens:
-                fail(EXIT_STATE, "STATE")
-            digests = [token[0] for token in tokens]
-            key_hash = int.from_bytes(
-                hashlib.sha256(key.encode("utf-8")).digest(), "big"
-            )
-            index = bisect.bisect_left(digests, key_hash)
-            if index == len(tokens):
-                index = 0  # 越界回绕到环首
-            chosen_id = tokens[index][3]
-            remapped = mapped is not None
-            sticky_map[key] = chosen_id
+            chosen_id, sticky, remapped = select_route(key)
             results.append(
                 {
                     "op": "route",
                     "key": key,
                     "backend": chosen_id,
-                    "sticky": False,
+                    "sticky": sticky,
                     "remapped": remapped,
                 }
             )
@@ -1003,6 +1087,73 @@ def run():
                     "end": drain["end"],
                     "deadline": drain["deadline"],
                     "forced": drain["forced"],
+                }
+            )
+
+        elif op[0] == "ls":
+            _, scope, bucket_id, r, b, now = op
+            # B 桶挂在现存后端上；未知后端优先于其它检查报 BACKEND。
+            if scope == "B" and bucket_id not in backends:
+                fail(EXIT_BACKEND, "BACKEND")
+            key_pair = (scope, bucket_id)
+            bucket = buckets.get(key_pair)
+            if bucket is None:
+                # 新桶以满令牌起步。
+                buckets[key_pair] = {
+                    "r": r,
+                    "b": b,
+                    "t": b,
+                    "at": now,
+                    "last": (r, b, now),
+                }
+            else:
+                if bucket["last"] == (r, b, now):
+                    # 同 (r, b, now) 重报幂等，不补令牌、不推进时钟。
+                    results.append({"op": "ls", "ok": True})
+                    continue
+                # 其余一律按重配置处理：t=b、at=now。
+                bucket["r"] = r
+                bucket["b"] = b
+                bucket["t"] = b
+                bucket["at"] = now
+                bucket["last"] = (r, b, now)
+            results.append({"op": "ls", "ok": True})
+
+        elif op[0] == "la":
+            _, c, s, key, now = op
+            # 先按原 route 选后端（未配环或无可选后端报 STATE），再检查
+            # 该后端/客户端/服务类三个桶；未配置即不限制。
+            backend_id, _, _ = select_route(key)
+            chosen = []
+            for scope, bucket_id in (("B", backend_id), ("C", c), ("S", s)):
+                bucket = buckets.get((scope, bucket_id))
+                if bucket is not None:
+                    chosen.append(bucket)
+            for bucket in chosen:
+                refill(bucket, now)
+            # 均有 t>=1 才各减 1；任一不足则 RATE/6：无 stdout、整批原子。
+            if not all(bucket["t"] >= 1 for bucket in chosen):
+                fail(EXIT_RATE, "RATE")
+            for bucket in chosen:
+                bucket["t"] -= 1
+            results.append({"op": "la", "backend": backend_id, "ok": True})
+
+        elif op[0] == "lg":
+            _, scope, bucket_id, now = op
+            bucket = buckets.get((scope, bucket_id))
+            if bucket is None:
+                # 查询未配置桶报 STATE。
+                fail(EXIT_STATE, "STATE")
+            refill(bucket, now)
+            results.append(
+                {
+                    "op": "lg",
+                    "scope": scope,
+                    "id": bucket_id,
+                    "r": bucket["r"],
+                    "b": bucket["b"],
+                    "t": bucket["t"],
+                    "at": bucket["at"],
                 }
             )
 
