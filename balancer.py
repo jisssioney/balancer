@@ -137,6 +137,21 @@ latency=耗时；无可用项则 R、backend=null、latency=0。结果键序
 op,cid,state,backend,latency,remaps。fx 完成后按归属 id 追加一次等价
 mr 度量（见请求度量段），结果项本身不变。fs O(1)，fx 仍为 O(BV)。
 
+故障重试：fr 键集 op,cid,flow,key,timeout,max,now，cid/flow/key 同
+fx，timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数，now 纳入
+共用非递减时钟。自 key 哈希点按 fx 顺序遍历不同后端至多 max 个（环同
+route，仅健康、熔断 C、排空 A），每个候选即一次尝试：窗口内 D 或故障
+相位 F 失败、耗时 0，S 且 v>timeout 失败、耗时 timeout，否则成功、
+耗时 v 或 0 并终止；耗尽全部尝试仍无成功则拒绝。attempts=尝试数，
+retries=remaps=max(attempts-1,0)，latency 为各次耗时之和。成功按 open
+建连且 opened_at=now，拒绝不建连。结果键序
+op,cid,state,backend,attempts,retries,latency,remaps，state ∈ A/R，
+backend 成功为 id 否则 null。未配环或环内无候选报 STATE/4 且先于 cid
+判定，重复活动 cid 报 CONNECTION/5，非法键、类型、范围、编码或时钟
+倒退报 INPUT/2。每个尝试后端各追加一条 mr 度量（now=fr.now）：仅成功
+尝试 ok=true，ms 为该次耗时，首项的 retries/remaps 记总值、余项为 0。
+fr 时空 O(BV)；record/replay 照常覆盖 fr，其余契约不变。
+
 确定性操作记录：record 把原始 stdin 字节作为全新 run 输入执行，无论底层
 成功或按既有错误失败，均退出 0、stderr 为空，stdout 输出一行紧凑 JSON
 记录，键序 version,stdin,exit,stdout,stderr：version=1（非 bool 整数），
@@ -279,6 +294,17 @@ def parse_circuit_window(value):
 
 def parse_vnodes(value):
     # bool 是 int 的子类，必须显式排除。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 1024
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_attempt_max(value):
+    # fr 的 max（至多尝试的不同后端数）∈ [1,1024]，非 bool 整数。
     if (
         not isinstance(value, int)
         or isinstance(value, bool)
@@ -529,7 +555,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og",
         "mr", "mg",
         "ce", "ci",
-        "fs", "fx",
+        "fs", "fx", "fr",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -816,6 +842,19 @@ def parse_op(raw_op):
             parse_fault_num(raw_op["now"]),
         )
 
+    if name == "fr":
+        if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "fr",
+            parse_cid(raw_op["cid"]),
+            parse_flow(raw_op["flow"]),
+            parse_key(raw_op["key"]),
+            parse_fault_num(raw_op["timeout"]),
+            parse_attempt_max(raw_op["max"]),
+            parse_fault_num(raw_op["now"]),
+        )
+
     if name in ("ce", "ci"):
         if name == "ce":
             if keys != {"op"}:
@@ -1017,7 +1056,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
-            "ci", "fx",
+            "ci", "fx", "fr",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -1944,6 +1983,95 @@ def run(raw):
             if metric_id is not None:
                 record_metric(
                     metric_id, state == "A", latency, remaps, remaps, now
+                )
+
+        elif op[0] == "fr":
+            _, cid, flow, key, timeout, max_attempts, now = op
+            if ring_vnodes is None:
+                # 未配环报 STATE，且先于 cid 重复判定。
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                # 环内无候选同样报 STATE（区别于 fx 的 R），先于 cid。
+                fail(EXIT_STATE, "STATE")
+            if cid in connections:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            digests = [token[0] for token in tokens]
+            key_hash = int.from_bytes(
+                hashlib.sha256(key.encode("utf-8")).digest(), "big"
+            )
+            index = bisect.bisect_left(digests, key_hash)
+            if index == len(tokens):
+                index = 0  # 越界回绕到环首
+            # 自哈希点按 fx 顺序遍历不同后端，至多 max 个，每个候选即一次尝试：
+            # D/故障相位 F 失败、耗时 0；S 的 v>timeout 失败、耗时 timeout；
+            # 否则成功、耗时 v 或 0。attempts 记录 (后端, 本次耗时)。
+            attempts_made = []
+            seen = set()
+            state = "R"
+            chosen_id = None
+            for offset in range(len(tokens)):
+                if len(attempts_made) >= max_attempts:
+                    break
+                backend_id = tokens[(index + offset) % len(tokens)][3]
+                if backend_id in seen:
+                    continue
+                seen.add(backend_id)
+                fault = backends[backend_id]["fault"]
+                cost = 0
+                unavailable = False
+                if fault is not None and fault[1] <= now < fault[2]:
+                    k, a, _, v = fault
+                    if k == "D":
+                        unavailable = True
+                    elif k == "F":
+                        # 抖动：((now-a)//v)%2=0 的相位为故障。
+                        unavailable = ((now - a) // v) % 2 == 0
+                    else:  # S：可用，基础耗时 v。
+                        cost = v
+                if unavailable:
+                    attempts_made.append((backend_id, 0))
+                    continue
+                if cost > timeout:
+                    # S 且 v>timeout：本尝试失败，耗时按 timeout 计后重试。
+                    attempts_made.append((backend_id, timeout))
+                    continue
+                # 首个成功尝试即终止：耗时 v 或 0。
+                attempts_made.append((backend_id, cost))
+                chosen_id = backend_id
+                state = "A"
+                break
+            attempts = len(attempts_made)
+            retries = max(attempts - 1, 0)
+            latency = sum(cost for _, cost in attempts_made)
+            if state == "A":
+                # 成功按 open 建连（opened_at=now）；耗尽拒绝不建连。
+                backends[chosen_id]["conns"] += 1
+                connections[cid] = [chosen_id, flow, now]
+            results.append(
+                {
+                    "op": "fr",
+                    "cid": cid,
+                    "state": state,
+                    "backend": chosen_id,
+                    "attempts": attempts,
+                    "retries": retries,
+                    "latency": latency,
+                    "remaps": retries,
+                }
+            )
+            # 每个尝试后端各记一条 mr：仅成功尝试 ok=true；ms 为本次耗时；
+            # 首项 retries/remaps 记总值，余项为 0。
+            for idx, (metric_id, cost) in enumerate(attempts_made):
+                attempt_ok = state == "A" and idx == attempts - 1
+                attempt_retries = retries if idx == 0 else 0
+                record_metric(
+                    metric_id,
+                    attempt_ok,
+                    cost,
+                    attempt_retries,
+                    attempt_retries,
+                    now,
                 )
 
         else:  # get
