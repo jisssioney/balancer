@@ -310,15 +310,27 @@ def reject_duplicate_keys(pairs):
     return result
 
 
+def check_utf8_encodable(value):
+    """公开标识字符串须能直接编码为 UTF-8；JSON 转义可能解码出孤立
+    高/低代理或代理对（如 “d800”），它们无法编码，一律 INPUT。
+    真实非 BMP 字符编码正常，合法。"""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(EXIT_INPUT, "INPUT")
+
+
 def parse_cid(value):
     if not isinstance(value, str) or value == "":
         fail(EXIT_INPUT, "INPUT")
+    check_utf8_encodable(value)
     return value
 
 
 def parse_backend_id(value):
     if not isinstance(value, str) or value == "":
         fail(EXIT_INPUT, "INPUT")
+    check_utf8_encodable(value)
     return value
 
 
@@ -476,10 +488,7 @@ def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
         fail(EXIT_INPUT, "INPUT")
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        fail(EXIT_INPUT, "INPUT")
+    check_utf8_encodable(value)
     return value
 
 
@@ -563,6 +572,7 @@ def parse_flow(value):
     for ip in (src_ip, dst_ip):
         if not isinstance(ip, str) or ip == "":
             fail(EXIT_INPUT, "INPUT")
+        check_utf8_encodable(ip)
     for port in (src_port, dst_port):
         if (
             not isinstance(port, int)
