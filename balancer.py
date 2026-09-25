@@ -30,6 +30,19 @@ warm 带整数 start/end，其余为 null。pick 以当前有效权重执行旧�
 open 按连接数升序、有效权重降序、加入顺序选取；chash/route 忽略权重；
 backends.weight 始终为目标整数权重。
 
+熔断器：cs 键集 op,id,n,m,r,w,q（n,q,r ∈ [1,100]，m ∈ [1,n]，w ∈ [1,10^9]，
+均非 bool 整数），首配或异参重配置 C 并清空窗，同参重报幂等；配置可选，
+未配后端的 cr/cg 报 STATE，remove 后重加即回到未配。cr 键集 op,id,ok,now
+（ok 仅 bool）：C 保留最近 n 次报告，样本数 ≥ m 且失败数×100 ≥ r×样本数
+转 O 并记 next=now+w；O 且 now<next 的 cr 报 STATE，否则先转 H；H 中失败
+立即重开并重算 next，连续 q 次成功转 C 并清窗。同 (id, now, ok) 的 cr 重报
+幂等，同 (id, now) 异 ok 报 INPUT。cg 键集 op,id,now，触发 O 到期转 H，返
+回键序 op,id,state,count,fail,reason,next,used：state ∈ C/O/H，count/fail
+为窗口样本与失败数，reason 非 C 为 rate 否则 null，next 仅 O 为整数否则
+null，used 仅 H 为已报告数否则 0。cs/cr 返回 op,ok。cr/cg 的 now 纳入同一
+非递减时钟。pick/open/route 只选 healthy 且熔断状态为 C（含未配）的后端；
+粘性目标非 C 时沿原环迁移且不迁回。
+
 一致性哈希：chash 配置每个 healthy 后端的虚拟节点数 vnodes（1..1024），
 同值幂等、异值生效。每个 healthy 后端为 i=0..vnodes-1 生成令牌
 SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，摘要按 256 位大端无符号数
@@ -43,6 +56,7 @@ import bisect
 import hashlib
 import json
 import sys
+from collections import deque
 
 EXIT_INPUT = 2
 EXIT_BACKEND = 3
@@ -121,6 +135,17 @@ def parse_duration(value):
     return value
 
 
+def parse_circuit_window(value):
+    # 熔断恢复窗口 w ∈ [1, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_vnodes(value):
     # bool 是 int 的子类，必须显式排除。
     if (
@@ -151,11 +176,17 @@ def encode_backend_id(value):
         fail(EXIT_INPUT, "INPUT")
 
 
+def circuit_closed(record):
+    """未配置熔断器或熔断状态为 C 的后端才参与调度。"""
+    circuit = record["circuit"]
+    return circuit is None or circuit["state"] == "C"
+
+
 def build_ring(backends, vnodes):
-    """按 (摘要, 加入顺序, i) 升序返回 healthy 后端的令牌环。"""
+    """按 (摘要, 加入顺序, i) 升序返回 healthy 且熔断闭合后端的令牌环。"""
     tokens = []
     for join_index, (backend_id, record) in enumerate(backends.items()):
-        if not record["healthy"]:
+        if not record["healthy"] or not circuit_closed(record):
             continue
         encoded = encode_backend_id(backend_id)
         for i in range(vnodes):
@@ -196,6 +227,7 @@ def parse_op(raw_op):
     if name not in (
         "add", "remove", "pick", "open", "close", "get",
         "hset", "probe", "hget", "chash", "route", "ws", "wg",
+        "cs", "cr", "cg",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -300,6 +332,45 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("route", parse_key(raw_op["key"]))
 
+    if name == "cs":
+        if keys != {"op", "id", "n", "m", "r", "w", "q"}:
+            fail(EXIT_INPUT, "INPUT")
+        n = parse_threshold(raw_op["n"])
+        r = parse_threshold(raw_op["r"])
+        q = parse_threshold(raw_op["q"])
+        m = raw_op["m"]
+        # m ∈ [1, n]，须先校验 n；bool 是 int 的子类，必须显式排除。
+        if not isinstance(m, int) or isinstance(m, bool) or not 1 <= m <= n:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "cs",
+            parse_backend_id(raw_op["id"]),
+            n,
+            m,
+            r,
+            parse_circuit_window(raw_op["w"]),
+            q,
+        )
+
+    if name == "cr":
+        if keys != {"op", "id", "ok", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        ok = raw_op["ok"]
+        # ok 只接受真正的 bool。
+        if not isinstance(ok, bool):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "cr",
+            parse_backend_id(raw_op["id"]),
+            ok,
+            parse_now(raw_op["now"]),
+        )
+
+    if name == "cg":
+        if keys != {"op", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("cg", parse_backend_id(raw_op["id"]), parse_now(raw_op["now"]))
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -346,7 +417,11 @@ def run():
     # （用于幂等重报判定）。预热：stage ∈ warm/steady，warm_from 为段内
     # 起始有效权重（百分制，新增/恢复为 100，调权为当时有效值），
     # warm_start/warm_end 为预热区间，warm_d 为登记的 d（恢复时复用）。
-    # last_op 记录最近一次写操作的形状用于同参/冲突重报判定。
+    # last_op 记录最近一次写操作的形状用于同参/冲突重报判定。circuit 为
+    # 熔断器状态（未配为 None，remove 后重加即回到未配）：params 为
+    # (n, m, r, w, q)，state ∈ C/O/H，window 为 C 态最近 n 次报告的
+    # deque，next 为 O 态恢复时刻，used 为 H 态已报告数，cr_now/cr_ok
+    # 为最近一次生效的 cr（用于幂等重报判定）。
     backends = {}
     # 活动连接：cid -> [backend_id, flow, opened_at]；关闭即删除，cid 可复用。
     connections = {}
@@ -360,7 +435,7 @@ def run():
     for raw_op in ops:
         op = parse_op(raw_op)
 
-        if op[0] in ("open", "close", "probe", "add", "ws", "wg"):
+        if op[0] in ("open", "close", "probe", "add", "ws", "wg", "cr", "cg"):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
             if now is not None:
@@ -411,6 +486,7 @@ def run():
                 "warm_from": warm_from,
                 "warm_start": warm_start,
                 "warm_end": warm_end,
+                "circuit": None,
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
             }
             results.append({"op": "add", "ok": True})
@@ -426,13 +502,14 @@ def run():
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
-            # 只在 healthy 池内平滑加权：以最近时钟时刻的当前有效权重
-            # （百分制整数）累加，累加与总权重扣减都忽略 unhealthy。
+            # 只在 healthy 且熔断闭合的池内平滑加权：以最近时钟时刻的当前
+            # 有效权重（百分制整数）累加，累加与总权重扣减都忽略不健康
+            # 或熔断非 C 的后端。
             chosen_id = None
             chosen_current = None
             healthy_total = 0
             for backend_id, record in backends.items():
-                if not record["healthy"]:
+                if not record["healthy"] or not circuit_closed(record):
                     continue
                 weight = effective_weight(record, last_now)
                 record["current"] += weight
@@ -451,7 +528,7 @@ def run():
             chosen_id = None
             chosen_key = None
             for backend_id, record in backends.items():
-                if not record["healthy"]:
+                if not record["healthy"] or not circuit_closed(record):
                     continue
                 # 连接数升序、有效权重降序、加入顺序（dict 遍历序）。
                 key = (record["conns"], -effective_weight(record, now))
@@ -629,8 +706,12 @@ def run():
             mapped = sticky_map.get(key)
             if mapped is not None:
                 record = backends.get(mapped)
-                if record is not None and record["healthy"]:
-                    # 健康旧映射命中，无需动环。
+                if (
+                    record is not None
+                    and record["healthy"]
+                    and circuit_closed(record)
+                ):
+                    # 健康且熔断闭合的旧映射命中，无需动环。
                     results.append(
                         {
                             "op": "route",
@@ -661,6 +742,106 @@ def run():
                     "backend": chosen_id,
                     "sticky": False,
                     "remapped": remapped,
+                }
+            )
+
+        elif op[0] == "cs":
+            _, backend_id, n, m, r, w, q = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            params = (n, m, r, w, q)
+            circuit = record["circuit"]
+            if circuit is not None and circuit["params"] == params:
+                # 同参重报幂等，不重置状态与窗口。
+                results.append({"op": "cs", "ok": True})
+                continue
+            # 首配或异参重配：置 C 并清空窗。
+            record["circuit"] = {
+                "params": params,
+                "state": "C",
+                "window": deque(maxlen=n),
+                "next": None,
+                "used": 0,
+                "cr_now": None,
+                "cr_ok": None,
+            }
+            results.append({"op": "cs", "ok": True})
+
+        elif op[0] == "cr":
+            _, backend_id, ok, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            circuit = record["circuit"]
+            if circuit is None:
+                fail(EXIT_STATE, "STATE")
+            if circuit["cr_now"] == now:
+                # 同一 (id, now) 已生效过：ok 相同则幂等，不同即冲突重报。
+                if circuit["cr_ok"] != ok:
+                    fail(EXIT_INPUT, "INPUT")
+                results.append({"op": "cr", "ok": True})
+                continue
+            n, m, r, w, q = circuit["params"]
+            if circuit["state"] == "O":
+                if now < circuit["next"]:
+                    # 熔断恢复窗口未到期，拒绝报告。
+                    fail(EXIT_STATE, "STATE")
+                # 到期先转 H，本条按 H 处理。
+                circuit["state"] = "H"
+                circuit["next"] = None
+                circuit["used"] = 0
+            if circuit["state"] == "C":
+                window = circuit["window"]
+                window.append(ok)
+                samples = len(window)
+                failures = sum(1 for value in window if not value)
+                if samples >= m and failures * 100 >= r * samples:
+                    circuit["state"] = "O"
+                    circuit["next"] = now + w
+                    circuit["used"] = 0
+            else:  # H
+                if ok:
+                    circuit["used"] += 1
+                    if circuit["used"] >= q:
+                        # 连续 q 次成功转 C 并清窗。
+                        circuit["state"] = "C"
+                        circuit["window"].clear()
+                        circuit["used"] = 0
+                else:
+                    # H 中失败立即重开并重算恢复时刻。
+                    circuit["state"] = "O"
+                    circuit["next"] = now + w
+                    circuit["used"] = 0
+            circuit["cr_now"] = now
+            circuit["cr_ok"] = ok
+            results.append({"op": "cr", "ok": True})
+
+        elif op[0] == "cg":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            circuit = record["circuit"]
+            if circuit is None:
+                fail(EXIT_STATE, "STATE")
+            if circuit["state"] == "O" and now >= circuit["next"]:
+                # 恢复窗口到期，触发转 H。
+                circuit["state"] = "H"
+                circuit["next"] = None
+                circuit["used"] = 0
+            state = circuit["state"]
+            window = circuit["window"]
+            results.append(
+                {
+                    "op": "cg",
+                    "id": backend_id,
+                    "state": state,
+                    "count": len(window),
+                    "fail": sum(1 for value in window if not value),
+                    "reason": None if state == "C" else "rate",
+                    "next": circuit["next"] if state == "O" else None,
+                    "used": circuit["used"] if state == "H" else 0,
                 }
             )
 
