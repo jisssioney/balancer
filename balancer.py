@@ -117,8 +117,19 @@ B 限流引用未知后端判 BACKEND/3，有活动连接或排队项判 STATE/4
 成功时原子替换配置并以 now 重建默认运行态（全部 healthy、d>0 自 now 起算
 预热、熔断 C 空窗、排空 A、桶满、队空、粘性清空、度量归零）；失败回滚不变更。
 ce/ci 均 O(B+L) 时空（L 为限流项数）。
+
+确定性操作记录：record 把原始 stdin 字节作为全新 run 输入执行，无论底层
+成功或按既有错误失败，均退出 0、stderr 为空，stdout 输出一行紧凑 JSON
+记录，键序 version,stdin,exit,stdout,stderr：version=1（非 bool 整数），
+exit 为实际码 0/2/3/4/5/6/7，三个字节字段为带标准填充的 RFC4648 Base64。
+replay 只接受该精确键集且拒绝重复键；类型、版本、退出码、解码失败或非
+规范 Base64 均报 INPUT/2（无 stdout）。合法记录在全新状态重执解码的
+stdin 并逐字节比较退出码、stdout、stderr；不符时 stderr 写
+{"error":"REPLAY"} 加换行、退出 8、无 stdout；一致时原样写出记录的
+stdout、stderr 并采用记录退出码。两者额外时空 O(I+O)。
 """
 
+import base64
 import bisect
 import hashlib
 import json
@@ -131,6 +142,7 @@ EXIT_STATE = 4
 EXIT_CONNECTION = 5
 EXIT_RATE = 6
 EXIT_OVERLOAD = 7
+EXIT_REPLAY = 8
 
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
@@ -139,11 +151,17 @@ DEFAULT_SUCCESS = 2
 METRIC_CAP = 10 ** 18
 
 
+class _Failure(Exception):
+    """fail() 抛出的内部异常：携带退出码与错误标签，由最外层统一落盘。"""
+
+    def __init__(self, exit_code, label):
+        super().__init__(label)
+        self.exit_code = exit_code
+        self.label = label
+
+
 def fail(exit_code, label):
-    sys.stderr.buffer.write(
-        ('{"error":"%s"}\n' % label).encode("utf-8")
-    )
-    sys.exit(exit_code)
+    raise _Failure(exit_code, label)
 
 
 def reject_duplicate_keys(pairs):
@@ -773,8 +791,8 @@ def effective_weight(record, now):
     return record["warm_from"] + (target - record["warm_from"]) * elapsed // span
 
 
-def run():
-    raw = sys.stdin.buffer.read()
+def run(raw):
+    """在全新状态执行一批操作，返回 stdout 字节；错误经 fail 抛出。"""
     try:
         text = raw.decode("utf-8")
         data = json.loads(text, object_pairs_hook=reject_duplicate_keys)
@@ -1781,13 +1799,114 @@ def run():
     encoded = json.dumps(output, ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8"
     )
-    sys.stdout.buffer.write(encoded + b"\n")
+    return encoded + b"\n"
+
+
+def execute(raw):
+    """在全新状态执行 raw，返回 (退出码, stdout 字节, stderr 字节)。"""
+    try:
+        return 0, run(raw), b""
+    except _Failure as error:
+        return (
+            error.exit_code,
+            b"",
+            ('{"error":"%s"}\n' % error.label).encode("utf-8"),
+        )
+
+
+def build_record(raw):
+    """把原始 stdin 字节作为全新 run 输入执行，返回记录行（紧凑 JSON + 换行）。
+
+    键序 version,stdin,exit,stdout,stderr；三个字节字段为带标准填充的
+    RFC4648 Base64。底层成功或按既有错误失败均产出记录。
+    """
+    exit_code, out, err = execute(raw)
+    record = {
+        "version": 1,
+        "stdin": base64.b64encode(raw).decode("ascii"),
+        "exit": exit_code,
+        "stdout": base64.b64encode(out).decode("ascii"),
+        "stderr": base64.b64encode(err).decode("ascii"),
+    }
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    return line.encode("utf-8") + b"\n"
+
+
+def decode_base64_field(value):
+    """校验并解码带标准填充的规范 Base64；类型、解码或规范性不符判 INPUT。"""
+    if not isinstance(value, str):
+        fail(EXIT_INPUT, "INPUT")
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        fail(EXIT_INPUT, "INPUT")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        fail(EXIT_INPUT, "INPUT")
+    # 重编码必须逐字节一致：拒绝非零填充位、缺/多填充等非规范形式。
+    if base64.b64encode(decoded) != encoded:
+        fail(EXIT_INPUT, "INPUT")
+    return decoded
+
+
+def replay(raw):
+    """校验记录并在全新状态重执解码的 stdin，逐字节比对退出码与两路输出。
+
+    一致时返回 (记录退出码, 记录 stdout, 记录 stderr)；记录非法判 INPUT，
+    比对不符判 REPLAY/8。
+    """
+    try:
+        text = raw.decode("utf-8")
+        data = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, ValueError):
+        fail(EXIT_INPUT, "INPUT")
+    if not isinstance(data, dict) or set(data) != {
+        "version", "stdin", "exit", "stdout", "stderr",
+    }:
+        fail(EXIT_INPUT, "INPUT")
+    version = data["version"]
+    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+        fail(EXIT_INPUT, "INPUT")
+    exit_code = data["exit"]
+    if (
+        not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+        or exit_code not in (0, 2, 3, 4, 5, 6, 7)
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    stdin_bytes = decode_base64_field(data["stdin"])
+    stdout_bytes = decode_base64_field(data["stdout"])
+    stderr_bytes = decode_base64_field(data["stderr"])
+    actual_code, actual_out, actual_err = execute(stdin_bytes)
+    if (
+        actual_code != exit_code
+        or actual_out != stdout_bytes
+        or actual_err != stderr_bytes
+    ):
+        fail(EXIT_REPLAY, "REPLAY")
+    return exit_code, stdout_bytes, stderr_bytes
 
 
 def main(argv):
-    if len(argv) != 2 or argv[1] != "run":
-        fail(EXIT_INPUT, "INPUT")
-    run()
+    try:
+        if len(argv) != 2 or argv[1] not in ("run", "record", "replay"):
+            fail(EXIT_INPUT, "INPUT")
+        raw = sys.stdin.buffer.read()
+        if argv[1] == "run":
+            exit_code, out, err = execute(raw)
+        elif argv[1] == "record":
+            # 底层成败均退出 0、stderr 为空，stdout 输出记录。
+            exit_code, out, err = 0, build_record(raw), b""
+        else:
+            exit_code, out, err = replay(raw)
+    except _Failure as error:
+        exit_code = error.exit_code
+        out = b""
+        err = ('{"error":"%s"}\n' % error.label).encode("utf-8")
+    sys.stdout.buffer.write(out)
+    sys.stderr.buffer.write(err)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
