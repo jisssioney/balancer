@@ -164,6 +164,23 @@ window,requests,qps,errors,error_rate,latency,retries,remaps；整数与五
 桶为 0、两字符串为 0.00。mh 不改度量，失败原子回滚；record/replay 逐
 字节覆盖 mh。mh 时间 O(R)、额外空间 O(60B)。
 
+后端采样历史：ms 键集 op,id,now（now 为 [0,10^9] 非 bool 整数，纳入共用
+非递减时钟），id 须现存否则 BACKEND。每次采样记录该后端当时的活动连接数
+与 removed——removed 沿用 mg 的取值与优先级（drain、health、circuit、
+fault 或 null）。按 window=now//60 分窗保留最近 60 窗，每窗至多 60 个
+不同 now（每后端至多 3600 样本）。同 (id, now) 重报：采样值（连接数与
+removed）一致幂等，不一致属冲突重报报 STATE/4。ms 返回键序 op,ok，
+ok=true。mx 精确键集 op,id,from,to,now，数值与关系约束同 mh（非法键集、
+类型、范围、关系或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，from 早于
+max(0,now//60-59) 报 STATE/4）。结果键序 op,id,windows，windows 含 from
+至 to 所有窗并按窗升序，项键序 window,samples,peak,last,removed：
+samples 为窗内采样数、peak 为窗内并发峰值、last 为末次采样的并发；空窗
+samples/peak 为 0 且 last=null；removed 为键序 drain,health,circuit,
+fault,none 的非负整数计数对象，removed=null 的样本计入 none。mx 不改变
+采样，失败原子回滚；record/replay 逐字节覆盖。remove 后重加、ci 成功均
+清空采样历史。ms 为 O(1)，mx 为 O(R+S)（R 为窗数、S 为区间内样本数），
+仅用标准库，其余子命令与既有操作行为不变。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure}：
 version=2；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
@@ -737,7 +754,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh",
+        "mr", "mg", "mh", "ms", "mx",
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
@@ -1063,6 +1080,23 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("mh", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "ms":
+        if keys != {"op", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ms", parse_backend_id(raw_op["id"]),
+                parse_metric_num(raw_op["now"]))
+
+    if name == "mx":
+        if keys != {"op", "id", "from", "to", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系同 mh：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("mx", parse_backend_id(raw_op["id"]), start, end, now)
 
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
@@ -1418,12 +1452,26 @@ def run(raw):
             return ((now - a) // v) % 2 == 0
         return False
 
+    def removed_reason(record, now):
+        """ms/mg 共用的 removed 优先级：drain（D/X）> health（unhealthy）>
+        circuit（熔断非 C）> fault（D 窗口内或 F 故障相位），否则 null。"""
+        if record["drain"]["state"] in ("D", "X"):
+            return "drain"
+        if not record["healthy"]:
+            return "health"
+        if not circuit_closed(record):
+            return "circuit"
+        if fault_active(record, now):
+            return "fault"
+        return None
+
     for raw_op in ops:
         op = parse_op(raw_op)
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
+            "ms", "mx",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq",
         ):
             now = op[-1]
@@ -1491,6 +1539,11 @@ def run(raw):
                 # 度量历史：window -> [requests, errors, retries, remaps,
                 # [五个延迟桶]]，仅保留最近 60 窗；空表示从未 mr。
                 "metrics": {},
+                # 后端采样历史（ms/mx）：window -> {now: (活动连接数,
+                # removed)}，内层按采样先后（now 升序）保序；按 now//60
+                # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
+                # ci 成功即清空。
+                "samples": {},
             }
             results.append({"op": "add", "ok": True})
 
@@ -2199,19 +2252,9 @@ def run(raw):
             else:
                 rate = errors * 10000 // requests
                 error_rate = "%d.%02d" % divmod(rate, 100)
-            # removed 优先级：drain（D/X）> health（unhealthy）> circuit
-            # （非 C）> fault（D 窗口内或 F 故障相位），否则 null。
-            drain_state = record["drain"]["state"]
-            if drain_state in ("D", "X"):
-                removed = "drain"
-            elif not record["healthy"]:
-                removed = "health"
-            elif not circuit_closed(record):
-                removed = "circuit"
-            elif fault_active(record, now):
-                removed = "fault"
-            else:
-                removed = None
+            # removed 优先级与 ms 共用同一判定：drain > health > circuit >
+            # fault，否则 null。
+            removed = removed_reason(record, now)
             results.append(
                 {
                     "op": "mg",
@@ -2272,6 +2315,85 @@ def run(raw):
                     }
                 )
             results.append({"op": "mh", "id": backend_id, "windows": windows})
+
+        elif op[0] == "ms":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            window = now // 60
+            history = record["samples"]
+            snapshot = history.get(window)
+            if snapshot is None:
+                # 首次采样该窗：新建该窗快照；时钟非递减，顺带丢弃 60 窗前
+                # 的旧窗（每后端至多 60 窗、每窗至多 60 个不同 now，即
+                # 3600 样本）。
+                snapshot = {}
+                history[window] = snapshot
+                cutoff = window - 59
+                for old in [w for w in history if w < cutoff]:
+                    del history[old]
+            # 采样值为当时的 (活动连接数, removed)，removed 沿用 mg 优先级。
+            current = (record["conns"], removed_reason(record, now))
+            previous = snapshot.get(now)
+            if previous is not None:
+                # 同 (id, now)：采样值相同幂等，不同即冲突重报，报 STATE。
+                if previous != current:
+                    fail(EXIT_STATE, "STATE")
+            else:
+                snapshot[now] = current
+            results.append({"op": "ms", "ok": True})
+
+        elif op[0] == "mx":
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current_window = now // 60
+            if start < max(0, current_window - 59):
+                # from 早于最近 60 窗的下界（同 mh）。
+                fail(EXIT_STATE, "STATE")
+            history = record["samples"]
+            windows = []
+            for window in range(start, end + 1):
+                snapshot = history.get(window)
+                # removed 计数对象固定键序 drain,health,circuit,fault,none；
+                # removed=null 的样本计入 none。
+                counts = {
+                    "drain": 0, "health": 0, "circuit": 0,
+                    "fault": 0, "none": 0,
+                }
+                if not snapshot:
+                    # 空窗：samples/peak 与各计数为 0，last 为 null。
+                    windows.append(
+                        {
+                            "window": window,
+                            "samples": 0,
+                            "peak": 0,
+                            "last": None,
+                            "removed": counts,
+                        }
+                    )
+                    continue
+                peak = 0
+                last = 0
+                # 内层 dict 按采样先后（共用时钟非递减）保序，末次并发即
+                # 末项；遍历同时求窗内峰值与 removed 分类计数。
+                for _, (conns, reason) in snapshot.items():
+                    if conns > peak:
+                        peak = conns
+                    last = conns
+                    counts[reason if reason is not None else "none"] += 1
+                windows.append(
+                    {
+                        "window": window,
+                        "samples": len(snapshot),
+                        "peak": peak,
+                        "last": last,
+                        "removed": counts,
+                    }
+                )
+            results.append({"op": "mx", "id": backend_id, "windows": windows})
 
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
@@ -2404,6 +2526,8 @@ def run(raw):
                     # 热加载不携带历史写操作形状。
                     "last_op": None,
                     "metrics": {},
+                    # ci 成功清空采样历史，默认运行态为空。
+                    "samples": {},
                     # 热加载以默认运行态重建，不携带故障演练。
                     "fault": None,
                 }
