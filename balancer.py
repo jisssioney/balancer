@@ -52,7 +52,7 @@ SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，摘要按 256 位大端无符号�
 （remapped）。route 不改连接数；未 chash 或无 healthy 后端时报 STATE。
 
 限时粘性：ss 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数），首配或同值返回
-op,ok=true，异值报 STATE/4；ss 不携带 now、不进入 ce/ci，O(1)。route 新增
+op,ok=true，异值报 STATE/4；ss 不携带 now，O(1)，登记值进入 ce/ci。route 新增
 三键键集 op,key,now（now 为非负非 bool 整数，纳入共用非递减时钟），旧二键
 行为与结果不变；三键 route 未 ss、未 chash 或无可选后端报 STATE/4。粘性映射
 为 key->[b,e]（b=backend、e=expires）：二键 route 无项按环写 [b,null]，
@@ -130,8 +130,9 @@ available=os.q-queued。启用后 oa 可立即接纳时仍按原规则扣令牌�
 本应排队时 P 态报 OVERLOAD/7 且无变更（不耗令牌、不入队），N 态照常入
 队，队长达到 high 即转 P；队满仍 OVERLOAD/7。ot 照常先过期再自队首接
 纳，处理完若 P 且队长 ≤low 则转 N，否则不变；oc 取消后 P 且队长 ≤low
-立即转 N，其他状态不变。bp 不进入 ce/ci，ci 成功
-后取消 bp；bp、bq 及 oa 新增判定均 O(1)，ot 仍 O(q)，额外空间 O(1)。
+立即转 N，其他状态不变。bp 登记值进入 ce/ci，ci 成功
+后按导入值重配并置 N（null 即取消）；bp、bq 及 oa 新增判定均 O(1)，
+ot 仍 O(q)，额外空间 O(1)。
 
 请求度量：mr 键集 op,id,ok,ms,retries,remaps,now，id 须现存否则 BACKEND，
 ok 仅 bool，ms/retries/remaps/now 四数均为 [0,10^9] 非 bool 整数，now 纳入
@@ -152,17 +153,23 @@ retries=remaps、remaps=remaps、now=fx.now。mr 与 fx 自动度量按操作顺
 累加；失败批次不留度量。remove 后重加统计归零。mr/mg 均 O(1)，空间 O(B)。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
-{version,backends,vnodes,limits,overload}：version=1；backends 按加入序，
-项 {id,weight,d,fail,success,circuit,drain}，circuit=null 或 {n,m,r,w,q}，
-drain=null 或登记的 t，均只含登记值不含运行态；vnodes=null 或整数；limits
-项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；overload=
-null 或 {cap,q,ttl}。ci 键集 op,config,now，结果 op,ok=true；now 为非负
-非 bool 整数并纳入共用非递减时钟，各值沿用 add/hset/ws/chash/cs/ds/ls/os
-的类型与范围。非法结构、类型、范围、编码、时钟及重复后端/限流项判 INPUT/2，
-B 限流引用未知后端判 BACKEND/3，有活动连接或排队项判 STATE/4，依次判错。
-成功时原子替换配置并以 now 重建默认运行态（全部 healthy、d>0 自 now 起算
-预热、熔断 C 空窗、排空 A、桶满、队空、粘性清空、度量归零）；失败回滚不变更。
-ce/ci 均 O(B+L) 时空（L 为限流项数）。
+{version,backends,vnodes,limits,overload,sticky,idle,backpressure}：
+version=2；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
+circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，均只含登记值不含
+运行态；vnodes=null 或整数；limits 项 {scope,id,r,b}，按 scope 的 B/C/S
+序、id 的 UTF-8 字节升序；overload=null 或 {cap,q,ttl}；sticky/idle 为
+null 或 {ttl}（ttl ∈ [1,10^9] 非 bool 整数）；backpressure 为 null 或
+{low,high}（两值为 [0,10^6] 非 bool 整数），均只导出登记值。ci 键集
+op,config,now，结果 op,ok=true；也接受 version=1 原五键结构，此时
+sticky/idle/backpressure 三项为 null。now 为非负非 bool 整数并纳入共用
+非递减时钟，各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp 的类型与
+范围；backpressure 非 null 时 overload 须非 null 且 low<high≤overload.q。
+非法结构、键集、版本、类型、范围、重复项、编码、交叉约束或时钟倒退判
+INPUT/2，B 限流引用未知后端判 BACKEND/3，有活动连接或排队项判 STATE/4，
+依次判错。成功时原子替换配置并以 now 重建默认运行态（全部 healthy、
+d>0 自 now 起算预热、熔断 C 空窗、排空 A、桶满、队空、粘性清空、idle
+用于新连接、背压置 N、度量归零）；失败回滚不变更。ce/ci 均 O(B+L)
+时空（L 为限流项数）。
 
 时钟故障演练：fs 键集 op,id,k,a,z,v（a,z,v ∈ [0,10^9] 非 bool 整数，
 a<z；k ∈ D/F/S，D 须 v=0，F/S 须 v>0）为后端登记故障演练，同参重报
@@ -207,8 +214,8 @@ backend 成功为 id 否则 null。未配环或环内无候选报 STATE/4 且先
 fr 时空 O(BV)；record/replay 照常覆盖 fr，其余契约不变。
 
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
-空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，不进入
-ce/ci；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
+空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值
+进入 ce/ci；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
 tk 键集 op,cid,now：未到期（now < last+ttl）才置 last=now，返回 op,ok；
 未知 cid 或命中已到期 cid 报 CONNECTION。tg 键集 op,cid,now，返回键序
 op,cid,backend,state,opened,last,deadline：deadline=last+ttl，state 为
@@ -538,15 +545,40 @@ def parse_flow(value):
     return [src_ip, src_port, dst_ip, dst_port, protocol]
 
 
-def parse_config(value):
-    """校验 ci 的 config 并返回规范化结构；结构、类型、范围、编码或重复后端/
-    限流项一律 INPUT。B 限流对后端的引用在执行期判 BACKEND。"""
-    if not isinstance(value, dict) or set(value) != {
-        "version", "backends", "vnodes", "limits", "overload",
-    }:
+def parse_config_ttl(value):
+    """ce/ci 的 sticky/idle 项：null 或 {"ttl":整数}，ttl ∈ [1,10^9] 非 bool
+    整数；null 返回 None，否则返回 ttl。"""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"ttl"}:
         fail(EXIT_INPUT, "INPUT")
-    version = value["version"]
-    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+    return parse_sticky_ttl(value["ttl"])
+
+
+def parse_config(value):
+    """校验 ci 的 config 并返回规范化结构；结构、键集、版本、类型、范围、
+    编码、重复后端/限流项及交叉约束（backpressure 非 null 时 overload 须非
+    null 且 low<high≤overload.q）一律 INPUT。B 限流对后端的引用在执行期判
+    BACKEND。version=1 为旧五键结构（sticky/idle/backpressure 视为 null），
+    version=2 为八键结构。"""
+    if not isinstance(value, dict):
+        fail(EXIT_INPUT, "INPUT")
+    keys = set(value)
+    if keys == {"version", "backends", "vnodes", "limits", "overload"}:
+        version = 1
+    elif keys == {
+        "version", "backends", "vnodes", "limits", "overload",
+        "sticky", "idle", "backpressure",
+    }:
+        version = 2
+    else:
+        fail(EXIT_INPUT, "INPUT")
+    raw_version = value["version"]
+    if (
+        not isinstance(raw_version, int)
+        or isinstance(raw_version, bool)
+        or raw_version != version
+    ):
         fail(EXIT_INPUT, "INPUT")
 
     raw_backends = value["backends"]
@@ -643,11 +675,36 @@ def parse_config(value):
             parse_queue_param(raw_overload["ttl"]),
         )
 
+    if version == 2:
+        sticky = parse_config_ttl(value["sticky"])
+        idle = parse_config_ttl(value["idle"])
+        raw_backpressure = value["backpressure"]
+        if raw_backpressure is None:
+            backpressure = None
+        else:
+            if not isinstance(raw_backpressure, dict) or set(raw_backpressure) != {
+                "low", "high",
+            }:
+                fail(EXIT_INPUT, "INPUT")
+            low = parse_bp_num(raw_backpressure["low"])
+            high = parse_bp_num(raw_backpressure["high"])
+            # 交叉约束：backpressure 非 null 时 overload 须非 null 且
+            # low < high ≤ overload.q。
+            if overload is None or not low < high <= overload[1]:
+                fail(EXIT_INPUT, "INPUT")
+            backpressure = (low, high)
+    else:
+        # version=1 原结构：sticky/idle/backpressure 三项均为 null。
+        sticky = idle = backpressure = None
+
     return {
         "backends": normalized_backends,
         "vnodes": vnodes,
         "limits": normalized_limits,
         "overload": overload,
+        "sticky": sticky,
+        "idle": idle,
+        "backpressure": backpressure,
     }
 
 
@@ -1155,7 +1212,7 @@ def run(raw):
     ring_vnodes = None
     sticky_map = {}
     # 限时粘性：sticky_ttl 未 ss 时为 None，否则为登记时限；异值重配报 STATE，
-    # 不进入 ce/ci；三键 route 与 ss 后的 la/oa/ot 依赖它。
+    # 登记值进入 ce/ci；三键 route 与 ss 后的 la/oa/ot 依赖它。
     sticky_ttl = None
     # 令牌桶以 (scope, id) 唯一：scope ∈ B/C/S（后端/客户端/服务类）。
     # B 桶 id 必须是现存后端；remove 即删。每桶 r/b 为速率与容量，t/at
@@ -1170,11 +1227,12 @@ def run(raw):
     wait_queue = OrderedDict()
     # 确定性滞回背压：bp_cfg 未 bp 时为 None，否则为 (low, high)；bp_state
     # 为 N/P。首配或异参重配按当前队长 >=high 置 P，否则 N；同参幂等不改
-    # 状态。low < high <= queue_cfg[1]（os.q），不进入 ce/ci，ci 后取消。
+    # 状态。low < high <= queue_cfg[1]（os.q）；登记值进入 ce/ci，ci 后按
+    # 导入值重配并置 N。
     bp_cfg = None
     bp_state = "N"
     # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
-    # 不进入 ce/ci，异值重配报 STATE。
+    # 登记值进入 ce/ci，异值重配报 STATE。
     ttl_cfg = None
     last_now = None
     results = []
@@ -2182,15 +2240,27 @@ def run(raw):
                 if queue_cfg is None
                 else {"cap": queue_cfg[0], "q": queue_cfg[1], "ttl": queue_cfg[2]}
             )
+            # 限时粘性、空闲超时与滞回背压均只导出登记值（不含 bp_state 等
+            # 运行态）。
+            exported_sticky = None if sticky_ttl is None else {"ttl": sticky_ttl}
+            exported_idle = None if ttl_cfg is None else {"ttl": ttl_cfg}
+            exported_backpressure = (
+                None
+                if bp_cfg is None
+                else {"low": bp_cfg[0], "high": bp_cfg[1]}
+            )
             results.append(
                 {
                     "op": "ce",
                     "config": {
-                        "version": 1,
+                        "version": 2,
                         "backends": exported_backends,
                         "vnodes": ring_vnodes,
                         "limits": exported_limits,
                         "overload": exported_overload,
+                        "sticky": exported_sticky,
+                        "idle": exported_idle,
+                        "backpressure": exported_backpressure,
                     },
                 }
             )
@@ -2286,9 +2356,13 @@ def run(raw):
             ring_vnodes = config["vnodes"]
             queue_cfg = config["overload"]
             wait_queue = OrderedDict()
-            # ci 成功后取消 bp：滞回配置与状态均不进入热加载配置。
-            bp_cfg = None
+            # 背压按导入值重配（null 即取消），状态一律置 N。
+            bp_cfg = config["backpressure"]
             bp_state = "N"
+            # 限时粘性与空闲超时按导入值重配（null 即未配）；粘性映射清空，
+            # idle 作用于热加载后的新连接。
+            sticky_ttl = config["sticky"]
+            ttl_cfg = config["idle"]
             sticky_map = {}
             results.append({"op": "ci", "ok": True})
 
