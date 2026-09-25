@@ -111,8 +111,15 @@ op,now：先删除全部 now ≥ 入队 now+ttl 的排队项，再自队首逐�
 以入队成本重试接纳（opened_at=now，接纳才扣、过期不扣）至首个阻塞即停，
 返回 op,expired,admitted，两
 数组均按 FIFO 列 cid；ot 至多 q 次 route，空间 O(q)。og 键集 op，返回
-op,queue，queue 为 FIFO cid 数组。oa 未 os/chash、ot/og 未 os 报 STATE；
-非法键、类型、范围、编码或时钟倒退报 INPUT。
+op,queue，queue 为 FIFO cid 数组。oc 键集 op,cid，cid 沿用非空字符串校验，
+须已 os 且 cid 当前在等待队列；成功时 O(1) 从任意位置删除，返回键序
+op,cid,ok，ok=true，不扣减或返还令牌、不建连接，入队路由已产生的粘性映射
+保留，其余项 FIFO 相对次序不变。oa/ot/og/oc 未 os 报 STATE（oa 另含未
+chash）；oc 非法键集或 cid 报 INPUT/2，cid 不在队列（活动中或从未存在）报
+CONNECTION/5，按 INPUT、STATE、CONNECTION 顺序判定。失败批次回滚队列顺序、
+成员索引与背压状态；入队、ot 接纳或过期、oc 取消及 ci 成功清队列均同步成员
+索引，oa 查重与 oc 删除均 O(1)，og 仍 O(q)。非法键、类型、范围、编码或时钟
+倒退报 INPUT。
 
 确定性滞回背压：bp 键集 op,low,high，low/high 为 [0,10^6] 非 bool 整数且
 low<high≤os.q，未 os 报 STATE/4，非法键集、类型、范围或阈值关系报
@@ -122,7 +129,8 @@ INPUT/2。首配或异参重配按当前队长 >=high 置 P，否则 N；同参�
 available=os.q-queued。启用后 oa 可立即接纳时仍按原规则扣令牌并建连；
 本应排队时 P 态报 OVERLOAD/7 且无变更（不耗令牌、不入队），N 态照常入
 队，队长达到 high 即转 P；队满仍 OVERLOAD/7。ot 照常先过期再自队首接
-纳，处理完若 P 且队长 ≤low 则转 N，否则不变。bp 不进入 ce/ci，ci 成功
+纳，处理完若 P 且队长 ≤low 则转 N，否则不变；oc 取消后 P 且队长 ≤low
+立即转 N，其他状态不变。bp 不进入 ce/ci，ci 成功
 后取消 bp；bp、bq 及 oa 新增判定均 O(1)，ot 仍 O(q)，额外空间 O(1)。
 
 请求度量：mr 键集 op,id,ok,ms,retries,remaps,now，id 须现存否则 BACKEND，
@@ -226,7 +234,7 @@ import bisect
 import hashlib
 import json
 import sys
-from collections import deque
+from collections import deque, OrderedDict
 
 EXIT_INPUT = 2
 EXIT_BACKEND = 3
@@ -655,7 +663,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg",
-        "os", "oa", "ot", "og", "bp", "bq",
+        "os", "oa", "ot", "og", "oc", "bp", "bq",
         "mr", "mg",
         "ce", "ci",
         "fs", "fx", "fr",
@@ -925,6 +933,12 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("og",)
 
+    if name == "oc":
+        # 精确键集 op,cid，无 now；cid 沿用非空字符串校验。
+        if keys != {"op", "cid"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("oc", parse_cid(raw_op["cid"]))
+
     if name == "bp":
         if keys != {"op", "low", "high"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1148,10 +1162,12 @@ def run(raw):
     # 为当前令牌与最近补充时刻，last 为最近一次 ls 的 (r,b,now) 用于重报。
     buckets = {}
     # 排队接纳：queue_cfg 未 os 时为 None，否则为 (cap, q, ttl)；wait_queue
-    # 为 FIFO deque，元素 (cid, flow, c, s, key, bc, cc, sc, enqueue_now)，
-    # 容量上限 q；bc/cc/sc 为入队请求的三项令牌成本。
+    # 为 FIFO 有序映射 cid -> (cid, flow, c, s, key, bc, cc, sc, enqueue_now)，
+    # 容量上限 q；bc/cc/sc 为入队请求的三项令牌成本。OrderedDict 即哈希表加
+    # 双向链表：键集同时是排队成员索引，入队/接纳/过期/取消/ci 单点维护即同步，
+    # oa 查重与 oc 任意位置删除均 O(1) 且其余项 FIFO 相对次序不变。
     queue_cfg = None
-    wait_queue = deque()
+    wait_queue = OrderedDict()
     # 确定性滞回背压：bp_cfg 未 bp 时为 None，否则为 (low, high)；bp_state
     # 为 N/P。首配或异参重配按当前队长 >=high 置 P，否则 N；同参幂等不改
     # 状态。low < high <= queue_cfg[1]（os.q），不进入 ce/ci，ci 后取消。
@@ -1935,8 +1951,8 @@ def run(raw):
             if routed is None:
                 # 未 chash 或无可选后端。
                 fail(EXIT_STATE, "STATE")
-            if cid in connections or any(item[0] == cid for item in wait_queue):
-                # 活动或排队中 cid 重复。
+            if cid in connections or cid in wait_queue:
+                # 活动或排队中 cid 重复（OrderedDict 键集即成员索引，O(1)）。
                 fail(EXIT_CONNECTION, "CONNECTION")
             status, backend_id = evaluate_admit(
                 routed[0], cid, flow, c, s, (bc, cc, sc), now
@@ -1952,8 +1968,9 @@ def run(raw):
                 if len(wait_queue) >= queue_cfg[1]:
                     # FIFO 已满，尾拒绝。
                     fail(EXIT_OVERLOAD, "OVERLOAD")
-                # 三项成本随请求入队，ot 重试时按此成本扣减。
-                wait_queue.append((cid, flow, c, s, key, bc, cc, sc, now))
+                # 三项成本随请求入队，ot 重试时按此成本扣减。新键追加到
+                # OrderedDict 队尾，即 FIFO 入队（重复已在上方拒绝）。
+                wait_queue[cid] = (cid, flow, c, s, key, bc, cc, sc, now)
                 if bp_cfg is not None and len(wait_queue) >= bp_cfg[1]:
                     # N 态照常入队，队长达到 high 即转 P（滞回上沿）。
                     bp_state = "P"
@@ -1966,20 +1983,17 @@ def run(raw):
             if queue_cfg is None:
                 fail(EXIT_STATE, "STATE")
             ttl = queue_cfg[2]
-            # 先删除全部 now >= 入队 now + ttl 的项（保留 FIFO 相对顺序）。
-            survivors = deque()
+            # 先删除全部 now >= 入队 now + ttl 的项（pop 保序，其余项 FIFO
+            # 相对次序不变）。快照 items 按 FIFO 遍历，额外空间 O(q)。
             expired = []
-            for item in wait_queue:
+            for queued_cid, item in list(wait_queue.items()):
                 if now >= item[8] + ttl:
-                    expired.append(item[0])
-                else:
-                    survivors.append(item)
-            wait_queue.clear()
-            wait_queue.extend(survivors)
+                    expired.append(queued_cid)
+                    wait_queue.pop(queued_cid)
             # 再自队首重试接纳，至首个阻塞即停（每个键至多一次 route）。
             admitted = []
             while wait_queue:
-                item = wait_queue.popleft()
+                queued_cid, item = wait_queue.popitem(last=False)
                 # 接纳时刻为本次 ot 的 now（opened_at=now），入队时刻仅用于过期；
                 # 按入队时登记的三项成本扣减，过期不扣。
                 status, _ = try_admit(
@@ -1987,10 +2001,12 @@ def run(raw):
                     (item[5], item[6], item[7]), now,
                 )
                 if status == "admit":
-                    admitted.append(item[0])
+                    admitted.append(queued_cid)
                 else:
                     # 阻塞（含路由不可用）：连同该项整体放回队首后停止。
-                    wait_queue.appendleft(item)
+                    # 追加到队尾再移至队首，其余项次序保持不变。
+                    wait_queue[queued_cid] = item
+                    wait_queue.move_to_end(queued_cid, last=False)
                     break
             if bp_cfg is not None and bp_state == "P" and len(wait_queue) <= bp_cfg[0]:
                 # 滞回下沿：过期与接纳处理完后，P 态队长 <=low 即转 N。
@@ -2003,8 +2019,31 @@ def run(raw):
             if queue_cfg is None:
                 fail(EXIT_STATE, "STATE")
             results.append(
-                {"op": "og", "queue": [item[0] for item in wait_queue]}
+                {"op": "og", "queue": list(wait_queue)}
             )
+
+        elif op[0] == "oc":
+            _, cid = op
+            # 判定顺序：非法键集/cid 已在解析期判 INPUT；未 os 判 STATE；
+            # cid 不在等待队列（活动连接或从未存在）判 CONNECTION。全部校验
+            # 先于任何变更，失败批次天然不改动队列与背压状态。
+            if queue_cfg is None:
+                # 未 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            if cid not in wait_queue:
+                # 活动中或从未入队均非排队成员。
+                fail(EXIT_CONNECTION, "CONNECTION")
+            # 成功：O(1) 从任意位置删除，其余项 FIFO 相对次序不变；不扣减或
+            # 返还令牌、不建连接；入队路由已产生的粘性映射保留。
+            wait_queue.pop(cid)
+            if (
+                bp_cfg is not None
+                and bp_state == "P"
+                and len(wait_queue) <= bp_cfg[0]
+            ):
+                # 取消后滞回下沿：P 态队长 <=low 立即转 N；N 态等其余情形不变。
+                bp_state = "N"
+            results.append({"op": "oc", "cid": cid, "ok": True})
 
         elif op[0] == "bp":
             _, low, high = op
@@ -2246,7 +2285,7 @@ def run(raw):
             buckets = new_buckets
             ring_vnodes = config["vnodes"]
             queue_cfg = config["overload"]
-            wait_queue = deque()
+            wait_queue = OrderedDict()
             # ci 成功后取消 bp：滞回配置与状态均不进入热加载配置。
             bp_cfg = None
             bp_state = "N"
