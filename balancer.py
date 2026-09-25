@@ -114,6 +114,16 @@ op,now：先删除全部 now ≥ 入队 now+ttl 的排队项，再自队首逐�
 op,queue，queue 为 FIFO cid 数组。oa 未 os/chash、ot/og 未 os 报 STATE；
 非法键、类型、范围、编码或时钟倒退报 INPUT。
 
+排队取消：oc 键集 op,cid，cid 沿用非空字符串校验；非法键集或 cid 报
+INPUT/2，未 os 报 STATE/4，cid 不在等待队列（含活动或从未存在）报
+CONNECTION/5，按此顺序判定。成功时从任意位置删除，返回键序
+op,cid,ok，ok=true；不扣减或返还令牌、不建连接，入队路由已产生的
+粘性映射保留，其余项 FIFO 相对次序不变。若已 bp，取消后 P 态且队长
+≤low 立即转 N，其他状态不变。等待队列以 cid 为键的有序 dict 同时
+充当成员索引：入队、ot 接纳或过期、oc 取消及 ci 成功清队列均同步，
+oa 对活动或排队 cid 的查重与 oc 删除均 O(1)，og 仍按 FIFO 输出且
+O(q)，ot 仍 O(q)，队列额外空间 O(q)。
+
 确定性滞回背压：bp 键集 op,low,high，low/high 为 [0,10^6] 非 bool 整数且
 low<high≤os.q，未 os 报 STATE/4，非法键集、类型、范围或阈值关系报
 INPUT/2。首配或异参重配按当前队长 >=high 置 P，否则 N；同参幂等且不改
@@ -655,7 +665,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg",
-        "os", "oa", "ot", "og", "bp", "bq",
+        "os", "oa", "ot", "og", "oc", "bp", "bq",
         "mr", "mg",
         "ce", "ci",
         "fs", "fx", "fr",
@@ -925,6 +935,11 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("og",)
 
+    if name == "oc":
+        if keys != {"op", "cid"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("oc", parse_cid(raw_op["cid"]))
+
     if name == "bp":
         if keys != {"op", "low", "high"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1148,10 +1163,12 @@ def run(raw):
     # 为当前令牌与最近补充时刻，last 为最近一次 ls 的 (r,b,now) 用于重报。
     buckets = {}
     # 排队接纳：queue_cfg 未 os 时为 None，否则为 (cap, q, ttl)；wait_queue
-    # 为 FIFO deque，元素 (cid, flow, c, s, key, bc, cc, sc, enqueue_now)，
-    # 容量上限 q；bc/cc/sc 为入队请求的三项令牌成本。
+    # 为 cid -> (flow, c, s, key, bc, cc, sc, enqueue_now) 的有序 dict，
+    # 插入序即 FIFO 序，容量上限 q；bc/cc/sc 为入队请求的三项令牌成本。
+    # dict 本身即排队成员索引：oa 查重、oc 任意位置删除均 O(1)，入队、
+    # ot 接纳/过期、oc 取消与 ci 清队列都经它同步。
     queue_cfg = None
-    wait_queue = deque()
+    wait_queue = {}
     # 确定性滞回背压：bp_cfg 未 bp 时为 None，否则为 (low, high)；bp_state
     # 为 N/P。首配或异参重配按当前队长 >=high 置 P，否则 N；同参幂等不改
     # 状态。low < high <= queue_cfg[1]（os.q），不进入 ce/ci，ci 后取消。
@@ -1935,8 +1952,8 @@ def run(raw):
             if routed is None:
                 # 未 chash 或无可选后端。
                 fail(EXIT_STATE, "STATE")
-            if cid in connections or any(item[0] == cid for item in wait_queue):
-                # 活动或排队中 cid 重复。
+            if cid in connections or cid in wait_queue:
+                # 活动或排队中 cid 重复（排队成员索引 O(1) 查重）。
                 fail(EXIT_CONNECTION, "CONNECTION")
             status, backend_id = evaluate_admit(
                 routed[0], cid, flow, c, s, (bc, cc, sc), now
@@ -1953,7 +1970,7 @@ def run(raw):
                     # FIFO 已满，尾拒绝。
                     fail(EXIT_OVERLOAD, "OVERLOAD")
                 # 三项成本随请求入队，ot 重试时按此成本扣减。
-                wait_queue.append((cid, flow, c, s, key, bc, cc, sc, now))
+                wait_queue[cid] = (flow, c, s, key, bc, cc, sc, now)
                 if bp_cfg is not None and len(wait_queue) >= bp_cfg[1]:
                     # N 态照常入队，队长达到 high 即转 P（滞回上沿）。
                     bp_state = "P"
@@ -1967,30 +1984,29 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             ttl = queue_cfg[2]
             # 先删除全部 now >= 入队 now + ttl 的项（保留 FIFO 相对顺序）。
-            survivors = deque()
-            expired = []
-            for item in wait_queue:
-                if now >= item[8] + ttl:
-                    expired.append(item[0])
-                else:
-                    survivors.append(item)
-            wait_queue.clear()
-            wait_queue.extend(survivors)
+            expired = [
+                cid
+                for cid, item in wait_queue.items()
+                if now >= item[7] + ttl
+            ]
+            for cid in expired:
+                del wait_queue[cid]
             # 再自队首重试接纳，至首个阻塞即停（每个键至多一次 route）。
             admitted = []
             while wait_queue:
-                item = wait_queue.popleft()
+                cid = next(iter(wait_queue))
+                item = wait_queue[cid]
                 # 接纳时刻为本次 ot 的 now（opened_at=now），入队时刻仅用于过期；
                 # 按入队时登记的三项成本扣减，过期不扣。
                 status, _ = try_admit(
-                    item[0], item[1], item[2], item[3], item[4],
-                    (item[5], item[6], item[7]), now,
+                    cid, item[0], item[1], item[2], item[3],
+                    (item[4], item[5], item[6]), now,
                 )
                 if status == "admit":
-                    admitted.append(item[0])
+                    del wait_queue[cid]
+                    admitted.append(cid)
                 else:
-                    # 阻塞（含路由不可用）：连同该项整体放回队首后停止。
-                    wait_queue.appendleft(item)
+                    # 阻塞（含路由不可用）：该项留在队首，停止处理。
                     break
             if bp_cfg is not None and bp_state == "P" and len(wait_queue) <= bp_cfg[0]:
                 # 滞回下沿：过期与接纳处理完后，P 态队长 <=low 即转 N。
@@ -2002,9 +2018,23 @@ def run(raw):
         elif op[0] == "og":
             if queue_cfg is None:
                 fail(EXIT_STATE, "STATE")
-            results.append(
-                {"op": "og", "queue": [item[0] for item in wait_queue]}
-            )
+            results.append({"op": "og", "queue": list(wait_queue)})
+
+        elif op[0] == "oc":
+            _, cid = op
+            if queue_cfg is None:
+                # 未 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            if cid not in wait_queue:
+                # cid 不在等待队列（含活动或从未存在）。
+                fail(EXIT_CONNECTION, "CONNECTION")
+            # 自任意位置 O(1) 删除；不扣减或返还令牌、不建连接，入队路由
+            # 已产生的粘性映射保留，其余项 FIFO 相对次序不变。
+            del wait_queue[cid]
+            if bp_cfg is not None and bp_state == "P" and len(wait_queue) <= bp_cfg[0]:
+                # 滞回下沿：取消后 P 态队长 <=low 即转 N，其他状态不变。
+                bp_state = "N"
+            results.append({"op": "oc", "cid": cid, "ok": True})
 
         elif op[0] == "bp":
             _, low, high = op
@@ -2246,7 +2276,7 @@ def run(raw):
             buckets = new_buckets
             ring_vnodes = config["vnodes"]
             queue_cfg = config["overload"]
-            wait_queue = deque()
+            wait_queue = {}
             # ci 成功后取消 bp：滞回配置与状态均不进入热加载配置。
             bp_cfg = None
             bp_state = "N"
