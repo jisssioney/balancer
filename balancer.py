@@ -16,8 +16,18 @@ hset 只替换阈值并清连续计数，不改健康状态；probe 按 ok 递�
 连续成功达 success 转 healthy，迁移时计数与平滑当前权重一并清零。同一
 (id, now, ok) 的 probe 重报幂等；同 (id, now) 而 ok 不同属冲突重报，报
 INPUT。pick/open 只作用于 healthy 后端；无 healthy 后端时报 STATE。
+
+一致性哈希：chash 配置每个 healthy 后端的虚拟节点数 vnodes（1..1024），
+同值幂等、异值生效。每个 healthy 后端为 i=0..vnodes-1 生成令牌
+SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，摘要按 256 位大端无符号数
+排序（并列按加入顺序、i 升序）构成哈希环。route 哈希 UTF8(key) 取首个
+不小于它的令牌，越界回绕；首见 key 建立映射，目标 healthy 时命中
+（sticky），增删后端或改 vnodes 不迁移，目标不可用时依环迁移且不迁回
+（remapped）。route 不改连接数；未 chash 或无 healthy 后端时报 STATE。
 """
 
+import bisect
+import hashlib
 import json
 import sys
 
@@ -76,6 +86,52 @@ def parse_threshold(value):
     return value
 
 
+def parse_vnodes(value):
+    # bool 是 int 的子类，必须显式排除。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 1024
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_key(value):
+    # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
+    if not isinstance(value, str) or value == "":
+        fail(EXIT_INPUT, "INPUT")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def encode_backend_id(value):
+    """chash/route 建环时遇到的 id 也必须 UTF-8 可编码。"""
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(EXIT_INPUT, "INPUT")
+
+
+def build_ring(backends, vnodes):
+    """按 (摘要, 加入顺序, i) 升序返回 healthy 后端的令牌环。"""
+    tokens = []
+    for join_index, (backend_id, record) in enumerate(backends.items()):
+        if not record["healthy"]:
+            continue
+        encoded = encode_backend_id(backend_id)
+        for i in range(vnodes):
+            digest = hashlib.sha256(
+                encoded + b"\x00" + str(i).encode("ascii")
+            ).digest()
+            tokens.append((int.from_bytes(digest, "big"), join_index, i, backend_id))
+    tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+    return tokens
+
+
 def parse_flow(value):
     """校验 [源IP,源端口,目的IP,目的端口,协议]，返回规范化五元组。"""
     if not isinstance(value, list) or len(value) != 5:
@@ -104,7 +160,7 @@ def parse_op(raw_op):
     name = raw_op.get("op")
     if name not in (
         "add", "remove", "pick", "open", "close", "get",
-        "hset", "probe", "hget",
+        "hset", "probe", "hget", "chash", "route",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -172,6 +228,16 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("hget", parse_backend_id(raw_op["id"]))
 
+    if name == "chash":
+        if keys != {"op", "vnodes"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("chash", parse_vnodes(raw_op["vnodes"]))
+
+    if name == "route":
+        if keys != {"op", "key"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("route", parse_key(raw_op["key"]))
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -199,6 +265,10 @@ def run():
     backends = {}
     # 活动连接：cid -> [backend_id, flow, opened_at]；关闭即删除，cid 可复用。
     connections = {}
+    # 一致性哈希：ring_vnodes 未 chash 时为 None；sticky 映射 key -> backend_id，
+    # 只在目标不可用时依环改写（不迁回），增删后端或改 vnodes 均不动它。
+    ring_vnodes = None
+    sticky_map = {}
     last_now = None
     results = []
 
@@ -346,6 +416,57 @@ def run():
                     "failures": record["failures"],
                     "fail": record["fail"],
                     "success": record["success"],
+                }
+            )
+
+        elif op[0] == "chash":
+            _, vnodes = op
+            # 同值幂等、异值生效；建环会遇到的 healthy id 必须可编码。
+            for record_id, record in backends.items():
+                if record["healthy"]:
+                    encode_backend_id(record_id)
+            ring_vnodes = vnodes
+            results.append({"op": "chash", "ok": True})
+
+        elif op[0] == "route":
+            _, key = op
+            if ring_vnodes is None:
+                fail(EXIT_STATE, "STATE")
+            mapped = sticky_map.get(key)
+            if mapped is not None:
+                record = backends.get(mapped)
+                if record is not None and record["healthy"]:
+                    # 健康旧映射命中，无需动环。
+                    results.append(
+                        {
+                            "op": "route",
+                            "key": key,
+                            "backend": mapped,
+                            "sticky": True,
+                            "remapped": False,
+                        }
+                    )
+                    continue
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                fail(EXIT_STATE, "STATE")
+            digests = [token[0] for token in tokens]
+            key_hash = int.from_bytes(
+                hashlib.sha256(key.encode("utf-8")).digest(), "big"
+            )
+            index = bisect.bisect_left(digests, key_hash)
+            if index == len(tokens):
+                index = 0  # 越界回绕到环首
+            chosen_id = tokens[index][3]
+            remapped = mapped is not None
+            sticky_map[key] = chosen_id
+            results.append(
+                {
+                    "op": "route",
+                    "key": key,
+                    "backend": chosen_id,
+                    "sticky": False,
+                    "remapped": remapped,
                 }
             )
 
