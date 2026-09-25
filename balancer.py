@@ -107,7 +107,8 @@ remaps,removed：window=now//60，concurrency 为活动连接数，latency 为�
 查询时已跨入新窗（含从未 mr）按零计且不改存储。每次 fx 完成只追加一次同构
 度量、不新增结果项：归属 id 取 fx 结果 backend，backend 为 null 时取环遍历
 首个后端，环内无候选不记；字段为 ok=(state 为 A)、ms=latency、
-retries=remaps、remaps=remaps、now=fx.now。mr 与 fx 自动度量按操作顺序
+retries=remaps、remaps=remaps、now=fx.now。fr 则按各尝试后端逐次记录
+（详见故障重试段）。mr 与 fx 自动度量按操作顺序
 累加；失败批次不留度量。remove 后重加统计归零。mr/mg 均 O(1)，空间 O(B)。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
@@ -136,6 +137,19 @@ chash 报 STATE，重复 cid 报 CONNECTION。环同 route（仅健康、熔断 
 latency=耗时；无可用项则 R、backend=null、latency=0。结果键序
 op,cid,state,backend,latency,remaps。fx 完成后按归属 id 追加一次等价
 mr 度量（见请求度量段），结果项本身不变。fs O(1)，fx 仍为 O(BV)。
+
+故障重试：fr 键集 op,cid,flow,key,timeout,max,now，cid/flow/key 同 fx，
+timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均为非 bool 整数，now 纳入共用
+非递减时钟。未 chash 或环内无候选（无 healthy、熔断 C、排空 A 后端）
+报 STATE 且先于 cid 判定，重复活动 cid 报 CONNECTION。自 key 哈希点按
+fx 顺序遍历至多 max 个不同后端，不读写粘性映射：故障窗内 D 或 F 的故障
+相位（((now-a)//v)%2=0）该次失败、耗时 0；S 且 v>timeout 失败、耗时
+timeout；否则成功，耗时 v（窗内 S）或 0。首个成功即停止并按 open 建连
+（opened_at=now），state=A；全部失败则耗尽拒绝，state=R、backend=null。
+attempts 为尝试数，retries=remaps=max(attempts-1,0)，latency 为各次耗时
+之和；结果键序 op,cid,state,backend,attempts,retries,latency,remaps。
+每个尝试后端各追加一次 mr 度量：仅成功项 ok=true，ms 为该次耗时，首项
+的 retries/remaps 为总值、余项为 0。fr 时空 O(BV)。
 
 确定性操作记录：record 把原始 stdin 字节作为全新 run 输入执行，无论底层
 成功或按既有错误失败，均退出 0、stderr 为空，stdout 输出一行紧凑 JSON
@@ -311,11 +325,22 @@ def parse_metric_num(value):
 
 
 def parse_fault_num(value):
-    # fs 的 a/z/v 与 fx 的 timeout/now ∈ [0, 10^9]，非 bool 整数。
+    # fs 的 a/z/v 与 fx/fr 的 timeout/now ∈ [0, 10^9]，非 bool 整数。
     if (
         not isinstance(value, int)
         or isinstance(value, bool)
         or not 0 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_max_attempts(value):
+    # fr 的 max ∈ [1, 1024]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 1024
     ):
         fail(EXIT_INPUT, "INPUT")
     return value
@@ -529,7 +554,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og",
         "mr", "mg",
         "ce", "ci",
-        "fs", "fx",
+        "fs", "fx", "fr",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -816,6 +841,19 @@ def parse_op(raw_op):
             parse_fault_num(raw_op["now"]),
         )
 
+    if name == "fr":
+        if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "fr",
+            parse_cid(raw_op["cid"]),
+            parse_flow(raw_op["flow"]),
+            parse_key(raw_op["key"]),
+            parse_fault_num(raw_op["timeout"]),
+            parse_max_attempts(raw_op["max"]),
+            parse_fault_num(raw_op["now"]),
+        )
+
     if name in ("ce", "ci"):
         if name == "ce":
             if keys != {"op"}:
@@ -1017,7 +1055,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
-            "ci", "fx",
+            "ci", "fx", "fr",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -1945,6 +1983,86 @@ def run(raw):
                 record_metric(
                     metric_id, state == "A", latency, remaps, remaps, now
                 )
+
+        elif op[0] == "fr":
+            _, cid, flow, key, timeout, max_attempts, now = op
+            if ring_vnodes is None:
+                # 未 chash 或无候选均报 STATE，且先于 cid 重复判定（同 fx）。
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                fail(EXIT_STATE, "STATE")
+            if cid in connections:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            # 自 key 哈希点按 fx 顺序遍历，至多 max 个不同后端。
+            digests = [token[0] for token in tokens]
+            key_hash = int.from_bytes(
+                hashlib.sha256(key.encode("utf-8")).digest(), "big"
+            )
+            index = bisect.bisect_left(digests, key_hash)
+            if index == len(tokens):
+                index = 0  # 越界回绕到环首
+            attempts_mr = []  # (backend_id, ok, cost)，供逐尝试记度量
+            chosen_id = None
+            latency = 0
+            seen = set()
+            offset = 0
+            while len(attempts_mr) < max_attempts and offset < len(tokens):
+                backend_id = tokens[(index + offset) % len(tokens)][3]
+                offset += 1
+                if backend_id in seen:
+                    continue
+                seen.add(backend_id)
+                # D/故障相位 F：该次失败、耗时 0；S 且 v>timeout：失败、
+                # 耗时 timeout；否则成功，耗时 v（窗内 S）或 0。
+                fault = backends[backend_id]["fault"]
+                cost = 0
+                failed = False
+                if fault is not None and fault[1] <= now < fault[2]:
+                    k, a, _, v = fault
+                    if k == "D":
+                        failed = True
+                    elif k == "F":
+                        # 抖动：((now-a)//v)%2=0 的相位不可用。
+                        failed = ((now - a) // v) % 2 == 0
+                    else:  # S：可用但耗时 v。
+                        cost = v
+                        if v > timeout:
+                            failed = True
+                            cost = timeout
+                attempts_mr.append((backend_id, not failed, cost))
+                latency += cost
+                if not failed:
+                    chosen_id = backend_id
+                    break
+            attempts = len(attempts_mr)
+            retries = max(attempts - 1, 0)
+            if chosen_id is not None:
+                state = "A"
+                backends[chosen_id]["conns"] += 1
+                connections[cid] = [chosen_id, flow, now]
+            else:
+                # 耗尽（全部失败）拒绝，不建连。
+                state = "R"
+            results.append(
+                {
+                    "op": "fr",
+                    "cid": cid,
+                    "state": state,
+                    "backend": chosen_id,
+                    "attempts": attempts,
+                    "retries": retries,
+                    "latency": latency,
+                    "remaps": retries,
+                }
+            )
+            # 每个尝试后端各记一次 mr：仅成功项 ok=true，ms 为该次耗时；
+            # 首项 retries/remaps 为总值，余项为 0。
+            for mr_index, (metric_id, ok, cost) in enumerate(attempts_mr):
+                if mr_index == 0:
+                    record_metric(metric_id, ok, cost, retries, retries, now)
+                else:
+                    record_metric(metric_id, ok, cost, 0, 0, now)
 
         else:  # get
             _, cid = op
