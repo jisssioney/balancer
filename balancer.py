@@ -69,25 +69,32 @@ op,id,state,connections,start,end,deadline,forced，state ∈ A/D/X
 now ≥ 0 纳入共用非递减时钟；B 桶的 id 须为现存后端，否则 BACKEND。
 桶以 (scope,id) 唯一，新桶满令牌起步，同 (r,b,now) 重报幂等（不补充
 不推进时钟），其余 ls 一律重配置并置 t=b、at=now；remove 同步删除其
-B 桶。la 键集 op,c,s,key,now：先按原 route 语义选后端（含粘性建立
-与迁移，未配环或无可选后端报 STATE），再检查该后端 B 桶、客户端 C 桶
-（以 c 标识）、服务类 S 桶（以 s 标识），未配置即不限制。各在配桶先
-作 t=min(b,t+(now-at)*r)、at=now，均有 t>=1 才各减 1，否则 RATE/6
-（无 stdout、整批原子）；成功返回键序 op,backend,ok，ok=true。
-lg 键集 op,scope,id,now，按同样规则补充但不消费，查未配置桶报 STATE；
-返回键序 op,scope,id,r,b,t,at，值均为整数。ls 返回 op,ok。桶操作
-O(1)，la 继承 route 的复杂度上界，空间 O(B+K)。
+B 桶。la 键集 op,c,s,key,now 或精确键集 op,c,s,key,bc,cc,sc,now：
+bc/cc/sc 为后端/客户端/服务类三项扣减成本，均 [0,10^9] 非 bool 整数
+且至少一项非零（键集错误、成本非法或全零报 INPUT），原键集等价于
+三项成本均为 1。先按原 route 语义选后端（含粘性建立与迁移，未配环
+或无可选后端报 STATE），再补充该后端 B 桶、客户端 C 桶（以 c 标识）、
+服务类 S 桶（以 s 标识），未配置即不限制也不扣减。各在配桶先作
+t=min(b,t+(now-at)*r)、at=now，均有 t>=对应成本才各减对应成本，
+否则 RATE/6（无 stdout、整批原子）；成功返回键序 op,backend,ok，
+ok=true。lg 键集 op,scope,id,now，按同样规则补充但不消费，查未配置
+桶报 STATE；返回键序 op,scope,id,r,b,t,at，值均为整数。ls 返回
+op,ok。桶操作 O(1)，la 继承 route 的复杂度上界，空间 O(B+K)。
 
 排队接纳：os 键集 op,cap,q,ttl（均 1..10^6 非 bool 整数），依次为每后端
 连接上限、FIFO 容量、等待时限；首配或同参返回 op,ok，异参报 STATE。
-oa 键集 op,cid,flow,c,s,key,now：cid/flow 同 open，c/s/key 同 la，now
+oa 键集 op,cid,flow,c,s,key,now 或精确键集
+op,cid,flow,c,s,key,bc,cc,sc,now：cid/flow 同 open，c/s/key 同 la，
+bc/cc/sc 同 la 的成本规则（原键集等价于三项成本均为 1），now
 纳入共用非递减时钟。活动或排队中 cid 重复报 CONNECTION。先按 la 的路由
 语义选后端（未 chash 或无可选后端报 STATE），再对在配桶补充检查但不消费，
-目标另须排空 A 且连接数 < cap；令牌不足或目标不满足均阻塞入队，返回键序
-op,cid,state,backend：接纳为 A 加后端 id（此时才耗令牌并按 open 建连接，
-opened_at=now），阻塞为 Q 加 null；队满尾拒绝报 OVERLOAD/7。ot 键集
-op,now：先删除全部 now ≥ 入队 now+ttl 的排队项，再自队首逐项按 oa 规则
-重试接纳（opened_at=now）至首个阻塞即停，返回 op,expired,admitted，两
+目标另须排空 A 且连接数 < cap；令牌不足或目标不满足均阻塞入队（三项
+成本随请求入 FIFO），返回键序
+op,cid,state,backend：接纳为 A 加后端 id（此时才按成本耗令牌并按 open
+建连接，opened_at=now），阻塞为 Q 加 null；队满尾拒绝报 OVERLOAD/7。
+ot 键集 op,now：先删除全部 now ≥ 入队 now+ttl 的排队项（过期不扣），
+再自队首逐项按入队成本以 oa 规则
+重试接纳（opened_at=now，接纳才扣）至首个阻塞即停，返回 op,expired,admitted，两
 数组均按 FIFO 列 cid；ot 至多 q 次 route，空间 O(q)。og 键集 op，返回
 op,queue，queue 为 FIFO cid 数组。oa 未 os/chash、ot/og 未 os 报 STATE；
 非法键、类型、范围、编码或时钟倒退报 INPUT。
@@ -323,6 +330,27 @@ def parse_queue_param(value):
     ):
         fail(EXIT_INPUT, "INPUT")
     return value
+
+
+def parse_cost(value):
+    # la/oa 新键集的单项成本 bc/cc/sc ∈ [0, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_costs(raw_op):
+    """解析 la/oa 新键集的三项成本 (bc, cc, sc)；各项合法且至少一项非零。"""
+    bc = parse_cost(raw_op["bc"])
+    cc = parse_cost(raw_op["cc"])
+    sc = parse_cost(raw_op["sc"])
+    if bc == 0 and cc == 0 and sc == 0:
+        fail(EXIT_INPUT, "INPUT")
+    return bc, cc, sc
 
 
 def parse_metric_num(value):
@@ -729,13 +757,21 @@ def parse_op(raw_op):
         )
 
     if name == "la":
-        if keys != {"op", "c", "s", "key", "now"}:
+        if keys == {"op", "c", "s", "key", "now"}:
+            # 原键集：等价于三项成本均为 1。
+            bc = cc = sc = 1
+        elif keys == {"op", "c", "s", "key", "bc", "cc", "sc", "now"}:
+            bc, cc, sc = parse_costs(raw_op)
+        else:
             fail(EXIT_INPUT, "INPUT")
         return (
             "la",
             parse_key(raw_op["c"]),
             parse_key(raw_op["s"]),
             parse_key(raw_op["key"]),
+            bc,
+            cc,
+            sc,
             parse_now(raw_op["now"]),
         )
 
@@ -763,7 +799,12 @@ def parse_op(raw_op):
         )
 
     if name == "oa":
-        if keys != {"op", "cid", "flow", "c", "s", "key", "now"}:
+        if keys == {"op", "cid", "flow", "c", "s", "key", "now"}:
+            # 原键集：等价于三项成本均为 1。
+            bc = cc = sc = 1
+        elif keys == {"op", "cid", "flow", "c", "s", "key", "bc", "cc", "sc", "now"}:
+            bc, cc, sc = parse_costs(raw_op)
+        else:
             fail(EXIT_INPUT, "INPUT")
         return (
             "oa",
@@ -772,6 +813,9 @@ def parse_op(raw_op):
             parse_key(raw_op["c"]),
             parse_key(raw_op["s"]),
             parse_key(raw_op["key"]),
+            bc,
+            cc,
+            sc,
             parse_now(raw_op["now"]),
         )
 
@@ -933,7 +977,8 @@ def run(raw):
     # 为当前令牌与最近补充时刻，last 为最近一次 ls 的 (r,b,now) 用于重报。
     buckets = {}
     # 排队接纳：queue_cfg 未 os 时为 None，否则为 (cap, q, ttl)；wait_queue
-    # 为 FIFO deque，元素 (cid, flow, c, s, key, enqueue_now)，容量上限 q。
+    # 为 FIFO deque，元素 (cid, flow, c, s, key, enqueue_now, bc, cc, sc)，
+    # 容量上限 q；bc/cc/sc 为入队时登记的三项成本，ot 按原成本重试。
     queue_cfg = None
     wait_queue = deque()
     last_now = None
@@ -981,32 +1026,36 @@ def run(raw):
         )
         bucket["at"] = now
 
-    def evaluate_admit(backend_id, cid, flow, c, s, now):
-        """对已路由的后端按 la 规则补充检查但不消费；令牌不足、目标非 A 或
-        连接数达 cap 时返回 ("block", id)，全部满足才耗令牌、建连接
-        （opened_at=now），返回 ("admit", id)。"""
+    def evaluate_admit(backend_id, cid, flow, c, s, now, bc, cc, sc):
+        """对已路由的后端按 la 规则补充检查但不消费；令牌不足（不少于对应
+        成本）、目标非 A 或连接数达 cap 时返回 ("block", id)，全部满足才
+        按成本耗令牌、建连接（opened_at=now），返回 ("admit", id)。"""
         chosen = []
-        for scope, bucket_id in (("B", backend_id), ("C", c), ("S", s)):
+        for scope, bucket_id, cost in (
+            ("B", backend_id, bc),
+            ("C", c, cc),
+            ("S", s, sc),
+        ):
             bucket = buckets.get((scope, bucket_id))
             if bucket is not None:
-                chosen.append(bucket)
-        for bucket in chosen:
+                chosen.append((bucket, cost))
+        for bucket, _ in chosen:
             refill(bucket, now)
         record = backends[backend_id]
         if (
-            not all(bucket["t"] >= 1 for bucket in chosen)
+            not all(bucket["t"] >= cost for bucket, cost in chosen)
             or record["drain"]["state"] != "A"
             or record["conns"] >= queue_cfg[0]
         ):
             return "block", backend_id
-        # 接纳才耗令牌并按 open 建连接。
-        for bucket in chosen:
-            bucket["t"] -= 1
+        # 接纳才按成本耗令牌并按 open 建连接。
+        for bucket, cost in chosen:
+            bucket["t"] -= cost
         record["conns"] += 1
         connections[cid] = [backend_id, flow, now]
         return "admit", backend_id
 
-    def try_admit(cid, flow, c, s, key, now):
+    def try_admit(cid, flow, c, s, key, now, bc, cc, sc):
         """按 oa/ot 规则尝试一次接纳：先路由再评估。路由不可用（未配环或无
         可选后端）返回 ("route", None)——oa 据此报 STATE，ot 视为队首阻塞即
         停；其余返回 evaluate_admit 的结果。"""
@@ -1014,7 +1063,7 @@ def run(raw):
         if routed is None:
             return "route", None
         backend_id, _, _ = routed
-        return evaluate_admit(backend_id, cid, flow, c, s, now)
+        return evaluate_admit(backend_id, cid, flow, c, s, now, bc, cc, sc)
 
     def record_metric(backend_id, ok, ms, retries, remaps, now):
         """按 mr 语义累加一条度量：window=now//60，换窗清零，五延迟桶
@@ -1576,22 +1625,27 @@ def run(raw):
             results.append({"op": "ls", "ok": True})
 
         elif op[0] == "la":
-            _, c, s, key, now = op
+            _, c, s, key, bc, cc, sc, now = op
             # 先按原 route 选后端（未配环或无可选后端报 STATE），再检查
-            # 该后端/客户端/服务类三个桶；未配置即不限制。
+            # 该后端/客户端/服务类三个桶；未配置即不限制也不扣减。
             backend_id, _, _ = select_route(key)
             chosen = []
-            for scope, bucket_id in (("B", backend_id), ("C", c), ("S", s)):
+            for scope, bucket_id, cost in (
+                ("B", backend_id, bc),
+                ("C", c, cc),
+                ("S", s, sc),
+            ):
                 bucket = buckets.get((scope, bucket_id))
                 if bucket is not None:
-                    chosen.append(bucket)
-            for bucket in chosen:
+                    chosen.append((bucket, cost))
+            for bucket, _ in chosen:
                 refill(bucket, now)
-            # 均有 t>=1 才各减 1；任一不足则 RATE/6：无 stdout、整批原子。
-            if not all(bucket["t"] >= 1 for bucket in chosen):
+            # 均有 t>=对应成本才各减对应成本；任一不足则 RATE/6：
+            # 无 stdout、整批原子。
+            if not all(bucket["t"] >= cost for bucket, cost in chosen):
                 fail(EXIT_RATE, "RATE")
-            for bucket in chosen:
-                bucket["t"] -= 1
+            for bucket, cost in chosen:
+                bucket["t"] -= cost
             results.append({"op": "la", "backend": backend_id, "ok": True})
 
         elif op[0] == "lg":
@@ -1624,7 +1678,7 @@ def run(raw):
             results.append({"op": "os", "ok": True})
 
         elif op[0] == "oa":
-            _, cid, flow, c, s, key, now = op
+            _, cid, flow, c, s, key, bc, cc, sc, now = op
             if queue_cfg is None:
                 # 未 os 报 STATE。
                 fail(EXIT_STATE, "STATE")
@@ -1637,7 +1691,7 @@ def run(raw):
                 # 活动或排队中 cid 重复。
                 fail(EXIT_CONNECTION, "CONNECTION")
             status, backend_id = evaluate_admit(
-                routed[0], cid, flow, c, s, now
+                routed[0], cid, flow, c, s, now, bc, cc, sc
             )
             if status == "admit":
                 results.append(
@@ -1647,7 +1701,8 @@ def run(raw):
                 if len(wait_queue) >= queue_cfg[1]:
                     # FIFO 已满，尾拒绝。
                     fail(EXIT_OVERLOAD, "OVERLOAD")
-                wait_queue.append((cid, flow, c, s, key, now))
+                # 三项成本随请求入队，ot 按原成本重试。
+                wait_queue.append((cid, flow, c, s, key, now, bc, cc, sc))
                 results.append(
                     {"op": "oa", "cid": cid, "state": "Q", "backend": None}
                 )
@@ -1671,9 +1726,11 @@ def run(raw):
             admitted = []
             while wait_queue:
                 item = wait_queue.popleft()
-                # 接纳时刻为本次 ot 的 now（opened_at=now），入队时刻仅用于过期。
+                # 接纳时刻为本次 ot 的 now（opened_at=now），入队时刻仅用于过期；
+                # 按入队时登记的三项成本重试，接纳才扣减，过期项不扣。
                 status, _ = try_admit(
-                    item[0], item[1], item[2], item[3], item[4], now
+                    item[0], item[1], item[2], item[3], item[4], now,
+                    item[6], item[7], item[8],
                 )
                 if status == "admit":
                     admitted.append(item[0])
