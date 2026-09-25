@@ -173,6 +173,20 @@ op,expired（cid 数组）。tk/tg/tx 的 now 纳入共用非递减时钟；未 
 tk/tg/tx 报 STATE。close 与 dg 强关同样清理连接的空闲状态。ts/tk/tg 为
 O(1)，tx 为 O(C)，额外空间 O(C)。
 
+限时粘性：ss 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置粘性到期
+时限，首配或同值返回 op,ok=true，异值报 STATE，不进入 ce/ci。粘性映
+射为 key -> [backend, expires]：二键 route 行为不变，无项按环写
+[b,null]，b 可用即命中且 e 不变，否则重选为 [b',null]；route 新增键
+集 op,key,now，now 为非负非 bool 整数，纳入共用非递减时钟，未 ss、
+未配环或无可选后端报 STATE。三键规则：无项选 b；e=null 时保留可用
+b 否则重选；e 非 null 时仅 now<e 且 b 可用才保留，否则重选；无项、
+e=null 或重选均写 e=now+ttl，仅未到期命中不改写 e。route 结果键序
+op,key,backend,sticky,remapped,expired,expires：sticky 为沿用已有
+b，remapped 为已有项且新旧 b 不同，expired 为原 e 非 null 且
+now>=原 e（重选同一 b 仍为 true），其余 false，expires 为映射落盘
+后的 e。ss 后 la/oa/ot 按各自 now 用三键规则路由，未 ss 保持旧义。
+ss 为 O(1)，路由沿用上界，空间 O(S)。
+
 确定性操作记录：record 把原始 stdin 字节作为全新 run 输入执行，无论底层
 成功或按既有错误失败，均退出 0、stderr 为空，stdout 输出一行紧凑 JSON
 记录，键序 version,stdin,exit,stdout,stderr：version=1（非 bool 整数），
@@ -421,7 +435,7 @@ def parse_drain_timeout(value):
 
 
 def parse_idle_ttl(value):
-    # 连接空闲时限 ttl ∈ [1, 10^9]，非 bool 整数。
+    # 连接空闲时限与限时粘性 ttl ∈ [1, 10^9]，非 bool 整数。
     if (
         not isinstance(value, int)
         or isinstance(value, bool)
@@ -600,6 +614,7 @@ def parse_op(raw_op):
         "ce", "ci",
         "fs", "fx", "fr",
         "ts", "tk", "tg", "tx",
+        "ss",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -700,9 +715,18 @@ def parse_op(raw_op):
         return ("chash", parse_vnodes(raw_op["vnodes"]))
 
     if name == "route":
-        if keys != {"op", "key"}:
+        if keys == {"op", "key"}:
+            # 二键旧形式：无 now，不参与时钟，行为不变。
+            return ("route", parse_key(raw_op["key"]), None)
+        if keys == {"op", "key", "now"}:
+            # 三键限时粘性：now 为非负非 bool 整数，纳入共用非递减时钟。
+            return ("route", parse_key(raw_op["key"]), parse_now(raw_op["now"]))
+        fail(EXIT_INPUT, "INPUT")
+
+    if name == "ss":
+        if keys != {"op", "ttl"}:
             fail(EXIT_INPUT, "INPUT")
-        return ("route", parse_key(raw_op["key"]))
+        return ("ss", parse_idle_ttl(raw_op["ttl"]))
 
     if name == "cs":
         if keys != {"op", "id", "n", "m", "r", "w", "q"}:
@@ -1011,10 +1035,15 @@ def run(raw):
     # 可复用。last 为最近活动时刻（建连时置 opened_at，tk 未到期时置 now），
     # 供 ts/tk/tg/tx 的空闲超时判定；dict 保序即建连顺序。
     connections = {}
-    # 一致性哈希：ring_vnodes 未 chash 时为 None；sticky 映射 key -> backend_id，
-    # 只在目标不可用时依环改写（不迁回），增删后端或改 vnodes 均不动它。
+    # 一致性哈希：ring_vnodes 未 chash 时为 None；sticky 映射
+    # key -> [backend_id, expires]，expires 为限时粘性到期时刻（二键
+    # route 与未 ss 的 la/oa/ot 写入为 None）。只在目标不可用或到期时
+    # 依环改写（不迁回），增删后端或改 vnodes 均不动它。
     ring_vnodes = None
     sticky_map = {}
+    # 限时粘性：ss_cfg 未 ss 时为 None，否则为登记的 ttl；首配或同值
+    # 幂等，异值报 STATE；不进入 ce/ci。
+    ss_cfg = None
     # 令牌桶以 (scope, id) 唯一：scope ∈ B/C/S（后端/客户端/服务类）。
     # B 桶 id 必须是现存后端；remove 即删。每桶 r/b 为速率与容量，t/at
     # 为当前令牌与最近补充时刻，last 为最近一次 ls 的 (r,b,now) 用于重报。
@@ -1030,24 +1059,53 @@ def run(raw):
     last_now = None
     results = []
 
-    def select_route(key, fatal=True):
-        """按原 route 语义选后端：首见建立粘性映射，目标不可用依环迁移且不
-        迁回；返回 (backend_id, sticky, remapped)，未配环或无可选后端报 STATE。
+    def select_route(key, now=None, fatal=True):
+        """按 route 语义选后端并维护粘性映射 key -> [backend, expires]。
+
+        now 为 None（二键 route，或未 ss 的 la/oa/ot）时沿用旧规则：无项
+        按环写 [b, null]；b 可用即命中且 e 不变，否则重选为 [b', null]。
+        now 非 None（三键 route，或已 ss 的 la/oa/ot 按各自 now）时：无项
+        选 b；e=null 保留可用 b 否则重选；e 非 null 仅 now<e 且 b 可用才
+        保留，否则重选；无项、e=null 或重选均写 e=now+ttl，仅未到期命中
+        不改写 e。返回 (backend_id, sticky, remapped, expired, expires)：
+        sticky 为沿用已有 b，remapped 为已有项且新旧 b 不同，expired 为
+        原 e 非 null 且 now>=原 e（重选同一 b 仍为 true），expires 为映射
+        落盘后的 e。未 ss 的三键 route、未配环或无可选后端报 STATE；
         fatal=False 时不退出而返回 None（供排队重试把该情形视为阻塞）。"""
+        if now is not None and ss_cfg is None:
+            # 三键 route 未 ss 报 STATE。
+            if fatal:
+                fail(EXIT_STATE, "STATE")
+            return None
         if ring_vnodes is None:
             if fatal:
                 fail(EXIT_STATE, "STATE")
             return None
-        mapped = sticky_map.get(key)
-        if mapped is not None:
+        entry = sticky_map.get(key)
+        expired = False
+        if entry is not None:
+            mapped, old_expires = entry
             record = backends.get(mapped)
-            if (
+            available = (
                 record is not None
                 and record["healthy"]
                 and circuit_closed(record)
                 and record["drain"]["state"] != "X"
-            ):
-                return mapped, True, False
+            )
+            if now is None:
+                # 二键规则：b 可用即命中且 e 不变，否则重选。
+                if available:
+                    return mapped, True, False, False, old_expires
+            elif old_expires is None:
+                # e=null：保留可用 b，但改写 e=now+ttl。
+                if available:
+                    entry[1] = now + ss_cfg
+                    return mapped, True, False, False, entry[1]
+            else:
+                expired = now >= old_expires
+                # e 非 null：仅 now<e 且 b 可用才保留，e 不变。
+                if not expired and available:
+                    return mapped, True, False, False, old_expires
         tokens = build_ring(backends, ring_vnodes)
         if not tokens:
             if fatal:
@@ -1061,9 +1119,10 @@ def run(raw):
         if index == len(tokens):
             index = 0  # 越界回绕到环首
         chosen_id = tokens[index][3]
-        remapped = mapped is not None
-        sticky_map[key] = chosen_id
-        return chosen_id, False, remapped
+        remapped = entry is not None and chosen_id != entry[0]
+        new_expires = None if now is None else now + ss_cfg
+        sticky_map[key] = [chosen_id, new_expires]
+        return chosen_id, False, remapped, expired, new_expires
 
     def refill(bucket, now):
         # 先按时间差补充至容量上限，再推进时钟。
@@ -1104,11 +1163,13 @@ def run(raw):
     def try_admit(cid, flow, c, s, key, costs, now):
         """按 oa/ot 规则尝试一次接纳：先路由再评估。路由不可用（未配环或无
         可选后端）返回 ("route", None)——oa 据此报 STATE，ot 视为队首阻塞即
-        停；其余返回 evaluate_admit 的结果。"""
-        routed = select_route(key, fatal=False)
+        停；其余返回 evaluate_admit 的结果。ss 后按各自 now 用限时粘性规则。"""
+        routed = select_route(
+            key, now=now if ss_cfg is not None else None, fatal=False
+        )
         if routed is None:
             return "route", None
-        backend_id, _, _ = routed
+        backend_id = routed[0]
         return evaluate_admit(backend_id, cid, flow, c, s, costs, now)
 
     def record_metric(backend_id, ok, ms, retries, remaps, now):
@@ -1151,10 +1212,10 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
-            "ci", "fx", "fr", "tk", "tg", "tx",
+            "ci", "fx", "fr", "tk", "tg", "tx", "route",
         ):
             now = op[-1]
-            # 三键 add 的 now 占位为 None，不参与时钟。
+            # 三键 add 与二键 route 的 now 占位为 None，不参与时钟。
             if now is not None:
                 if last_now is not None and now < last_now:
                     fail(EXIT_INPUT, "INPUT")
@@ -1445,8 +1506,10 @@ def run(raw):
             results.append({"op": "chash", "ok": True})
 
         elif op[0] == "route":
-            _, key = op
-            chosen_id, sticky, remapped = select_route(key)
+            _, key, now = op
+            chosen_id, sticky, remapped, expired, expires = select_route(
+                key, now=now
+            )
             results.append(
                 {
                     "op": "route",
@@ -1454,8 +1517,20 @@ def run(raw):
                     "backend": chosen_id,
                     "sticky": sticky,
                     "remapped": remapped,
+                    "expired": expired,
+                    "expires": expires,
                 }
             )
+
+        elif op[0] == "ss":
+            _, ttl = op
+            if ss_cfg is None:
+                # 首配作用于既有与后续映射。
+                ss_cfg = ttl
+            elif ss_cfg != ttl:
+                # 异值重配报 STATE；同值幂等。
+                fail(EXIT_STATE, "STATE")
+            results.append({"op": "ss", "ok": True})
 
         elif op[0] == "cs":
             _, backend_id, n, m, r, w, q = op
@@ -1672,9 +1747,12 @@ def run(raw):
 
         elif op[0] == "la":
             _, c, s, key, bc, cc, sc, now = op
-            # 先按原 route 选后端（未配环或无可选后端报 STATE），再检查
-            # 该后端/客户端/服务类三个桶；未配置即不限制也不扣减。
-            backend_id, _, _ = select_route(key)
+            # 先按 route 选后端（ss 后按各自 now 用限时粘性规则，未 ss 保持
+            # 旧义；未配环或无可选后端报 STATE），再检查该后端/客户端/服务
+            # 类三个桶；未配置即不限制也不扣减。
+            backend_id = select_route(
+                key, now=now if ss_cfg is not None else None
+            )[0]
             chosen = []
             for scope, bucket_id, cost in (
                 ("B", backend_id, bc),
@@ -1729,7 +1807,9 @@ def run(raw):
                 # 未 os 报 STATE。
                 fail(EXIT_STATE, "STATE")
             # 路由检查先于 cid 重复判定，与 open 的 STATE 先于 CONNECTION 一致。
-            routed = select_route(key, fatal=False)
+            routed = select_route(
+                key, now=now if ss_cfg is not None else None, fatal=False
+            )
             if routed is None:
                 # 未 chash 或无可选后端。
                 fail(EXIT_STATE, "STATE")
