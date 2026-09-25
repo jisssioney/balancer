@@ -183,21 +183,24 @@ fault,none 的非负整数计数对象，removed=null 的样本计入 none。mx 
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler}：
-version=4；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
+version=5；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
 circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，均只含登记值不含运行态；
 vnodes=null 或整数；limits 项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的
 UTF-8 字节升序；overload=null 或 {cap,q,ttl}；sticky/idle 为 null 或
 {"ttl":整数}（ttl ∈ [1,10^9] 非 bool 整数，登记 ss/ts 才非 null）；
 backpressure=null 或键序 {low,high}（low/high ∈ [0,10^6] 非 bool 整数，
 登记 bp 才非 null，此时 overload 必非 null 且 low<high≤overload.q）；
-scheduler 精确为 {"pick":"W"}、{"pick":"R"} 或 {"pick":"L"}（只含登记值
-不含运行态），W 为既有平滑加权，R 为轮询，L 为最少连接。ci 精确键集
+scheduler 精确为 {"pick":"W"}、{"pick":"R"}、{"pick":"L"} 或
+{"pick":"H"}（只含登记值不含运行态），W 为既有平滑加权，R 为轮询，
+L 为最少连接，H 为一致性哈希。ci 精确键集
 op,config,now，结果 op,ok=true；now 为非负非 bool 整数并纳入共用非递减
 时钟，亦接受 version=1 原结构（仅前五键）与 version=2 结构（追加三键），
 两者 scheduler 缺省等价于 W；version=3 同为九键但 scheduler 仅收 W/R，
-version=4 须含 scheduler 并收 W/R/L。
+version=4 须含 scheduler 并收 W/R/L，version=5 收 W/R/L/H 且选 H 时
+vnodes 须非 null。
 各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp 的类型与范围。scheduler
 缺失（v1/v2）合法，v3 多键、类型错误或 pick 非 W/R，v4 的 pick 非 W/R/L，
+v5 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
 连同其余非法结构、键集、版本、类型、范围、重复后端/限流项、编码、交叉
 约束或时钟倒退判
 INPUT/2，B 限流引用未知后端判 BACKEND/3，有活动连接或排队项判 STATE/4，
@@ -213,8 +216,16 @@ INPUT/2，B 限流引用未知后端判 BACKEND/3，有活动连接或排队项�
 考虑 healthy、熔断 C、排空 A 的后端，取活动连接数 conns 最少者，并列取
 最早加入者；无候选报 STATE/4，否则结果键序 op,id。L 忽略权重、无游标；
 连接操作实时改变 conns，L 的 pick 不改 conns、current 或 ticket，后端
-增删及资格迁移仅改变下次候选。ce/ci 均 O(B+M) 时空（M 为限流项数）；
-R/L 的 pick 均为 O(B) 时间、O(1) 额外空间。
+增删及资格迁移仅改变下次候选。H 模式为一致性哈希调度：pick 仅收
+{op,key} 或 {op,key,now}（now ∈ [0,10^9] 非 bool 整数，纳入共用非递减
+时钟，三键须已 ss），原 {op} 形状与 W/R/L 下带 key 的形状均报 STATE/4；
+key 沿用 route 校验。H 共享既有环与粘性映射：首次按环选，原目标合格
+（healthy、熔断 C、排空 A）则命中；目标删除或因健康、熔断、排空失格才
+依环迁移且不迁回；改 vnodes 不主动迁移；三键沿用到期规则。二键结果键序
+op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配环、
+三键未 ss 或无合格后端报 STATE/4。H 不改连接数及 W/R/L 运行态。ce/ci
+均 O(B+M) 时空（M 为限流项数）；R/L 的 pick 均为 O(B) 时间、O(1) 额外
+空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
 时钟故障演练：fs 键集 op,id,k,a,z,v（a,z,v ∈ [0,10^9] 非 bool 整数，
 a<z；k ∈ D/F/S，D 须 v=0，F/S 须 v>0）为后端登记故障演练，同参重报
@@ -672,8 +683,9 @@ def parse_config(value):
     sticky/idle/backpressure 一律视为 null；version=2 须精确含追加三键，
     sticky/idle 为 null 或 {"ttl":整数}，backpressure 为 null 或 {"low",
     "high"}，非 null 时 overload 必非 null 且 low<high≤overload.q；
-    version=3/4 在 v2 八键末追加 scheduler，须精确为 {"pick":...} 单键
-    对象，v3 仅收 W/R，v4 收 W/R/L。v1/v2 的 scheduler 缺省等价于 W。"""
+    version=3/4/5 在 v2 八键末追加 scheduler，须精确为 {"pick":...} 单键
+    对象，v3 仅收 W/R，v4 收 W/R/L，v5 收 W/R/L/H；v5 选 H 时 vnodes 须
+    非 null。v1/v2 的 scheduler 缺省等价于 W。"""
     if not isinstance(value, dict):
         fail(EXIT_INPUT, "INPUT")
     config_keys = set(value)
@@ -685,7 +697,7 @@ def parse_config(value):
     elif config_keys == v2_keys:
         version = 2
     elif config_keys == v3_keys:
-        # 九键结构为 v3/v4 共用，具体版本由 version 字段区分。
+        # 九键结构为 v3/v4/v5 共用，具体版本由 version 字段区分。
         version = None
     else:
         fail(EXIT_INPUT, "INPUT")
@@ -693,7 +705,7 @@ def parse_config(value):
     if not isinstance(raw_version, int) or isinstance(raw_version, bool):
         fail(EXIT_INPUT, "INPUT")
     if version is None:
-        if raw_version not in (3, 4):
+        if raw_version not in (3, 4, 5):
             fail(EXIT_INPUT, "INPUT")
         version = raw_version
     elif raw_version != version:
@@ -830,17 +842,24 @@ def parse_config(value):
     if version >= 3:
         # scheduler 精确为 {"pick":...} 单键对象：缺失（v1/v2 键集不含该
         # 键，已在上文分流）不会出现；多键、非对象、键名错误或 pick 非
-        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L。
+        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5 收 W/R/L/H。
         raw_scheduler = value["scheduler"]
         if (
             not isinstance(raw_scheduler, dict)
             or set(raw_scheduler) != {"pick"}
         ):
             fail(EXIT_INPUT, "INPUT")
-        allowed = ("W", "R") if version == 3 else ("W", "R", "L")
+        allowed = (
+            ("W", "R")
+            if version == 3
+            else (("W", "R", "L") if version == 4 else ("W", "R", "L", "H"))
+        )
         if raw_scheduler["pick"] not in allowed:
             fail(EXIT_INPUT, "INPUT")
         scheduler = raw_scheduler["pick"]
+        # v5 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
+        if scheduler == "H" and vnodes is None:
+            fail(EXIT_INPUT, "INPUT")
     else:
         # v1/v2 旧结构等价于既有平滑加权 W。
         scheduler = "W"
@@ -905,9 +924,18 @@ def parse_op(raw_op):
         return ("remove", parse_backend_id(raw_op["id"]))
 
     if name == "pick":
-        if keys != {"op"}:
-            fail(EXIT_INPUT, "INPUT")
-        return ("pick",)
+        if keys == {"op"}:
+            # 原 pick 键集：W/R/L 模式专用，行为不变。
+            return ("pick", None, None)
+        if keys == {"op", "key"}:
+            # H（一致性哈希）二键形式：now 占位为 None，沿用无过期语义。
+            return ("pick", parse_key(raw_op["key"]), None)
+        if keys == {"op", "key", "now"}:
+            # H 三键形式：限时粘性，now ∈ [0,10^9] 非 bool 整数，纳入共用
+            # 非递减时钟；未 ss 留执行期报 STATE。
+            return ("pick", parse_key(raw_op["key"]),
+                    parse_warm_now(raw_op["now"]))
+        fail(EXIT_INPUT, "INPUT")
 
     if name == "open":
         if keys != {"op", "cid", "flow", "now"}:
@@ -1420,17 +1448,17 @@ def run(raw):
     last_now = None
     results = []
 
-    def backend_routable(record):
+    def backend_routable(record, drain_strict=False):
         """粘性沿用条件：现存、healthy、熔断 C 且未摘除到 X（D 态原粘性仍
-        命中，故只排除 X；新映射建环时另要求 A 态）。"""
-        return (
-            record is not None
-            and record["healthy"]
-            and circuit_closed(record)
-            and record["drain"]["state"] != "X"
-        )
+        命中，故只排除 X；新映射建环时另要求 A 态）。drain_strict=True 时
+        （H 模式 pick）排空 D 同样失格，仅 A 态可沿用。"""
+        if record is None or not record["healthy"] or not circuit_closed(record):
+            return False
+        if drain_strict:
+            return record["drain"]["state"] == "A"
+        return record["drain"]["state"] != "X"
 
-    def select_route(key, now=None, fatal=True):
+    def select_route(key, now=None, fatal=True, drain_strict=False):
         """按 route 语义选后端，返回
         (backend_id, sticky, remapped, expired, expires)。
 
@@ -1441,7 +1469,8 @@ def run(raw):
         无项、e=None 或重选均写 e=now+sticky_ttl。expired
         为原 e 非 None 且 now>=原 e（重选回同一 b 仍为 True）。未配环或无
         可选后端报 STATE；fatal=False 时不退出而返回 None（供排队重试把该
-        情形视为阻塞）。"""
+        情形视为阻塞）。drain_strict=True（H 模式 pick）时粘性保留另要求 A
+        态：D/X 均按失格依环迁移；建环本就只含 A 态。"""
         if ring_vnodes is None or (now is not None and sticky_ttl is None):
             # 三键（now 非 None）还要求已 ss。
             if fatal:
@@ -1456,11 +1485,15 @@ def run(raw):
             if now is None or old_expires is None:
                 # 二键语义不判到期（e 原样保留）；三键遇 e=null 也只判 b
                 # 可用性，但沿用时仍要写 e=now+ttl（下方处理）。
-                keep = backend_routable(backends.get(old_b))
+                keep = backend_routable(
+                    backends.get(old_b), drain_strict=drain_strict
+                )
             else:
                 # 三键且 e 非 null：到期标志先于可用性判定。
                 expired = now >= old_expires
-                keep = not expired and backend_routable(backends.get(old_b))
+                keep = not expired and backend_routable(
+                    backends.get(old_b), drain_strict=drain_strict
+                )
         if keep:
             if now is not None and old_expires is None:
                 # 三键沿用 e=null 项的可用 b：b 不变，但补写 e=now+ttl。
@@ -1594,7 +1627,7 @@ def run(raw):
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
             "ms", "mx",
-            "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq",
+            "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -1681,6 +1714,47 @@ def run(raw):
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
+            _, key, pick_now = op
+            if pick_mode == "H":
+                if key is None:
+                    # H 仅收 {op,key} 或 {op,key,now}：原 {op} 形状与 H
+                    # 模式不符，报 STATE（键集本身非法已在解析期判 INPUT）。
+                    fail(EXIT_STATE, "STATE")
+                # H 共享既有环与粘性映射，沿用 route 选择语义；粘性保留另
+                # 要求 A 态（D 态原粘性也失格，依环迁移且不迁回）。首次按
+                # 环选，目标删除或因健康、熔断、排空失格才迁移；改 vnodes
+                # 不主动迁移；三键沿用到期规则。pick 不改连接数与 W/R/L
+                # 运行态（current/ticket/conns 均不动）。
+                chosen_id, sticky, remapped, expired, expires = select_route(
+                    key, pick_now, drain_strict=True
+                )
+                if pick_now is None:
+                    # 二键结果键序 op,id,sticky,remapped。
+                    results.append(
+                        {
+                            "op": "pick",
+                            "id": chosen_id,
+                            "sticky": sticky,
+                            "remapped": remapped,
+                        }
+                    )
+                else:
+                    # 三键追加 expired,expires，值义同 route。
+                    results.append(
+                        {
+                            "op": "pick",
+                            "id": chosen_id,
+                            "sticky": sticky,
+                            "remapped": remapped,
+                            "expired": expired,
+                            "expires": expires,
+                        }
+                    )
+                continue
+            if key is not None:
+                # W/R/L 仅收原 {op} 形状；{op,key} 或 {op,key,now} 与
+                # 当前模式不符，报 STATE（now 时钟已先于分支校验）。
+                fail(EXIT_STATE, "STATE")
             if pick_mode == "L":
                 # 最少连接：仅考虑 healthy、熔断 C、排空 A 的后端，取活动
                 # 连接数 conns 最少者，并列取最早加入者（dict 遍历序即加入
@@ -2613,12 +2687,12 @@ def run(raw):
             )
             # 三项均只导出登记值：sticky/idle 为 null 或 {"ttl":整数}，
             # backpressure 为 null 或 {low,high}（不含 bp_state 运行态）；
-            # scheduler 精确为 {"pick":"W"/"R"/"L"}（不含 ticket 运行态）。
+            # scheduler 精确为 {"pick":"W"/"R"/"L"/"H"}（不含 ticket 运行态）。
             results.append(
                 {
                     "op": "ce",
                     "config": {
-                        "version": 4,
+                        "version": 5,
                         "backends": exported_backends,
                         "vnodes": ring_vnodes,
                         "limits": exported_limits,
