@@ -104,6 +104,19 @@ remaps,removed：window=now//60，concurrency 为活动连接数，latency 为�
 两位定点串；removed 依次取 drain（D/X）、health（unhealthy）、circuit（熔断
 非 C），否则 null；查询时已跨入新窗（含从未 mr）按零计且不改存储。remove 后
 重加统计归零。mr/mg 均 O(1)，空间 O(B)。
+
+配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
+{version,backends,vnodes,limits,overload}：version=1；backends 按加入序，
+项 {id,weight,d,fail,success,circuit,drain}，circuit=null 或 {n,m,r,w,q}，
+drain=null 或登记的 t，均只含登记值不含运行态；vnodes=null 或整数；limits
+项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；overload=
+null 或 {cap,q,ttl}。ci 键集 op,config,now，结果 op,ok=true；now 为非负
+非 bool 整数并纳入共用非递减时钟，各值沿用 add/hset/ws/chash/cs/ds/ls/os
+的类型与范围。非法结构、类型、范围、编码、时钟及重复后端/限流项判 INPUT/2，
+B 限流引用未知后端判 BACKEND/3，有活动连接或排队项判 STATE/4，依次判错。
+成功时原子替换配置并以 now 重建默认运行态（全部 healthy、d>0 自 now 起算
+预热、熔断 C 空窗、排空 A、桶满、队空、粘性清空、度量归零）；失败回滚不变更。
+ce/ci 均 O(B+L) 时空（L 为限流项数）。
 """
 
 import bisect
@@ -341,6 +354,119 @@ def parse_flow(value):
     return [src_ip, src_port, dst_ip, dst_port, protocol]
 
 
+def parse_config(value):
+    """校验 ci 的 config 并返回规范化结构；结构、类型、范围、编码或重复后端/
+    限流项一律 INPUT。B 限流对后端的引用在执行期判 BACKEND。"""
+    if not isinstance(value, dict) or set(value) != {
+        "version", "backends", "vnodes", "limits", "overload",
+    }:
+        fail(EXIT_INPUT, "INPUT")
+    version = value["version"]
+    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+        fail(EXIT_INPUT, "INPUT")
+
+    raw_backends = value["backends"]
+    if not isinstance(raw_backends, list):
+        fail(EXIT_INPUT, "INPUT")
+    normalized_backends = []
+    seen_backend_ids = set()
+    for item in raw_backends:
+        if not isinstance(item, dict) or set(item) != {
+            "id", "weight", "d", "fail", "success", "circuit", "drain",
+        }:
+            fail(EXIT_INPUT, "INPUT")
+        backend_id = parse_backend_id(item["id"])
+        # 后端 id 须 UTF-8 可编码（建环与输出排序都会用到其字节）。
+        encode_backend_id(backend_id)
+        if backend_id in seen_backend_ids:
+            fail(EXIT_INPUT, "INPUT")
+        seen_backend_ids.add(backend_id)
+        weight = parse_threshold(item["weight"])
+        d = parse_duration(item["d"])
+        fail_threshold = parse_threshold(item["fail"])
+        success_threshold = parse_threshold(item["success"])
+        raw_circuit = item["circuit"]
+        if raw_circuit is None:
+            circuit_params = None
+        else:
+            if not isinstance(raw_circuit, dict) or set(raw_circuit) != {
+                "n", "m", "r", "w", "q",
+            }:
+                fail(EXIT_INPUT, "INPUT")
+            n = parse_threshold(raw_circuit["n"])
+            r = parse_threshold(raw_circuit["r"])
+            q = parse_threshold(raw_circuit["q"])
+            m = raw_circuit["m"]
+            # m ∈ [1,n]，与 cs 同范围；bool 显式排除。
+            if not isinstance(m, int) or isinstance(m, bool) or not 1 <= m <= n:
+                fail(EXIT_INPUT, "INPUT")
+            w = parse_circuit_window(raw_circuit["w"])
+            circuit_params = (n, m, r, w, q)
+        raw_drain = item["drain"]
+        drain_t = None if raw_drain is None else parse_drain_timeout(raw_drain)
+        normalized_backends.append(
+            (
+                backend_id,
+                weight,
+                d,
+                fail_threshold,
+                success_threshold,
+                circuit_params,
+                drain_t,
+            )
+        )
+
+    vnodes = None if value["vnodes"] is None else parse_vnodes(value["vnodes"])
+
+    raw_limits = value["limits"]
+    if not isinstance(raw_limits, list):
+        fail(EXIT_INPUT, "INPUT")
+    normalized_limits = []
+    seen_buckets = set()
+    scope_rank = {"B": 0, "C": 1, "S": 2}
+    previous_order_key = None
+    for item in raw_limits:
+        if not isinstance(item, dict) or set(item) != {"scope", "id", "r", "b"}:
+            fail(EXIT_INPUT, "INPUT")
+        scope = item["scope"]
+        if scope not in scope_rank:
+            fail(EXIT_INPUT, "INPUT")
+        bucket_id = parse_key(item["id"])
+        r = parse_rate(item["r"])
+        b = parse_burst(item["b"])
+        pair = (scope, bucket_id)
+        if pair in seen_buckets:
+            fail(EXIT_INPUT, "INPUT")
+        seen_buckets.add(pair)
+        order_key = (scope_rank[scope], bucket_id.encode("utf-8"))
+        if previous_order_key is not None and not previous_order_key < order_key:
+            # 必须严格按 scope 的 B/C/S 序、id 的 UTF-8 字节升序排列。
+            fail(EXIT_INPUT, "INPUT")
+        previous_order_key = order_key
+        normalized_limits.append((scope, bucket_id, r, b))
+
+    raw_overload = value["overload"]
+    if raw_overload is None:
+        overload = None
+    else:
+        if not isinstance(raw_overload, dict) or set(raw_overload) != {
+            "cap", "q", "ttl",
+        }:
+            fail(EXIT_INPUT, "INPUT")
+        overload = (
+            parse_queue_param(raw_overload["cap"]),
+            parse_queue_param(raw_overload["q"]),
+            parse_queue_param(raw_overload["ttl"]),
+        )
+
+    return {
+        "backends": normalized_backends,
+        "vnodes": vnodes,
+        "limits": normalized_limits,
+        "overload": overload,
+    }
+
+
 def parse_op(raw_op):
     """校验单个操作的形状，返回规范化元组；不合格式直接 INPUT 退出。"""
     if not isinstance(raw_op, dict):
@@ -354,6 +480,7 @@ def parse_op(raw_op):
         "ls", "la", "lg",
         "os", "oa", "ot", "og",
         "mr", "mg",
+        "ce", "ci",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -609,6 +736,18 @@ def parse_op(raw_op):
             parse_metric_num(raw_op["now"]),
         )
 
+    if name in ("ce", "ci"):
+        if name == "ce":
+            if keys != {"op"}:
+                fail(EXIT_INPUT, "INPUT")
+            return ("ce",)
+        if keys != {"op", "config", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        # now 为非负非 bool 整数，时钟倒退在执行期与其余操作同序判定。
+        parse_now(raw_op["now"])
+        config = parse_config(raw_op["config"])
+        return ("ci", config, raw_op["now"])
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -764,6 +903,7 @@ def run():
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
+            "ci",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -1468,6 +1608,153 @@ def run():
                     "removed": removed,
                 }
             )
+
+        elif op[0] == "ce":
+            # 导出纯配置（登记值），不含任何运行态。
+            exported_backends = []
+            for backend_id, record in backends.items():
+                circuit = record["circuit"]
+                exported_backends.append(
+                    {
+                        "id": backend_id,
+                        "weight": record["weight"],
+                        "d": record["warm_d"],
+                        "fail": record["fail"],
+                        "success": record["success"],
+                        "circuit": (
+                            None
+                            if circuit is None
+                            else {
+                                "n": circuit["params"][0],
+                                "m": circuit["params"][1],
+                                "r": circuit["params"][2],
+                                "w": circuit["params"][3],
+                                "q": circuit["params"][4],
+                            }
+                        ),
+                        "drain": record["drain"]["t"],
+                    }
+                )
+            exported_limits = [
+                {"scope": scope, "id": bucket_id, "r": bucket["r"], "b": bucket["b"]}
+                # 仅遍历不消费：按 (scope 秩, id UTF-8 字节) 升序输出。
+                for (scope, bucket_id), bucket in sorted(
+                    buckets.items(),
+                    key=lambda item: (
+                        {"B": 0, "C": 1, "S": 2}[item[0][0]],
+                        item[0][1].encode("utf-8"),
+                    ),
+                )
+            ]
+            exported_overload = (
+                None
+                if queue_cfg is None
+                else {"cap": queue_cfg[0], "q": queue_cfg[1], "ttl": queue_cfg[2]}
+            )
+            results.append(
+                {
+                    "op": "ce",
+                    "config": {
+                        "version": 1,
+                        "backends": exported_backends,
+                        "vnodes": ring_vnodes,
+                        "limits": exported_limits,
+                        "overload": exported_overload,
+                    },
+                }
+            )
+
+        elif op[0] == "ci":
+            _, config, now = op
+            config_backends = config["backends"]
+            config_limits = config["limits"]
+            # B 限流引用未知后端：BACKEND，先于活动状态判定。
+            config_backend_ids = {entry[0] for entry in config_backends}
+            for scope, bucket_id, _, _ in config_limits:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 有活动连接或排队项时拒绝热加载：STATE。
+            if connections or wait_queue:
+                fail(EXIT_STATE, "STATE")
+
+            # 校验全部通过，原子替换配置并以 now 重建默认运行态。
+            def make_record(weight, d, fail_threshold, success_threshold,
+                            circuit_params, drain_t):
+                if d == 0:
+                    stage = "steady"
+                    warm_from = warm_start = warm_end = None
+                else:
+                    # 预热自本次 now 起算。
+                    stage = "warm"
+                    warm_from = 100
+                    warm_start = now
+                    warm_end = now + d
+                return {
+                    "weight": weight,
+                    "current": 0,
+                    "conns": 0,
+                    "healthy": True,
+                    "fail": fail_threshold,
+                    "success": success_threshold,
+                    "failures": 0,
+                    "successes": 0,
+                    "probe_now": None,
+                    "probe_ok": None,
+                    "stage": stage,
+                    "warm_d": d,
+                    "warm_from": warm_from,
+                    "warm_start": warm_start,
+                    "warm_end": warm_end,
+                    "circuit": (
+                        None
+                        if circuit_params is None
+                        else {
+                            "params": circuit_params,
+                            "state": "C",
+                            "window": deque(maxlen=circuit_params[0]),
+                            "next": None,
+                            "used": 0,
+                            "cr_now": None,
+                            "cr_ok": None,
+                        }
+                    ),
+                    "drain": {
+                        "t": drain_t,
+                        "state": "A",
+                        "start": None,
+                        "end": None,
+                        "deadline": None,
+                        "forced": 0,
+                    },
+                    # 热加载不携带历史写操作形状。
+                    "last_op": None,
+                    "metrics": None,
+                }
+
+            new_backends = {}
+            for (backend_id, weight, d, fail_threshold,
+                 success_threshold, circuit_params, drain_t) in config_backends:
+                new_backends[backend_id] = make_record(
+                    weight, d, fail_threshold, success_threshold,
+                    circuit_params, drain_t,
+                )
+            # 新桶满令牌起步，at=now。
+            new_buckets = {}
+            for scope, bucket_id, r, b in config_limits:
+                new_buckets[(scope, bucket_id)] = {
+                    "r": r,
+                    "b": b,
+                    "t": b,
+                    "at": now,
+                    "last": None,
+                }
+            backends = new_backends
+            buckets = new_buckets
+            ring_vnodes = config["vnodes"]
+            queue_cfg = config["overload"]
+            wait_queue = deque()
+            sticky_map = {}
+            results.append({"op": "ci", "ok": True})
 
         else:  # get
             _, cid = op
