@@ -16,8 +16,17 @@ hset 只替换阈值并清连续计数，不改健康状态；probe 按 ok 递�
 连续成功达 success 转 healthy，迁移时计数与平滑当前权重一并清零。同一
 (id, now, ok) 的 probe 重报幂等；同 (id, now) 而 ok 不同属冲突重报，报
 INPUT。pick/open 只作用于 healthy 后端；无 healthy 后端时报 STATE。
+
+一致性哈希：chash 配置 vnodes（1..1024），同值幂等、异值生效（重排环）。
+每个 healthy 后端为 i=0..vnodes-1 生成令牌
+SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，摘要为 256 位大端无符号数，
+环按摘要、加入顺序、i 升序。route 哈希后取首个不小于该哈希的令牌，
+越界回绕；首见 key 建映射，目标 healthy 命中，增删后端或改 vnodes 不迁移，
+目标失效时沿环迁移且不迁回。route 不影响连接数。未配置或无 healthy 后端
+时 route 报 STATE。
 """
 
+import hashlib
 import json
 import sys
 
@@ -76,6 +85,39 @@ def parse_threshold(value):
     return value
 
 
+def parse_vnodes(value):
+    # bool 是 int 的子类，必须显式排除。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 1024
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_route_key(value):
+    if not isinstance(value, str) or value == "":
+        fail(EXIT_INPUT, "INPUT")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def backend_token(backend_id, order, i):
+    """生成一致性哈希环令牌 (摘要, 加入顺序, vnode 序号, 后端 id)。"""
+    try:
+        id_bytes = backend_id.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(EXIT_INPUT, "INPUT")
+    digest = hashlib.sha256(
+        id_bytes + b"\x00" + str(i).encode("ascii")
+    ).digest()
+    return (int.from_bytes(digest, "big"), order, i, backend_id)
+
+
 def parse_flow(value):
     """校验 [源IP,源端口,目的IP,目的端口,协议]，返回规范化五元组。"""
     if not isinstance(value, list) or len(value) != 5:
@@ -104,7 +146,7 @@ def parse_op(raw_op):
     name = raw_op.get("op")
     if name not in (
         "add", "remove", "pick", "open", "close", "get",
-        "hset", "probe", "hget",
+        "hset", "probe", "hget", "chash", "route",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -172,6 +214,16 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("hget", parse_backend_id(raw_op["id"]))
 
+    if name == "chash":
+        if keys != {"op", "vnodes"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("chash", parse_vnodes(raw_op["vnodes"]))
+
+    if name == "route":
+        if keys != {"op", "key"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("route", parse_route_key(raw_op["key"]))
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -195,12 +247,30 @@ def run():
     # dict 保序即加入顺序；删除后重加自然落到末尾。每个后端记录：
     # weight/current 平滑加权，conns 活动连接数，healthy 健康状态，
     # fail/success 迁移阈值，failures/successes 当前连续计数，
-    # probe_now/probe_ok 最近一次生效的 probe（用于幂等重报判定）。
+    # probe_now/probe_ok 最近一次生效的 probe（用于幂等重报判定），
+    # order 单调加入序号（环上摘要并列时的次序）。
     backends = {}
     # 活动连接：cid -> [backend_id, flow, opened_at]；关闭即删除，cid 可复用。
     connections = {}
     last_now = None
     results = []
+    # 一致性哈希：vnodes 未配置为 None；routes 为首见 key 的粘性映射。
+    vnodes = None
+    routes = {}
+    next_order = 0
+
+    def build_ring(v):
+        """按当前 healthy 后端集与 vnodes=v 重建哈希环（按摘要、加入
+        顺序、i 升序）。增删后端或改 vnodes 后环自动反映现状；遇不可
+        UTF-8 编码的后端 id 报 INPUT。"""
+        ring = []
+        for backend_id, record in backends.items():
+            if not record["healthy"]:
+                continue
+            for i in range(v):
+                ring.append(backend_token(backend_id, record["order"], i))
+        ring.sort()
+        return ring
 
     for raw_op in ops:
         op = parse_op(raw_op)
@@ -226,7 +296,9 @@ def run():
                 "successes": 0,
                 "probe_now": None,
                 "probe_ok": None,
+                "order": next_order,
             }
+            next_order += 1
             results.append({"op": "add", "ok": True})
 
         elif op[0] == "remove":
@@ -346,6 +418,57 @@ def run():
                     "failures": record["failures"],
                     "fail": record["fail"],
                     "success": record["success"],
+                }
+            )
+
+        elif op[0] == "chash":
+            _, new_vnodes = op
+            if new_vnodes != vnodes:
+                # 异值生效：按新 vnodes 重建环（同时校验 healthy 后端
+                # id 可编码）；同值幂等，不重建。
+                build_ring(new_vnodes)
+                vnodes = new_vnodes
+            results.append({"op": "chash", "ok": True})
+
+        elif op[0] == "route":
+            _, key = op
+            if vnodes is None:
+                fail(EXIT_STATE, "STATE")
+            ring = build_ring(vnodes)
+            if not ring:
+                fail(EXIT_STATE, "STATE")
+            mapped = routes.get(key)
+            record = backends.get(mapped) if mapped is not None else None
+            if record is not None and record["healthy"]:
+                # 目标仍 healthy：命中旧映射，不迁移、不迁回。
+                chosen_id = mapped
+                sticky = True
+                remapped = False
+            else:
+                # 首个不小于 key 哈希的令牌，越界回绕到环首。
+                key_digest = int.from_bytes(
+                    hashlib.sha256(key.encode("utf-8")).digest(), "big"
+                )
+                lo, hi = 0, len(ring)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if ring[mid][0] < key_digest:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                if lo == len(ring):
+                    lo = 0
+                chosen_id = ring[lo][3]
+                routes[key] = chosen_id
+                sticky = False
+                remapped = mapped is not None
+            results.append(
+                {
+                    "op": "route",
+                    "key": key,
+                    "backend": chosen_id,
+                    "sticky": sticky,
+                    "remapped": remapped,
                 }
             )
 
