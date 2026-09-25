@@ -102,7 +102,8 @@ op,id,window,requests,qps,concurrency,errors,error_rate,latency,retries,
 remaps,removed：window=now//60，concurrency 为活动连接数，latency 为五整数
 桶，qps=requests/60、error_rate=100*errors/requests（零请求为 0）均下截为
 两位定点串；removed 依次取 drain（D/X）、health（unhealthy）、circuit（熔断
-非 C），否则 null；查询时已跨入新窗（含从未 mr）按零计且不改存储。remove 后
+非 C）、fault（D 窗口内，或 F 窗口内且 ((now-a)//v)%2=0），否则 null（S、
+非故障相位不记）；查询时已跨入新窗（含从未 mr）按零计且不改存储。remove 后
 重加统计归零。mr/mg 均 O(1)，空间 O(B)。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
@@ -129,7 +130,11 @@ chash 报 STATE，重复 cid 报 CONNECTION。环同 route（仅健康、熔断 
 时 0；跳过 D/F 时 remaps 加 1，环外不计。首个可用后端耗时 ≤ timeout
 则按 open 建连、state=A；超限不建连，state=R、backend=该 id、
 latency=耗时；无可用项则 R、backend=null、latency=0。结果键序
-op,cid,state,backend,latency,remaps。fs O(1)，fx 时空 O(BV)。
+op,cid,state,backend,latency,remaps。每次 fx 完成另按 mr 语义累加一次
+度量（不新增结果项）：归属 id 取结果 backend，为 null 时取环遍历首个
+后端，环内无候选不记；ok=(state 为 A)、ms=latency、retries=remaps、
+remaps=remaps、now 取 fx.now，与 mr 共用同一存储按操作顺序累加。
+fs O(1)，fx 时空 O(BV)。
 
 确定性操作记录：record 把原始 stdin 字节作为全新 run 输入执行，无论底层
 成功或按既有错误失败，均退出 0、stderr 为空，stdout 输出一行紧凑 JSON
@@ -845,6 +850,27 @@ def effective_weight(record, now):
     span = record["warm_end"] - record["warm_start"]
     elapsed = now - record["warm_start"]
     return record["warm_from"] + (target - record["warm_from"]) * elapsed // span
+
+
+def update_metrics(record, ok, ms, retries, remaps, now):
+    """按 mr 语义累加一次请求度量：60 秒窗（now//60）、五延迟桶、10^18 封顶。
+
+    mr 与 fx 的自动度量共用同一存储，按操作顺序累加。
+    """
+    window = now // 60
+    metrics = record["metrics"]
+    if metrics is None or metrics[0] != window:
+        # 首次报告或换窗：统计全部清零，只保留当前窗。
+        metrics = [window, 0, 0, 0, 0, [0, 0, 0, 0, 0]]
+        record["metrics"] = metrics
+    metrics[1] = min(METRIC_CAP, metrics[1] + 1)
+    if not ok:
+        metrics[2] = min(METRIC_CAP, metrics[2] + 1)
+    metrics[3] = min(METRIC_CAP, metrics[3] + retries)
+    metrics[4] = min(METRIC_CAP, metrics[4] + remaps)
+    # 上界 [1,10,100,1000]：桶依次为 ≤1、≤10、≤100、≤1000、>1000。
+    bucket = bisect.bisect_left((1, 10, 100, 1000), ms)
+    metrics[5][bucket] = min(METRIC_CAP, metrics[5][bucket] + 1)
 
 
 def run(raw):
@@ -1618,20 +1644,7 @@ def run(raw):
             record = backends.get(backend_id)
             if record is None:
                 fail(EXIT_BACKEND, "BACKEND")
-            window = now // 60
-            metrics = record["metrics"]
-            if metrics is None or metrics[0] != window:
-                # 首次报告或换窗：统计全部清零，只保留当前窗。
-                metrics = [window, 0, 0, 0, 0, [0, 0, 0, 0, 0]]
-                record["metrics"] = metrics
-            metrics[1] = min(METRIC_CAP, metrics[1] + 1)
-            if not ok:
-                metrics[2] = min(METRIC_CAP, metrics[2] + 1)
-            metrics[3] = min(METRIC_CAP, metrics[3] + retries)
-            metrics[4] = min(METRIC_CAP, metrics[4] + remaps)
-            # 上界 [1,10,100,1000]：桶依次为 ≤1、≤10、≤100、≤1000、>1000。
-            bucket = bisect.bisect_left((1, 10, 100, 1000), ms)
-            metrics[5][bucket] = min(METRIC_CAP, metrics[5][bucket] + 1)
+            update_metrics(record, ok, ms, retries, remaps, now)
             results.append({"op": "mr", "ok": True})
 
         elif op[0] == "mg":
@@ -1658,14 +1671,29 @@ def run(raw):
             else:
                 rate = errors * 10000 // requests
                 error_rate = "%d.%02d" % divmod(rate, 100)
-            # removed 优先级：drain（D/X）> health（unhealthy）> circuit（非 C）。
+            # removed 优先级：drain（D/X）> health（unhealthy）> circuit（非 C）
+            # > fault（D 窗口内，或 F 窗口内且处于不可用相位）；S、非故障相位
+            # 及无前述状态为 null。
             drain_state = record["drain"]["state"]
+            fault = record["fault"]
             if drain_state in ("D", "X"):
                 removed = "drain"
             elif not record["healthy"]:
                 removed = "health"
             elif not circuit_closed(record):
                 removed = "circuit"
+            elif (
+                fault is not None
+                and fault[1] <= now < fault[2]
+                and (
+                    fault[0] == "D"
+                    or (
+                        fault[0] == "F"
+                        and ((now - fault[1]) // fault[3]) % 2 == 0
+                    )
+                )
+            ):
+                removed = "fault"
             else:
                 removed = None
             results.append(
@@ -1856,6 +1884,7 @@ def run(raw):
             state = "R"
             chosen_id = None
             latency = 0
+            first_id = None
             if tokens:
                 digests = [token[0] for token in tokens]
                 key_hash = int.from_bytes(
@@ -1864,6 +1893,8 @@ def run(raw):
                 index = bisect.bisect_left(digests, key_hash)
                 if index == len(tokens):
                     index = 0  # 越界回绕到环首
+                # 环遍历首个后端：无可用项时充当度量归属 id。
+                first_id = tokens[index][3]
                 seen = set()
                 for offset in range(len(tokens)):
                     backend_id = tokens[(index + offset) % len(tokens)][3]
@@ -1896,6 +1927,18 @@ def run(raw):
                 # 按 open 建连（opened_at=now）。
                 backends[chosen_id]["conns"] += 1
                 connections[cid] = [chosen_id, flow, now]
+            # 每次 fx 完成只更新一次等价 mr 度量：归属 id 取结果 backend，
+            # 为 null 时取环遍历首个后端；环内无候选不记。
+            metric_id = chosen_id if chosen_id is not None else first_id
+            if metric_id is not None:
+                update_metrics(
+                    backends[metric_id],
+                    state == "A",
+                    latency,
+                    remaps,
+                    remaps,
+                    now,
+                )
             results.append(
                 {
                     "op": "fx",
