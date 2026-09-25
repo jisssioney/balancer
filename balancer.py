@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""平滑加权轮询（smooth weighted round-robin）后端池，仅用标准库。
+"""平滑加权轮询（smooth weighted round-robin）后端池与连接管理，仅用标准库。
 
 入口：python balancer.py run
 stdin 为 UTF-8 JSON：{"ops": [...]}，成功时 stdout 输出
 {"results":[...],"backends":[...]}（无多余空白，末尾恰好一个换行）。
-任何错误都不产生 stdout，只向 stderr 写一行 {"error":"..."} 并以约定码退出。
+add/remove/pick 管理后端池并做平滑加权轮询；open/close/get 管理连接：
+open 选活动连接最少（并列取最早加入）的后端。now 仅由 open/close 携带，
+须为非负整数且依序不递减。
+任何错误都不产生 stdout，只向 stderr 写一行 {"error":"..."} 并以约定码退出：
+INPUT=2，BACKEND=3，STATE=4，CONNECTION=5。
 """
 
 import json
@@ -13,6 +17,7 @@ import sys
 EXIT_INPUT = 2
 EXIT_BACKEND = 3
 EXIT_STATE = 4
+EXIT_CONNECTION = 5
 
 
 def fail(exit_code, label):
@@ -31,13 +36,36 @@ def reject_duplicate_keys(pairs):
     return result
 
 
+def is_int(value):
+    """整数校验：bool 是 int 子类，必须显式排除。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def parse_flow(raw):
+    """校验 flow = [源IP,源端口,目的IP,目的端口,协议]。"""
+    if not isinstance(raw, list) or len(raw) != 5:
+        fail(EXIT_INPUT, "INPUT")
+    src_ip, src_port, dst_ip, dst_port, proto = raw
+    if not isinstance(src_ip, str) or src_ip == "":
+        fail(EXIT_INPUT, "INPUT")
+    if not isinstance(dst_ip, str) or dst_ip == "":
+        fail(EXIT_INPUT, "INPUT")
+    if not is_int(src_port) or not 1 <= src_port <= 65535:
+        fail(EXIT_INPUT, "INPUT")
+    if not is_int(dst_port) or not 1 <= dst_port <= 65535:
+        fail(EXIT_INPUT, "INPUT")
+    if proto not in ("tcp", "udp"):
+        fail(EXIT_INPUT, "INPUT")
+    return [src_ip, src_port, dst_ip, dst_port, proto]
+
+
 def parse_op(raw_op):
     """校验单个操作的形状，返回规范化元组；不合格式直接 INPUT 退出。"""
     if not isinstance(raw_op, dict):
         fail(EXIT_INPUT, "INPUT")
 
     name = raw_op.get("op")
-    if name not in ("add", "remove", "pick"):
+    if name not in ("add", "remove", "pick", "open", "close", "get"):
         fail(EXIT_INPUT, "INPUT")
 
     keys = set(raw_op)
@@ -48,12 +76,7 @@ def parse_op(raw_op):
         weight = raw_op["weight"]
         if not isinstance(backend_id, str) or backend_id == "":
             fail(EXIT_INPUT, "INPUT")
-        # bool 是 int 的子类，必须显式排除。
-        if (
-            not isinstance(weight, int)
-            or isinstance(weight, bool)
-            or not 1 <= weight <= 100
-        ):
+        if not is_int(weight) or not 1 <= weight <= 100:
             fail(EXIT_INPUT, "INPUT")
         return ("add", backend_id, weight)
 
@@ -65,10 +88,41 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("remove", backend_id)
 
-    # pick
-    if keys != {"op"}:
+    if name == "pick":
+        if keys != {"op"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("pick",)
+
+    if name == "open":
+        if keys != {"op", "cid", "flow", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        cid = raw_op["cid"]
+        if not isinstance(cid, str) or cid == "":
+            fail(EXIT_INPUT, "INPUT")
+        flow = parse_flow(raw_op["flow"])
+        now = raw_op["now"]
+        if not is_int(now) or now < 0:
+            fail(EXIT_INPUT, "INPUT")
+        return ("open", cid, flow, now)
+
+    if name == "close":
+        if keys != {"op", "cid", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        cid = raw_op["cid"]
+        if not isinstance(cid, str) or cid == "":
+            fail(EXIT_INPUT, "INPUT")
+        now = raw_op["now"]
+        if not is_int(now) or now < 0:
+            fail(EXIT_INPUT, "INPUT")
+        return ("close", cid, now)
+
+    # get
+    if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
-    return ("pick",)
+    cid = raw_op["cid"]
+    if not isinstance(cid, str) or cid == "":
+        fail(EXIT_INPUT, "INPUT")
+    return ("get", cid)
 
 
 def run():
@@ -85,9 +139,13 @@ def run():
     if not isinstance(ops, list):
         fail(EXIT_INPUT, "INPUT")
 
-    # dict 保序即加入顺序；删除后重加自然落到末尾。记录为 [weight, current]。
+    # backends 的 dict 保序即加入顺序；删除后重加自然落到末尾。
+    # 记录为 [weight, current, active_count]。
     backends = {}
     total_weight = 0
+    # cid -> [backend_id, flow, opened_at]；close 后键删除，cid 即可复用。
+    connections = {}
+    last_now = None
     results = []
 
     for raw_op in ops:
@@ -97,7 +155,7 @@ def run():
             _, backend_id, weight = op
             if backend_id in backends:
                 fail(EXIT_BACKEND, "BACKEND")
-            backends[backend_id] = [weight, 0]
+            backends[backend_id] = [weight, 0, 0]
             total_weight += weight
             results.append({"op": "add", "ok": True})
 
@@ -106,11 +164,13 @@ def run():
             record = backends.get(backend_id)
             if record is None:
                 fail(EXIT_BACKEND, "BACKEND")
+            if record[2] > 0:
+                fail(EXIT_STATE, "STATE")
             total_weight -= record[0]
             del backends[backend_id]
             results.append({"op": "remove", "ok": True})
 
-        else:  # pick
+        elif op[0] == "pick":
             if not backends:
                 fail(EXIT_STATE, "STATE")
             chosen_id = None
@@ -123,6 +183,53 @@ def run():
                     chosen_id = backend_id
             backends[chosen_id][1] -= total_weight
             results.append({"op": "pick", "id": chosen_id})
+
+        elif op[0] == "open":
+            _, cid, flow, now = op
+            if last_now is not None and now < last_now:
+                fail(EXIT_INPUT, "INPUT")
+            last_now = now
+            if cid in connections:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            if not backends:
+                fail(EXIT_STATE, "STATE")
+            chosen_id = None
+            chosen_count = None
+            for backend_id, record in backends.items():
+                # 严格小于：并列时保留遍历到的最早加入者。
+                if chosen_count is None or record[2] < chosen_count:
+                    chosen_count = record[2]
+                    chosen_id = backend_id
+            backends[chosen_id][2] += 1
+            connections[cid] = [chosen_id, flow, now]
+            results.append({"op": "open", "cid": cid, "backend": chosen_id})
+
+        elif op[0] == "close":
+            _, cid, now = op
+            if last_now is not None and now < last_now:
+                fail(EXIT_INPUT, "INPUT")
+            last_now = now
+            record = connections.get(cid)
+            if record is None:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            backends[record[0]][2] -= 1
+            del connections[cid]
+            results.append({"op": "close", "ok": True})
+
+        else:  # get
+            _, cid = op
+            record = connections.get(cid)
+            if record is None:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            results.append(
+                {
+                    "op": "get",
+                    "cid": cid,
+                    "flow": record[1],
+                    "backend": record[0],
+                    "opened_at": record[2],
+                }
+            )
 
     output = {
         "results": results,
