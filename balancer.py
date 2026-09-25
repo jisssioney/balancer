@@ -159,6 +159,19 @@ latency=耗时；无可用项则 R、backend=null、latency=0。结果键序
 op,cid,state,backend,latency,remaps。fx 完成后按归属 id 追加一次等价
 mr 度量（见请求度量段），结果项本身不变。fs O(1)，fx 仍为 O(BV)。
 
+批量故障登记与快照：fb 键集 op,items，items 为数组，项键集 id,k,a,z,v；
+id 须为现存且互异的后端，k 仅 D/F/S，a/z/v 为 [0,10^9] 非 bool 整数且
+a<z，D 须 v=0、F/S 须 v>0（同 fs 各项校验）。items 按后端加入序规范化
+后一次替换全部 fs 登记（未列入后端的登记被清除），空数组清空；与 fs
+同源，fs 仍可改单项，remove/ci 仍清除，fx/fr 与 mg 观察相同结果。计划
+重报幂等，返回键序 op,ok，ok=true。fq 键集 op,now，now 为非负非 bool
+整数，纳入共用非递减时钟；返回键序 op,faults,down,slow：faults 按加入
+序列已登记后端，项键序 id,k,a,z,v,effect，effect ∈ N/D/S——窗口 [a,z)
+外为 N，窗口内 D 为 D、F 按 ((now-a)//v)%2=0 取 D 否则 N、S 取 S；
+down/slow 分别计 effect 为 D/S 的项数。非法键、容器、重复 id、类型、
+范围或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，失败批次原子回滚。
+fb/fq 时间 O(B+T)、额外空间 O(T)。
+
 故障重试：fr 键集 op,cid,flow,key,timeout,max,now，cid/flow/key 同
 fx，timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数，now 纳入
 共用非递减时钟。自 key 哈希点按 fx 顺序遍历不同后端至多 max 个（环同
@@ -624,6 +637,7 @@ def parse_op(raw_op):
         "mr", "mg",
         "ce", "ci",
         "fs", "fx", "fr",
+        "fb", "fq",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -934,6 +948,44 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("fs", parse_backend_id(raw_op["id"]), k, a, z, v)
 
+    if name == "fb":
+        if keys != {"op", "items"}:
+            fail(EXIT_INPUT, "INPUT")
+        raw_items = raw_op["items"]
+        if not isinstance(raw_items, list):
+            fail(EXIT_INPUT, "INPUT")
+        # 先整体校验并规范化（键集、类型、范围、重复 id 均判 INPUT），
+        # 未知 id 留到执行期判 BACKEND；失败批次原子回滚。
+        plan = {}
+        for item in raw_items:
+            if not isinstance(item, dict) or set(item) != {"id", "k", "a", "z", "v"}:
+                fail(EXIT_INPUT, "INPUT")
+            item_id = parse_backend_id(item["id"])
+            k = item["k"]
+            if k not in ("D", "F", "S"):
+                fail(EXIT_INPUT, "INPUT")
+            a = parse_fault_num(item["a"])
+            z = parse_fault_num(item["z"])
+            v = parse_fault_num(item["v"])
+            if not a < z:
+                fail(EXIT_INPUT, "INPUT")
+            # D（不可用）须 v=0；F（抖动）/S（慢）须 v>0。
+            if k == "D":
+                if v != 0:
+                    fail(EXIT_INPUT, "INPUT")
+            elif v == 0:
+                fail(EXIT_INPUT, "INPUT")
+            if item_id in plan:
+                # 同一批次内 id 互异。
+                fail(EXIT_INPUT, "INPUT")
+            plan[item_id] = (k, a, z, v)
+        return ("fb", plan)
+
+    if name == "fq":
+        if keys != {"op", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fq", parse_now(raw_op["now"]))
+
     if name == "fx":
         if keys != {"op", "cid", "flow", "key", "timeout", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1225,7 +1277,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
-            "ci", "fx", "fr", "tk", "tg", "tx", "route",
+            "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -2121,6 +2173,56 @@ def run(raw):
             # 同参重报幂等（不改登记），异参覆盖；均返回 ok。
             record["fault"] = (k, a, z, v)
             results.append({"op": "fs", "ok": True})
+
+        elif op[0] == "fb":
+            _, plan = op
+            # 未知 id 报 BACKEND，先于任何变更；失败批次原子回滚。
+            for item_id in plan:
+                if item_id not in backends:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 与 fs 同源：按后端加入序一次替换全部登记（未列入的清除），
+            # 空计划即清空；整体替换使同计划重报天然幂等。
+            for backend_id, record in backends.items():
+                record["fault"] = plan.get(backend_id)
+            results.append({"op": "fb", "ok": True})
+
+        elif op[0] == "fq":
+            _, now = op
+            # 按加入序列出已登记后端；effect：窗口外 N，窗口内 D 为 D、
+            # F 按 ((now-a)//v)%2=0 取 D 否则 N、S 取 S。
+            faults = []
+            down = 0
+            slow = 0
+            for backend_id, record in backends.items():
+                fault = record["fault"]
+                if fault is None:
+                    continue
+                k, a, z, v = fault
+                if not a <= now < z:
+                    effect = "N"
+                elif k == "D":
+                    effect = "D"
+                elif k == "F":
+                    effect = "D" if ((now - a) // v) % 2 == 0 else "N"
+                else:  # S：窗口内仅变慢。
+                    effect = "S"
+                if effect == "D":
+                    down += 1
+                elif effect == "S":
+                    slow += 1
+                faults.append(
+                    {
+                        "id": backend_id,
+                        "k": k,
+                        "a": a,
+                        "z": z,
+                        "v": v,
+                        "effect": effect,
+                    }
+                )
+            results.append(
+                {"op": "fq", "faults": faults, "down": down, "slow": slow}
+            )
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
