@@ -280,6 +280,19 @@ backend 成功为 id 否则 null。未配环或环内无候选报 STATE/4 且先
 尝试 ok=true，ms 为该次耗时，首项的 retries/remaps 记总值、余项为 0。
 fr 时空 O(BV)；record/replay 照常覆盖 fr，其余契约不变。
 
+故障演练统计：fx/fr 访问后端时按 fq 在 now 的 effect 与登记种类 D/F/S
+记账：effect 为 D 或 S 则该种类 affected 加 1；D 失败（fx 跳过、fr 尝
+试失败）或 S 耗时超 timeout 则 rejected 加 1。fx 跳过 D/F 后端时为其
+种类 remaps 加 1；fr 失败后确有下一尝试时，为失败后端种类的 retries、
+remaps 各加 1。同请求同后端至多记一次，各计数封顶 10^18。同一登记被
+观察为受影响后，首次再观察为 N 时该种类 recovered 加 1；连续 N 不重
+复，再受影响方可再计。fs/fb 异参替换或移除只清恢复判定基线、不清计
+数，同参不清；remove 后重加与 ci 成功清零统计。fm 精确键集 op,id，
+只读；非法键集或 id 报 INPUT/2，未知 id 报 BACKEND/3；结果键序
+op,id,D,F,S，D/F/S 各为键序 affected,rejected,retries,remaps,
+recovered 的非负整数对象。fm 与记账均 O(1)，空间 O(B)；失败批回滚统
+计与恢复状态；record/replay 逐字节覆盖 fm。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -323,8 +336,21 @@ EXIT_REPLAY = 8
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
 
-# mr 各计数（requests/errors/retries/remaps/延迟桶）封顶 10^18。
+# mr 各计数（requests/errors/retries/remaps/延迟桶）与 fm 各计数
+# （affected/rejected/retries/remaps/recovered）均封顶 10^18。
 METRIC_CAP = 10 ** 18
+
+
+def new_fault_stats():
+    """故障演练统计（fm）的初始计数：D/F/S 三种登记种类各五键，键序固定
+    为 affected,rejected,retries,remaps,recovered。"""
+    return {
+        kind: {
+            "affected": 0, "rejected": 0, "retries": 0,
+            "remaps": 0, "recovered": 0,
+        }
+        for kind in "DFS"
+    }
 
 
 class _Failure(Exception):
@@ -904,7 +930,7 @@ def parse_op(raw_op):
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
-        "hm",
+        "hm", "fm",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -1330,6 +1356,13 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("hm", parse_backend_id(raw_op["id"]))
 
+    if name == "fm":
+        # 故障演练统计查询：精确键集 op,id，只读；非法 id 在解析期判 INPUT，
+        # 未知 id 在执行期判 BACKEND。
+        if keys != {"op", "id"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fm", parse_backend_id(raw_op["id"]))
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1639,6 +1672,43 @@ def run(raw):
             return "fault"
         return None
 
+    def fault_effect(fault, now):
+        """fq 同款 effect：未登记或窗口 [a,z) 外为 N；窗口内 D 为 D、F 按
+        ((now-a)//v)%2=0 相位取 D 否则 N、S 为 S。"""
+        if fault is None or not fault[1] <= now < fault[2]:
+            return "N"
+        k, a, _, v = fault
+        if k == "D":
+            return "D"
+        if k == "F":
+            return "D" if ((now - a) // v) % 2 == 0 else "N"
+        return "S"
+
+    def observe_fault(record, effect, rejected):
+        """fx/fr 访问后端的一次记账（O(1)），按登记种类归账：effect 为 D/S
+        即受影响（affected+1 并置恢复基线），D 失败或 S 耗时超 timeout 另
+        rejected+1；effect 为 N 且基线已置即恢复（recovered+1 并清基线，
+        连续 N 不重复）。各计数封顶 10^18。"""
+        fault = record["fault"]
+        if fault is None:
+            return
+        stats = record["fault_stats"][fault[0]]
+        if effect == "N":
+            if record["fault_affected"]:
+                stats["recovered"] = min(METRIC_CAP, stats["recovered"] + 1)
+                record["fault_affected"] = False
+            return
+        stats["affected"] = min(METRIC_CAP, stats["affected"] + 1)
+        record["fault_affected"] = True
+        if rejected:
+            stats["rejected"] = min(METRIC_CAP, stats["rejected"] + 1)
+
+    def bump_fault(record, field):
+        """fx 跳过（remaps）与 fr 重试（retries/remaps）的计数：归失败后端
+        当前登记种类，封顶 10^18。仅在确有故障登记时被调用。"""
+        stats = record["fault_stats"][record["fault"][0]]
+        stats[field] = min(METRIC_CAP, stats[field] + 1)
+
     def record_h_pick(chosen_id, old_entry, now):
         """H 模式 pick 成功后记一次账，归属返回 id chosen_id：仅在成功项调用
         一次。分类（重叠按 expired>removed>health>circuit>drain）：
@@ -1744,6 +1814,14 @@ def run(raw):
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
                 # 故障演练：fs 登记的 (k, a, z, v)，未登记为 None；remove/ci 清除。
                 "fault": None,
+                # 故障演练统计（fm）：按登记种类 D/F/S 各记
+                # affected/rejected/retries/remaps/recovered 五计数，封顶
+                # 10^18；fault_affected 为恢复判定基线（当前登记被观察为
+                # 受影响即置位，再观察为 N 时结算 recovered 并清除；fs/fb
+                # 异参替换或移除只清基线不清计数，同参不清）。remove 后重加
+                # 与 ci 成功随新记录清零。
+                "fault_stats": new_fault_stats(),
+                "fault_affected": False,
                 # 度量历史：window -> [requests, errors, retries, remaps,
                 # [五个延迟桶]]，仅保留最近 60 窗；空表示从未 mr。
                 "metrics": {},
@@ -2851,6 +2929,9 @@ def run(raw):
                     "samples": {},
                     # 热加载以默认运行态重建，不携带故障演练。
                     "fault": None,
+                    # ci 成功清零故障演练统计与恢复判定基线。
+                    "fault_stats": new_fault_stats(),
+                    "fault_affected": False,
                 }
 
             new_backends = {}
@@ -2892,8 +2973,12 @@ def run(raw):
             record = backends.get(backend_id)
             if record is None:
                 fail(EXIT_BACKEND, "BACKEND")
-            # 同参重报幂等（不改登记），异参覆盖；均返回 ok。
-            record["fault"] = (k, a, z, v)
+            # 同参重报幂等（不改登记也不清恢复基线）；异参覆盖只清恢复判定
+            # 基线、不清计数；均返回 ok。
+            new_fault = (k, a, z, v)
+            if record["fault"] != new_fault:
+                record["fault_affected"] = False
+            record["fault"] = new_fault
             results.append({"op": "fs", "ok": True})
 
         elif op[0] == "fb":
@@ -2903,9 +2988,13 @@ def run(raw):
                 if item_id not in backends:
                     fail(EXIT_BACKEND, "BACKEND")
             # 与 fs 同源：按后端加入序一次替换全部登记（未列入的清除），
-            # 空计划即清空；整体替换使同计划重报天然幂等。
+            # 空计划即清空；整体替换使同计划重报天然幂等。异参替换或移除
+            # 只清恢复判定基线、不清计数，同参不动基线。
             for backend_id, record in backends.items():
-                record["fault"] = plan.get(backend_id)
+                new_fault = plan.get(backend_id)
+                if record["fault"] != new_fault:
+                    record["fault_affected"] = False
+                record["fault"] = new_fault
             results.append({"op": "fb", "ok": True})
 
         elif op[0] == "fq":
@@ -2970,6 +3059,26 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "fm":
+            # 故障演练统计只读查询：未知 id 报 BACKEND；不改变任何计数与
+            # 恢复基线，失败批次天然回滚。返回键序 op,id,D,F,S；D/F/S 各为
+            # 键序 affected,rejected,retries,remaps,recovered 的对象。必须
+            # 快照：结果在批次末尾才序列化，直接引用会被后续记账污染。
+            _, backend_id = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            stats = record["fault_stats"]
+            results.append(
+                {
+                    "op": "fm",
+                    "id": backend_id,
+                    "D": dict(stats["D"]),
+                    "F": dict(stats["F"]),
+                    "S": dict(stats["S"]),
+                }
+            )
+
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
             if ring_vnodes is None:
@@ -3000,23 +3109,19 @@ def run(raw):
                     seen.add(backend_id)
                     if first_id is None:
                         first_id = backend_id
-                    fault = backends[backend_id]["fault"]
-                    cost = 0
-                    unavailable = False
-                    if fault is not None and fault[1] <= now < fault[2]:
-                        k, a, _, v = fault
-                        if k == "D":
-                            unavailable = True
-                        elif k == "F":
-                            # 抖动：((now-a)//v)%2=0 的相位不可用。
-                            unavailable = ((now - a) // v) % 2 == 0
-                        else:  # S：可用但耗时 v。
-                            cost = v
-                    if unavailable:
-                        # 跳过 D/F 计一次 remap；环外后端不计。
+                    record = backends[backend_id]
+                    fault = record["fault"]
+                    effect = fault_effect(fault, now)
+                    cost = fault[3] if effect == "S" else 0
+                    if effect == "D":
+                        # D/故障相位 F 不可用：受影响且 D 失败，跳过即 remap。
+                        observe_fault(record, effect, True)
+                        bump_fault(record, "remaps")
                         remaps += 1
                         continue
-                    # 首个可用后端即终止遍历：耗时超限则不建连。
+                    # 可用后端：S 耗时超 timeout 记 rejected；effect N 只作
+                    # 恢复观察。首个可用后端即终止遍历，耗时超限不建连。
+                    observe_fault(record, effect, cost > timeout)
                     chosen_id = backend_id
                     latency = cost
                     if cost <= timeout:
@@ -3076,26 +3181,22 @@ def run(raw):
                 if backend_id in seen:
                     continue
                 seen.add(backend_id)
-                fault = backends[backend_id]["fault"]
-                cost = 0
-                unavailable = False
-                if fault is not None and fault[1] <= now < fault[2]:
-                    k, a, _, v = fault
-                    if k == "D":
-                        unavailable = True
-                    elif k == "F":
-                        # 抖动：((now-a)//v)%2=0 的相位为故障。
-                        unavailable = ((now - a) // v) % 2 == 0
-                    else:  # S：可用，基础耗时 v。
-                        cost = v
-                if unavailable:
+                record = backends[backend_id]
+                fault = record["fault"]
+                effect = fault_effect(fault, now)
+                cost = fault[3] if effect == "S" else 0
+                if effect == "D":
+                    # D/故障相位 F：本尝试失败、耗时 0；受影响且 D 失败。
+                    observe_fault(record, effect, True)
                     attempts_made.append((backend_id, 0))
                     continue
                 if cost > timeout:
                     # S 且 v>timeout：本尝试失败，耗时按 timeout 计后重试。
+                    observe_fault(record, effect, True)
                     attempts_made.append((backend_id, timeout))
                     continue
-                # 首个成功尝试即终止：耗时 v 或 0。
+                # 首个成功尝试即终止：耗时 v 或 0；effect N 只作恢复观察。
+                observe_fault(record, effect, False)
                 attempts_made.append((backend_id, cost))
                 chosen_id = backend_id
                 state = "A"
@@ -3103,6 +3204,13 @@ def run(raw):
             attempts = len(attempts_made)
             retries = max(attempts - 1, 0)
             latency = sum(cost for _, cost in attempts_made)
+            # fr 失败后确有下一尝试时，为失败后端的登记种类 retries、remaps
+            # 各加 1：即除末次尝试外的全部（失败）尝试，同请求同后端至多
+            # 一次（遍历本就去重）。
+            for attempt_index in range(attempts - 1):
+                attempt_record = backends[attempts_made[attempt_index][0]]
+                bump_fault(attempt_record, "retries")
+                bump_fault(attempt_record, "remaps")
             if state == "A":
                 # 成功按 open 建连（opened_at=now）；耗尽拒绝不建连。
                 backends[chosen_id]["conns"] += 1
