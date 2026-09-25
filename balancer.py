@@ -152,6 +152,18 @@ remaps,removed：window=now//60，concurrency 为活动连接数，latency 为�
 retries=remaps、remaps=remaps、now=fx.now。mr 与 fx 自动度量按操作顺序
 累加；失败批次不留度量。remove 后重加统计归零。mr/mg 均 O(1)，空间 O(B)。
 
+度量历史：每后端按 window=now//60 分窗保留最近 60 窗；mr、fx/fr 自动
+度量写入所属窗，各窗沿用既有封顶值、五延迟桶、错误、重试与重映射累计
+规则；remove 后重加、ci 成功均清空历史。mh 精确键集 op,id,from,to,now，
+from/to/now 为 [0,10^9] 非 bool 整数，now 纳入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60；键集、类型、范围、关系或时钟非法报
+INPUT/2，未知 id 报 BACKEND/3，from 早于 max(0,now//60-59) 报 STATE/4。
+结果键序 op,id,windows；windows 含 from 至 to 所有窗并升序，项键序
+window,requests,qps,errors,error_rate,latency,retries,remaps；整数与五
+整数 latency 同 mg，qps、error_rate 仍下截两位小数字符串，空窗计数及
+桶为 0、两字符串为 0.00。mh 不改度量，失败原子回滚；record/replay 逐
+字节覆盖 mh。mh 时间 O(R)、额外空间 O(60B)。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure}：
 version=2；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
@@ -725,7 +737,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg",
+        "mr", "mg", "mh",
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
@@ -1040,6 +1052,17 @@ def parse_op(raw_op):
             parse_backend_id(raw_op["id"]),
             parse_metric_num(raw_op["now"]),
         )
+
+    if name == "mh":
+        if keys != {"op", "id", "from", "to", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("mh", parse_backend_id(raw_op["id"]), start, end, now)
 
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
@@ -1358,24 +1381,28 @@ def run(raw):
         return evaluate_admit(backend_id, cid, flow, c, s, costs, now)
 
     def record_metric(backend_id, ok, ms, retries, remaps, now):
-        """按 mr 语义累加一条度量：window=now//60，换窗清零，五延迟桶
-        [≤1,≤10,≤100,≤1000,>1000]，各计数封顶 10^18。mr 与 fx 完成后
-        的自动度量按操作顺序共用此入口。"""
+        """按 mr 语义累加一条度量：写入 window=now//60 所属窗，每后端只保留
+        最近 60 窗，五延迟桶 [≤1,≤10,≤100,≤1000,>1000]，各计数封顶 10^18。
+        mr 与 fx/fr 完成后的自动度量按操作顺序共用此入口。"""
         record = backends[backend_id]
         window = now // 60
-        metrics = record["metrics"]
-        if metrics is None or metrics[0] != window:
-            # 首次报告或换窗：统计全部清零，只保留当前窗。
-            metrics = [window, 0, 0, 0, 0, [0, 0, 0, 0, 0]]
-            record["metrics"] = metrics
-        metrics[1] = min(METRIC_CAP, metrics[1] + 1)
+        history = record["metrics"]
+        metrics = history.get(window)
+        if metrics is None:
+            # 首次报告该窗：新建计数；时钟非递减，顺带丢弃 60 窗前的旧窗。
+            metrics = [0, 0, 0, 0, [0, 0, 0, 0, 0]]
+            history[window] = metrics
+            cutoff = window - 59
+            for old in [w for w in history if w < cutoff]:
+                del history[old]
+        metrics[0] = min(METRIC_CAP, metrics[0] + 1)
         if not ok:
-            metrics[2] = min(METRIC_CAP, metrics[2] + 1)
-        metrics[3] = min(METRIC_CAP, metrics[3] + retries)
-        metrics[4] = min(METRIC_CAP, metrics[4] + remaps)
+            metrics[1] = min(METRIC_CAP, metrics[1] + 1)
+        metrics[2] = min(METRIC_CAP, metrics[2] + retries)
+        metrics[3] = min(METRIC_CAP, metrics[3] + remaps)
         # 上界 [1,10,100,1000]：桶依次为 ≤1、≤10、≤100、≤1000、>1000。
         bucket = bisect.bisect_left((1, 10, 100, 1000), ms)
-        metrics[5][bucket] = min(METRIC_CAP, metrics[5][bucket] + 1)
+        metrics[4][bucket] = min(METRIC_CAP, metrics[4][bucket] + 1)
 
     def fault_active(record, now):
         """mg 的 removed=fault 判定：fs 登记且 now ∈ [a,z) 窗口内时，D 恒为
@@ -1396,7 +1423,7 @@ def run(raw):
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
+            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq",
         ):
             now = op[-1]
@@ -1461,9 +1488,9 @@ def run(raw):
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
                 # 故障演练：fs 登记的 (k, a, z, v)，未登记为 None；remove/ci 清除。
                 "fault": None,
-                # 度量：None 表示从未 mr；否则 (window, requests, errors,
-                # retries, remaps, [五个延迟桶])，仅保留当前 60 秒窗。
-                "metrics": None,
+                # 度量历史：window -> [requests, errors, retries, remaps,
+                # [五个延迟桶]]，仅保留最近 60 窗；空表示从未 mr。
+                "metrics": {},
             }
             results.append({"op": "add", "ok": True})
 
@@ -2154,17 +2181,17 @@ def run(raw):
             if record is None:
                 fail(EXIT_BACKEND, "BACKEND")
             window = now // 60
-            metrics = record["metrics"]
-            if metrics is None or metrics[0] != window:
+            metrics = record["metrics"].get(window)
+            if metrics is None:
                 # 查询新窗（含从未 mr）按零计，不写回存储。
                 requests = errors = retries = remaps = 0
                 latency = [0, 0, 0, 0, 0]
             else:
-                requests = metrics[1]
-                errors = metrics[2]
-                retries = metrics[3]
-                remaps = metrics[4]
-                latency = metrics[5]
+                requests = metrics[0]
+                errors = metrics[1]
+                retries = metrics[2]
+                remaps = metrics[3]
+                latency = metrics[4]
             # qps=requests/60、error_rate=100*errors/requests 均下截两位。
             qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
             if requests == 0:
@@ -2201,6 +2228,50 @@ def run(raw):
                     "removed": removed,
                 }
             )
+
+        elif op[0] == "mh":
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = record["metrics"]
+            windows = []
+            for window in range(start, end + 1):
+                metrics = history.get(window)
+                if metrics is None:
+                    # 空窗：计数与桶为 0，两个比率串为 0.00。
+                    requests = errors = retries = remaps = 0
+                    latency = [0, 0, 0, 0, 0]
+                else:
+                    requests = metrics[0]
+                    errors = metrics[1]
+                    retries = metrics[2]
+                    remaps = metrics[3]
+                    latency = metrics[4]
+                # qps=requests/60、error_rate=100*errors/requests 均下截两位。
+                qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
+                if requests == 0:
+                    error_rate = "0.00"
+                else:
+                    rate = errors * 10000 // requests
+                    error_rate = "%d.%02d" % divmod(rate, 100)
+                windows.append(
+                    {
+                        "window": window,
+                        "requests": requests,
+                        "qps": qps,
+                        "errors": errors,
+                        "error_rate": error_rate,
+                        "latency": list(latency),
+                        "retries": retries,
+                        "remaps": remaps,
+                    }
+                )
+            results.append({"op": "mh", "id": backend_id, "windows": windows})
 
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
@@ -2332,7 +2403,7 @@ def run(raw):
                     },
                     # 热加载不携带历史写操作形状。
                     "last_op": None,
-                    "metrics": None,
+                    "metrics": {},
                     # 热加载以默认运行态重建，不携带故障演练。
                     "fault": None,
                 }
