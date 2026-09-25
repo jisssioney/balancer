@@ -64,6 +64,20 @@ op,id,state,connections,start,end,deadline,forced，state ∈ A/D/X
 （可用/排空/已摘除），未开始时三时间为 null。未知 id 报 BACKEND，
 未 ds 的 dr/du/dg 报 STATE。
 
+指标采集：mr 键集 op,id,ok,ms,retries,remaps,now（id 为现存后端，
+ok 仅 bool，ms/retries/remaps/now 为 [0,10^9] 非 bool 整数），now 纳入
+共用非递减时钟。后端按 window=now//60 记当前分钟窗，换窗即清零；窗内
+requests 加 1，ok=false 时 errors 加 1，并累加 retries/remaps；ms 按上界
+[1,10,100,1000] 落入五整数桶（边界归右桶）；各计数封顶 10^18。mr 返回
+op,ok，ok=true。mg 键集 op,id,now，返回键序 op,id,window,requests,qps,
+concurrency,errors,error_rate,latency,retries,remaps,removed：window 为
+now//60（异于当前窗则各项为零），concurrency 为当前连接数，latency 为
+五整数桶（按上界 1/10/100/1000），qps=requests/60、error_rate=
+100*errors/requests（零请求为 0），均下截为两位定点串。removed 依次取
+drain（D/X）、health（unhealthy）、circuit（熔断非 C），否则 null。非法
+键/类型/范围/时钟倒退报 INPUT/2，未知 id 报 BACKEND/3；remove 后重加
+统计归零。mr/mg 均 O(1)。
+
 令牌桶：ls 键集 op,scope,id,r,b,now，scope ∈ B/C/S（后端/客户端/
 服务类），id/c/s/key 均为非空 UTF-8 串，r,b ∈ [1,10^9] 非 bool 整数，
 now ≥ 0 纳入共用非递减时钟；B 桶的 id 须为现存后端，否则 BACKEND。
@@ -108,6 +122,10 @@ EXIT_OVERLOAD = 7
 
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
+
+# mr 指标：延迟五桶上界与各计数封顶。
+LATENCY_BOUNDS = (1, 10, 100, 1000)
+METRIC_CAP = 10 ** 18
 
 
 def fail(exit_code, label):
@@ -233,6 +251,17 @@ def parse_queue_param(value):
     return value
 
 
+def parse_metric_count(value):
+    # mr 的 ms/retries/remaps ∈ [0, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
@@ -326,6 +355,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ls", "la", "lg",
         "os", "oa", "ot", "og",
+        "mr", "mg",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -555,6 +585,28 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("og",)
 
+    if name == "mr":
+        if keys != {"op", "id", "ok", "ms", "retries", "remaps", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        ok = raw_op["ok"]
+        # ok 只接受真正的 bool。
+        if not isinstance(ok, bool):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "mr",
+            parse_backend_id(raw_op["id"]),
+            ok,
+            parse_metric_count(raw_op["ms"]),
+            parse_metric_count(raw_op["retries"]),
+            parse_metric_count(raw_op["remaps"]),
+            parse_now(raw_op["now"]),
+        )
+
+    if name == "mg":
+        if keys != {"op", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("mg", parse_backend_id(raw_op["id"]), parse_now(raw_op["now"]))
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -578,6 +630,18 @@ def effective_weight(record, now):
     span = record["warm_end"] - record["warm_start"]
     elapsed = now - record["warm_start"]
     return record["warm_from"] + (target - record["warm_from"]) * elapsed // span
+
+
+def fresh_stats():
+    """新后端（或 remove 后重加）的空白分钟窗指标。"""
+    return {
+        "window": None,
+        "requests": 0,
+        "errors": 0,
+        "latency": [0, 0, 0, 0, 0],
+        "retries": 0,
+        "remaps": 0,
+    }
 
 
 def run():
@@ -608,7 +672,8 @@ def run():
     # 为最近一次生效的 cr（用于幂等重报判定）。drain 为优雅摘除状态：
     # t 为 ds 登记的排空时限（未 ds 为 None，remove 后重加即回到未配），
     # state ∈ A/D/X（可用/排空/已摘除），start/end/deadline 为本次摘除
-    # 的三个时刻（未开始为 None），forced 为 dg 强关的连接数。
+    # 的三个时刻（未开始为 None），forced 为 dg 强关的连接数。stats 为 mr
+    # 指标的当前分钟窗：window 与请求/错误/五延迟桶/retries/remaps 计数。
     backends = {}
     # 活动连接：cid -> [backend_id, flow, opened_at]；关闭即删除，cid 可复用。
     connections = {}
@@ -709,7 +774,7 @@ def run():
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot",
+            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -771,6 +836,7 @@ def run():
                     "forced": 0,
                 },
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
+                "stats": fresh_stats(),
             }
             results.append({"op": "add", "ok": True})
 
@@ -1338,6 +1404,85 @@ def run():
                 fail(EXIT_STATE, "STATE")
             results.append(
                 {"op": "og", "queue": [item[0] for item in wait_queue]}
+            )
+
+        elif op[0] == "mr":
+            _, backend_id, ok, ms, retries, remaps, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            stats = record["stats"]
+            window = now // 60
+            if stats["window"] != window:
+                # 换窗即清零（含首报落入其所在窗）。
+                stats["window"] = window
+                stats["requests"] = 0
+                stats["errors"] = 0
+                stats["latency"] = [0, 0, 0, 0, 0]
+                stats["retries"] = 0
+                stats["remaps"] = 0
+            stats["requests"] = min(METRIC_CAP, stats["requests"] + 1)
+            if not ok:
+                stats["errors"] = min(METRIC_CAP, stats["errors"] + 1)
+            stats["retries"] = min(METRIC_CAP, stats["retries"] + retries)
+            stats["remaps"] = min(METRIC_CAP, stats["remaps"] + remaps)
+            # 上界 [1,10,100,1000]：bisect_right 令边界归入右桶，超 1000 入尾桶。
+            bucket_index = bisect.bisect_right(LATENCY_BOUNDS, ms)
+            stats["latency"][bucket_index] = min(
+                METRIC_CAP, stats["latency"][bucket_index] + 1
+            )
+            results.append({"op": "mr", "ok": True})
+
+        elif op[0] == "mg":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            window = now // 60
+            stats = record["stats"]
+            if stats["window"] != window:
+                # 查询窗异于记录窗：按空窗呈现，不推进也不清空已记录窗。
+                requests = errors = retries = remaps = 0
+                latency = [0, 0, 0, 0, 0]
+            else:
+                requests = stats["requests"]
+                errors = stats["errors"]
+                retries = stats["retries"]
+                remaps = stats["remaps"]
+                # 拷贝，避免后续 mr 改动已入列结果引用的同一列表。
+                latency = list(stats["latency"])
+            # qps=requests/60、error_rate=100*errors/requests，均下截两位。
+            qps_whole, qps_cents = divmod(requests * 100 // 60, 100)
+            qps = "%d.%02d" % (qps_whole, qps_cents)
+            if requests == 0:
+                error_rate = "0.00"
+            else:
+                rate_whole, rate_cents = divmod(errors * 10000 // requests, 100)
+                error_rate = "%d.%02d" % (rate_whole, rate_cents)
+            drain_state = record["drain"]["state"]
+            if drain_state in ("D", "X"):
+                removed = "drain"
+            elif not record["healthy"]:
+                removed = "health"
+            elif not circuit_closed(record):
+                removed = "circuit"
+            else:
+                removed = None
+            results.append(
+                {
+                    "op": "mg",
+                    "id": backend_id,
+                    "window": window,
+                    "requests": requests,
+                    "qps": qps,
+                    "concurrency": record["conns"],
+                    "errors": errors,
+                    "error_rate": error_rate,
+                    "latency": latency,
+                    "retries": retries,
+                    "remaps": remaps,
+                    "removed": removed,
+                }
             )
 
         else:  # get
