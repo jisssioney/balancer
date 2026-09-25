@@ -227,6 +227,19 @@ op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配�
 均 O(B+M) 时空（M 为限流项数）；R/L 的 pick 均为 O(B) 时间、O(1) 额外
 空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
+H pick 事件记账：仅成功的 H 模式 pick 记一次并归属其返回 id，调度与映射
+规则不变。无旧映射记 first；旧目标合格且本次未判到期记 sticky；三键旧
+expires 非 null 且 now≥expires 记 expired（即使选回原 id 也算 expired）；
+否则按旧目标不存在、unhealthy、熔断非 C、排空非 A 依次记 removed、
+health、circuit、drain。多重原因重叠时按 expired>removed>health>
+circuit>drain 只归一类。归属后端的 total 与对应分类各 +1，均封顶 10^18；
+失败的 pick 及非 H 操作不记。hm 精确键集 op,id，返回键序
+op,id,total,first,sticky,expired,removed,health,circuit,drain，各计数为
+非负整数；非法键集或 id 判 INPUT/2，未知 id 判 BACKEND/3。hm 只读、无
+now、O(1)，不参与时钟；失败批次回滚（记账在成功 append 前完成，失败 op
+不产生 stdout）。add、remove 后重加及 ci 成功均清零记账；record/replay
+逐字节覆盖。记账 O(1)、空间 O(B)，H pick 复杂度上界不变。
+
 时钟故障演练：fs 键集 op,id,k,a,z,v（a,z,v ∈ [0,10^9] 非 bool 整数，
 a<z；k ∈ D/F/S，D 须 v=0，F/S 须 v>0）为后端登记故障演练，同参重报
 幂等、异参覆盖，remove/ci 清除，返回 op,ok；未知 id 报 BACKEND。fx
@@ -596,6 +609,25 @@ def circuit_closed(record):
     return circuit is None or circuit["state"] == "C"
 
 
+def pick_kind_for_old(old_record, expired):
+    """H pick 成功后对旧目标的唯一事件归类（重叠按
+    expired>removed>health>circuit>drain 判定）：
+
+    expired——三键旧 expires 非 null 且 now>=expires（选回原 id 也算）；
+    removed——旧目标已删除；health——旧目标存在但 unhealthy；
+    circuit——存在、healthy 但熔断非 C；drain——存在、healthy、C 但排空非 A。
+    到期已由 select_route 置 expired，故此处 expired 最先判。"""
+    if expired:
+        return "expired"
+    if old_record is None:
+        return "removed"
+    if not old_record["healthy"]:
+        return "health"
+    if not circuit_closed(old_record):
+        return "circuit"
+    return "drain"
+
+
 def drain_available(record):
     """仅 A（可用）态后端参与 pick/open 与新的 route 映射。"""
     return record["drain"]["state"] == "A"
@@ -889,7 +921,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh", "ms", "mx",
+        "mr", "mg", "mh", "ms", "mx", "hm",
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
@@ -1242,6 +1274,13 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("mx", parse_backend_id(raw_op["id"]), start, end, now)
 
+    if name == "hm":
+        # 精确键集 op,id，只读查询；非法 id 由 parse_backend_id 判 INPUT，
+        # 未知 id 留执行期判 BACKEND。hm 无 now，不参与时钟。
+        if keys != {"op", "id"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("hm", parse_backend_id(raw_op["id"]))
+
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1460,8 +1499,11 @@ def run(raw):
 
     def select_route(key, now=None, fatal=True, drain_strict=False):
         """按 route 语义选后端，返回
-        (backend_id, sticky, remapped, expired, expires)。
+        (backend_id, sticky, remapped, expired, expires, kind)。
 
+        kind 仅描述本次选择相对旧映射项的事件类别，供 H pick 记账：first
+        （无旧项）、sticky（沿用旧目标）、expired（旧 expires 到期）、或旧
+        目标 removed/health/circuit/drain 之一；route/la/oa 等调用方忽略。
         now=None 为旧二键语义：映射项 [b,e] 的 e 不参与判定，b 可用即沿用
         且 e 不变；无项或重选写 e=None。now 为整数时限时语义（三键 route 与
         ss 后的 la/oa/ot）：须已 ss，e=None 时仅判 b 可用性（沿用 b 但补写
@@ -1499,9 +1541,15 @@ def run(raw):
                 # 三键沿用 e=null 项的可用 b：b 不变，但补写 e=now+ttl。
                 new_expires = now + sticky_ttl
                 sticky_map[key] = [old_b, new_expires]
-                return old_b, True, False, False, new_expires
+                return old_b, True, False, False, new_expires, "sticky"
             # 其余沿用一律 e 不变。
-            return old_b, True, False, False, old_expires
+            return old_b, True, False, False, old_expires, "sticky"
+        # 未沿用：先在重建环前捕获旧目标记录（删除时为 None），用于归类。
+        old_record = backends.get(old_b) if entry is not None else None
+        if entry is None:
+            kind = "first"
+        else:
+            kind = pick_kind_for_old(old_record, expired)
         tokens = build_ring(backends, ring_vnodes)
         if not tokens:
             if fatal:
@@ -1518,7 +1566,7 @@ def run(raw):
         remapped = entry is not None and chosen_id != old_b
         new_expires = None if now is None else now + sticky_ttl
         sticky_map[key] = [chosen_id, new_expires]
-        return chosen_id, False, remapped, expired, new_expires
+        return chosen_id, False, remapped, expired, new_expires, kind
 
     def refill(bucket, now):
         # 先按时间差补充至容量上限，再推进时钟。
@@ -1699,6 +1747,13 @@ def run(raw):
                 # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
                 # ci 成功即清空。
                 "samples": {},
+                # H pick 事件记账：成功项仅记一次并归属返回 id。total 与
+                # first/sticky/expired/removed/health/circuit/drain 各计数，
+                # 封顶 10^18；add、remove 后重加、ci 成功均清零。
+                "picks": {
+                    "total": 0, "first": 0, "sticky": 0, "expired": 0,
+                    "removed": 0, "health": 0, "circuit": 0, "drain": 0,
+                },
             }
             results.append({"op": "add", "ok": True})
 
@@ -1725,9 +1780,15 @@ def run(raw):
                 # 环选，目标删除或因健康、熔断、排空失格才迁移；改 vnodes
                 # 不主动迁移；三键沿用到期规则。pick 不改连接数与 W/R/L
                 # 运行态（current/ticket/conns 均不动）。
-                chosen_id, sticky, remapped, expired, expires = select_route(
+                chosen_id, sticky, remapped, expired, expires, kind = select_route(
                     key, pick_now, drain_strict=True
                 )
+                # 成功项仅记一次并归属返回 id：total 与对应分类各 +1，封顶
+                # 10^18；select_route 失败（未配环/无合格后端）直接 fail，
+                # 不会到达此处，故失败不记。
+                picks = backends[chosen_id]["picks"]
+                picks["total"] = min(METRIC_CAP, picks["total"] + 1)
+                picks[kind] = min(METRIC_CAP, picks[kind] + 1)
                 if pick_now is None:
                     # 二键结果键序 op,id,sticky,remapped。
                     results.append(
@@ -2030,7 +2091,7 @@ def run(raw):
 
         elif op[0] == "route":
             _, key, route_now = op
-            chosen_id, sticky, remapped, expired, expires = select_route(
+            chosen_id, sticky, remapped, expired, expires, _kind = select_route(
                 key, route_now
             )
             if route_now is None:
@@ -2277,9 +2338,9 @@ def run(raw):
             # 先按 route 选后端（未配环或无可选后端报 STATE），再检查
             # 该后端/客户端/服务类三个桶；未配置即不限制也不扣减。ss 后按
             # 三键限时粘性规则（以本操作的 now），未 ss 沿用旧二键语义。
-            backend_id, _, _, _, _ = select_route(
+            backend_id = select_route(
                 key, now if sticky_ttl is not None else None
-            )
+            )[0]
             chosen = []
             for scope, bucket_id, cost in (
                 ("B", backend_id, bc),
@@ -2643,6 +2704,30 @@ def run(raw):
                 )
             results.append({"op": "mx", "id": backend_id, "windows": windows})
 
+        elif op[0] == "hm":
+            _, backend_id = op
+            record = backends.get(backend_id)
+            if record is None:
+                # 未知 id 报 BACKEND；hm 只读，不改任何记账。
+                fail(EXIT_BACKEND, "BACKEND")
+            picks = record["picks"]
+            # 键序 op,id,total,first,sticky,expired,removed,health,
+            # circuit,drain；计数均为非负整数。
+            results.append(
+                {
+                    "op": "hm",
+                    "id": backend_id,
+                    "total": picks["total"],
+                    "first": picks["first"],
+                    "sticky": picks["sticky"],
+                    "expired": picks["expired"],
+                    "removed": picks["removed"],
+                    "health": picks["health"],
+                    "circuit": picks["circuit"],
+                    "drain": picks["drain"],
+                }
+            )
+
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
             exported_backends = []
@@ -2778,6 +2863,11 @@ def run(raw):
                     "metrics": {},
                     # ci 成功清空采样历史，默认运行态为空。
                     "samples": {},
+                    # ci 成功清零 H pick 事件记账。
+                    "picks": {
+                        "total": 0, "first": 0, "sticky": 0, "expired": 0,
+                        "removed": 0, "health": 0, "circuit": 0, "drain": 0,
+                    },
                     # 热加载以默认运行态重建，不携带故障演练。
                     "fault": None,
                 }
