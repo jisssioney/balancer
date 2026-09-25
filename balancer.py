@@ -182,24 +182,34 @@ fault,none 的非负整数计数对象，removed=null 的样本计入 none。mx 
 仅用标准库，其余子命令与既有操作行为不变。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
-{version,backends,vnodes,limits,overload,sticky,idle,backpressure}：
-version=2；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
+{version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler}：
+version=3；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
 circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，均只含登记值不含运行态；
 vnodes=null 或整数；limits 项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的
 UTF-8 字节升序；overload=null 或 {cap,q,ttl}；sticky/idle 为 null 或
 {"ttl":整数}（ttl ∈ [1,10^9] 非 bool 整数，登记 ss/ts 才非 null）；
 backpressure=null 或键序 {low,high}（low/high ∈ [0,10^6] 非 bool 整数，
-登记 bp 才非 null，此时 overload 必非 null 且 low<high≤overload.q）。
+登记 bp 才非 null，此时 overload 必非 null 且 low<high≤overload.q）；
+scheduler 精确为 {"pick":"W"} 或 {"pick":"R"}，W 为既有平滑加权，R 为
+轮询，只含登记值不含运行态。
 ci 精确键集 op,config,now，结果 op,ok=true；now 为非负非 bool 整数并纳入
-共用非递减时钟，亦接受 version=1 原结构（仅前五键），此时 sticky/idle/
-backpressure 三项为 null。各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp
+共用非递减时钟，亦接受 version=1 原结构（仅前五键，此时 sticky/idle/
+backpressure 三项为 null）与 version=2 八键结构，旧结构均等价于
+scheduler 为 W，ce 一律导出 version=3；scheduler 缺失、多键、类型错误或
+pick 非 W/R 判 INPUT/2。各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp
 的类型与范围。非法结构、键集、版本、类型、范围、重复后端/限流项、编码、
 交叉约束或时钟倒退判 INPUT/2，B 限流引用未知后端判 BACKEND/3，有活动连接
 或排队项判 STATE/4，依次判错。成功时原子替换配置并以 now 重建默认运行态
 （全部 healthy、d>0 自 now 起算预热、熔断 C 空窗、排空 A、桶满、队空、
 粘性清空、度量归零）：sticky/idle 以登记值作用于新连接（idle 为新连接的
-空闲时限，无连接故仅登记），backpressure 携带时置 N、未携带时取消；失败
-回滚不变更。ce/ci 均 O(B+L) 时空（L 为限流项数）。
+空闲时限，无连接故仅登记），backpressure 携带时置 N、未携带时取消，轮询
+ticket 置 0；失败回滚不变更。ce/ci 均 O(B+L) 时空（L 为限流项数）。
+
+调度策略：scheduler 的 pick=W 为既有平滑加权（旧行为不变）；pick=R 时
+pick 按既有健康、熔断、排空条件取得加入序可选列表 E，E 空报 STATE/4，
+否则返回 E[ticket%len(E)] 并将 ticket 加一，忽略权重且不改平滑 current，
+结果仍按键序 op,id；add、remove 或状态迁移不重置 ticket，仅 ci 成功置
+ticket=0。R 的 pick 为 O(B) 时间、O(1) 额外空间。
 
 时钟故障演练：fs 键集 op,id,k,a,z,v（a,z,v ∈ [0,10^9] 非 bool 整数，
 a<z；k ∈ D/F/S，D 须 v=0，F/S 须 v>0）为后端登记故障演练，同参重报
@@ -656,16 +666,22 @@ def parse_config(value):
     version=1 为原结构（仅 version/backends/vnodes/limits/overload 五键），
     sticky/idle/backpressure 一律视为 null；version=2 须精确含追加三键，
     sticky/idle 为 null 或 {"ttl":整数}，backpressure 为 null 或 {"low",
-    "high"}，非 null 时 overload 必非 null 且 low<high≤overload.q。"""
+    "high"}，非 null 时 overload 必非 null 且 low<high≤overload.q；
+    version=3 在八键序末追加 scheduler，精确为 {"pick":"W"} 或
+    {"pick":"R"}；version=1/2 旧结构等价于 scheduler 为 W。scheduler
+    缺失、多键、类型错误或 pick 非 W/R 均判 INPUT。"""
     if not isinstance(value, dict):
         fail(EXIT_INPUT, "INPUT")
     config_keys = set(value)
     v1_keys = {"version", "backends", "vnodes", "limits", "overload"}
     v2_keys = v1_keys | {"sticky", "idle", "backpressure"}
+    v3_keys = v2_keys | {"scheduler"}
     if config_keys == v1_keys:
         version = 1
     elif config_keys == v2_keys:
         version = 2
+    elif config_keys == v3_keys:
+        version = 3
     else:
         fail(EXIT_INPUT, "INPUT")
     raw_version = value["version"]
@@ -775,6 +791,7 @@ def parse_config(value):
         sticky_ttl = None
         idle_ttl = None
         backpressure = None
+        scheduler = "W"
     else:
         raw_sticky = value["sticky"]
         if raw_sticky is None:
@@ -803,6 +820,20 @@ def parse_config(value):
             if overload is None or not bp_low < bp_high or bp_high > overload[1]:
                 fail(EXIT_INPUT, "INPUT")
             backpressure = (bp_low, bp_high)
+        if version == 2:
+            # 八键旧结构不含 scheduler：等价于 W（既有平滑加权）。
+            scheduler = "W"
+        else:
+            raw_scheduler = value["scheduler"]
+            # scheduler 精确为 {"pick":"W"} 或 {"pick":"R"}；缺失、多键、
+            # 类型错误或 pick 非 W/R 均判 INPUT。
+            if not isinstance(raw_scheduler, dict) or set(raw_scheduler) != {
+                "pick",
+            }:
+                fail(EXIT_INPUT, "INPUT")
+            scheduler = raw_scheduler["pick"]
+            if scheduler not in ("W", "R"):
+                fail(EXIT_INPUT, "INPUT")
 
     return {
         "backends": normalized_backends,
@@ -812,6 +843,7 @@ def parse_config(value):
         "sticky": sticky_ttl,
         "idle": idle_ttl,
         "backpressure": backpressure,
+        "scheduler": scheduler,
     }
 
 
@@ -1369,6 +1401,11 @@ def run(raw):
     # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
     # 异值重配报 STATE，登记值随 ce/ci 导出导入（ci 后作用于新连接）。
     ttl_cfg = None
+    # pick 调度策略：scheduler_pick ∈ W（既有平滑加权）/R（轮询），登记值随
+    # ce/ci 导出导入；rr_ticket 为轮询票据，仅 ci 成功置 0，add/remove 或
+    # 健康/熔断/排空状态迁移均不重置。
+    scheduler_pick = "W"
+    rr_ticket = 0
     last_now = None
     results = []
 
@@ -1633,9 +1670,40 @@ def run(raw):
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
-            # 只在 healthy 且熔断闭合的可用（A）池内平滑加权：以最近时钟时刻
-            # 的当前有效权重（百分制整数）累加，累加与总权重扣减都忽略不健
-            # 康、熔断非 C 或排空中/已摘除的后端。
+            if scheduler_pick == "R":
+                # 轮询：按既有健康、熔断、排空条件取加入序可选列表 E，返回
+                # E[ticket%len(E)] 并将 ticket 加一；忽略权重且不改平滑
+                # current。两遍扫描（先计数再定位第 ticket%len(E) 个可选
+                # 后端），O(B) 时间、O(1) 额外空间。
+                eligible_count = 0
+                for record in backends.values():
+                    if (
+                        record["healthy"]
+                        and circuit_closed(record)
+                        and drain_available(record)
+                    ):
+                        eligible_count += 1
+                if eligible_count == 0:
+                    fail(EXIT_STATE, "STATE")
+                target = rr_ticket % eligible_count
+                chosen_id = None
+                for backend_id, record in backends.items():
+                    if (
+                        not record["healthy"]
+                        or not circuit_closed(record)
+                        or not drain_available(record)
+                    ):
+                        continue
+                    if target == 0:
+                        chosen_id = backend_id
+                        break
+                    target -= 1
+                rr_ticket += 1
+                results.append({"op": "pick", "id": chosen_id})
+                continue
+            # W（平滑加权）：只在 healthy 且熔断闭合的可用（A）池内以最近时钟
+            # 时刻的当前有效权重（百分制整数）累加，累加与总权重扣减都忽略
+            # 不健康、熔断非 C 或排空中/已摘除的后端。
             chosen_id = None
             chosen_current = None
             healthy_total = 0
@@ -2512,12 +2580,14 @@ def run(raw):
                 else {"cap": queue_cfg[0], "q": queue_cfg[1], "ttl": queue_cfg[2]}
             )
             # 三项均只导出登记值：sticky/idle 为 null 或 {"ttl":整数}，
-            # backpressure 为 null 或 {low,high}（不含 bp_state 运行态）。
+            # backpressure 为 null 或 {low,high}（不含 bp_state 运行态）；
+            # scheduler 为 {"pick":W/R}（不含轮询 ticket 运行态），一律
+            # 导出 version=3。
             results.append(
                 {
                     "op": "ce",
                     "config": {
-                        "version": 2,
+                        "version": 3,
                         "backends": exported_backends,
                         "vnodes": ring_vnodes,
                         "limits": exported_limits,
@@ -2531,6 +2601,7 @@ def run(raw):
                             if bp_cfg is None
                             else {"low": bp_cfg[0], "high": bp_cfg[1]}
                         ),
+                        "scheduler": {"pick": scheduler_pick},
                     },
                 }
             )
@@ -2634,6 +2705,9 @@ def run(raw):
             ttl_cfg = config["idle"]
             bp_cfg = config["backpressure"]
             bp_state = "N"
+            # 调度策略取登记值（v1/v2 旧结构为 W），轮询 ticket 置 0。
+            scheduler_pick = config["scheduler"]
+            rr_ticket = 0
             sticky_map = {}
             results.append({"op": "ci", "ok": True})
 
