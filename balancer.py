@@ -270,6 +270,8 @@ import base64
 import bisect
 import hashlib
 import json
+import json.scanner
+import re
 import sys
 from collections import deque, OrderedDict
 
@@ -310,15 +312,89 @@ def reject_duplicate_keys(pairs):
     return result
 
 
+_JSON_STRINGCHUNK = re.compile(
+    r'(.*?)(["\\\x00-\x1f])', re.VERBOSE | re.MULTILINE | re.DOTALL
+).match
+_JSON_HEXDIGITS = re.compile(r"[0-9A-Fa-f]{4}").match
+_JSON_BACKSLASH = {
+    '"': '"', "\\": "\\", "/": "/",
+    "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+}
+
+
+def scan_json_string(s, end, strict=True):
+    """与 json 纯 Python scanstring 相同的字符串扫描，但不合并代理对：
+    \\uXXXX 转义逐段解码，孤立代理与转义写出的代理对都保留为代理码点，
+    交由标识符校验判 INPUT；真实非 BMP 字符（原始 UTF-8 字节）不受影响。
+    end 为开引号之后的位置；返回 (解码串, 闭引号之后的位置)。"""
+    chunks = []
+    begin = end - 1
+    while True:
+        chunk = _JSON_STRINGCHUNK(s, end)
+        if chunk is None:
+            raise ValueError("Unterminated string starting at: %r" % begin)
+        end = chunk.end()
+        content, terminator = chunk.groups()
+        if content:
+            chunks.append(content)
+        if terminator == '"':
+            break
+        if terminator != "\\":
+            if strict:
+                raise ValueError("Invalid control character: %r" % terminator)
+            chunks.append(terminator)
+            continue
+        try:
+            esc = s[end]
+        except IndexError:
+            raise ValueError("Unterminated string starting at: %r" % begin)
+        if esc != "u":
+            try:
+                char = _JSON_BACKSLASH[esc]
+            except KeyError:
+                raise ValueError("Invalid \\escape: %r" % esc)
+            end += 1
+        else:
+            match = _JSON_HEXDIGITS(s, end + 1)
+            if match is None:
+                raise ValueError("Invalid \\uXXXX escape")
+            char = chr(int(match.group(), 16))
+            end += 5
+        chunks.append(char)
+    return "".join(chunks), end
+
+
+def decode_json(text):
+    """以不合并代理对的 scanstring 解析 JSON 并拒绝重复键。
+
+    字符串值经自定义 scanstring（纯 Python 扫描器）；对象键只可能是
+    字段名，沿用默认扫描不影响判定。"""
+    decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_keys)
+    decoder.parse_string = scan_json_string
+    decoder.scan_once = json.scanner.py_make_scanner(decoder)
+    return decoder.decode(text)
+
+
+def check_utf8_encodable(value):
+    # 公开标识字符串须能直接编码为 UTF-8；JSON 可能解码出孤立高/低
+    # 代理项（含转义写出的代理对），一律判 INPUT。真实非 BMP 字符合法。
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(EXIT_INPUT, "INPUT")
+
+
 def parse_cid(value):
     if not isinstance(value, str) or value == "":
         fail(EXIT_INPUT, "INPUT")
+    check_utf8_encodable(value)
     return value
 
 
 def parse_backend_id(value):
     if not isinstance(value, str) or value == "":
         fail(EXIT_INPUT, "INPUT")
+    check_utf8_encodable(value)
     return value
 
 
@@ -476,10 +552,7 @@ def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
         fail(EXIT_INPUT, "INPUT")
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        fail(EXIT_INPUT, "INPUT")
+    check_utf8_encodable(value)
     return value
 
 
@@ -563,6 +636,7 @@ def parse_flow(value):
     for ip in (src_ip, dst_ip):
         if not isinstance(ip, str) or ip == "":
             fail(EXIT_INPUT, "INPUT")
+        check_utf8_encodable(ip)
     for port in (src_port, dst_port):
         if (
             not isinstance(port, int)
@@ -1236,7 +1310,7 @@ def run(raw):
     """在全新状态执行一批操作，返回 stdout 字节；错误经 fail 抛出。"""
     try:
         text = raw.decode("utf-8")
-        data = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+        data = decode_json(text)
     except (UnicodeDecodeError, ValueError):
         fail(EXIT_INPUT, "INPUT")
 
@@ -2932,7 +3006,7 @@ def replay(raw):
     """
     try:
         text = raw.decode("utf-8")
-        data = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+        data = decode_json(text)
     except (UnicodeDecodeError, ValueError):
         fail(EXIT_INPUT, "INPUT")
     if not isinstance(data, dict) or set(data) != {
