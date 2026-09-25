@@ -17,6 +17,17 @@ hset 只替换阈值并清连续计数，不改健康状态；probe 按 ok 递�
 (id, now, ok) 的 probe 重报幂等；同 (id, now) 而 ok 不同属冲突重报，报
 INPUT。pick/open 只作用于 healthy 后端；无 healthy 后端时报 STATE。
 
+权重预热与调权：add 可带 d,now（三键形式视为 d=0，旧行为不变）；weight 为
+目标值，d=0 立即生效，否则从 1.00 起在 [now, now+d] 内线性爬升，插值向下
+取整到 0.01，到期后恒取目标。ws（op,id,weight,d,now）自当前有效值线性过渡
+到新目标并清零平滑当前值；同 (id,now) 同参重报幂等、异参报 INPUT，unhealthy
+时报 STATE。恢复（unhealthy 转 healthy）以该 probe 的 now 从 1.00 按 d 重启
+预热。wg（op,id,now）返回 target、effective（两位小数字符串，unhealthy 固定
+0.00）、stage（warm/steady/unhealthy）、start/end（仅 warm 为整数，否则
+null）。pick 以当前有效权重执行平滑加权；open 按连接数升序、有效权重降序、
+加入顺序选取；chash/route 忽略权重。add/ws/wg 的 now 与 open/close/probe 共
+用同一非递减时钟。
+
 一致性哈希：chash 配置每个 healthy 后端的虚拟节点数 vnodes（1..1024），
 同值幂等、异值生效。每个 healthy 后端为 i=0..vnodes-1 生成令牌
 SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，摘要按 256 位大端无符号数
@@ -38,6 +49,8 @@ EXIT_CONNECTION = 5
 
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
+
+MAX_RAMP_PARAM = 10**9
 
 
 def fail(exit_code, label):
@@ -97,6 +110,17 @@ def parse_vnodes(value):
     return value
 
 
+def parse_ramp_param(value):
+    # add/ws/wg 的 d 与 now：非 bool 整数，0..10^9。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= MAX_RAMP_PARAM
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
@@ -132,6 +156,29 @@ def build_ring(backends, vnodes):
     return tokens
 
 
+def effective_weight_h(record, now):
+    """now 时刻的有效权重，以 0.01 为单位的非负整数（unhealthy 恒为 0）。
+
+    预热/调权在 [ramp_start, ramp_start+d] 内从 ramp_from_h 线性过渡到
+    目标，插值向下取整到 0.01；到期后恒为目标。ramp_start 为 None 表示
+    稳态（d=0 立即生效）。
+    """
+    if not record["healthy"]:
+        return 0
+    target_h = record["weight"] * 100
+    start = record["ramp_start"]
+    if start is None:
+        return target_h
+    span = record["d"]
+    if span == 0 or now >= start + span:
+        return target_h
+    from_h = record["ramp_from_h"]
+    if now <= start:
+        return from_h
+    # 纯整数运算实现向下取整：Python 的 // 对负分子同样向 -inf 取整。
+    return (from_h * span + (target_h - from_h) * (now - start)) // span
+
+
 def parse_flow(value):
     """校验 [源IP,源端口,目的IP,目的端口,协议]，返回规范化五元组。"""
     if not isinstance(value, list) or len(value) != 5:
@@ -160,19 +207,30 @@ def parse_op(raw_op):
     name = raw_op.get("op")
     if name not in (
         "add", "remove", "pick", "open", "close", "get",
-        "hset", "probe", "hget", "chash", "route",
+        "hset", "probe", "hget", "chash", "route", "ws", "wg",
     ):
         fail(EXIT_INPUT, "INPUT")
 
     keys = set(raw_op)
     if name == "add":
-        if keys != {"op", "id", "weight"}:
-            fail(EXIT_INPUT, "INPUT")
-        return (
-            "add",
-            parse_backend_id(raw_op["id"]),
-            parse_threshold(raw_op["weight"]),
-        )
+        if keys == {"op", "id", "weight"}:
+            # 三键形式视为 d=0：立即生效，无预热。
+            return (
+                "add",
+                parse_backend_id(raw_op["id"]),
+                parse_threshold(raw_op["weight"]),
+                0,
+                None,
+            )
+        if keys == {"op", "id", "weight", "d", "now"}:
+            return (
+                "add",
+                parse_backend_id(raw_op["id"]),
+                parse_threshold(raw_op["weight"]),
+                parse_ramp_param(raw_op["d"]),
+                parse_ramp_param(raw_op["now"]),
+            )
+        fail(EXIT_INPUT, "INPUT")
 
     if name == "remove":
         if keys != {"op", "id"}:
@@ -238,6 +296,26 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("route", parse_key(raw_op["key"]))
 
+    if name == "ws":
+        if keys != {"op", "id", "weight", "d", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "ws",
+            parse_backend_id(raw_op["id"]),
+            parse_threshold(raw_op["weight"]),
+            parse_ramp_param(raw_op["d"]),
+            parse_ramp_param(raw_op["now"]),
+        )
+
+    if name == "wg":
+        if keys != {"op", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "wg",
+            parse_backend_id(raw_op["id"]),
+            parse_ramp_param(raw_op["now"]),
+        )
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -259,9 +337,12 @@ def run():
         fail(EXIT_INPUT, "INPUT")
 
     # dict 保序即加入顺序；删除后重加自然落到末尾。每个后端记录：
-    # weight/current 平滑加权，conns 活动连接数，healthy 健康状态，
+    # weight 目标权重，d 预热/调权时长，ramp_start/ramp_from_h 线性过渡的
+    # 起点时刻与起始有效权重（0.01 单位，ramp_start 为 None 表示稳态），
+    # current 平滑加权当前值，conns 活动连接数，healthy 健康状态，
     # fail/success 迁移阈值，failures/successes 当前连续计数，
-    # probe_now/probe_ok 最近一次生效的 probe（用于幂等重报判定）。
+    # probe_now/probe_ok 最近一次生效的 probe（用于幂等重报判定），
+    # last_ws 最近一次生效的 ws（now, weight, d，用于幂等重报判定）。
     backends = {}
     # 活动连接：cid -> [backend_id, flow, opened_at]；关闭即删除，cid 可复用。
     connections = {}
@@ -275,18 +356,24 @@ def run():
     for raw_op in ops:
         op = parse_op(raw_op)
 
-        if op[0] in ("open", "close", "probe"):
+        if op[0] in ("open", "close", "probe", "add", "ws", "wg"):
             now = op[-1]
-            if last_now is not None and now < last_now:
-                fail(EXIT_INPUT, "INPUT")
-            last_now = now
+            # 三键 add 无 now，不推进时钟。
+            if now is not None:
+                if last_now is not None and now < last_now:
+                    fail(EXIT_INPUT, "INPUT")
+                last_now = now
 
         if op[0] == "add":
-            _, backend_id, weight = op
+            _, backend_id, weight, duration, now = op
             if backend_id in backends:
                 fail(EXIT_BACKEND, "BACKEND")
             backends[backend_id] = {
                 "weight": weight,
+                "d": duration,
+                # d>0 时从 1.00 起线性预热；d=0 立即生效（稳态）。
+                "ramp_start": now if duration > 0 else None,
+                "ramp_from_h": 100,
                 "current": 0,
                 "conns": 0,
                 "healthy": True,
@@ -296,6 +383,7 @@ def run():
                 "successes": 0,
                 "probe_now": None,
                 "probe_ok": None,
+                "last_ws": None,
             }
             results.append({"op": "add", "ok": True})
 
@@ -311,14 +399,18 @@ def run():
 
         elif op[0] == "pick":
             # 只在 healthy 池内平滑加权：累加与总权重扣减都忽略 unhealthy。
+            # 权重取当前有效值（0.01 单位）；d=0 时等价于旧权重整体放大
+            # 100 倍，平滑加权对缩放不变，故旧行为逐字节保持。
+            clock = last_now if last_now is not None else 0
             chosen_id = None
             chosen_current = None
             healthy_total = 0
             for backend_id, record in backends.items():
                 if not record["healthy"]:
                     continue
-                record["current"] += record["weight"]
-                healthy_total += record["weight"]
+                effective = effective_weight_h(record, clock)
+                record["current"] += effective
+                healthy_total += effective
                 # 严格大于：并列时保留遍历到的最早者。
                 if chosen_current is None or record["current"] > chosen_current:
                     chosen_current = record["current"]
@@ -332,13 +424,23 @@ def run():
             _, cid, flow, now = op
             chosen_id = None
             chosen_conns = None
+            chosen_effective = None
             for backend_id, record in backends.items():
                 if not record["healthy"]:
                     continue
-                # 严格小于：并列时保留遍历到的最早（最早加入）者。
-                if chosen_conns is None or record["conns"] < chosen_conns:
-                    chosen_conns = record["conns"]
+                effective = effective_weight_h(record, now)
+                # 连接数升序、有效权重降序；皆并列时保留最早加入者。
+                if (
+                    chosen_id is None
+                    or record["conns"] < chosen_conns
+                    or (
+                        record["conns"] == chosen_conns
+                        and effective > chosen_effective
+                    )
+                ):
                     chosen_id = backend_id
+                    chosen_conns = record["conns"]
+                    chosen_effective = effective
             if chosen_id is None:
                 fail(EXIT_STATE, "STATE")
             if cid in connections:
@@ -388,6 +490,9 @@ def run():
                         record["successes"] = 0
                         record["failures"] = 0
                         record["current"] = 0
+                        # 恢复即以该 probe 的 now 从 1.00 按 d 重启预热。
+                        record["ramp_start"] = now
+                        record["ramp_from_h"] = 100
                 else:
                     record["failures"] = min(
                         record["failures"] + 1, record["fail"]
@@ -467,6 +572,63 @@ def run():
                     "backend": chosen_id,
                     "sticky": False,
                     "remapped": remapped,
+                }
+            )
+
+        elif op[0] == "ws":
+            _, backend_id, weight, duration, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            last_ws = record["last_ws"]
+            if last_ws is not None and last_ws[0] == now:
+                # 同一 (id, now) 已生效过：同参幂等，异参即冲突重报。
+                if last_ws[1] != weight or last_ws[2] != duration:
+                    fail(EXIT_INPUT, "INPUT")
+            else:
+                if not record["healthy"]:
+                    fail(EXIT_STATE, "STATE")
+                # 自当前有效值线性过渡到新目标；调权清零平滑当前值。
+                # 必须先用旧状态求当前有效值，再写入新目标。
+                current_h = effective_weight_h(record, now)
+                record["weight"] = weight
+                record["d"] = duration
+                record["ramp_start"] = now if duration > 0 else None
+                record["ramp_from_h"] = current_h
+                record["current"] = 0
+                record["last_ws"] = (now, weight, duration)
+            results.append({"op": "ws", "ok": True})
+
+        elif op[0] == "wg":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            if not record["healthy"]:
+                stage = "unhealthy"
+                start = None
+                end = None
+                effective = "0.00"
+            else:
+                start = record["ramp_start"]
+                end = None
+                if start is not None and record["d"] > 0 and now < start + record["d"]:
+                    stage = "warm"
+                    end = start + record["d"]
+                else:
+                    stage = "steady"
+                    start = None
+                effective_h = effective_weight_h(record, now)
+                effective = "%d.%02d" % (effective_h // 100, effective_h % 100)
+            results.append(
+                {
+                    "op": "wg",
+                    "id": backend_id,
+                    "target": record["weight"],
+                    "effective": effective,
+                    "stage": stage,
+                    "start": start,
+                    "end": end,
                 }
             )
 
