@@ -91,6 +91,19 @@ op,now：先删除全部 now ≥ 入队 now+ttl 的排队项，再自队首逐�
 数组均按 FIFO 列 cid；ot 至多 q 次 route，空间 O(q)。og 键集 op，返回
 op,queue，queue 为 FIFO cid 数组。oa 未 os/chash、ot/og 未 os 报 STATE；
 非法键、类型、范围、编码或时钟倒退报 INPUT。
+
+请求度量：mr 键集 op,id,ok,ms,retries,remaps,now，id 须现存否则 BACKEND，
+ok 仅 bool，ms/retries/remaps/now 四数均为 [0,10^9] 非 bool 整数，now 纳入
+共用非递减时钟。每后端按 window=now//60 只保留当前窗统计，换窗即全部清零；
+每报 requests 加 1，ok=false 时 errors 加 1，并累加 retries/remaps；ms 按
+上界 [1,10,100,1000] 落入五整数桶（≤1、≤10、≤100、≤1000、>1000），各计数
+封顶 10^18。mr 返回 op,ok，ok=true。mg 键集 op,id,now，返回键序
+op,id,window,requests,qps,concurrency,errors,error_rate,latency,retries,
+remaps,removed：window=now//60，concurrency 为活动连接数，latency 为五整数
+桶，qps=requests/60、error_rate=100*errors/requests（零请求为 0）均下截为
+两位定点串；removed 依次取 drain（D/X）、health（unhealthy）、circuit（熔断
+非 C），否则 null；查询时已跨入新窗（含从未 mr）按零计且不改存储。remove 后
+重加统计归零。mr/mg 均 O(1)，空间 O(B)。
 """
 
 import bisect
@@ -108,6 +121,9 @@ EXIT_OVERLOAD = 7
 
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
+
+# mr 各计数（requests/errors/retries/remaps/延迟桶）封顶 10^18。
+METRIC_CAP = 10 ** 18
 
 
 def fail(exit_code, label):
@@ -233,6 +249,17 @@ def parse_queue_param(value):
     return value
 
 
+def parse_metric_num(value):
+    # mr 的 ms/retries/remaps/now ∈ [0, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
@@ -326,6 +353,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ls", "la", "lg",
         "os", "oa", "ot", "og",
+        "mr", "mg",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -555,6 +583,32 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("og",)
 
+    if name == "mr":
+        if keys != {"op", "id", "ok", "ms", "retries", "remaps", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        ok = raw_op["ok"]
+        # ok 只接受真正的 bool。
+        if not isinstance(ok, bool):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "mr",
+            parse_backend_id(raw_op["id"]),
+            ok,
+            parse_metric_num(raw_op["ms"]),
+            parse_metric_num(raw_op["retries"]),
+            parse_metric_num(raw_op["remaps"]),
+            parse_metric_num(raw_op["now"]),
+        )
+
+    if name == "mg":
+        if keys != {"op", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "mg",
+            parse_backend_id(raw_op["id"]),
+            parse_metric_num(raw_op["now"]),
+        )
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -709,7 +763,7 @@ def run():
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot",
+            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -771,6 +825,9 @@ def run():
                     "forced": 0,
                 },
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
+                # 度量：None 表示从未 mr；否则 (window, requests, errors,
+                # retries, remaps, [五个延迟桶])，仅保留当前 60 秒窗。
+                "metrics": None,
             }
             results.append({"op": "add", "ok": True})
 
@@ -1338,6 +1395,78 @@ def run():
                 fail(EXIT_STATE, "STATE")
             results.append(
                 {"op": "og", "queue": [item[0] for item in wait_queue]}
+            )
+
+        elif op[0] == "mr":
+            _, backend_id, ok, ms, retries, remaps, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            window = now // 60
+            metrics = record["metrics"]
+            if metrics is None or metrics[0] != window:
+                # 首次报告或换窗：统计全部清零，只保留当前窗。
+                metrics = [window, 0, 0, 0, 0, [0, 0, 0, 0, 0]]
+                record["metrics"] = metrics
+            metrics[1] = min(METRIC_CAP, metrics[1] + 1)
+            if not ok:
+                metrics[2] = min(METRIC_CAP, metrics[2] + 1)
+            metrics[3] = min(METRIC_CAP, metrics[3] + retries)
+            metrics[4] = min(METRIC_CAP, metrics[4] + remaps)
+            # 上界 [1,10,100,1000]：桶依次为 ≤1、≤10、≤100、≤1000、>1000。
+            bucket = bisect.bisect_left((1, 10, 100, 1000), ms)
+            metrics[5][bucket] = min(METRIC_CAP, metrics[5][bucket] + 1)
+            results.append({"op": "mr", "ok": True})
+
+        elif op[0] == "mg":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            window = now // 60
+            metrics = record["metrics"]
+            if metrics is None or metrics[0] != window:
+                # 查询新窗（含从未 mr）按零计，不写回存储。
+                requests = errors = retries = remaps = 0
+                latency = [0, 0, 0, 0, 0]
+            else:
+                requests = metrics[1]
+                errors = metrics[2]
+                retries = metrics[3]
+                remaps = metrics[4]
+                latency = metrics[5]
+            # qps=requests/60、error_rate=100*errors/requests 均下截两位。
+            qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
+            if requests == 0:
+                error_rate = "0.00"
+            else:
+                rate = errors * 10000 // requests
+                error_rate = "%d.%02d" % divmod(rate, 100)
+            # removed 优先级：drain（D/X）> health（unhealthy）> circuit（非 C）。
+            drain_state = record["drain"]["state"]
+            if drain_state in ("D", "X"):
+                removed = "drain"
+            elif not record["healthy"]:
+                removed = "health"
+            elif not circuit_closed(record):
+                removed = "circuit"
+            else:
+                removed = None
+            results.append(
+                {
+                    "op": "mg",
+                    "id": backend_id,
+                    "window": window,
+                    "requests": requests,
+                    "qps": qps,
+                    "concurrency": record["conns"],
+                    "errors": errors,
+                    "error_rate": error_rate,
+                    "latency": list(latency),
+                    "retries": retries,
+                    "remaps": remaps,
+                    "removed": removed,
+                }
             )
 
         else:  # get
