@@ -77,6 +77,20 @@ B 桶。la 键集 op,c,s,key,now：先按原 route 语义选后端（含粘性�
 lg 键集 op,scope,id,now，按同样规则补充但不消费，查未配置桶报 STATE；
 返回键序 op,scope,id,r,b,t,at，值均为整数。ls 返回 op,ok。桶操作
 O(1)，la 继承 route 的复杂度上界，空间 O(B+K)。
+
+排队接纳：os 键集 op,cap,q,ttl（均 1..10^6 非 bool 整数），依次为每后端
+连接上限、FIFO 容量、等待时限；首配或同参返回 op,ok，异参报 STATE。
+oa 键集 op,cid,flow,c,s,key,now：cid/flow 同 open，c/s/key 同 la，now
+纳入共用非递减时钟。活动或排队中 cid 重复报 CONNECTION。先按 la 的路由
+语义选后端（未 chash 或无可选后端报 STATE），再对在配桶补充检查但不消费，
+目标另须排空 A 且连接数 < cap；令牌不足或目标不满足均阻塞入队，返回键序
+op,cid,state,backend：接纳为 A 加后端 id（此时才耗令牌并按 open 建连接，
+opened_at=now），阻塞为 Q 加 null；队满尾拒绝报 OVERLOAD/7。ot 键集
+op,now：先删除全部 now ≥ 入队 now+ttl 的排队项，再自队首逐项按 oa 规则
+重试接纳（opened_at=now）至首个阻塞即停，返回 op,expired,admitted，两
+数组均按 FIFO 列 cid；ot 至多 q 次 route，空间 O(q)。og 键集 op，返回
+op,queue，queue 为 FIFO cid 数组。oa 未 os/chash、ot/og 未 os 报 STATE；
+非法键、类型、范围、编码或时钟倒退报 INPUT。
 """
 
 import bisect
@@ -90,6 +104,7 @@ EXIT_BACKEND = 3
 EXIT_STATE = 4
 EXIT_CONNECTION = 5
 EXIT_RATE = 6
+EXIT_OVERLOAD = 7
 
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
@@ -207,6 +222,17 @@ def parse_vnodes(value):
     return value
 
 
+def parse_queue_param(value):
+    # os 的 cap/q/ttl ∈ [1, 10^6]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 6
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
@@ -299,6 +325,7 @@ def parse_op(raw_op):
         "hset", "probe", "hget", "chash", "route", "ws", "wg",
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ls", "la", "lg",
+        "os", "oa", "ot", "og",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -495,6 +522,39 @@ def parse_op(raw_op):
             parse_now(raw_op["now"]),
         )
 
+    if name == "os":
+        if keys != {"op", "cap", "q", "ttl"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "os",
+            parse_queue_param(raw_op["cap"]),
+            parse_queue_param(raw_op["q"]),
+            parse_queue_param(raw_op["ttl"]),
+        )
+
+    if name == "oa":
+        if keys != {"op", "cid", "flow", "c", "s", "key", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "oa",
+            parse_cid(raw_op["cid"]),
+            parse_flow(raw_op["flow"]),
+            parse_key(raw_op["c"]),
+            parse_key(raw_op["s"]),
+            parse_key(raw_op["key"]),
+            parse_now(raw_op["now"]),
+        )
+
+    if name == "ot":
+        if keys != {"op", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ot", parse_now(raw_op["now"]))
+
+    if name == "og":
+        if keys != {"op"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("og",)
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -560,14 +620,21 @@ def run():
     # B 桶 id 必须是现存后端；remove 即删。每桶 r/b 为速率与容量，t/at
     # 为当前令牌与最近补充时刻，last 为最近一次 ls 的 (r,b,now) 用于重报。
     buckets = {}
+    # 排队接纳：queue_cfg 未 os 时为 None，否则为 (cap, q, ttl)；wait_queue
+    # 为 FIFO deque，元素 (cid, flow, c, s, key, enqueue_now)，容量上限 q。
+    queue_cfg = None
+    wait_queue = deque()
     last_now = None
     results = []
 
-    def select_route(key):
+    def select_route(key, fatal=True):
         """按原 route 语义选后端：首见建立粘性映射，目标不可用依环迁移且不
-        迁回；返回 (backend_id, sticky, remapped)，未配环或无可选后端报 STATE。"""
+        迁回；返回 (backend_id, sticky, remapped)，未配环或无可选后端报 STATE。
+        fatal=False 时不退出而返回 None（供排队重试把该情形视为阻塞）。"""
         if ring_vnodes is None:
-            fail(EXIT_STATE, "STATE")
+            if fatal:
+                fail(EXIT_STATE, "STATE")
+            return None
         mapped = sticky_map.get(key)
         if mapped is not None:
             record = backends.get(mapped)
@@ -580,7 +647,9 @@ def run():
                 return mapped, True, False
         tokens = build_ring(backends, ring_vnodes)
         if not tokens:
-            fail(EXIT_STATE, "STATE")
+            if fatal:
+                fail(EXIT_STATE, "STATE")
+            return None
         digests = [token[0] for token in tokens]
         key_hash = int.from_bytes(
             hashlib.sha256(key.encode("utf-8")).digest(), "big"
@@ -600,12 +669,47 @@ def run():
         )
         bucket["at"] = now
 
+    def evaluate_admit(backend_id, cid, flow, c, s, now):
+        """对已路由的后端按 la 规则补充检查但不消费；令牌不足、目标非 A 或
+        连接数达 cap 时返回 ("block", id)，全部满足才耗令牌、建连接
+        （opened_at=now），返回 ("admit", id)。"""
+        chosen = []
+        for scope, bucket_id in (("B", backend_id), ("C", c), ("S", s)):
+            bucket = buckets.get((scope, bucket_id))
+            if bucket is not None:
+                chosen.append(bucket)
+        for bucket in chosen:
+            refill(bucket, now)
+        record = backends[backend_id]
+        if (
+            not all(bucket["t"] >= 1 for bucket in chosen)
+            or record["drain"]["state"] != "A"
+            or record["conns"] >= queue_cfg[0]
+        ):
+            return "block", backend_id
+        # 接纳才耗令牌并按 open 建连接。
+        for bucket in chosen:
+            bucket["t"] -= 1
+        record["conns"] += 1
+        connections[cid] = [backend_id, flow, now]
+        return "admit", backend_id
+
+    def try_admit(cid, flow, c, s, key, now):
+        """按 oa/ot 规则尝试一次接纳：先路由再评估。路由不可用（未配环或无
+        可选后端）返回 ("route", None)——oa 据此报 STATE，ot 视为队首阻塞即
+        停；其余返回 evaluate_admit 的结果。"""
+        routed = select_route(key, fatal=False)
+        if routed is None:
+            return "route", None
+        backend_id, _, _ = routed
+        return evaluate_admit(backend_id, cid, flow, c, s, now)
+
     for raw_op in ops:
         op = parse_op(raw_op)
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg",
+            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -1155,6 +1259,85 @@ def run():
                     "t": bucket["t"],
                     "at": bucket["at"],
                 }
+            )
+
+        elif op[0] == "os":
+            _, cap, q, ttl = op
+            params = (cap, q, ttl)
+            if queue_cfg is not None and queue_cfg != params:
+                # 异参重配报 STATE（已排队项保留不动）。
+                fail(EXIT_STATE, "STATE")
+            # 首配或同参重报：同参幂等。
+            queue_cfg = params
+            results.append({"op": "os", "ok": True})
+
+        elif op[0] == "oa":
+            _, cid, flow, c, s, key, now = op
+            if queue_cfg is None:
+                # 未 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            # 路由检查先于 cid 重复判定，与 open 的 STATE 先于 CONNECTION 一致。
+            routed = select_route(key, fatal=False)
+            if routed is None:
+                # 未 chash 或无可选后端。
+                fail(EXIT_STATE, "STATE")
+            if cid in connections or any(item[0] == cid for item in wait_queue):
+                # 活动或排队中 cid 重复。
+                fail(EXIT_CONNECTION, "CONNECTION")
+            status, backend_id = evaluate_admit(
+                routed[0], cid, flow, c, s, now
+            )
+            if status == "admit":
+                results.append(
+                    {"op": "oa", "cid": cid, "state": "A", "backend": backend_id}
+                )
+            else:
+                if len(wait_queue) >= queue_cfg[1]:
+                    # FIFO 已满，尾拒绝。
+                    fail(EXIT_OVERLOAD, "OVERLOAD")
+                wait_queue.append((cid, flow, c, s, key, now))
+                results.append(
+                    {"op": "oa", "cid": cid, "state": "Q", "backend": None}
+                )
+
+        elif op[0] == "ot":
+            _, now = op
+            if queue_cfg is None:
+                fail(EXIT_STATE, "STATE")
+            ttl = queue_cfg[2]
+            # 先删除全部 now >= 入队 now + ttl 的项（保留 FIFO 相对顺序）。
+            survivors = deque()
+            expired = []
+            for item in wait_queue:
+                if now >= item[5] + ttl:
+                    expired.append(item[0])
+                else:
+                    survivors.append(item)
+            wait_queue.clear()
+            wait_queue.extend(survivors)
+            # 再自队首重试接纳，至首个阻塞即停（每个键至多一次 route）。
+            admitted = []
+            while wait_queue:
+                item = wait_queue.popleft()
+                # 接纳时刻为本次 ot 的 now（opened_at=now），入队时刻仅用于过期。
+                status, _ = try_admit(
+                    item[0], item[1], item[2], item[3], item[4], now
+                )
+                if status == "admit":
+                    admitted.append(item[0])
+                else:
+                    # 阻塞（含路由不可用）：连同该项整体放回队首后停止。
+                    wait_queue.appendleft(item)
+                    break
+            results.append(
+                {"op": "ot", "expired": expired, "admitted": admitted}
+            )
+
+        elif op[0] == "og":
+            if queue_cfg is None:
+                fail(EXIT_STATE, "STATE")
+            results.append(
+                {"op": "og", "queue": [item[0] for item in wait_queue]}
             )
 
         else:  # get
