@@ -37,6 +37,20 @@ SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，摘要按 256 位大端无符号�
 不小于它的令牌，越界回绕；首见 key 建立映射，目标 healthy 时命中
 （sticky），增删后端或改 vnodes 不迁移，目标不可用时依环迁移且不迁回
 （remapped）。route 不改连接数；未 chash 或无 healthy 后端时报 STATE。
+
+断路器（circuit breaker）：cs 键集 op,id,n,m,r,w,q 配置参数（n,q,r ∈
+[1,100]、m ∈ [1,n]、w ∈ [1,10^9]，均为非 bool 整数）；首次配置与异参
+重配以空窗进入 C，同参重报幂等，未配置时 cr/cg 报 STATE，删除后重新
+加入的后端为未配置。cr 键集 op,id,ok,now（ok 仅 bool）上报样本：C 保留
+最近 n 次，样本数 ≥ m 且 失败数×100 ≥ r×样本数 时转 O，next=now+w；
+O 中 now<next 的上报报 STATE，到期先转 H 再处理该上报；H 中失败即重开
+并重算 next，连续 q 次成功则转 C 并清空窗口。同一 (id,now,ok) 重报幂等，
+同 (id,now) 异 ok 报 INPUT。cg 键集 op,id,now，到期转 H，返回键序
+op,id,state,count,fail,reason,next,used：state ∈ {C,O,H}，count/fail/used
+为非负整数，reason 非 C 为 rate、C 为 null，next 仅 O 为整数否则 null，
+used 仅 H 为报告数否则 0。cs/cr 成功返回 {op,ok:true}。cr/cg 的 now 纳入
+非递减时钟；pick/open/route 仅选 healthy 且未配置或处于 C 的后端，粘性
+目标处于 O/H 时沿原环迁移且不迁回。
 """
 
 import bisect
@@ -121,6 +135,28 @@ def parse_duration(value):
     return value
 
 
+def parse_cb_window(value):
+    # 断路器等待时长 w ∈ [1, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_cb_m(value, n):
+    # m ∈ [1, n]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= n
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_vnodes(value):
     # bool 是 int 的子类，必须显式排除。
     if (
@@ -152,10 +188,10 @@ def encode_backend_id(value):
 
 
 def build_ring(backends, vnodes):
-    """按 (摘要, 加入顺序, i) 升序返回 healthy 后端的令牌环。"""
+    """按 (摘要, 加入顺序, i) 升序返回可选后端的令牌环。"""
     tokens = []
     for join_index, (backend_id, record) in enumerate(backends.items()):
-        if not record["healthy"]:
+        if not selectable(record):
             continue
         encoded = encode_backend_id(backend_id)
         for i in range(vnodes):
@@ -196,6 +232,7 @@ def parse_op(raw_op):
     if name not in (
         "add", "remove", "pick", "open", "close", "get",
         "hset", "probe", "hget", "chash", "route", "ws", "wg",
+        "cs", "cr", "cg",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -290,6 +327,39 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("wg", parse_backend_id(raw_op["id"]), parse_warm_now(raw_op["now"]))
 
+    if name == "cs":
+        if keys != {"op", "id", "n", "m", "r", "w", "q"}:
+            fail(EXIT_INPUT, "INPUT")
+        n = parse_threshold(raw_op["n"])
+        return (
+            "cs",
+            parse_backend_id(raw_op["id"]),
+            n,
+            parse_cb_m(raw_op["m"], n),
+            parse_threshold(raw_op["r"]),
+            parse_cb_window(raw_op["w"]),
+            parse_threshold(raw_op["q"]),
+        )
+
+    if name == "cr":
+        if keys != {"op", "id", "ok", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        ok = raw_op["ok"]
+        # ok 只接受真正的 bool。
+        if not isinstance(ok, bool):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "cr",
+            parse_backend_id(raw_op["id"]),
+            ok,
+            parse_now(raw_op["now"]),
+        )
+
+    if name == "cg":
+        if keys != {"op", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("cg", parse_backend_id(raw_op["id"]), parse_now(raw_op["now"]))
+
     if name == "chash":
         if keys != {"op", "vnodes"}:
             fail(EXIT_INPUT, "INPUT")
@@ -323,6 +393,13 @@ def effective_weight(record, now):
     span = record["warm_end"] - record["warm_start"]
     elapsed = now - record["warm_start"]
     return record["warm_from"] + (target - record["warm_from"]) * elapsed // span
+
+
+def selectable(record):
+    """pick/open/route 的可选条件：healthy 且断路器未配置或处于 C。"""
+    return record["healthy"] and (
+        record["cb"] is None or record["cb"]["state"] == "C"
+    )
 
 
 def run():
@@ -360,7 +437,7 @@ def run():
     for raw_op in ops:
         op = parse_op(raw_op)
 
-        if op[0] in ("open", "close", "probe", "add", "ws", "wg"):
+        if op[0] in ("open", "close", "probe", "add", "ws", "wg", "cr", "cg"):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
             if now is not None:
@@ -412,6 +489,11 @@ def run():
                 "warm_start": warm_start,
                 "warm_end": warm_end,
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
+                # 断路器：cb 为 None 表示未配置；否则记录参数与运行态：
+                # state ∈ C/O/H，window 为最近样本 (now, ok) 列表（C 保留
+                # 最近 n 次），next 为 O/H 的等待到期时刻，used 为 H 中
+                # 已处理的报告数，last 为最近一次生效的 (now, ok) 重报键。
+                "cb": None,
             }
             results.append({"op": "add", "ok": True})
 
@@ -426,13 +508,14 @@ def run():
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
-            # 只在 healthy 池内平滑加权：以最近时钟时刻的当前有效权重
-            # （百分制整数）累加，累加与总权重扣减都忽略 unhealthy。
+            # 只在可选池（healthy 且断路器未配置或处于 C）内平滑加权：以最近
+            # 时钟时刻的当前有效权重（百分制整数）累加，累加与总权重扣减
+            # 都忽略不可选后端。
             chosen_id = None
             chosen_current = None
             healthy_total = 0
             for backend_id, record in backends.items():
-                if not record["healthy"]:
+                if not selectable(record):
                     continue
                 weight = effective_weight(record, last_now)
                 record["current"] += weight
@@ -451,7 +534,7 @@ def run():
             chosen_id = None
             chosen_key = None
             for backend_id, record in backends.items():
-                if not record["healthy"]:
+                if not selectable(record):
                     continue
                 # 连接数升序、有效权重降序、加入顺序（dict 遍历序）。
                 key = (record["conns"], -effective_weight(record, now))
@@ -613,11 +696,128 @@ def run():
                 }
             )
 
+        elif op[0] == "cs":
+            _, backend_id, n, m, r, w, q = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            params = {"n": n, "m": m, "r": r, "w": w, "q": q}
+            if record["cb"] is not None and record["cb"]["params"] == params:
+                # 同参重报幂等：状态、窗口、next 均不变。
+                results.append({"op": "cs", "ok": True})
+                continue
+            # 首次配置或异参重配：以空窗进入 C。
+            record["cb"] = {
+                "params": params,
+                "state": "C",
+                "window": [],
+                "next": None,
+                "used": 0,
+                "last": None,
+            }
+            results.append({"op": "cs", "ok": True})
+
+        elif op[0] == "cr":
+            _, backend_id, ok, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            cb = record["cb"]
+            if cb is None:
+                fail(EXIT_STATE, "STATE")
+            if cb["last"] == (now, ok):
+                # 同一 (id, now, ok) 重报幂等，不重复处理。
+                results.append({"op": "cr", "ok": True})
+                continue
+            if cb["last"] is not None and cb["last"][0] == now:
+                # 同 (id, now) 而异 ok：冲突重报。
+                fail(EXIT_INPUT, "INPUT")
+            state = cb["state"]
+            if state == "O":
+                if now < cb["next"]:
+                    fail(EXIT_STATE, "STATE")
+                # 到期：先转 H，再把本次报告作为首个观察样本（转 H 不计 used）。
+                state = "H"
+                cb["state"] = "H"
+                cb["used"] = 0
+            if state == "C":
+                # 只保留最近 n 个样本；达标即按失败率转 O。
+                cb["window"].append((now, ok))
+                if len(cb["window"]) > cb["params"]["n"]:
+                    del cb["window"][0]
+                samples = len(cb["window"])
+                failures = sum(
+                    1 for _t, sample_ok in cb["window"] if not sample_ok
+                )
+                if (
+                    samples >= cb["params"]["m"]
+                    and failures * 100 >= cb["params"]["r"] * samples
+                ):
+                    cb["state"] = "O"
+                    cb["next"] = now + cb["params"]["w"]
+            else:  # H
+                cb["used"] += 1
+                if not ok:
+                    # 观察期失败：立即重开（回 O）并重算 next，重新计时。
+                    cb["state"] = "O"
+                    cb["next"] = now + cb["params"]["w"]
+                    cb["used"] = 0
+                elif cb["used"] >= cb["params"]["q"]:
+                    # 连续 q 次成功：转 C 并清空窗口。
+                    cb["state"] = "C"
+                    cb["window"] = []
+                    cb["next"] = None
+                    cb["used"] = 0
+            cb["last"] = (now, ok)
+            results.append({"op": "cr", "ok": True})
+
+        elif op[0] == "cg":
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            cb = record["cb"]
+            if cb is None:
+                fail(EXIT_STATE, "STATE")
+            if cb["state"] == "O" and now >= cb["next"]:
+                # 到期触发：O -> H。
+                cb["state"] = "H"
+                cb["used"] = 0
+            state = cb["state"]
+            if state == "C":
+                count = len(cb["window"])
+                fail_count = sum(
+                    1 for _t, sample_ok in cb["window"] if not sample_ok
+                )
+                reason = None
+                next_value = None
+                used = 0
+            else:
+                # O/H 期间窗口不再追加样本：count 为观察期已处理报告数，
+                # 失败即重开不留失败计数，故 fail 恒为 0。
+                count = cb["used"]
+                fail_count = 0
+                reason = "rate"
+                next_value = cb["next"] if state == "O" else None
+                used = cb["used"] if state == "H" else 0
+            results.append(
+                {
+                    "op": "cg",
+                    "id": backend_id,
+                    "state": state,
+                    "count": count,
+                    "fail": fail_count,
+                    "reason": reason,
+                    "next": next_value,
+                    "used": used,
+                }
+            )
+
         elif op[0] == "chash":
             _, vnodes = op
-            # 同值幂等、异值生效；建环会遇到的 healthy id 必须可编码。
+            # 同值幂等、异值生效；建环会遇到的可选 id 必须可编码。
             for record_id, record in backends.items():
-                if record["healthy"]:
+                if selectable(record):
                     encode_backend_id(record_id)
             ring_vnodes = vnodes
             results.append({"op": "chash", "ok": True})
@@ -629,8 +829,8 @@ def run():
             mapped = sticky_map.get(key)
             if mapped is not None:
                 record = backends.get(mapped)
-                if record is not None and record["healthy"]:
-                    # 健康旧映射命中，无需动环。
+                if record is not None and selectable(record):
+                    # 可选旧映射命中（healthy 且断路器处于 C），无需动环。
                     results.append(
                         {
                             "op": "route",
