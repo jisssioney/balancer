@@ -227,6 +227,17 @@ op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配�
 均 O(B+M) 时空（M 为限流项数）；R/L 的 pick 均为 O(B) 时间、O(1) 额外
 空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
+H pick 记账：扩展 H 模式 pick，调度与映射行为不变，成功项仅记一次并归属
+返回 id。无旧映射记 first；旧目标合格且本次未判到期记 sticky；三键旧映射
+e 非 null 且 now≥e 记 expired（重选回原 id 也算 expired）；否则按旧目标
+不存在（已删除）、unhealthy、熔断非 C、排空非 A 分别记 removed、health、
+circuit、drain；重叠按 expired>removed>health>circuit>drain 判定。total
+与对应项各 +1 并封顶 10^18；失败 pick 及非 H 操作不记。hm 精确键集
+op,id，非法键集或 id→INPUT/2，未知 id→BACKEND/3，返回键序
+op,id,total,first,sticky,expired,removed,health,circuit,drain，计数均为
+非负整数。hm 只读，失败批次回滚；add、remove 后重加及 ci 成功均清零；
+record/replay 逐字节覆盖；记账与 hm 均 O(1)，额外空间 O(B)。
+
 时钟故障演练：fs 键集 op,id,k,a,z,v（a,z,v ∈ [0,10^9] 非 bool 整数，
 a<z；k ∈ D/F/S，D 须 v=0，F/S 须 v>0）为后端登记故障演练，同参重报
 幂等、异参覆盖，remove/ci 清除，返回 op,ok；未知 id 报 BACKEND。fx
@@ -893,6 +904,7 @@ def parse_op(raw_op):
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
+        "hm",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -1311,6 +1323,13 @@ def parse_op(raw_op):
             parse_fault_num(raw_op["now"]),
         )
 
+    if name == "hm":
+        # H pick 记账查询：精确键集 op,id，只读；非法 id 在解析期判 INPUT，
+        # 未知 id 在执行期判 BACKEND。
+        if keys != {"op", "id"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("hm", parse_backend_id(raw_op["id"]))
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1620,6 +1639,40 @@ def run(raw):
             return "fault"
         return None
 
+    def record_h_pick(chosen_id, old_entry, now):
+        """H 模式 pick 成功后记一次账，归属返回 id chosen_id：仅在成功项调用
+        一次。分类（重叠按 expired>removed>health>circuit>drain）：
+        无旧映射 first；三键旧 e 非 null 且 now>=e 为 expired（重选回原 id
+        亦然）；否则旧目标不存在 removed、unhealthy 为 health、熔断非 C 为
+        circuit、排空非 A 为 drain；旧目标合格且未判到期为 sticky。total 与
+        对应项各 +1，封顶 10^18。"""
+        if old_entry is None:
+            category = "first"
+        else:
+            old_b = old_entry[0]
+            old_expires = old_entry[1]
+            if (
+                now is not None
+                and old_expires is not None
+                and now >= old_expires
+            ):
+                category = "expired"
+            else:
+                old_record = backends.get(old_b)
+                if old_record is None:
+                    category = "removed"
+                elif not old_record["healthy"]:
+                    category = "health"
+                elif not circuit_closed(old_record):
+                    category = "circuit"
+                elif old_record["drain"]["state"] != "A":
+                    category = "drain"
+                else:
+                    category = "sticky"
+        counts = backends[chosen_id]["pick_counts"]
+        counts["total"] = min(METRIC_CAP, counts["total"] + 1)
+        counts[category] = min(METRIC_CAP, counts[category] + 1)
+
     for raw_op in ops:
         op = parse_op(raw_op)
 
@@ -1694,6 +1747,13 @@ def run(raw):
                 # 度量历史：window -> [requests, errors, retries, remaps,
                 # [五个延迟桶]]，仅保留最近 60 窗；空表示从未 mr。
                 "metrics": {},
+                # H pick 记账：total/first/sticky/expired/removed/health/
+                # circuit/drain 七计数，各封顶 10^18；remove 后重加即随新记录
+                # 清零。hm 只读查询。
+                "pick_counts": {
+                    "total": 0, "first": 0, "sticky": 0, "expired": 0,
+                    "removed": 0, "health": 0, "circuit": 0, "drain": 0,
+                },
                 # 后端采样历史（ms/mx）：window -> {now: (活动连接数,
                 # removed)}，内层按采样先后（now 升序）保序；按 now//60
                 # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
@@ -1725,9 +1785,15 @@ def run(raw):
                 # 环选，目标删除或因健康、熔断、排空失格才迁移；改 vnodes
                 # 不主动迁移；三键沿用到期规则。pick 不改连接数与 W/R/L
                 # 运行态（current/ticket/conns 均不动）。
+                # 必须在 select_route 改写映射之前抓取旧项供记账分类；
+                # select_route 失败会抛 STATE 错，不会走到下方记账，故失败
+                # 项自然不记。
+                old_entry = sticky_map.get(key)
                 chosen_id, sticky, remapped, expired, expires = select_route(
                     key, pick_now, drain_strict=True
                 )
+                # 调度与映射不变；成功项仅记一次并归属返回 id。
+                record_h_pick(chosen_id, old_entry, pick_now)
                 if pick_now is None:
                     # 二键结果键序 op,id,sticky,remapped。
                     results.append(
@@ -2776,6 +2842,11 @@ def run(raw):
                     # 热加载不携带历史写操作形状。
                     "last_op": None,
                     "metrics": {},
+                    # ci 成功清零 H pick 记账。
+                    "pick_counts": {
+                        "total": 0, "first": 0, "sticky": 0, "expired": 0,
+                        "removed": 0, "health": 0, "circuit": 0, "drain": 0,
+                    },
                     # ci 成功清空采样历史，默认运行态为空。
                     "samples": {},
                     # 热加载以默认运行态重建，不携带故障演练。
@@ -2873,6 +2944,30 @@ def run(raw):
                 )
             results.append(
                 {"op": "fq", "faults": faults, "down": down, "slow": slow}
+            )
+
+        elif op[0] == "hm":
+            # H pick 记账只读查询：未知 id 报 BACKEND；不改变任何计数，失败
+            # 批次天然回滚。返回键序
+            # op,id,total,first,sticky,expired,removed,health,circuit,drain。
+            _, backend_id = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            counts = record["pick_counts"]
+            results.append(
+                {
+                    "op": "hm",
+                    "id": backend_id,
+                    "total": counts["total"],
+                    "first": counts["first"],
+                    "sticky": counts["sticky"],
+                    "expired": counts["expired"],
+                    "removed": counts["removed"],
+                    "health": counts["health"],
+                    "circuit": counts["circuit"],
+                    "drain": counts["drain"],
+                }
             )
 
         elif op[0] == "fx":
