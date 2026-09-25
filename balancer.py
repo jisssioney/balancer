@@ -77,6 +77,21 @@ B 桶。la 键集 op,c,s,key,now：先按原 route 语义选后端（含粘性�
 lg 键集 op,scope,id,now，按同样规则补充但不消费，查未配置桶报 STATE；
 返回键序 op,scope,id,r,b,t,at，值均为整数。ls 返回 op,ok。桶操作
 O(1)，la 继承 route 的复杂度上界，空间 O(B+K)。
+
+等待队列：os 键集 op,cap,q,ttl（均 ∈ [1,10^6] 非 bool 整数），依次为
+每后端连接上限、FIFO 容量、等待时限；首配或同参重报幂等返回 op,ok，
+异参报 STATE。oa 键集 op,cid,flow,c,s,key,now：cid/flow 同 open，
+c/s/key 同 la，now 共用时钟；未 os/chash 报 STATE，活动或排队 cid
+重复报 CONNECTION。按 la 规则路由并补桶检查但不消费（无可选后端或令
+牌不足均不报错而阻塞），目标另须排空 A 态且连接数 < cap；全部满足才
+耗令牌并按 open 建连接（opened_at=now），返回键序 op,cid,state,
+backend=oa,cid,A,id；否则入 FIFO 队尾，返回 oa,cid,Q,null；队满尾拒
+绝报 OVERLOAD/7。ot 键集 op,now：先删除全部 now ≥ 入队 now+ttl 的
+项，再自队首逐项按 oa 同规则接纳（路由重算，令牌与连接均在接纳时生
+效，opened_at=now），至首个阻塞项止且阻塞项留队首；返回键序
+op,expired,admitted，两数组均按 FIFO 列 cid。og 键集 op，返回
+op,queue，为 FIFO cid 数组；ot/og 未 os 报 STATE。ot 至多 q 次
+route，空间 O(q)。
 """
 
 import bisect
@@ -90,6 +105,7 @@ EXIT_BACKEND = 3
 EXIT_STATE = 4
 EXIT_CONNECTION = 5
 EXIT_RATE = 6
+EXIT_OVERLOAD = 7
 
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
@@ -207,6 +223,17 @@ def parse_vnodes(value):
     return value
 
 
+def parse_wait_param(value):
+    # os 的 cap/q/ttl ∈ [1,10^6]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 6
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
@@ -299,6 +326,7 @@ def parse_op(raw_op):
         "hset", "probe", "hget", "chash", "route", "ws", "wg",
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ls", "la", "lg",
+        "os", "oa", "ot", "og",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -495,6 +523,39 @@ def parse_op(raw_op):
             parse_now(raw_op["now"]),
         )
 
+    if name == "os":
+        if keys != {"op", "cap", "q", "ttl"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "os",
+            parse_wait_param(raw_op["cap"]),
+            parse_wait_param(raw_op["q"]),
+            parse_wait_param(raw_op["ttl"]),
+        )
+
+    if name == "oa":
+        if keys != {"op", "cid", "flow", "c", "s", "key", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "oa",
+            parse_cid(raw_op["cid"]),
+            parse_flow(raw_op["flow"]),
+            parse_key(raw_op["c"]),
+            parse_key(raw_op["s"]),
+            parse_key(raw_op["key"]),
+            parse_now(raw_op["now"]),
+        )
+
+    if name == "ot":
+        if keys != {"op", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ot", parse_now(raw_op["now"]))
+
+    if name == "og":
+        if keys != {"op"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("og",)
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -560,13 +621,22 @@ def run():
     # B 桶 id 必须是现存后端；remove 即删。每桶 r/b 为速率与容量，t/at
     # 为当前令牌与最近补充时刻，last 为最近一次 ls 的 (r,b,now) 用于重报。
     buckets = {}
+    # 等待队列：wait_cfg 未 os 时为 None，否则为 (cap, q, ttl)；wait_queue
+    # 为 FIFO deque，每项 [cid, flow, c, s, key, enqueued_now]，queued_cids
+    # 记录排队中 cid 以 O(1) 查重。
+    wait_cfg = None
+    wait_queue = deque()
+    queued_cids = set()
     last_now = None
     results = []
 
-    def select_route(key):
+    def select_route(key, soft=False):
         """按原 route 语义选后端：首见建立粘性映射，目标不可用依环迁移且不
-        迁回；返回 (backend_id, sticky, remapped)，未配环或无可选后端报 STATE。"""
+        迁回；返回 (backend_id, sticky, remapped)。未配环或无可选后端时
+        soft=True 返回 None（供等待队列按阻塞处理），否则报 STATE。"""
         if ring_vnodes is None:
+            if soft:
+                return None
             fail(EXIT_STATE, "STATE")
         mapped = sticky_map.get(key)
         if mapped is not None:
@@ -580,6 +650,8 @@ def run():
                 return mapped, True, False
         tokens = build_ring(backends, ring_vnodes)
         if not tokens:
+            if soft:
+                return None
             fail(EXIT_STATE, "STATE")
         digests = [token[0] for token in tokens]
         key_hash = int.from_bytes(
@@ -600,12 +672,40 @@ def run():
         )
         bucket["at"] = now
 
+    def admit_wait(entry, now):
+        """oa/ot 共用的接纳判定：按 la 规则路由（含粘性建立/迁移）并对在配
+        三桶补令牌检查但不消费；目标另须 A 态且连接数 < cap。全部满足才耗令
+        牌、按 open 建连接（opened_at=now），返回后端 id；不满足返回 None
+        （路由无可用后端亦视为阻塞）。不改动 sticky 以外的任何状态。"""
+        cid, flow, c, s, key, _enqueued = entry
+        routed = select_route(key, soft=True)
+        if routed is None:
+            return None
+        backend_id, _, _ = routed
+        record = backends.get(backend_id)
+        if not drain_available(record) or record["conns"] >= wait_cfg[0]:
+            return None
+        chosen = []
+        for scope, bucket_id in (("B", backend_id), ("C", c), ("S", s)):
+            bucket = buckets.get((scope, bucket_id))
+            if bucket is not None:
+                chosen.append(bucket)
+        for bucket in chosen:
+            refill(bucket, now)
+        if not all(bucket["t"] >= 1 for bucket in chosen):
+            return None
+        for bucket in chosen:
+            bucket["t"] -= 1
+        record["conns"] += 1
+        connections[cid] = [backend_id, flow, now]
+        return backend_id
+
     for raw_op in ops:
         op = parse_op(raw_op)
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg",
+            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -1156,6 +1256,70 @@ def run():
                     "at": bucket["at"],
                 }
             )
+
+        elif op[0] == "os":
+            _, cap, q, ttl = op
+            params = (cap, q, ttl)
+            if wait_cfg is not None and wait_cfg != params:
+                # 异参重配置报 STATE；同参幂等。已排队条目在同参时原样保留。
+                fail(EXIT_STATE, "STATE")
+            wait_cfg = params
+            results.append({"op": "os", "ok": True})
+
+        elif op[0] == "oa":
+            _, cid, flow, c, s, key, now = op
+            # 未 os 或未 chash 报 STATE。
+            if wait_cfg is None or ring_vnodes is None:
+                fail(EXIT_STATE, "STATE")
+            # 活动或排队 cid 重复报 CONNECTION。
+            if cid in connections or cid in queued_cids:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            admitted_backend = admit_wait([cid, flow, c, s, key, now], now)
+            if admitted_backend is not None:
+                results.append(
+                    {"op": "oa", "cid": cid, "state": "A", "backend": admitted_backend}
+                )
+            else:
+                # 阻塞：队尾入队；队满尾拒绝报 OVERLOAD/7。
+                if len(wait_queue) >= wait_cfg[1]:
+                    fail(EXIT_OVERLOAD, "OVERLOAD")
+                wait_queue.append([cid, flow, c, s, key, now])
+                queued_cids.add(cid)
+                results.append(
+                    {"op": "oa", "cid": cid, "state": "Q", "backend": None}
+                )
+
+        elif op[0] == "ot":
+            _, now = op
+            if wait_cfg is None:
+                fail(EXIT_STATE, "STATE")
+            ttl = wait_cfg[2]
+            expired = []
+            # 先删除全部 now >= 入队 now + ttl 项（按 FIFO 顺序收集 cid）。
+            remaining = deque()
+            for entry in wait_queue:
+                if now >= entry[5] + ttl:
+                    expired.append(entry[0])
+                    queued_cids.discard(entry[0])
+                else:
+                    remaining.append(entry)
+            wait_queue = remaining
+            # 再自队首接纳至首个阻塞；阻塞项留队首，其后不尝试。
+            admitted = []
+            while wait_queue:
+                entry = wait_queue[0]
+                backend_id = admit_wait(entry, now)
+                if backend_id is None:
+                    break
+                wait_queue.popleft()
+                queued_cids.discard(entry[0])
+                admitted.append(entry[0])
+            results.append({"op": "ot", "expired": expired, "admitted": admitted})
+
+        elif op[0] == "og":
+            if wait_cfg is None:
+                fail(EXIT_STATE, "STATE")
+            results.append({"op": "og", "queue": [entry[0] for entry in wait_queue]})
 
         else:  # get
             _, cid = op
