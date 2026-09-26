@@ -1111,6 +1111,466 @@ class MoSnapshotTest(unittest.TestCase):
         )
 
 
+class QuotaTest(unittest.TestCase):
+    """固定窗口配额：qs/qg 与 la 的配额判定。"""
+
+    @staticmethod
+    def quota_ops():
+        """add+chash 后登记 B/C/S 三份配额并各查一次。"""
+        return [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "qs", "scope": "C", "id": "u",
+             "limit": 3, "span": 10, "now": 0},
+            {"op": "qs", "scope": "S", "id": "w",
+             "limit": 10 ** 18, "span": 1, "now": 0},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 0},
+            {"op": "qg", "scope": "C", "id": "u", "now": 0},
+            {"op": "qg", "scope": "S", "id": "w", "now": 0},
+        ]
+
+    def test_qs_qg_key_order_and_values(self):
+        code, stdout, _ = run_balancer("run", encode_ops(self.quota_ops()))
+        self.assertEqual(code, 0)
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        self.assertEqual(
+            results[2:],
+            [
+                {"op": "qs", "ok": True},
+                {"op": "qs", "ok": True},
+                {"op": "qs", "ok": True},
+                {"op": "qg", "scope": "B", "id": "b1", "limit": 5,
+                 "span": 10, "window": 0, "used": 0, "remaining": 5},
+                {"op": "qg", "scope": "C", "id": "u", "limit": 3,
+                 "span": 10, "window": 0, "used": 0, "remaining": 3},
+                {"op": "qg", "scope": "S", "id": "w", "limit": 10 ** 18,
+                 "span": 1, "window": 0, "used": 0, "remaining": 10 ** 18},
+            ],
+        )
+        # 键序精确为 op,scope,id,limit,span,window,used,remaining。
+        self.assertEqual(
+            list(results[5]),
+            ["op", "scope", "id", "limit", "span",
+             "window", "used", "remaining"],
+        )
+
+    def test_qs_window_floored(self):
+        ops = [
+            {"op": "qs", "scope": "C", "id": "u",
+             "limit": 5, "span": 10, "now": 25},
+            {"op": "qg", "scope": "C", "id": "u", "now": 25},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        result = json.loads(stdout.decode("utf-8"))["results"][1]
+        self.assertEqual(result["window"], 2)
+
+    def test_qg_cross_window_clears_used(self):
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 2, "cc": 0, "sc": 0, "now": 1},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 9},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 10},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        self.assertEqual(
+            (results[4]["window"], results[4]["used"],
+             results[4]["remaining"]),
+            (0, 2, 3),
+        )
+        self.assertEqual(
+            (results[5]["window"], results[5]["used"],
+             results[5]["remaining"]),
+            (1, 0, 5),
+        )
+
+    def test_qs_idempotent_replay_keeps_used(self):
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 2, "cc": 0, "sc": 0, "now": 0},
+            # 同 (limit,span,now) 重报幂等：不重置当窗用量。
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 0},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        result = json.loads(stdout.decode("utf-8"))["results"][-1]
+        self.assertEqual((result["used"], result["remaining"]), (2, 3))
+
+    def test_qs_reconfig_resets_window_and_used(self):
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 2, "cc": 0, "sc": 0, "now": 0},
+            # 异参重配置：window=now//span、used=0。
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 7, "span": 10, "now": 0},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 0},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        result = json.loads(stdout.decode("utf-8"))["results"][-1]
+        self.assertEqual(
+            (result["limit"], result["used"], result["remaining"]),
+            (7, 0, 7),
+        )
+
+    def test_la_deducts_each_scope_quota(self):
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "qs", "scope": "C", "id": "u",
+             "limit": 6, "span": 10, "now": 0},
+            {"op": "qs", "scope": "S", "id": "w",
+             "limit": 7, "span": 10, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 2, "cc": 3, "sc": 4, "now": 0},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 0},
+            {"op": "qg", "scope": "C", "id": "u", "now": 0},
+            {"op": "qg", "scope": "S", "id": "w", "now": 0},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        self.assertEqual(
+            [r["used"] for r in results[6:]],
+            [2, 3, 4],
+        )
+
+    def test_la_quota_exhausted_is_rate(self):
+        # 令牌充足但配额不足：RATE/6，无 stdout。
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "ls", "scope": "B", "id": "b1",
+             "r": 100, "b": 100, "now": 0},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 1, "span": 10, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 1, "cc": 0, "sc": 0, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 1, "cc": 0, "sc": 0, "now": 0},
+        ]
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (6, b""))
+        self.assertEqual(stderr, b'{"error":"RATE"}\n')
+
+    def test_la_token_exhausted_is_rate_with_quota(self):
+        # 配额充足但令牌不足：RATE/6。
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "ls", "scope": "B", "id": "b1",
+             "r": 1, "b": 1, "now": 0},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 100, "span": 10, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 1, "cc": 0, "sc": 0, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 1, "cc": 0, "sc": 0, "now": 0},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (6, b""))
+
+    def test_la_unconfigured_quota_unlimited(self):
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "la", "c": "u", "s": "w", "key": "k", "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k", "now": 1},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        self.assertEqual(
+            results[2:],
+            [
+                {"op": "la", "backend": "b1", "ok": True},
+                {"op": "la", "backend": "b1", "ok": True},
+            ],
+        )
+
+    def test_la_cross_window_allows_again(self):
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 1, "span": 10, "now": 0},
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 1, "cc": 0, "sc": 0, "now": 0},
+            # 跨窗清零：同配额下一窗再次放行。
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 1, "cc": 0, "sc": 0, "now": 10},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 10},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        result = json.loads(stdout.decode("utf-8"))["results"][-1]
+        self.assertEqual(
+            (result["window"], result["used"]), (1, 1)
+        )
+
+    def test_qg_unconfigured_is_state(self):
+        ops = [{"op": "qg", "scope": "C", "id": "u", "now": 0}]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+
+    def test_qs_unknown_backend_is_backend(self):
+        ops = [
+            {"op": "qs", "scope": "B", "id": "nope",
+             "limit": 1, "span": 1, "now": 0},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (3, b""))
+
+    def test_remove_deletes_backend_quota(self):
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "qs", "scope": "B", "id": "b1",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "remove", "id": "b1"},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 0},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+
+    def test_ci_clears_quotas_and_ce_unchanged(self):
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "qs", "scope": "C", "id": "u",
+             "limit": 5, "span": 10, "now": 0},
+            {
+                "op": "ci",
+                "config": {
+                    "version": 7,
+                    "backends": [
+                        {"id": "b1", "weight": 1, "d": 0, "fail": 3,
+                         "success": 2, "circuit": None, "drain": None,
+                         "endpoint": None},
+                    ],
+                    "vnodes": None,
+                    "limits": [],
+                    "overload": None,
+                    "sticky": None,
+                    "idle": None,
+                    "backpressure": None,
+                    "scheduler": {"pick": "W"},
+                    "faults": [],
+                },
+                "now": 1,
+            },
+            {"op": "ce"},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        config = json.loads(stdout.decode("utf-8"))["results"][-1]["config"]
+        # ce 不导出配额：十键结构不变。
+        self.assertEqual(
+            set(config),
+            {"version", "backends", "vnodes", "limits", "overload",
+             "sticky", "idle", "backpressure", "scheduler", "faults"},
+        )
+        # ci 成功后配额已清空：qg 报 STATE。
+        ops.append({"op": "qg", "scope": "C", "id": "u", "now": 1})
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+
+    def test_invalid_inputs(self):
+        base = {"op": "qs", "scope": "C", "id": "u",
+                "limit": 5, "span": 10, "now": 0}
+        bad_ops = []
+        # 非法键集。
+        for keys in ({"op", "scope", "id", "limit", "span"},
+                     {"op", "scope", "id", "limit", "span", "now", "x"}):
+            bad_ops.append({k: base[k] for k in keys if k in base} |
+                           ({"x": 1} if "x" in keys else {}))
+        # 非法 scope、类型、范围。
+        for patch in (
+            {"scope": "X"},
+            {"scope": 1},
+            {"id": ""},
+            {"limit": 0},
+            {"limit": 10 ** 18 + 1},
+            {"limit": True},
+            {"limit": "5"},
+            {"span": 0},
+            {"span": 10 ** 9 + 1},
+            {"span": False},
+            {"now": -1},
+            {"now": 10 ** 9 + 1},
+            {"now": True},
+        ):
+            bad_ops.append(base | patch)
+        # qg 非法键集与 now。
+        bad_ops.append({"op": "qg", "scope": "C", "id": "u"})
+        bad_ops.append(
+            {"op": "qg", "scope": "C", "id": "u", "now": 10 ** 9 + 1}
+        )
+        for bad in bad_ops:
+            code, stdout, _ = run_balancer("run", encode_ops([bad]))
+            self.assertEqual((code, stdout), (2, b""), bad)
+
+    def test_clock_regression_is_input(self):
+        ops = [
+            {"op": "qs", "scope": "C", "id": "u",
+             "limit": 5, "span": 10, "now": 1},
+            {"op": "qg", "scope": "C", "id": "u", "now": 0},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (2, b""))
+
+    def test_record_replay_covers_quota(self):
+        ops = self.quota_ops() + [
+            {"op": "la", "c": "u", "s": "w", "key": "k",
+             "bc": 2, "cc": 1, "sc": 1, "now": 1},
+            {"op": "qg", "scope": "B", "id": "b1", "now": 1},
+            {"op": "qg", "scope": "C", "id": "u", "now": 11},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
+class V7FaultNormalizationTest(unittest.TestCase):
+    """ci version=7 故障段规范化：乱序段按 a 升序，重叠判定不变。"""
+
+    @staticmethod
+    def ci_with_faults(faults):
+        return [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 1},
+            {
+                "op": "ci",
+                "config": {
+                    "version": 7,
+                    "backends": [
+                        {"id": "b1", "weight": 1, "d": 0, "fail": 3,
+                         "success": 2, "circuit": None, "drain": None,
+                         "endpoint": None},
+                        {"id": "b2", "weight": 1, "d": 0, "fail": 3,
+                         "success": 2, "circuit": None, "drain": None,
+                         "endpoint": None},
+                    ],
+                    "vnodes": None,
+                    "limits": [],
+                    "overload": None,
+                    "sticky": None,
+                    "idle": None,
+                    "backpressure": None,
+                    "scheduler": {"pick": "W"},
+                    "faults": faults,
+                },
+                "now": 0,
+            },
+            {"op": "ce"},
+        ]
+
+    def test_unordered_segments_sorted_by_a(self):
+        faults = [
+            {"id": "b1", "k": "S", "a": 100, "z": 200, "v": 5},
+            {"id": "b2", "k": "D", "a": 0, "z": 10, "v": 0},
+            {"id": "b1", "k": "D", "a": 0, "z": 50, "v": 0},
+            {"id": "b1", "k": "F", "a": 50, "z": 100, "v": 2},
+        ]
+        code, stdout, _ = run_balancer(
+            "run", encode_ops(self.ci_with_faults(faults))
+        )
+        self.assertEqual(code, 0)
+        exported = json.loads(stdout.decode("utf-8"))["results"][-1][
+            "config"
+        ]["faults"]
+        # 按后端加入序、同后端段 a 升序输出。
+        self.assertEqual(
+            exported,
+            [
+                {"id": "b1", "k": "D", "a": 0, "z": 50, "v": 0},
+                {"id": "b1", "k": "F", "a": 50, "z": 100, "v": 2},
+                {"id": "b1", "k": "S", "a": 100, "z": 200, "v": 5},
+                {"id": "b2", "k": "D", "a": 0, "z": 10, "v": 0},
+            ],
+        )
+
+    def test_overlap_still_rejected(self):
+        # 乱序提交但规范化后重叠：INPUT/2（判定不变）。
+        faults = [
+            {"id": "b1", "k": "S", "a": 40, "z": 200, "v": 5},
+            {"id": "b1", "k": "D", "a": 0, "z": 50, "v": 0},
+        ]
+        code, stdout, _ = run_balancer(
+            "run", encode_ops(self.ci_with_faults(faults))
+        )
+        self.assertEqual((code, stdout), (2, b""))
+
+    def test_same_start_rejected(self):
+        faults = [
+            {"id": "b1", "k": "D", "a": 0, "z": 50, "v": 0},
+            {"id": "b1", "k": "S", "a": 0, "z": 60, "v": 5},
+        ]
+        code, stdout, _ = run_balancer(
+            "run", encode_ops(self.ci_with_faults(faults))
+        )
+        self.assertEqual((code, stdout), (2, b""))
+
+    def test_adjacent_segments_accepted(self):
+        # 相邻端点可接（z_i == a_{i+1}）。
+        faults = [
+            {"id": "b1", "k": "S", "a": 50, "z": 100, "v": 5},
+            {"id": "b1", "k": "D", "a": 0, "z": 50, "v": 0},
+        ]
+        code, stdout, _ = run_balancer(
+            "run", encode_ops(self.ci_with_faults(faults))
+        )
+        self.assertEqual(code, 0)
+        exported = json.loads(stdout.decode("utf-8"))["results"][-1][
+            "config"
+        ]["faults"]
+        self.assertEqual(
+            exported,
+            [
+                {"id": "b1", "k": "D", "a": 0, "z": 50, "v": 0},
+                {"id": "b1", "k": "S", "a": 50, "z": 100, "v": 5},
+            ],
+        )
+
+    def test_record_replay_covers_v7_faults(self):
+        faults = [
+            {"id": "b1", "k": "S", "a": 100, "z": 200, "v": 5},
+            {"id": "b1", "k": "D", "a": 0, "z": 50, "v": 0},
+            {"id": "b2", "k": "F", "a": 10, "z": 20, "v": 3},
+        ]
+        raw = encode_ops(self.ci_with_faults(faults))
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 class RecordReplayTest(unittest.TestCase):
     """核心输入经 record、replay 逐字节复现退出码、stdout、stderr。"""
 

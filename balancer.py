@@ -96,6 +96,20 @@ lg 键集 op,scope,id,now，按同样规则补充但不消费，查未配置桶�
 返回键序 op,scope,id,r,b,t,at，值均为整数。ls 返回 op,ok。桶操作
 O(1)，la 继承 route 的复杂度上界，空间 O(B+K)。
 
+固定窗口配额：qs 键集 op,scope,id,limit,span,now，scope ∈ B/C/S，
+id 同 ls，limit ∈ [1,10^18]、span ∈ [1,10^9]、now ∈ [0,10^9] 均非
+bool 整数，now 纳入共用非递减时钟；B 配额的 id 须为现存后端，否则
+BACKEND。配额以 (scope,id) 唯一，同 (limit,span,now) 重报幂等，其
+余 qs 一律重配置并置 window=now//span、used=0；remove 同步删除其
+B 配额，ci/cb 成功清空配额，ce 不导出。qs 返回 op,ok。qg 键集
+op,scope,id,now，跨窗先置 window=now//span 并清 used，查未配置配
+额报 STATE；返回键序 op,scope,id,limit,span,window,used,remaining，
+remaining=limit-used。la 在令牌检查之外按 bc/cc/sc 检查对应 B/C/S
+配额：未配置不限；各在配配额先跨窗清零，令牌与配额全足才原子扣减
+（配额 used 加对应成本），否则 RATE/6（无 stdout、整批原子）。非法
+键集、类型、范围、编码或时钟倒退报 INPUT。qs/qg 与 la 新增判定均
+O(1)，空间 O(Q)，仅用标准库；oa/ot 等其余操作不检查配额，行为不变。
+
 排队接纳：os 键集 op,cap,q,ttl（均 1..10^6 非 bool 整数），依次为每后端
 连接上限、FIFO 容量、等待时限；首配或同参返回 op,ok，异参报 STATE。
 oa 键集 op,cid,flow,c,s,key,now 或
@@ -296,7 +310,8 @@ key 沿用 route 校验。H 共享既有环与粘性映射：首次按环选，�
 依环迁移且不迁回；改 vnodes 不主动迁移；三键沿用到期规则。二键结果键序
 op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配环、
 三键未 ss 或无合格后端报 STATE/4。H 不改连接数及 W/R/L 运行态。ce/ci
-均 O(B+M+T) 时空（M 为限流项数、T 为故障段数）；R/L 的 pick 均为 O(B)
+均 O(B+M+T) 时空（M 为限流项数、T 为故障段数；v7 faults 规范化对
+全体段按 a 作稳定基数排序，重叠判定与输出同 fp）；R/L 的 pick 均为 O(B)
 时间、O(1) 额外
 空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
@@ -693,6 +708,28 @@ def parse_burst(value):
     return value
 
 
+def parse_quota_limit(value):
+    # 固定窗口配额上限 limit ∈ [1, 10^18]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 18
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_quota_span(value):
+    # 固定窗口跨度 span ∈ [1, 10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_duration(value):
     # 预热时长 d ∈ [0, 10^9]，非 bool 整数。
     if (
@@ -946,20 +983,35 @@ def parse_config_faults(value):
     化按段起点 a 升序，半开区间 [a,z) 互不重叠（相邻端点可接）。返回
     {id: [(k,a,z,v),...]}，未列入的后端时间线为空；空计划为 {}。结构、
     键序、类型、范围、编码、重复或重叠判 INPUT；id 是否现存留执行期判
-    BACKEND（同 B 限流）。"""
+    BACKEND（同 B 限流）。规范化整体 O(T)：段起点 a ∈ [0,10^9] < 2^30，
+    全体段一次稳定 LSD 基数排序即按 a 升序，不做逐组比较排序。"""
     if not isinstance(value, list):
         fail(EXIT_INPUT, "INPUT")
     grouped = OrderedDict()
+    flat = []
     for item in value:
         if not isinstance(item, dict) or list(item) != ["id", "k", "a", "z", "v"]:
             fail(EXIT_INPUT, "INPUT")
         item_id = parse_backend_id(item["id"])
-        grouped.setdefault(item_id, []).append(parse_fault_segment(item))
+        segment = parse_fault_segment(item)
+        grouped.setdefault(item_id, True)
+        flat.append((item_id, segment))
+    # 四趟 8 位 LSD 基数排序（32 位覆盖 a < 2^30），稳定故同 a 段保持
+    # 提交先后；再按 id 分发回各组，每组内即按 a 升序——与逐组稳定排序
+    # 结果逐段一致，总时间 O(T) 而非 O(T log T)。
+    for shift in (0, 8, 16, 24):
+        digit_buckets = [[] for _ in range(256)]
+        for entry in flat:
+            digit_buckets[(entry[1][1] >> shift) & 0xFF].append(entry)
+        flat = [entry for bucket in digit_buckets for entry in bucket]
+    sorted_groups = {}
+    for item_id, segment in flat:
+        sorted_groups.setdefault(item_id, []).append(segment)
     plan = {}
-    for item_id, segments in grouped.items():
+    for item_id in grouped:
+        segments = sorted_groups[item_id]
         # 规范化同 fp：同 id 段按 a 升序，再校验半开区间互不重叠（z_i<=
         # a_{i+1}，相等为相邻可接）；同 a 或完全重复的段在此被拒。
-        segments.sort(key=lambda segment: segment[1])
         for idx in range(len(segments) - 1):
             if segments[idx][2] > segments[idx + 1][1]:
                 fail(EXIT_INPUT, "INPUT")
@@ -1215,6 +1267,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg",
+        "qs", "qg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
@@ -1449,6 +1502,35 @@ def parse_op(raw_op):
             scope,
             parse_key(raw_op["id"]),
             parse_now(raw_op["now"]),
+        )
+
+    if name == "qs":
+        if keys != {"op", "scope", "id", "limit", "span", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        scope = raw_op["scope"]
+        if scope not in ("B", "C", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "qs",
+            scope,
+            parse_key(raw_op["id"]),
+            parse_quota_limit(raw_op["limit"]),
+            parse_quota_span(raw_op["span"]),
+            # now ∈ [0, 10^9] 非 bool 整数，纳入共用非递减时钟。
+            parse_warm_now(raw_op["now"]),
+        )
+
+    if name == "qg":
+        if keys != {"op", "scope", "id", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        scope = raw_op["scope"]
+        if scope not in ("B", "C", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "qg",
+            scope,
+            parse_key(raw_op["id"]),
+            parse_warm_now(raw_op["now"]),
         )
 
     if name == "os":
@@ -1969,6 +2051,11 @@ def run(raw):
     # B 桶 id 必须是现存后端；remove 即删。每桶 r/b 为速率与容量，t/at
     # 为当前令牌与最近补充时刻，last 为最近一次 ls 的 (r,b,now) 用于重报。
     buckets = {}
+    # 固定窗口配额以 (scope, id) 唯一：limit 为窗内上限，span 为窗跨度，
+    # window 为当前窗号（now//span），used 为当窗已用量，last 为最近一次
+    # qs 的 (limit,span,now) 用于同参重报幂等。B 配额 id 须为现存后端；
+    # remove 即删，ci/cb 成功清空（ce 不导出）。空间 O(Q)。
+    quotas = {}
     # 排队接纳：queue_cfg 未 os 时为 None，否则为 (cap, q, ttl)；wait_queue
     # 为 FIFO 有序映射 cid -> (cid, flow, c, s, key, bc, cc, sc, enqueue_now)，
     # 容量上限 q；bc/cc/sc 为入队请求的三项令牌成本。OrderedDict 即哈希表加
@@ -2100,6 +2187,14 @@ def run(raw):
             bucket["b"], bucket["t"] + (now - bucket["at"]) * bucket["r"]
         )
         bucket["at"] = now
+
+    def roll_quota(quota, now):
+        # 固定窗口配额：跨窗先置 window=now//span 并清 used（时钟非递减，
+        # 窗号单调不减，同窗调用为无操作）。
+        window = now // quota["span"]
+        if window != quota["window"]:
+            quota["window"] = window
+            quota["used"] = 0
 
     def establish_connection(cid, backend_id, flow, now):
         """成功建连（open/oa/ot/fx/fr 共用）：后端并发加一、登记连接
@@ -2508,7 +2603,7 @@ def run(raw):
         清除；故障统计、分钟历史与恢复基线重置），并按 v7 faults 载入各后端
         登记时间线（v1..v6 为空计划）。调用方须已完成全部校验，本函数自身
         不再失败。"""
-        nonlocal backends, buckets, ring_vnodes, queue_cfg, wait_queue
+        nonlocal backends, buckets, quotas, ring_vnodes, queue_cfg, wait_queue
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal sticky_map, alert, alert_events
         nonlocal mo_seq, mo_cache
@@ -2613,6 +2708,8 @@ def run(raw):
             }
         backends = new_backends
         buckets = new_buckets
+        # ci/cb 成功清空固定窗口配额（ce 不导出，ci 不导入）。
+        quotas = {}
         ring_vnodes = config["vnodes"]
         queue_cfg = config["overload"]
         wait_queue = OrderedDict()
@@ -2639,7 +2736,8 @@ def run(raw):
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
+            "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
+            "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
             "ci", "cb", "fx", "fr", "fi", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
@@ -2767,6 +2865,7 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             del backends[backend_id]
             buckets.pop(("B", backend_id), None)
+            quotas.pop(("B", backend_id), None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -3349,12 +3448,14 @@ def run(raw):
         elif op[0] == "la":
             _, c, s, key, bc, cc, sc, now = op
             # 先按 route 选后端（未配环或无可选后端报 STATE），再检查
-            # 该后端/客户端/服务类三个桶；未配置即不限制也不扣减。ss 后按
-            # 三键限时粘性规则（以本操作的 now），未 ss 沿用旧二键语义。
+            # 该后端/客户端/服务类三个桶与三份固定窗口配额；未配置即不
+            # 限制也不扣减。ss 后按三键限时粘性规则（以本操作的 now），
+            # 未 ss 沿用旧二键语义。
             backend_id, _, _, _, _ = select_route(
                 key, now if sticky_ttl is not None else None
             )
             chosen = []
+            chosen_quotas = []
             for scope, bucket_id, cost in (
                 ("B", backend_id, bc),
                 ("C", c, cc),
@@ -3363,14 +3464,26 @@ def run(raw):
                 bucket = buckets.get((scope, bucket_id))
                 if bucket is not None:
                     chosen.append((bucket, cost))
+                quota = quotas.get((scope, bucket_id))
+                if quota is not None:
+                    chosen_quotas.append((quota, cost))
             for bucket, _ in chosen:
                 refill(bucket, now)
-            # 各在配桶均有 t>=对应成本才原子扣减；任一不足则 RATE/6：
-            # 无 stdout、整批原子。
-            if not all(bucket["t"] >= cost for bucket, cost in chosen):
+            for quota, _ in chosen_quotas:
+                roll_quota(quota, now)
+            # 各在配桶均有 t>=对应成本且各在配配额窗内余量足够才原子扣减；
+            # 任一不足则 RATE/6：无 stdout、整批原子。
+            if not all(
+                bucket["t"] >= cost for bucket, cost in chosen
+            ) or not all(
+                quota["used"] + cost <= quota["limit"]
+                for quota, cost in chosen_quotas
+            ):
                 fail(EXIT_RATE, "RATE")
             for bucket, cost in chosen:
                 bucket["t"] -= cost
+            for quota, cost in chosen_quotas:
+                quota["used"] += cost
             results.append({"op": "la", "backend": backend_id, "ok": True})
 
         elif op[0] == "lg":
@@ -3389,6 +3502,56 @@ def run(raw):
                     "b": bucket["b"],
                     "t": bucket["t"],
                     "at": bucket["at"],
+                }
+            )
+
+        elif op[0] == "qs":
+            _, scope, quota_id, limit, span, now = op
+            # B 配额挂在现存后端上；未知后端优先于其它检查报 BACKEND（同 ls）。
+            if scope == "B" and quota_id not in backends:
+                fail(EXIT_BACKEND, "BACKEND")
+            key_pair = (scope, quota_id)
+            quota = quotas.get(key_pair)
+            if quota is None:
+                # 新配额：置 window=now//span、used=0。
+                quotas[key_pair] = {
+                    "limit": limit,
+                    "span": span,
+                    "window": now // span,
+                    "used": 0,
+                    "last": (limit, span, now),
+                }
+            else:
+                if quota["last"] == (limit, span, now):
+                    # 同 (limit, span, now) 重报幂等，不重置当窗用量。
+                    results.append({"op": "qs", "ok": True})
+                    continue
+                # 其余一律重配置：置 window=now//span、used=0。
+                quota["limit"] = limit
+                quota["span"] = span
+                quota["window"] = now // span
+                quota["used"] = 0
+                quota["last"] = (limit, span, now)
+            results.append({"op": "qs", "ok": True})
+
+        elif op[0] == "qg":
+            _, scope, quota_id, now = op
+            quota = quotas.get((scope, quota_id))
+            if quota is None:
+                # 查询未配置配额报 STATE。
+                fail(EXIT_STATE, "STATE")
+            # 跨窗先置 window=now//span 并清 used。
+            roll_quota(quota, now)
+            results.append(
+                {
+                    "op": "qg",
+                    "scope": scope,
+                    "id": quota_id,
+                    "limit": quota["limit"],
+                    "span": quota["span"],
+                    "window": quota["window"],
+                    "used": quota["used"],
+                    "remaining": quota["limit"] - quota["used"],
                 }
             )
 
