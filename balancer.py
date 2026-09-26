@@ -117,16 +117,21 @@ oa 键集 op,cid,flow,c,s,key,now 或
 op,cid,flow,c,s,key,bc,cc,sc,now：cid/flow 同 open，c/s/key 同 la，
 bc/cc/sc 同 la 的成本校验（旧键集等价于三项均为 1），now
 纳入共用非递减时钟。活动或排队中 cid 重复报 CONNECTION。先按 la 的路由
-语义选后端（未 chash 或无可选后端报 STATE），再对在配桶补充检查但不消费，
-目标另须排空 A 且连接数 < cap；令牌不足或目标不满足均阻塞入队（三项
-成本随请求入队），返回键序
-op,cid,state,backend：接纳为 A 加后端 id（此时才按成本耗令牌并按 open
-建连接，
-opened_at=now），阻塞为 Q 加 null；队满尾拒绝报 OVERLOAD/7。ot 键集
-op,now：先删除全部 now ≥ 入队 now+ttl 的排队项，再自队首逐项按 oa 规则
-以入队成本重试接纳（opened_at=now，接纳才扣、过期不扣）至首个阻塞即停，
+语义选后端（未 chash 或无可选后端报 STATE），路由后按 B 后端、C 客户端、
+S 服务类检查在配令牌桶与在配固定窗口配额（未配置项不限）：各桶先补充、
+各配额先按 window=now//span 推进（跨窗清零 used），目标另须排空 A 且
+连接数 < cap；仅当各桶令牌不少于对应成本、各配额满足 used+成本≤limit
+时才原子扣令牌、配额 used 加成本并建连（opened_at=now），否则三项成本
+随请求入队阻塞，返回键序
+op,cid,state,backend：接纳为 A 加后端 id，阻塞为 Q 加 null；令牌或配额
+不足只入队，不报 RATE，队满尾拒绝或 P 态背压仍报 OVERLOAD/7。ot 键集
+op,now：先删除全部 now ≥ 入队 now+ttl 的排队项（到期不扣令牌、不扣配额），
+再自队首逐项以入队成本按 oa 规则重试：逐项以本次 now 补充桶并推进固定窗
+（opened_at=now，接纳才扣令牌、增 used 并建连，前序扣减对后续项可见），
+至首个阻塞项连同其已推进未扣减的桶/配额状态整体放回队首即停，
 返回 op,expired,admitted，两
-数组均按 FIFO 列 cid；ot 至多 q 次 route，空间 O(q)。og 键集 op，返回
+数组均按 FIFO 列 cid；ot 至多 q 项、每项至多一次 route，空间 O(q)。
+og 键集 op，返回
 op,queue，queue 为 FIFO cid 数组。oc 键集 op,cid，cid 沿用非空字符串校验，
 须已 os 且 cid 当前在等待队列；成功时 O(1) 从任意位置删除，返回键序
 op,cid,ok，ok=true，不扣减或返还令牌、不建连接，入队路由已产生的粘性映射
@@ -2303,10 +2308,13 @@ def run(raw):
             conn_endpoints[cid] = endpoint
 
     def evaluate_admit(backend_id, cid, flow, c, s, costs, now):
-        """对已路由的后端按 la 规则补充检查但不消费；令牌不足、目标非 A 或
-        连接数达 cap 时返回 ("block", id)，全部满足才按成本耗令牌、建连接
-        （opened_at=now），返回 ("admit", id)。costs 为 (bc, cc, sc)。"""
+        """对已路由的后端按 la 规则补充检查但不消费：先补充在配桶、推进在配
+        固定窗（均不回写扣减），令牌不足、配额 used+成本>limit、目标非 A 或
+        连接数达 cap 时返回 ("block", id)，全部满足才按成本原子耗令牌、配额
+        used 加成本并建连接（opened_at=now），返回 ("admit", id)。costs 为
+        (bc, cc, sc)。配额不足只导致排队阻塞，从不由 oa/ot 报 RATE。"""
         chosen = []
+        chosen_quotas = []
         for scope, bucket_id, cost in (
             ("B", backend_id, costs[0]),
             ("C", c, costs[1]),
@@ -2315,18 +2323,32 @@ def run(raw):
             bucket = buckets.get((scope, bucket_id))
             if bucket is not None:
                 chosen.append((bucket, cost))
+            quota = quotas.get((scope, bucket_id))
+            if quota is not None:
+                chosen_quotas.append((quota, cost))
+        # 先补充再判定：检查阶段只推进补充时刻与窗口，不扣令牌、不增 used；
+        # 阻塞时这些推进随批次成功保留（与 la 同口径），失败批整体回滚。
         for bucket, _ in chosen:
             refill(bucket, now)
+        for quota, _ in chosen_quotas:
+            roll_quota(quota, now)
         record = backends[backend_id]
         if (
             not all(bucket["t"] >= cost for bucket, cost in chosen)
+            or not all(
+                quota["used"] + cost <= quota["limit"]
+                for quota, cost in chosen_quotas
+            )
             or record["drain"]["state"] != "A"
             or record["conns"] >= queue_cfg[0]
         ):
             return "block", backend_id
-        # 接纳才按成本耗令牌并按 open 建连接。
+        # 接纳才按成本耗令牌、增配额 used 并按 open 建连接；全部满足后统一
+        # 扣减，天然原子（其间无 fail 路径）。
         for bucket, cost in chosen:
             bucket["t"] -= cost
+        for quota, cost in chosen_quotas:
+            quota["used"] += cost
         establish_connection(cid, backend_id, flow, now)
         return "admit", backend_id
 
@@ -3909,8 +3931,9 @@ def run(raw):
                     fail(EXIT_OVERLOAD, "OVERLOAD")
                 # 不可用原因历史：Q 入队且所选后端连接数已达 os.cap 时记
                 # overload（所选后端来自只含 healthy/C/A 的环，阻塞在此只可能
-                # 因令牌不足或连接达 cap）；P 态/队满的 OVERLOAD 已在上方回滚，
-                # 不记。同次至多记一次。
+                # 因令牌不足、固定窗配额不足或连接达 cap；配额不足只入队，
+                # 不报 RATE）；P 态/队满的 OVERLOAD 已在上方回滚，不记。同次
+                # 至多记一次。
                 if backends[routed[0]]["conns"] >= queue_cfg[0]:
                     record_reason(routed[0], "overload", now)
                 # 三项成本随请求入队，ot 重试时按此成本扣减。新键追加到
@@ -3934,13 +3957,17 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             ttl = queue_cfg[2]
             # 先删除全部 now >= 入队 now + ttl 的项（pop 保序，其余项 FIFO
-            # 相对次序不变）。快照 items 按 FIFO 遍历，额外空间 O(q)。
+            # 相对次序不变）；到期不补充/不扣令牌、不推进或扣减配额。快照
+            # items 按 FIFO 遍历，额外空间 O(q)。
             expired = []
             for queued_cid, item in list(wait_queue.items()):
                 if now >= item[8] + ttl:
                     expired.append(queued_cid)
                     wait_queue.pop(queued_cid)
             # 再自队首重试接纳，至首个阻塞即停（每个键至多一次 route）。
+            # 逐项以本次 ot 的 now 补充桶并按 window=now//span 推进固定窗，
+            # 接纳才扣令牌、增 used 并建连；前序接纳的扣减对后续项可见，首个
+            # 阻塞项连同其（已推进但未扣减的）桶/配额状态保留在队内。
             admitted = []
             while wait_queue:
                 queued_cid, item = wait_queue.popitem(last=False)

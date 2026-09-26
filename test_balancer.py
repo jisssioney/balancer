@@ -2433,5 +2433,272 @@ class OdTraceTest(unittest.TestCase):
         )
 
 
+class OaQuotaAdmissionTest(unittest.TestCase):
+    """固定窗口配额参与 oa/ot 接纳：qs/qg/la/oi/od 行为不变。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self, cap=10, q=4, ttl=10):
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": cap, "q": q, "ttl": ttl},
+        ]
+
+    def oa(self, cid, now, **extra):
+        op = {"op": "oa", "cid": cid, "flow": FLOW,
+              "c": "c1", "s": "s1", "key": "k", "now": now}
+        op.update(extra)
+        return op
+
+    def qs(self, scope, id_, limit, span=100, now=0):
+        return {"op": "qs", "scope": scope, "id": id_,
+                "limit": limit, "span": span, "now": now}
+
+    def test_admit_consumes_configured_quotas_by_cost(self):
+        # 旧键集成本默认 1：B 配额 used 加 1。
+        ops = self.base_ops() + [
+            self.qs("B", "a", 5),
+            self.oa("c1", 0),
+            {"op": "qg", "scope": "B", "id": "a", "now": 0},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[4]["state"], "A")
+        self.assertEqual(results[4]["backend"], "a")
+        self.assertEqual(results[5]["used"], 1)
+        # 新键集：C/S 配额按 cc/sc 扣减，B 未配置不限。
+        ops = self.base_ops() + [
+            self.qs("C", "c1", 10),
+            self.qs("S", "s1", 10),
+            self.oa("c1", 0, bc=0, cc=2, sc=7),
+            {"op": "qg", "scope": "C", "id": "c1", "now": 0},
+            {"op": "qg", "scope": "S", "id": "s1", "now": 0},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[6]["used"], 2)
+        self.assertEqual(results[7]["used"], 7)
+
+    def test_quota_shortage_queues_q_without_rate(self):
+        ops = self.base_ops() + [
+            self.qs("B", "a", 1, span=10),
+            self.oa("c1", 0),                    # A：used=1
+            self.oa("c2", 1),                    # 配额尽：Q，非 RATE
+            {"op": "og"},
+            {"op": "qg", "scope": "B", "id": "a", "now": 1},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[4], {"op": "oa", "cid": "c1",
+                                      "state": "A", "backend": "a"})
+        self.assertEqual(results[5], {"op": "oa", "cid": "c2",
+                                      "state": "Q", "backend": None})
+        self.assertEqual(results[6], {"op": "og", "queue": ["c2"]})
+        # 排队不扣配额：used 仍为 1，窗口未推进。
+        self.assertEqual(results[7]["used"], 1)
+        self.assertEqual(results[7]["window"], 0)
+
+    def test_queued_item_does_not_consume_or_roll_window(self):
+        # 阻塞入队只补充/推进检查态，不增 used；跨窗重置只发生在 ot 重试。
+        ops = self.base_ops() + [
+            self.qs("B", "a", 1, span=10),
+            self.oa("c1", 0),
+            self.oa("c2", 5),                    # 同窗 Q
+            {"op": "qg", "scope": "B", "id": "a", "now": 5},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[6]["window"], 0)
+        self.assertEqual(results[6]["used"], 1)
+
+    def test_ot_admits_queued_with_quota_and_cross_window_reset(self):
+        ops = self.base_ops() + [
+            self.qs("B", "a", 1, span=10),
+            self.oa("c1", 0),                    # A used=1
+            self.oa("c2", 1),                    # Q
+            {"op": "ot", "now": 10},             # 跨窗：used 清零后接纳
+            {"op": "og"},
+            {"op": "qg", "scope": "B", "id": "a", "now": 10},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            results[6],
+            {"op": "ot", "expired": [], "admitted": ["c2"]},
+        )
+        self.assertEqual(list(results[6]), ["op", "expired", "admitted"])
+        self.assertEqual(results[7], {"op": "og", "queue": []})
+        self.assertEqual(results[8]["window"], 1)
+        self.assertEqual(results[8]["used"], 1)
+
+    def test_ot_chain_admits_until_quota_blocks_and_keeps_fifo(self):
+        # C 配额限 2：c1/c2 接纳，c3（成本 1）与 c4（成本 2）排队；ot 跨窗
+        # 后 c3 接纳（used=1），c4 需 used+2=3>2 阻塞，放回队首。
+        ops = self.base_ops(ttl=1000) + [
+            self.qs("C", "c1", 2, span=10),
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            self.oa("c3", 0),                    # Q
+            self.oa("c4", 0, bc=1, cc=2, sc=1),      # Q
+            {"op": "ot", "now": 10},             # 跨窗
+            {"op": "og"},
+            {"op": "qg", "scope": "C", "id": "c1", "now": 10},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[8]["admitted"], ["c3"])
+        self.assertEqual(results[8]["expired"], [])
+        self.assertEqual(results[9], {"op": "og", "queue": ["c4"]})
+        self.assertEqual(results[10]["used"], 1)
+        self.assertEqual(results[10]["window"], 1)
+
+    def test_ot_uses_each_item_enqueued_costs(self):
+        # 队首 sc=3 阻塞时其后的 sc=1 项不得被尝试（FIFO 首阻塞即停）；
+        # 跨窗后按各自入队成本顺序扣减。
+        ops = self.base_ops(ttl=1000) + [
+            self.qs("S", "s1", 3),
+            self.oa("c1", 0, bc=0, cc=0, sc=3),  # A used=3
+            self.oa("cX", 0, bc=0, cc=0, sc=3),  # Q（6>3）
+            self.oa("cY", 0, bc=0, cc=0, sc=1),  # Q（4>3）
+            {"op": "ot", "now": 50},             # 同窗：cX 阻塞即停
+            {"op": "og"},
+            {"op": "ot", "now": 100},            # 跨窗 used=0：cX 用 3，cY 需 4>3
+            {"op": "og"},
+            {"op": "qg", "scope": "S", "id": "s1", "now": 100},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[7]["admitted"], [])
+        self.assertEqual(results[8], {"op": "og", "queue": ["cX", "cY"]})
+        self.assertEqual(results[9]["admitted"], ["cX"])
+        self.assertEqual(results[10], {"op": "og", "queue": ["cY"]})
+        self.assertEqual(results[11]["used"], 3)
+
+    def test_ot_expiry_deducts_no_tokens_and_no_quota(self):
+        ops = self.base_ops(ttl=10) + [
+            self.qs("S", "s1", 3, span=10),
+            self.oa("c1", 0, bc=0, cc=0, sc=3),  # A used=3
+            self.oa("c2", 0, bc=0, cc=0, sc=3),  # Q
+            {"op": "ot", "now": 10},             # now>=0+10 到期，且恰跨窗
+            {"op": "og"},
+            {"op": "qg", "scope": "S", "id": "s1", "now": 10},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[6],
+                         {"op": "ot", "expired": ["c2"], "admitted": []})
+        self.assertEqual(results[7], {"op": "og", "queue": []})
+        # 到期不扣；ot 的 now 恰跨窗，qg 读到新窗 used=0。
+        self.assertEqual(results[8]["window"], 1)
+        self.assertEqual(results[8]["used"], 0)
+
+    def test_token_shortage_also_queues_when_quota_free(self):
+        ops = self.base_ops() + [
+            {"op": "ls", "scope": "B", "id": "a",
+             "r": 1, "b": 1, "now": 0},
+            self.qs("B", "a", 100),
+            self.oa("c1", 0),                    # A：耗尽唯一令牌
+            self.oa("c2", 0),                    # 令牌不足：Q
+            {"op": "ot", "now": 0},              # 同时刻无补充：仍阻塞
+            {"op": "og"},
+            {"op": "ot", "now": 1},              # 补充 1 令牌：接纳
+            {"op": "qg", "scope": "B", "id": "a", "now": 1},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[6]["state"], "Q")
+        self.assertEqual(results[7]["admitted"], [])
+        self.assertEqual(results[8], {"op": "og", "queue": ["c2"]})
+        self.assertEqual(results[9]["admitted"], ["c2"])
+        self.assertEqual(results[10]["used"], 2)
+
+    def test_queue_full_with_quota_block_is_overload(self):
+        ops = self.base_ops(cap=10, q=1) + [
+            self.qs("B", "a", 1),
+            self.oa("c1", 0),                    # A
+            self.oa("c2", 0),                    # Q（占满 q=1）
+            self.oa("c3", 0),                    # 配额不足本应排队：队满
+        ]
+        self.assert_failure(ops, 7, "OVERLOAD")
+        # 失败批不扣额外配额、不留队列项。
+        results = self.run_ops(ops[:-1] + [
+            {"op": "og"},
+            {"op": "qg", "scope": "B", "id": "a", "now": 0},
+        ])
+        self.assertEqual(results[-2], {"op": "og", "queue": ["c2"]})
+        self.assertEqual(results[-1]["used"], 1)
+
+    def test_backpressure_p_quota_block_is_overload(self):
+        ops = self.base_ops() + [
+            {"op": "bp", "low": 0, "high": 1},
+            self.qs("B", "a", 1),
+            self.oa("c1", 0),                    # A
+            self.oa("c2", 0),                    # Q，队长达 high 转 P
+            {"op": "bq"},
+            self.oa("c3", 0),                    # P 态本应排队：OVERLOAD/7
+        ]
+        results = self.run_ops(ops[:-1])
+        self.assertEqual(results[7]["state"], "P")
+        self.assert_failure(ops, 7, "OVERLOAD")
+
+    def test_failed_batch_rolls_back_oa_quota_and_clock(self):
+        # 同一批次内 oa 接纳已扣配额（used=1），随后 la 把配额打满并再越界：
+        # RATE/6、无 stdout，整批回滚（含 oa 的扣减、入队与时钟）。
+        ops = self.base_ops() + [
+            self.qs("B", "a", 2, now=0),
+            self.oa("c1", 0),                    # A：used=1
+            {"op": "la", "c": "c1", "s": "s1", "key": "k", "now": 1},
+            {"op": "la", "c": "c1", "s": "s1", "key": "k", "now": 2},
+        ]
+        self.assert_failure(ops, 6, "RATE")
+        # 活动 cid 重复同样整批失败：CONNECTION/5。
+        ops = self.base_ops() + [
+            self.qs("B", "a", 5, now=0),
+            self.oa("c1", 0),
+            self.oa("c1", 1),
+        ]
+        self.assert_failure(ops, 5, "CONNECTION")
+
+    def test_clock_regression_on_ot_is_input(self):
+        ops = self.base_ops() + [
+            self.qs("B", "a", 5, now=5),
+            self.oa("c1", 5),
+            {"op": "ot", "now": 4},              # 时钟倒退
+        ]
+        self.assert_failure(ops, 2, "INPUT")
+
+    def test_unconfigured_quota_unlimited(self):
+        ops = self.base_ops(cap=2) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[3]["state"], "A")
+        self.assertEqual(results[4]["state"], "A")
+
+    def test_record_replay_round_trip(self):
+        ops = self.base_ops() + [
+            self.qs("B", "a", 1, span=10),
+            self.oa("c1", 0),
+            self.oa("c2", 0),                    # Q
+            {"op": "ot", "now": 10},             # 跨窗接纳
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
