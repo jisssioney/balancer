@@ -426,6 +426,30 @@ A/R 的 case 数，attempts 为各 case attempts 求和，retries 与 remaps 均
 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节行为照常，仅用标准库，
 其他子命令行为不变且不属本题范围。
 
+只读过载预演：oi 精确键序 op,key,c,s,bc,cc,sc,timeout,max,now（键须
+按此序出现）；key/c/s 与三成本 bc/cc/sc 沿用 la 新键集校验（成本 ∈
+[0,10^9] 非 bool 整数且三项不得全零），timeout/max/now 沿用 fr
+（timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数），now 纳入
+共用非递减时钟，倒退报 INPUT/2。须已配置 chash 与 os，否则报 STATE/4；
+环同 route，仅 healthy、熔断 C、排空 A 后端，环内无合格候选同样报
+STATE/4（STATE 判定先于任何准入；时钟倒退仍按全局序报 INPUT）。自 key
+哈希点按 fr 环序遍历至多 max 个不同后端，每个候选即一次尝试，按 fault、
+slow、capacity、quota 优先级短路判失败：窗口内 D 或故障相位 F 归 fault、
+耗时 0；S 且 v>timeout 归 slow、耗时 timeout；conns≥os.cap 归
+capacity、耗时 0；以 now 只读补令牌并推进固定窗后，任一在配 B/C/S 桶
+令牌不足（t<成本）或固定窗配额不足（used+成本>limit）归 quota、耗时 0
+（未配桶/配额即不限制，同 la）。四闸全过即 A 并停止，耗尽全部尝试为 R。
+S 尝试（v≤timeout 通过 slow 闸、其后因 capacity/quota 失败者亦然）
+延迟为 min(v,timeout)，其余尝试延迟 0。结果键序
+op,state,backend,attempts,latency,retries,remaps,fault,slow,capacity,
+quota；state ∈ A/R，backend 仅 A 为 id、否则 null，fault/slow/capacity/
+quota 四值为对应原因的失败尝试数，retries=remaps=max(attempts-1,0)，
+latency 为各次延迟之和。除共用时钟按 now 推进外不改任何运行态：不读写
+粘性映射、不建连、不耗令牌、不滚窗（桶 t/at 与配额 window/used 只读
+判定后还原）、不记 mr/fm/fh/过载历史，失败批次天然回滚。oi 时间
+O(BV)、额外空间 O(BV)；紧凑 UTF-8 固定键序 JSON、单换行及 record/
+replay 逐字节行为照常，仅用标准库，其他子命令行为不变且不属本题范围。
+
 故障演练统计：fx/fr 访问后端时按 now 取唯一活动段，依 fq 的 effect 与
 活动段种类 D/F/S 记账：effect 为 D 或 S 则当前段种类 affected 加 1；D
 失败（fx 跳过、fr 尝试失败）或 S 耗时超 timeout 则 rejected 加 1。fx
@@ -1282,7 +1306,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
-        "fs", "fx", "fr", "fi",
+        "fs", "fx", "fr", "fi", "oi",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
@@ -1930,6 +1954,35 @@ def parse_op(raw_op):
             parse_fault_num(raw_op["now"]),
         )
 
+    if name == "oi":
+        # 只读过载预演：精确键序 op,key,c,s,bc,cc,sc,timeout,max,now（键须
+        # 按此序出现）；key/c/s 与三成本沿用 la 新键集校验（三项成本不得全
+        # 零），timeout/max/now 沿用 fr（timeout/now ∈ [0,10^9]、max ∈
+        # [1,1024]），now 纳入共用非递减时钟。未配环/os 或无合格候选的
+        # STATE 留执行期判（同 fr，先于时钟）。
+        if list(raw_op) != [
+            "op", "key", "c", "s", "bc", "cc", "sc", "timeout", "max", "now",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        bc = parse_cost(raw_op["bc"])
+        cc = parse_cost(raw_op["cc"])
+        sc = parse_cost(raw_op["sc"])
+        if bc == 0 and cc == 0 and sc == 0:
+            # 三项成本全零非法（同 la/oa）。
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "oi",
+            parse_key(raw_op["key"]),
+            parse_key(raw_op["c"]),
+            parse_key(raw_op["s"]),
+            bc,
+            cc,
+            sc,
+            parse_fault_num(raw_op["timeout"]),
+            parse_attempt_max(raw_op["max"]),
+            parse_fault_num(raw_op["now"]),
+        )
+
     if name in ("ce", "ci"):
         if name == "ce":
             if keys != {"op"}:
@@ -2430,6 +2483,112 @@ def run(raw):
             break
         return state, chosen_id, attempts, latency
 
+    def simulate_oi(tokens, digests, key, c, s, costs,
+                    timeout, max_attempts, now):
+        """只读模拟一次 oi：在 fr 同款哈希遍历上叠加 la 的准入判定，返回
+        (state, backend, attempts, latency, retries, remaps,
+        fault_n, slow_n, capacity_n, quota_n)。
+
+        自 key 哈希点按环序遍历至多 max_attempts 个不同的 healthy、熔断 C、
+        排空 A 后端（tokens 已只含合格后端，调用方先就空环报 STATE），每个
+        候选即一次尝试，按 fault、slow、capacity、quota 优先级短路判失败：
+        D/故障相位 F 归 fault、耗时 0；S 的 v>timeout 归 slow、耗时
+        timeout；conns>=os.cap 归 capacity、耗时 0；以 now 只读补令牌并
+        推进固定窗后任一在配 B/C/S 桶令牌或配额不足归 quota、耗时 0。S
+        尝试（含其后因 capacity/quota 失败者）延迟一律 min(v,timeout)，
+        其余尝试 0。全部通过即 A 并终止，耗尽为 R。四原因为对应失败尝试
+        数；retries=remaps=max(attempts-1,0)。桶 t/at 与配额 window/used
+        在每次尝试后还原：除共用时钟外不改变任何运行态，亦不建连或记账。"""
+        cap = queue_cfg[0]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash)
+        if index == len(tokens):
+            index = 0  # 越界回绕到环首
+        attempts = 0
+        latency = 0
+        chosen_id = None
+        state = "R"
+        fault_n = slow_n = capacity_n = quota_n = 0
+        seen = set()
+        for offset in range(len(tokens)):
+            if attempts >= max_attempts:
+                break
+            backend_id = tokens[(index + offset) % len(tokens)][3]
+            if backend_id in seen:
+                continue
+            seen.add(backend_id)
+            record = backends[backend_id]
+            segment = active_fault(record, now)
+            effect = fault_effect(segment, now)
+            attempts += 1
+            if effect == "D":
+                # D/故障相位 F：fault 失败、耗时 0。
+                fault_n += 1
+                continue
+            if effect == "S":
+                # S 尝试延迟恒为 min(v,timeout)；v>timeout 归 slow 后重试，
+                # v<=timeout 通过本闸并继续 capacity/quota（延迟仍计 v）。
+                cost_v = segment[3]
+                latency += min(cost_v, timeout)
+                if cost_v > timeout:
+                    slow_n += 1
+                    continue
+            if record["conns"] >= cap:
+                # 连接数达 os.cap：capacity 失败、耗时 0。
+                capacity_n += 1
+                continue
+            # 收集该后端/客户端/服务类在配的桶与固定窗配额（未配即不限制，
+            # 同 la）；快照 t/at 与 window/used，补令牌、滚窗后只读判定，
+            # 无论成败随即还原，故下一尝试仍见原始令牌且本操作零写入。
+            chosen_buckets = []
+            chosen_quotas = []
+            for scope, limit_id, cost in (
+                ("B", backend_id, costs[0]),
+                ("C", c, costs[1]),
+                ("S", s, costs[2]),
+            ):
+                bucket = buckets.get((scope, limit_id))
+                if bucket is not None:
+                    chosen_buckets.append((bucket, cost))
+                quota = quotas.get((scope, limit_id))
+                if quota is not None:
+                    chosen_quotas.append((quota, cost))
+            bucket_snap = [(b, b["t"], b["at"]) for b, _ in chosen_buckets]
+            quota_snap = [
+                (q, q["window"], q["used"]) for q, _ in chosen_quotas
+            ]
+            for bucket, _ in chosen_buckets:
+                refill(bucket, now)
+            for quota, _ in chosen_quotas:
+                roll_quota(quota, now)
+            insufficient = not all(
+                bucket["t"] >= cost for bucket, cost in chosen_buckets
+            ) or not all(
+                quota["used"] + cost <= quota["limit"]
+                for quota, cost in chosen_quotas
+            )
+            for bucket, t_value, at_value in bucket_snap:
+                bucket["t"] = t_value
+                bucket["at"] = at_value
+            for quota, window_value, used_value in quota_snap:
+                quota["window"] = window_value
+                quota["used"] = used_value
+            if insufficient:
+                # 任一在配桶或配额不足：quota 失败、耗时 0。
+                quota_n += 1
+                continue
+            # 四闸全过：A 并停止（不耗令牌、不建连）。
+            chosen_id = backend_id
+            state = "A"
+            break
+        retries = max(attempts - 1, 0)
+        return (
+            state, chosen_id, attempts, latency, retries, retries,
+            fault_n, slow_n, capacity_n, quota_n,
+        )
+
     def fault_window_stats(record, now):
         """取 now//60 窗的故障记账计数组（惰性建窗），并只保留最近 60 窗。
         时钟非递减，新建窗时丢弃 cutoff 之前的旧窗；空窗不预建。fm 累计与
@@ -2784,7 +2943,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
-            "ci", "cb", "fx", "fr", "fi", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "fx", "fr", "fi", "oi", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh",
         ):
             now = op[-1]
@@ -4838,6 +4997,43 @@ def run(raw):
                         "retries": total_retries,
                         "remaps": total_retries,
                     },
+                }
+            )
+
+        elif op[0] == "oi":
+            # 只读过载预演：在 fr 的哈希遍历上叠加 la 的准入规则，除共用时钟
+            # 按 now 推进外不改任何运行态（不读写粘性映射、不建连、不耗令牌、
+            # 不滚窗、不记 mr/fm/fh/过载历史），桶/配额只读判定后随即还原，
+            # 失败批次天然回滚。
+            _, key, c, s, bc, cc, sc, timeout, max_attempts, now = op
+            if ring_vnodes is None or queue_cfg is None:
+                # 须已配置 chash 与 os；STATE 先于环构建与任何准入判定。
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                # 环内无 healthy、熔断 C、排空 A 候选同样报 STATE（同 fr/fi）。
+                fail(EXIT_STATE, "STATE")
+            digests = [token[0] for token in tokens]
+            (
+                state, chosen_id, attempts, latency, retries, remaps,
+                fault_n, slow_n, capacity_n, quota_n,
+            ) = simulate_oi(
+                tokens, digests, key, c, s, (bc, cc, sc),
+                timeout, max_attempts, now
+            )
+            results.append(
+                {
+                    "op": "oi",
+                    "state": state,
+                    "backend": chosen_id,
+                    "attempts": attempts,
+                    "latency": latency,
+                    "retries": retries,
+                    "remaps": remaps,
+                    "fault": fault_n,
+                    "slow": slow_n,
+                    "capacity": capacity_n,
+                    "quota": quota_n,
                 }
             )
 
