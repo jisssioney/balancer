@@ -351,6 +351,19 @@ op,expired（cid 数组）。tk/tg/tx 的 now 纳入共用非递减时钟；未 
 tk/tg/tx 报 STATE。close 与 dg 强关同样清理连接的空闲状态。ts/tk/tg 为
 O(1)，tx 为 O(C)，额外空间 O(C)。
 
+不可用原因分钟历史：按 window=now//60 为每后端记四类不可用事件——
+probe 使 healthy 转 unhealthy 时 health 加 1；dr 使 A 转 D/X 时 drain
+加 1；cr 使 C/H 转 O 时 circuit 加 1；oa 返回 Q 且所选后端 conns≥os.cap
+时 overload 加 1（同一 oa 多重阻塞只记一次）。重报与无转换不记，各计数
+封顶 10^18；OVERLOAD/7 回滚且不记。每后端只保留最近 60 窗，空窗不预建；
+remove 后重加与 ci 成功清空。rh 精确键集 op,id,from,to,now；三数为
+[0,10^9] 非 bool 整数，now 纳入共用非递减时钟，须 from≤to≤now//60 且
+to-from<60；返回键序 op,id,windows；windows 覆盖 from 至 to 所有窗并
+升序，项键序 window,health,drain,circuit,overload，值为非负整数，空窗
+全 0。键集、类型、范围、关系或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，
+from 早于 max(0,now//60-59) 报 STATE/4。rh 只读，失败批次回滚；记账
+O(1)，rh 时间 O(R)、额外空间 O(60B)；record/replay 逐字节覆盖。
+
 确定性操作记录：record 把原始 stdin 字节作为全新 run 输入执行，无论底层
 成功或按既有错误失败，均退出 0、stderr 为空，stdout 输出一行紧凑 JSON
 记录，键序 version,stdin,exit,stdout,stderr：version=1（非 bool 整数），
@@ -382,8 +395,9 @@ EXIT_REPLAY = 8
 DEFAULT_FAIL = 3
 DEFAULT_SUCCESS = 2
 
-# mr 各计数（requests/errors/retries/remaps/延迟桶）与 fm 各计数
-# （affected/rejected/retries/remaps/recovered）均封顶 10^18。
+# mr 各计数（requests/errors/retries/remaps/延迟桶）、fm 各计数
+# （affected/rejected/retries/remaps/recovered）与 rh 四类不可用原因计数
+# （health/drain/circuit/overload）均封顶 10^18。
 METRIC_CAP = 10 ** 18
 
 
@@ -973,7 +987,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh", "ms", "mx",
+        "mr", "mg", "mh", "ms", "mx", "rh",
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
@@ -1327,6 +1341,19 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("mx", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "rh":
+        # 不可用原因分钟历史：精确键集 op,id,from,to,now，只读；数值与关系
+        # 约束同 mh，from 过早的 STATE 留执行期判（未知 id 先 BACKEND）。
+        if keys != {"op", "id", "from", "to", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("rh", parse_backend_id(raw_op["id"]), start, end, now)
 
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
@@ -1775,6 +1802,24 @@ def run(raw):
         bucket = bisect.bisect_left((1, 10, 100, 1000), ms)
         metrics[4][bucket] = min(METRIC_CAP, metrics[4][bucket] + 1)
 
+    def record_reason(record, index, now):
+        """不可用原因分钟记账（O(1)）：写入 window=now//60 所属窗，每后端只
+        保留最近 60 窗，空窗不预建，计数封顶 10^18。index 依次为
+        0=health（probe 转 unhealthy）、1=drain（dr 转 D/X）、
+        2=circuit（cr 转 O）、3=overload（oa 入队且 conns≥cap）；仅在确有
+        转换/入队时调用，重报与无转换不记。"""
+        window = now // 60
+        history = record["reason_hist"]
+        counts = history.get(window)
+        if counts is None:
+            # 首次记账该窗：新建计数；时钟非递减，顺带丢弃 60 窗前的旧窗。
+            counts = [0, 0, 0, 0]
+            history[window] = counts
+            cutoff = window - 59
+            for old in [w for w in history if w < cutoff]:
+                del history[old]
+        counts[index] = min(METRIC_CAP, counts[index] + 1)
+
     def fault_active(record, now):
         """mg 的 removed=fault 判定：fs 登记且 now ∈ [a,z) 窗口内时，D 恒为
         故障，F 仅 ((now-a)//v)%2=0 相位为故障；S（仅变慢）与非故障相位
@@ -1916,7 +1961,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
-            "ms", "mx",
+            "ms", "mx", "rh",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
         ):
@@ -2010,6 +2055,10 @@ def run(raw):
                 # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
                 # ci 成功即清空。
                 "samples": {},
+                # 不可用原因分钟历史（rh）：window -> [health, drain,
+                # circuit, overload] 四计数，仅保留最近 60 窗，空窗不预建；
+                # remove 后重加、ci 成功即清空。
+                "reason_hist": {},
             }
             results.append({"op": "add", "ok": True})
 
@@ -2239,6 +2288,8 @@ def run(raw):
                         record["successes"] = 0
                         record["failures"] = 0
                         record["current"] = 0
+                        # healthy 转 unhealthy：记入当窗 health 原因。
+                        record_reason(record, 0, now)
                 record["probe_now"] = now
                 record["probe_ok"] = ok
             results.append({"op": "probe", "ok": True})
@@ -2431,6 +2482,8 @@ def run(raw):
                     circuit["state"] = "O"
                     circuit["next"] = now + w
                     circuit["used"] = 0
+                    # C 转 O：记入当窗 circuit 原因。
+                    record_reason(record, 2, now)
             else:  # H
                 if ok:
                     circuit["used"] += 1
@@ -2444,6 +2497,8 @@ def run(raw):
                     circuit["state"] = "O"
                     circuit["next"] = now + w
                     circuit["used"] = 0
+                    # H 转 O：记入当窗 circuit 原因。
+                    record_reason(record, 2, now)
             circuit["cr_now"] = now
             circuit["cr_ok"] = ok
             results.append({"op": "cr", "ok": True})
@@ -2511,6 +2566,8 @@ def run(raw):
                 else:
                     drain["state"] = "X"
                     drain["end"] = now
+                # A 转 D/X：记入当窗 drain 原因；D/X 再 dr 幂等不记。
+                record_reason(record, 1, now)
             # D/X 再 dr 幂等，不改状态。
             results.append({"op": "dr", "ok": True})
 
@@ -2675,6 +2732,11 @@ def run(raw):
                 if len(wait_queue) >= queue_cfg[1]:
                     # FIFO 已满，尾拒绝。
                     fail(EXIT_OVERLOAD, "OVERLOAD")
+                # 返回 Q 且所选后端 conns≥os.cap：记入当窗 overload 原因；
+                # 同一 oa 多重阻塞只记一次，OVERLOAD/7 回滚不记。
+                chosen_record = backends[backend_id]
+                if chosen_record["conns"] >= queue_cfg[0]:
+                    record_reason(chosen_record, 3, now)
                 # 三项成本随请求入队，ot 重试时按此成本扣减。新键追加到
                 # OrderedDict 队尾，即 FIFO 入队（重复已在上方拒绝）。
                 wait_queue[cid] = (cid, flow, c, s, key, bc, cc, sc, now)
@@ -2960,6 +3022,38 @@ def run(raw):
                 )
             results.append({"op": "mx", "id": backend_id, "windows": windows})
 
+        elif op[0] == "rh":
+            # 不可用原因分钟历史（只读）：未知 id 报 BACKEND，from 早于最近
+            # 60 窗下界报 STATE（与 mh 同序）；不改任何计数，失败批次天然
+            # 回滚。返回键序 op,id,windows；windows 覆盖 from..to 并升序，
+            # 项键序 window,health,drain,circuit,overload；空窗四项为 0。
+            # 计数逐窗拷入新 dict，避免结果被批次内后续记账污染。
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = record["reason_hist"]
+            windows = []
+            for window in range(start, end + 1):
+                counts = history.get(window)
+                if counts is None:
+                    # 空窗：四项全 0。
+                    counts = (0, 0, 0, 0)
+                windows.append(
+                    {
+                        "window": window,
+                        "health": counts[0],
+                        "drain": counts[1],
+                        "circuit": counts[2],
+                        "overload": counts[3],
+                    }
+                )
+            results.append({"op": "rh", "id": backend_id, "windows": windows})
+
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
             exported_backends = []
@@ -3107,6 +3201,8 @@ def run(raw):
                     "fault_affected": False,
                     # ci 成功清空故障统计分钟历史。
                     "fault_hist": {},
+                    # ci 成功清空不可用原因分钟历史。
+                    "reason_hist": {},
                 }
 
             new_backends = {}
