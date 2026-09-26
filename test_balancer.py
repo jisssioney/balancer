@@ -204,6 +204,14 @@ def config_v7(weight, faults=(), **overrides):
     return config
 
 
+def config_v8(weight, faults=(), quotas=(), **overrides):
+    """最小 version=8 配置：单后端 a，十键同 v7 且末置 quotas 数组。"""
+    config = config_v7(weight, faults=faults, **overrides)
+    config["version"] = 8
+    config["quotas"] = list(quotas)
+    return config
+
+
 class ConfigCommitTest(unittest.TestCase):
     """配置提交与回滚（ci 提交、cl 历史、cb 回滚）。"""
 
@@ -219,9 +227,9 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(list(result), ["op", "current", "commits"])
         self.assertEqual(result, {"op": "cl", "current": None, "commits": []})
 
-    def test_ci_commits_normalized_v7(self):
-        # version=1 旧结构成功加载后，提交为规范化 version=7 配置
-        # （faults 空计划）。
+    def test_ci_commits_normalized_v8(self):
+        # version=1 旧结构成功加载后，提交为规范化 version=8 配置
+        # （faults/quotas 空计划）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -251,7 +259,7 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(commit["rev"], 1)
         self.assertEqual(
             commit["config"],
-            config_v7(2),
+            config_v8(2),
         )
 
     def test_failed_ci_does_not_commit(self):
@@ -298,8 +306,8 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(
             results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
         )
-        # 回滚后当前配置即 rev=1 的规范化 v7 快照（faults 空计划）。
-        self.assertEqual(results[3]["config"], config_v7(1))
+        # 回滚后当前配置即 rev=1 的规范化 v8 快照（faults/quotas 空计划）。
+        self.assertEqual(results[3]["config"], config_v8(1))
 
     def test_cb_restores_runtime_state(self):
         # 回滚按目标快照重建默认运行态：调度策略、限流桶、预热自 cb.now 起算。
@@ -397,17 +405,18 @@ class FaultHotReloadTest(unittest.TestCase):
     def seg(self, backend="a", k="D", a=0, z=10, v=0):
         return {"id": backend, "k": k, "a": a, "z": z, "v": v}
 
-    def test_ce_exports_v7_with_empty_faults_last(self):
+    def test_ce_exports_v8_with_empty_quotas_last(self):
         results = self.run_ops([{"op": "add", "id": "a", "weight": 1},
                                 {"op": "ce"}])
         config = results[-1]["config"]
         self.assertEqual(
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
-             "idle", "backpressure", "scheduler", "faults"],
+             "idle", "backpressure", "scheduler", "faults", "quotas"],
         )
-        self.assertEqual(config["version"], 7)
+        self.assertEqual(config["version"], 8)
         self.assertEqual(config["faults"], [])
+        self.assertEqual(config["quotas"], [])
 
     def test_ci_loads_faults_observed_by_fq(self):
         # 乱序提交（段与后端），ce/fq 按后端加入序、段 a 升序规范化。
@@ -661,7 +670,7 @@ class FaultHotReloadTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
         # ce 输出逐字节固定键序、紧凑、单换行。
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":7', run_stdout)
+        self.assertIn(b'"version":8', run_stdout)
 
 
 class FaultTimelineTest(unittest.TestCase):
@@ -1385,7 +1394,7 @@ class QuotaWindowTest(unittest.TestCase):
         ]
         self.assert_failure(ops, 4, "STATE")
 
-    def test_ci_clears_quotas_and_ce_unchanged(self):
+    def test_ci_v7_clears_quotas_and_ce_exports_empty(self):
         ops = self.base_ops() + [
             {"op": "qs", "scope": "C", "id": "c",
              "limit": 1, "span": 1, "now": 0},
@@ -1393,12 +1402,13 @@ class QuotaWindowTest(unittest.TestCase):
             {"op": "ce"},
         ]
         results = self.run_ops(ops)
-        # ce 导出不变：精确十键、无配额内容。
+        # ce 导出精确十一键、quotas 末置；v7 热加载不携带配额，导出为空。
         self.assertEqual(
             list(results[4]["config"]),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
-             "idle", "backpressure", "scheduler", "faults"],
+             "idle", "backpressure", "scheduler", "faults", "quotas"],
         )
+        self.assertEqual(results[4]["config"]["quotas"], [])
         # ci 成功后配额已清空。
         self.assert_failure(
             self.base_ops() + [
@@ -1439,6 +1449,273 @@ class QuotaWindowTest(unittest.TestCase):
             (rep_code, rep_stdout, rep_stderr),
             (run_code, run_stdout, run_stderr),
         )
+
+
+class QuotaHotReloadTest(unittest.TestCase):
+    """version=8 quotas 固定窗口配额纳入 ce/ci/cl/cb 热加载与回滚。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def quota(self, scope="C", qid="c", limit=5, span=10):
+        return {"scope": scope, "id": qid, "limit": limit, "span": span}
+
+    @staticmethod
+    def _raw(**fields):
+        # 构造一个嵌入 quotas 原始 JSON 片段的 v8 config 字节。
+        parts = [
+            '"version":8',
+            '"backends":[{"id":"a","weight":1,"d":0,"fail":3,"success":2,'
+            '"circuit":null,"drain":null,"endpoint":null}]',
+            '"vnodes":null', '"limits":[]', '"overload":null',
+            '"sticky":null', '"idle":null', '"backpressure":null',
+            '"scheduler":{"pick":"W"}', '"faults":[]',
+        ]
+        for key, value in fields.items():
+            parts.append('"%s":%s' % (key, value))
+        return ("{" + ",".join(parts) + "}").encode("utf-8")
+
+    @staticmethod
+    def _enc(ops):
+        return encode_ops(ops)
+
+    def test_ce_exports_quotas_sorted_without_runtime(self):
+        results = self.run_ops([
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "qs", "scope": "S", "id": "s2",
+             "limit": 3, "span": 7, "now": 0},
+            {"op": "qs", "scope": "C", "id": "c2",
+             "limit": 2, "span": 5, "now": 0},
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 9, "span": 4, "now": 0},
+            {"op": "qs", "scope": "C", "id": "c1",
+             "limit": 1, "span": 6, "now": 0},
+            # UTF-8 字节升序："z"(0x7A) 先于 "é"(0xC3..)。
+            {"op": "qs", "scope": "C", "id": "é",
+             "limit": 4, "span": 8, "now": 0},
+            {"op": "qs", "scope": "C", "id": "z",
+             "limit": 6, "span": 9, "now": 0},
+            {"op": "ce"},
+        ])
+        quotas = results[-1]["config"]["quotas"]
+        self.assertEqual(
+            [(q["scope"], q["id"]) for q in quotas],
+            [("B", "a"), ("C", "c1"), ("C", "c2"), ("C", "z"), ("C", "é"),
+             ("S", "s2")],
+        )
+        # 项精确键序 scope,id,limit,span，不含 window/used 运行态。
+        for item in quotas:
+            self.assertEqual(list(item), ["scope", "id", "limit", "span"])
+
+    def test_ci_v8_loads_quotas_with_fresh_window(self):
+        config = config_v8(1, quotas=[
+            {"scope": "B", "id": "a", "limit": 5, "span": 10},
+            {"scope": "S", "id": "s", "limit": 7, "span": 100},
+        ])
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 25},
+            {"op": "qg", "scope": "B", "id": "a", "now": 25},
+            {"op": "qg", "scope": "S", "id": "s", "now": 25},
+        ])
+        # 各配额 window=now//span、used=0。
+        self.assertEqual((results[1]["window"], results[1]["used"]), (2, 0))
+        self.assertEqual((results[2]["window"], results[2]["used"]), (0, 0))
+
+    def test_v8_requires_exact_quotas_key(self):
+        # 十键结构但 version=8（v8 结构须含 quotas）。
+        missing = config_v7(1)
+        missing["version"] = 8
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": missing, "now": 0}]),
+            2, "INPUT",
+        )
+        # 十一键结构但 version=7（v7 结构不含 quotas）。
+        extra = config_v8(1)
+        extra["version"] = 7
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": extra, "now": 0}]),
+            2, "INPUT",
+        )
+
+    def test_quotas_validation_errors(self):
+        cases = [
+            # quotas 非数组。
+            b'{"op":"ci","now":0,"config":' + self._raw(quotas="{}") + b"}",
+            # 项缺 span。
+            b'{"op":"ci","now":0,"config":'
+            + self._raw(quotas='[{"scope":"C","id":"c","limit":1}]') + b"}",
+            # 项键序错误。
+            b'{"op":"ci","now":0,"config":'
+            + self._raw(quotas='[{"scope":"C","id":"c","span":1,"limit":1}]')
+            + b"}",
+            # 项多 window 键（运行态不随配置导入）。
+            b'{"op":"ci","now":0,"config":'
+            + self._raw(
+                quotas='[{"scope":"C","id":"c","limit":1,"span":1,"window":0}]'
+            ) + b"}",
+            # id 空串。
+            b'{"op":"ci","now":0,"config":'
+            + self._raw(quotas='[{"scope":"C","id":"","limit":1,"span":1}]')
+            + b"}",
+            # id 非 UTF-8（孤立代理）。
+            b'{"op":"ci","now":0,"config":'
+            + self._raw(
+                quotas='[{"scope":"C","id":"\\ud800","limit":1,"span":1}]'
+            ) + b"}",
+            # scope 越界。
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(scope="X")])}]),
+            # limit 越界（0、10^18+1、bool）。
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(limit=0)])}]),
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(limit=10 ** 18 + 1)])}]),
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(limit=True)])}]),
+            # span 越界（0、10^9+1、bool）。
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(span=0)])}]),
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(span=10 ** 9 + 1)])}]),
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(span=True)])}]),
+            # 重复 (scope,id)。
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(), self.quota()])}]),
+            # 乱序：scope 逆序。
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(scope="C"), self.quota(scope="B")])}]),
+            # 乱序：同 scope 内 id 逆序。
+            self._enc([{"op": "ci", "now": 0, "config": config_v8(
+                1, quotas=[self.quota(qid="c2"), self.quota(qid="c1")])}]),
+        ]
+        for raw in cases:
+            self.assert_failure(raw, 2, "INPUT")
+
+    def test_unknown_quota_backend_is_backend(self):
+        config = config_v8(
+            1, quotas=[{"scope": "B", "id": "ghost", "limit": 1, "span": 1}]
+        )
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": config, "now": 0}]),
+            3, "BACKEND",
+        )
+        # INPUT 先于 BACKEND：未知 id 但 limit 非法仍判 INPUT。
+        bad = config_v8(
+            1, quotas=[{"scope": "B", "id": "ghost", "limit": 0, "span": 1}]
+        )
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": bad, "now": 0}]),
+            2, "INPUT",
+        )
+
+    def test_backend_precedes_state_for_unknown_quota(self):
+        config = config_v8(
+            1, quotas=[{"scope": "B", "id": "ghost", "limit": 1, "span": 1}]
+        )
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": config_v8(1), "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                {"op": "ci", "config": config, "now": 2},
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_active_connection_or_queue_is_state(self):
+        with_quota = config_v8(1, quotas=[self.quota()])
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": config_v8(1), "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                {"op": "ci", "config": with_quota, "now": 2},
+            ]),
+            4, "STATE",
+        )
+
+    def test_cb_restores_target_quotas_and_resets_window(self):
+        with_quota = config_v8(
+            1, quotas=[{"scope": "C", "id": "c", "limit": 5, "span": 10}]
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": with_quota, "now": 25},
+            {"op": "ci", "config": config_v8(1), "now": 30},
+            {"op": "cb", "rev": 1, "now": 45},
+            {"op": "qg", "scope": "C", "id": "c", "now": 45},
+            {"op": "cl"},
+        ])
+        self.assertEqual(
+            results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
+        )
+        # 恢复目标 quotas，以 cb.now 重置 window=45//10、used=0。
+        self.assertEqual((results[3]["window"], results[3]["used"]), (4, 0))
+        commits = results[4]["commits"]
+        self.assertEqual([c["config"]["version"] for c in commits], [8, 8, 8])
+        self.assertEqual(
+            commits[0]["config"]["quotas"],
+            [{"scope": "C", "id": "c", "limit": 5, "span": 10}],
+        )
+        self.assertEqual(commits[1]["config"]["quotas"], [])
+        self.assertEqual(
+            commits[2]["config"]["quotas"], commits[0]["config"]["quotas"]
+        )
+
+    def test_export_and_commits_exclude_quota_runtime(self):
+        config = config_v8(
+            1, vnodes=4,
+            quotas=[{"scope": "B", "id": "a", "limit": 5, "span": 10}],
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            # la 消耗 B 配额 1（成本缺省为 1）。
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+            {"op": "qg", "scope": "B", "id": "a", "now": 0},
+            {"op": "ce"},
+            {"op": "cl"},
+        ])
+        self.assertEqual(results[2]["used"], 1)
+        # ce 与 cl 提交只含登记值，不含 window/used。
+        exported = results[3]["config"]["quotas"]
+        self.assertEqual(
+            exported, [{"scope": "B", "id": "a", "limit": 5, "span": 10}]
+        )
+        commit = results[4]["commits"][0]["config"]
+        self.assertEqual(commit["version"], 8)
+        self.assertEqual(commit["quotas"], exported)
+
+    def test_record_replay_covers_v8_quotas(self):
+        config = config_v8(
+            1, quotas=[{"scope": "B", "id": "a", "limit": 5, "span": 10}]
+        )
+        ops = [
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "qg", "scope": "B", "id": "a", "now": 1},
+            {"op": "ce"},
+            {"op": "cl"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+        self.assertIn(b'"version":8', run_stdout)
+        self.assertIn(b'"quotas"', run_stdout)
 
 
 class V7FaultNormalizationTest(unittest.TestCase):
