@@ -364,6 +364,227 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
 
 
+class FaultTimelineTest(unittest.TestCase):
+    """fp 故障时间线：多段、规范化、fq 快照与 fx/fm 跨段恢复记账。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if err:
+            self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def test_multi_segment_fq_effects(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fp", "items": [
+                {"id": "a", "k": "D", "a": 0, "z": 10, "v": 0},
+                {"id": "a", "k": "S", "a": 10, "z": 20, "v": 3},
+            ]},
+            {"op": "fq", "now": 5},
+            {"op": "fq", "now": 15},
+            {"op": "fq", "now": 20},
+        ]
+        results = self.run_ops(ops)
+        fq = [r for r in results if r["op"] == "fq"]
+        self.assertEqual(
+            [(f["k"], f["effect"]) for f in fq[0]["faults"]],
+            [("D", "D"), ("S", "N")],
+        )
+        self.assertEqual((fq[0]["down"], fq[0]["slow"]), (1, 0))
+        self.assertEqual(
+            [(f["k"], f["effect"]) for f in fq[1]["faults"]],
+            [("D", "N"), ("S", "S")],
+        )
+        self.assertEqual((fq[1]["down"], fq[1]["slow"]), (0, 1))
+        # 间隙/越界：全部段 effect=N。
+        self.assertTrue(
+            all(f["effect"] == "N" for f in fq[2]["faults"])
+        )
+        self.assertEqual((fq[2]["down"], fq[2]["slow"]), (0, 0))
+
+    def test_unordered_segments_normalized_and_idempotent(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fp", "items": [
+                {"id": "a", "k": "S", "a": 10, "z": 20, "v": 3},
+                {"id": "a", "k": "D", "a": 0, "z": 10, "v": 0},
+            ]},
+            {"op": "fq", "now": 5},
+        ]
+        results = self.run_ops(ops)
+        fq = results[-1]
+        # 输出按 a 升序规范化。
+        self.assertEqual([(f["k"], f["a"]) for f in fq["faults"]],
+                         [("D", 0), ("S", 10)])
+
+    def test_recovered_attributed_to_previous_segment_kind(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "fp", "items": [
+                {"id": "a", "k": "D", "a": 0, "z": 5, "v": 0},
+                {"id": "a", "k": "S", "a": 5, "z": 10, "v": 1},
+            ]},
+            {"op": "fx", "cid": "c1", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "now": 0},
+            {"op": "fx", "cid": "c2", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "now": 5},
+            {"op": "fm", "id": "a"},
+        ]
+        results = self.run_ops(ops)
+        fm = results[-1]
+        # D 段受影响并被拒；进入相邻 S 段时 D 记 recovered，S 记 affected。
+        self.assertEqual(
+            fm["D"],
+            {"affected": 1, "rejected": 1, "retries": 0,
+             "remaps": 1, "recovered": 1},
+        )
+        self.assertEqual(fm["S"]["affected"], 1)
+        self.assertEqual(fm["S"]["recovered"], 0)
+
+    def test_fp_empty_is_noop(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 10, "v": 0},
+            {"op": "fp", "items": []},
+            {"op": "fq", "now": 0},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["down"], 1)
+
+    def test_fb_clears_unlisted(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fp", "items": [
+                {"id": "a", "k": "D", "a": 0, "z": 10, "v": 0},
+            ]},
+            {"op": "fb", "items": []},
+            {"op": "fq", "now": 0},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["faults"], [])
+
+    def test_fp_rejections(self):
+        # 顶层键序错误。
+        self.assert_failure(
+            b'{"ops":[{"items":[],"op":"fp"}]}', 2, "INPUT"
+        )
+        # 项键序错误。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "fp", "items": [
+                    {"id": "a", "z": 2, "k": "D", "a": 1, "v": 0},
+                ]},
+            ]),
+            2, "INPUT",
+        )
+        # items 不是数组。
+        self.assert_failure(
+            b'{"ops":[{"op":"fp","items":{}}]}', 2, "INPUT"
+        )
+        # 同后端段重叠。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "fp", "items": [
+                    {"id": "a", "k": "D", "a": 0, "z": 5, "v": 0},
+                    {"id": "a", "k": "D", "a": 4, "z": 9, "v": 0},
+                ]},
+            ]),
+            2, "INPUT",
+        )
+        # 项数超 4096。
+        too_many = [
+            {"id": "a", "k": "D", "a": i, "z": i + 1, "v": 0}
+            for i in range(4097)
+        ]
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "fp", "items": too_many},
+            ]),
+            2, "INPUT",
+        )
+        # 结构合法但 id 未知 -> BACKEND。
+        self.assert_failure(
+            encode_ops([
+                {"op": "fp", "items": [
+                    {"id": "ghost", "k": "D", "a": 0, "z": 5, "v": 0},
+                ]},
+            ]),
+            3, "BACKEND",
+        )
+        # INPUT 先于 BACKEND 判定。
+        self.assert_failure(
+            b'{"ops":[{"op":"fp","items":['
+            b'{"id":"ghost","k":"X","a":0,"z":5,"v":0}]}]}',
+            2, "INPUT",
+        )
+
+    def test_fp_4096_adjacent_segments_accepted(self):
+        segments = [
+            {"id": "a", "k": "D", "a": i, "z": i + 1, "v": 0}
+            for i in range(4096)
+        ]
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fp", "items": segments},
+            {"op": "fq", "now": 7},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["down"], 1)
+        self.assertEqual(results[-1]["slow"], 0)
+        self.assertEqual(len(results[-1]["faults"]), 4096)
+
+    def test_fp_only_replaces_listed_backends(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 10, "v": 0},
+            {"op": "fs", "id": "b", "k": "D", "a": 0, "z": 10, "v": 0},
+            {"op": "fp", "items": [
+                {"id": "a", "k": "S", "a": 0, "z": 10, "v": 2},
+            ]},
+            {"op": "fq", "now": 0},
+        ]
+        results = self.run_ops(ops)
+        faults = results[-1]["faults"]
+        self.assertEqual(
+            [(f["id"], f["k"], f["effect"]) for f in faults],
+            [("a", "S", "S"), ("b", "D", "D")],
+        )
+
+    def test_record_replay_covers_fp(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fp", "items": [
+                {"id": "a", "k": "D", "a": 0, "z": 10, "v": 0},
+                {"id": "a", "k": "S", "a": 10, "z": 20, "v": 3},
+            ]},
+            {"op": "fq", "now": 15},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual(rec_code, 0)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+
+
 class RecordReplayTest(unittest.TestCase):
     """核心输入经 record、replay 逐字节复现退出码、stdout、stderr。"""
 

@@ -144,8 +144,9 @@ op,id,window,requests,qps,concurrency,errors,error_rate,latency,retries,
 remaps,removed：window=now//60，concurrency 为活动连接数，latency 为五整数
 桶，qps=requests/60、error_rate=100*errors/requests（零请求为 0）均下截为
 两位定点串；removed 依次取 drain（D/X）、health（unhealthy）、circuit（熔断
-非 C）、fault（fs 登记且 now 在 [a,z) 窗口内：D 恒为故障，F 仅于
-((now-a)//v)%2=0 相位为故障；S、非故障相位及无前述状态为 null），否则 null；
+非 C）、fault（fs/fb/fp 登记的时间线在 now 有活动段：D 恒为故障，F 仅于
+((now-a)//v)%2=0 相位为故障；S、F 非故障相位、段间隙及无前述状态为
+null），否则 null；
 查询时已跨入新窗（含从未 mr）按零计且不改存储。每次 fx 完成只追加一次同构
 度量、不新增结果项：归属 id 取 fx 结果 backend，backend 为 null 时取环遍历
 首个后端，环内无候选不记；字段为 ok=(state 为 A)、ms=latency、
@@ -296,31 +297,43 @@ op,id,total,first,sticky,expired,removed,health,circuit,drain，计数均为
 record/replay 逐字节覆盖；记账与 hm 均 O(1)，额外空间 O(B)。
 
 时钟故障演练：fs 键集 op,id,k,a,z,v（a,z,v ∈ [0,10^9] 非 bool 整数，
-a<z；k ∈ D/F/S，D 须 v=0，F/S 须 v>0）为后端登记故障演练，同参重报
-幂等、异参覆盖，remove/ci 清除，返回 op,ok；未知 id 报 BACKEND。fx
-键集 op,cid,flow,key,timeout,now（cid/flow/key 沿用 open/route 的校验，
-timeout/now ∈ [0,10^9] 非 bool 整数，now 纳入共用非递减时钟），未
-chash 报 STATE，重复 cid 报 CONNECTION。环同 route（仅健康、熔断 C、
-排空 A 后端），自 key 哈希点遍历不同后端，不读写粘性映射；a≤now<z
-时 D 不可用、F 于 ((now-a)//v)%2=0 时不可用、S 可用且耗时 v，否则耗
-时 0；跳过 D/F 时 remaps 加 1，环外不计。首个可用后端耗时 ≤ timeout
-则按 open 建连、state=A；超限不建连，state=R、backend=该 id、
-latency=耗时；无可用项则 R、backend=null、latency=0。结果键序
-op,cid,state,backend,latency,remaps。fx 完成后按归属 id 追加一次等价
-mr 度量（见请求度量段），结果项本身不变。fs O(1)，fx 仍为 O(BV)。
+a<z；k ∈ D/F/S，D 须 v=0，F/S 须 v>0）把该 id 的故障时间线替换为单段，
+同参（同为该单段）重报幂等、异参覆盖，remove/ci 清除，返回 op,ok；未知
+id 报 BACKEND。fx 键集 op,cid,flow,key,timeout,now（cid/flow/key 沿用
+open/route 的校验，timeout/now ∈ [0,10^9] 非 bool 整数，now 纳入共用非
+递减时钟），未 chash 报 STATE，重复 cid 报 CONNECTION。环同 route（仅
+健康、熔断 C、排空 A 后端），自 key 哈希点遍历不同后端，不读写粘性映射；
+按 now 在时间线中取唯一活动段（段按 a 升序且 [a,z) 不重叠，O(log T_b)），
+段间隙与未登记按 N：活动段 D 不可用、F 于 ((now-a)//v)%2=0 时不可用、S
+可用且耗时 v，否则耗时 0；跳过 D/F 时 remaps 加 1，环外不计。首个可用
+后端耗时 ≤ timeout 则按 open 建连、state=A；超限不建连，state=R、
+backend=该 id、latency=耗时；无可用项则 R、backend=null、latency=0。结
+果键序 op,cid,state,backend,latency,remaps。fx 完成后按归属 id 追加一次
+等价 mr 度量（见请求度量段），结果项本身不变。fs O(1)，fx 仍为 O(BV)。
+
+故障时间线：fp 精确键序 op,items（键须按此序出现），items 为 0..4096 项
+数组，项精确键序 id,k,a,z,v（键须按此序出现），字段约束同 fs；同一 id
+可有多段，规范化按段起点 a 升序（提交顺序允许乱序），半开区间 [a,z) 互不
+重叠，相邻段端点可接（z_i=a_{i+1}）。原子替换各列入 id 的时间线（未列入
+的后端不变，空 items 为无操作）；非法键序、容器、项数、字段、同后端重叠
+或编码报 INPUT/2，未知 id 报 BACKEND/3，依次判定，失败批次原子回滚。同
+计划（与段序无关的同一规范化结果）重报幂等，返回 op,ok=true。
 
 批量故障登记与快照：fb 键集 op,items，items 为数组，项键集 id,k,a,z,v；
 id 须为现存且互异的后端，k 仅 D/F/S，a/z/v 为 [0,10^9] 非 bool 整数且
 a<z，D 须 v=0、F/S 须 v>0（同 fs 各项校验）。items 按后端加入序规范化
-后一次替换全部 fs 登记（未列入后端的登记被清除），空数组清空；与 fs
-同源，fs 仍可改单项，remove/ci 仍清除，fx/fr 与 mg 观察相同结果。计划
-重报幂等，返回键序 op,ok，ok=true。fq 键集 op,now，now 为非负非 bool
-整数，纳入共用非递减时钟；返回键序 op,faults,down,slow：faults 按加入
-序列已登记后端，项键序 id,k,a,z,v,effect，effect ∈ N/D/S——窗口 [a,z)
-外为 N，窗口内 D 为 D、F 按 ((now-a)//v)%2=0 取 D 否则 N、S 取 S；
-down/slow 分别计 effect 为 D/S 的项数。非法键、容器、重复 id、类型、
-范围或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，失败批次原子回滚。
-fb/fq 时间 O(B+T)、额外空间 O(T)。
+后把全体时间线一次替换为各 id 的单段（未列入后端的时间线被清空），空数
+组清空；与 fs/fp 同源，fs 仍可改单项，remove/ci 仍清除，fx/fr 与 mg 观
+察相同结果。计划重报幂等，返回键序 op,ok，ok=true。fq 键集 op,now，now
+为非负非 bool 整数，纳入共用非递减时钟；返回键序 op,faults,down,slow：
+faults 列出全部段，按后端加入序、同后端段起点 a 升序，项键序
+id,k,a,z,v,effect，effect ∈ N/D/S——窗口 [a,z) 外为 N，窗口内 D 为 D、
+F 按 ((now-a)//v)%2=0 取 D 否则 N、S 取 S；down/slow 分别计 effect 为
+D/S 的后端数（同一后端同一 now 至多一个活动段，故即活动段计数）。非法
+键、容器、重复 id、类型、范围或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，
+失败批次原子回滚。fp 时间 O(T log T)、空间 O(T)，fb/fq 时间 O(B+T)、额
+外空间 O(T)，单后端活动段查找 O(log T_b)（T 为总段数、T_b 为该后端段
+数）。
 
 故障重试：fr 键集 op,cid,flow,key,timeout,max,now，cid/flow/key 同
 fx，timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数，now 纳入
@@ -337,22 +350,22 @@ backend 成功为 id 否则 null。未配环或环内无候选报 STATE/4 且先
 尝试 ok=true，ms 为该次耗时，首项的 retries/remaps 记总值、余项为 0。
 fr 时空 O(BV)；record/replay 照常覆盖 fr，其余契约不变。
 
-故障演练统计：fx/fr 访问后端时按 fq 在 now 的 effect 与登记种类 D/F/S
-记账：effect 为 D 或 S 则该种类 affected 加 1；D 失败（fx 跳过、fr 尝
-试失败）或 S 耗时超 timeout 则 rejected 加 1。fx 跳过 D/F 后端时为其
-种类 remaps 加 1；fr 失败后确有下一尝试时，为失败后端种类的 retries、
-remaps 各加 1。同请求同后端至多记一次，各计数封顶 10^18。同一登记被
-观察为受影响后，首次再观察为 N 时该种类 recovered 加 1；连续 N 不重
-复，再受影响方可再计。fs/fb 异参替换或移除只清恢复判定基线、不清计
-数，同参不清；remove 后重加与 ci 成功清零统计。fm 精确键集 op,id，
-只读；非法键集或 id 报 INPUT/2，未知 id 报 BACKEND/3；结果键序
-op,id,D,F,S，D/F/S 各为键序 affected,rejected,retries,remaps,
-recovered 的非负整数对象。fm 与记账均 O(1)，空间 O(B)；失败批回滚统
-计与恢复状态；record/replay 逐字节覆盖 fm。
+故障演练统计：fx/fr 访问后端时按 now 取唯一活动段，依 fq 的 effect 与
+活动段种类 D/F/S 记账：effect 为 D 或 S 则当前段种类 affected 加 1；D
+失败（fx 跳过、fr 尝试失败）或 S 耗时超 timeout 则 rejected 加 1。fx
+跳过 D/F 后端时为其活动段种类 remaps 加 1；fr 失败后确有下一尝试时，为
+失败后端该次活动段种类的 retries、remaps 各加 1。同请求同后端至多记一次，
+各计数封顶 10^18。统计增量归当前活动段 k；某段被观察为受影响后，首次变
+N（F 同段非故障相位、换段或落入段间隙）时 recovered 归上段自身种类 k，
+同次新段照常记账；连续 N 不重复，再受影响方可再计。fs/fb/fp 异参替换或
+移除只清按段恢复判定基线、不清计数与历史，同参不清；remove 后重加与 ci
+成功清零统计。fm 精确键集 op,id，只读；非法键集或 id 报 INPUT/2，未知 id 报 BACKEND/3；结果键序 op,id,D,F,S，D/F/S 各为键序
+affected,rejected,retries,remaps,recovered 的非负整数对象。fm 与记账均
+O(1)，空间 O(B)；失败批回滚统计与恢复基线；record/replay 逐字节覆盖 fm。
 
 故障统计分钟历史：fx/fr 每次对 fm 产生增量时同步归入 window=now//60
 的分钟窗，沿用 fm 的归属、单请求去重与 10^18 封顶；recovered 归首次
-观察到 N 的请求窗。每后端只保留最近 60 窗，空窗不预建；fs/fb 重报、
+观察到 N 的请求窗。每后端只保留最近 60 窗，空窗不预建；fs/fb/fp 重报、
 替换或移除不清历史，remove 后重加与 ci 成功清空。fh 精确键集
 op,id,from,to,now；from、to、now 为 [0,10^9] 非 bool 整数，now 纳入
 共用非递减时钟，须 from≤to≤now//60 且 to-from<60；返回键序
@@ -729,6 +742,27 @@ def parse_fault_num(value):
     return value
 
 
+def parse_fault_segment(fields):
+    """校验并规范化单个故障段除 id 外的字段（k,a,z,v）：k ∈ D/F/S，
+    a,z,v ∈ [0,10^9] 非 bool 整数且 a<z，D 须 v=0、F/S 须 v>0；
+    返回段元组 (k,a,z,v)。fs/fb/fp 三个入口共用同一套字段约束。"""
+    k = fields["k"]
+    if k not in ("D", "F", "S"):
+        fail(EXIT_INPUT, "INPUT")
+    a = parse_fault_num(fields["a"])
+    z = parse_fault_num(fields["z"])
+    v = parse_fault_num(fields["v"])
+    if not a < z:
+        fail(EXIT_INPUT, "INPUT")
+    # D（不可用）须 v=0；F（抖动）/S（慢）须 v>0。
+    if k == "D":
+        if v != 0:
+            fail(EXIT_INPUT, "INPUT")
+    elif v == 0:
+        fail(EXIT_INPUT, "INPUT")
+    return k, a, z, v
+
+
 def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
@@ -1095,7 +1129,7 @@ def parse_op(raw_op):
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr",
-        "fb", "fq",
+        "fb", "fp", "fq",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
         "ts", "tk", "tg", "tx",
@@ -1491,21 +1525,11 @@ def parse_op(raw_op):
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
             fail(EXIT_INPUT, "INPUT")
-        k = raw_op["k"]
-        if k not in ("D", "F", "S"):
-            fail(EXIT_INPUT, "INPUT")
-        a = parse_fault_num(raw_op["a"])
-        z = parse_fault_num(raw_op["z"])
-        v = parse_fault_num(raw_op["v"])
-        if not a < z:
-            fail(EXIT_INPUT, "INPUT")
-        # D（不可用）须 v=0；F（抖动）/S（慢）须 v>0。
-        if k == "D":
-            if v != 0:
-                fail(EXIT_INPUT, "INPUT")
-        elif v == 0:
-            fail(EXIT_INPUT, "INPUT")
-        return ("fs", parse_backend_id(raw_op["id"]), k, a, z, v)
+        return (
+            "fs",
+            parse_backend_id(raw_op["id"]),
+            parse_fault_segment(raw_op),
+        )
 
     if name == "fb":
         if keys != {"op", "items"}:
@@ -1520,25 +1544,50 @@ def parse_op(raw_op):
             if not isinstance(item, dict) or set(item) != {"id", "k", "a", "z", "v"}:
                 fail(EXIT_INPUT, "INPUT")
             item_id = parse_backend_id(item["id"])
-            k = item["k"]
-            if k not in ("D", "F", "S"):
-                fail(EXIT_INPUT, "INPUT")
-            a = parse_fault_num(item["a"])
-            z = parse_fault_num(item["z"])
-            v = parse_fault_num(item["v"])
-            if not a < z:
-                fail(EXIT_INPUT, "INPUT")
-            # D（不可用）须 v=0；F（抖动）/S（慢）须 v>0。
-            if k == "D":
-                if v != 0:
-                    fail(EXIT_INPUT, "INPUT")
-            elif v == 0:
-                fail(EXIT_INPUT, "INPUT")
             if item_id in plan:
                 # 同一批次内 id 互异。
                 fail(EXIT_INPUT, "INPUT")
-            plan[item_id] = (k, a, z, v)
+            plan[item_id] = parse_fault_segment(item)
         return ("fb", plan)
+
+    if name == "fp":
+        # 故障时间线原子替换：精确键序 op,items（键须按此序出现）；items 为
+        # 0..4096 项数组（bool 不是数组），项精确键序 id,k,a,z,v（键须按此
+        # 序出现），字段约束沿用 fs；同一 id 多段须按 a 升序且 [a,z) 互不
+        # 重叠（相邻端点可接）。键序/容器/项数/字段/重叠判 INPUT，未知 id
+        # 留执行期判 BACKEND。
+        if list(raw_op) != ["op", "items"]:
+            fail(EXIT_INPUT, "INPUT")
+        raw_items = raw_op["items"]
+        if (
+            not isinstance(raw_items, list)
+            or isinstance(raw_items, bool)
+            or not 0 <= len(raw_items) <= 4096
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        # 按 id 分组并保序收集段；全部校验先于任何状态变更，失败批回滚。
+        grouped = OrderedDict()
+        for item in raw_items:
+            if (
+                not isinstance(item, dict)
+                or list(item) != ["id", "k", "a", "z", "v"]
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            item_id = parse_backend_id(item["id"])
+            grouped.setdefault(item_id, []).append(
+                parse_fault_segment(item)
+            )
+        plan = {}
+        for item_id, segments in grouped.items():
+            # 规范化：同 id 段先按 a 升序排序，再校验半开区间互不重叠
+            # （z_i<=a_{i+1}，相等为相邻可接）。乱序但可排成不重叠序列的
+            # 计划合法；同 a 或任何相交在此被拒。
+            segments.sort(key=lambda segment: segment[1])
+            for idx in range(len(segments) - 1):
+                if segments[idx][2] > segments[idx + 1][1]:
+                    fail(EXIT_INPUT, "INPUT")
+            plan[item_id] = segments
+        return ("fp", plan)
 
     if name == "fq":
         if keys != {"op", "now"}:
@@ -2015,14 +2064,29 @@ def run(raw):
                 del history[old]
         counts[reason] = min(METRIC_CAP, counts[reason] + 1)
 
+    def active_fault(record, now):
+        """按 now 在故障时间线中取唯一活动段：段按 a 升序且 [a,z) 互不
+        重叠，故至多一段满足 a<=now<z（O(log T_b)，fault_a 为与 faults
+        平行的 a 列表，随替换原子更新）；未登记或处于段间隙时返回 None。"""
+        a_values = record["fault_a"]
+        if not a_values:
+            return None
+        idx = bisect.bisect_right(a_values, now) - 1
+        if idx < 0:
+            return None
+        segment = record["faults"][idx]
+        if now < segment[2]:
+            return segment
+        return None
+
     def fault_active(record, now):
-        """mg 的 removed=fault 判定：fs 登记且 now ∈ [a,z) 窗口内时，D 恒为
-        故障，F 仅 ((now-a)//v)%2=0 相位为故障；S（仅变慢）与非故障相位
-        均不算故障。"""
-        fault = record["fault"]
-        if fault is None or not fault[1] <= now < fault[2]:
+        """mg 的 removed=fault 判定：活动段且 now ∈ [a,z) 窗口内时，D 恒为
+        故障，F 仅 ((now-a)//v)%2=0 相位为故障；S（仅变慢）、F 非故障相位、
+        段间隙与未登记均不算故障。"""
+        segment = active_fault(record, now)
+        if segment is None:
             return False
-        k, a, _, v = fault
+        k, a, _, v = segment
         if k == "D":
             return True
         if k == "F":
@@ -2042,12 +2106,12 @@ def run(raw):
             return "fault"
         return None
 
-    def fault_effect(fault, now):
-        """fq 同款 effect：未登记或窗口 [a,z) 外为 N；窗口内 D 为 D、F 按
-        ((now-a)//v)%2=0 相位取 D 否则 N、S 为 S。"""
-        if fault is None or not fault[1] <= now < fault[2]:
+    def fault_effect(segment, now):
+        """fq 同款 effect：无活动段（未登记或段间隙）为 N；活动段 D 为 D、
+        F 按 ((now-a)//v)%2=0 相位取 D 否则 N、S 为 S。"""
+        if segment is None:
             return "N"
-        k, a, _, v = fault
+        k, a, _, v = segment
         if k == "D":
             return "D"
         if k == "F":
@@ -2069,48 +2133,77 @@ def run(raw):
                 del history[old]
         return stats
 
-    def observe_fault(record, effect, rejected, now):
-        """fx/fr 访问后端的一次记账（O(1)），按登记种类归账并同步写入 fm
-        累计与 window=now//60 的分钟窗历史：effect 为 D/S 即受影响
-        （affected+1 并置恢复基线），D 失败或 S 耗时超 timeout 另
-        rejected+1；effect 为 N 且基线已置即恢复（recovered 归当前观察窗，
-        即首次观察到 N 的请求窗，同时清基线；连续 N 不重复）。各计数封顶
-        10^18。"""
-        fault = record["fault"]
-        if fault is None:
+    def settle_fault_baseline(record, keep, now):
+        """换段或落入段间隙时结算旧基线：fault_base 中除 keep 外的已受影响
+        段各计一次 recovered（归该段自身种类 k 与当前观察窗 now//60），随后
+        移除；keep 为本次活动段时其基线保留。时间线段互不重叠、时钟非递减，
+        实际至多一个旧段在基线中。各计数封顶 10^18。"""
+        base = record["fault_base"]
+        if not base:
             return
-        kind = fault[0]
+        for old_segment in list(base):
+            if old_segment == keep:
+                continue
+            kind = old_segment[0]
+            totals = record["fault_stats"][kind]
+            totals["recovered"] = min(
+                METRIC_CAP, totals["recovered"] + 1
+            )
+            # 恢复归当前观察窗（首次观察到 N 的请求窗）；空窗不预建。
+            window_stats = fault_window_stats(record, now)[kind]
+            window_stats["recovered"] = min(
+                METRIC_CAP, window_stats["recovered"] + 1
+            )
+            base.discard(old_segment)
+
+    def observe_fault(record, segment, effect, rejected, now):
+        """fx/fr 访问后端的一次记账（O(1)）。segment 为按 now 取到的唯一
+        活动段（间隙为 None）；增量归活动段自身种类：effect 为 D/S 即受影响
+        （affected+1 并以段元组置恢复基线），D 失败或 S 耗时超 timeout 另
+        rejected+1。上次受影响段首次变 N——F 同段非故障相位、换段或落入
+        间隙——recovered 归上段种类（当前观察窗）并清其基线；同次新段照常
+        记账；连续 N 不重复。fm 累计与 window=now//60 分钟窗同序双写，各
+        计数封顶 10^18。"""
+        if segment is None:
+            # 段间隙：无活动段可记账，仅结算可能存在的上段恢复。
+            settle_fault_baseline(record, None, now)
+            return
+        kind = segment[0]
         totals = record["fault_stats"][kind]
         if effect == "N":
-            if record["fault_affected"]:
-                # 恢复归当前观察窗（首次观察到 N 的请求窗）；仅在确有增量
-                # 时取窗，空窗不预建。
-                window_stats = fault_window_stats(record, now)[kind]
+            # F 非故障相位：先结算其它段（换段）的恢复，本段仅在已置基线时
+            # 才计 recovered；连续 N 不重复。
+            settle_fault_baseline(record, segment, now)
+            if segment in record["fault_base"]:
                 totals["recovered"] = min(
                     METRIC_CAP, totals["recovered"] + 1
                 )
+                window_stats = fault_window_stats(record, now)[kind]
                 window_stats["recovered"] = min(
                     METRIC_CAP, window_stats["recovered"] + 1
                 )
-                record["fault_affected"] = False
+                record["fault_base"].discard(segment)
             return
+        # 受影响（D/S）：先结算其它已置基线段（换段时 recovered 归上段 k），
+        # 同次新段照常记 affected。
+        settle_fault_baseline(record, segment, now)
         window_stats = fault_window_stats(record, now)[kind]
         totals["affected"] = min(METRIC_CAP, totals["affected"] + 1)
         window_stats["affected"] = min(
             METRIC_CAP, window_stats["affected"] + 1
         )
-        record["fault_affected"] = True
+        record["fault_base"].add(segment)
         if rejected:
             totals["rejected"] = min(METRIC_CAP, totals["rejected"] + 1)
             window_stats["rejected"] = min(
                 METRIC_CAP, window_stats["rejected"] + 1
             )
 
-    def bump_fault(record, field, now):
+    def bump_fault(record, segment, field, now):
         """fx 跳过（remaps）与 fr 重试（retries/remaps）的计数：归失败后端
-        当前登记种类，fm 累计与 now//60 窗各加 1，封顶 10^18。仅在确有故障
-        登记时被调用。"""
-        kind = record["fault"][0]
+        该次活动段的登记种类，fm 累计与 now//60 窗各加 1，封顶 10^18。仅在
+        确有活动段（effect 为 D 或超时 S）时被调用。"""
+        kind = segment[0]
         totals = record["fault_stats"][kind]
         totals[field] = min(METRIC_CAP, totals[field] + 1)
         window_stats = fault_window_stats(record, now)[kind]
@@ -2293,11 +2386,17 @@ def run(raw):
                 },
                 # ci 成功清空采样历史，默认运行态为空。
                 "samples": {},
-                # 热加载以默认运行态重建，不携带故障演练。
-                "fault": None,
+                # 热加载以默认运行态重建，不携带故障时间线。
+                "faults": [],
+                # 与 faults 平行的段起点 a 列表，供 bisect O(log T_b) 取
+                # 唯一活动段，随 fs/fb/fp 的原子替换一并更新。
+                "fault_a": [],
                 # ci 成功清零故障演练统计与恢复判定基线。
                 "fault_stats": new_fault_stats(),
-                "fault_affected": False,
+                # 恢复判定基线：已被观察为受影响（D/S）的段元组集合；该段
+                # 首次再观察为 N（F 非故障相位、换段或落入间隙）时按段种类
+                # 结算 recovered 并移除。fs/fb/fp 异参替换只清基线不清计数。
+                "fault_base": set(),
                 # ci 成功清空故障统计分钟历史。
                 "fault_hist": {},
                 # ci 成功清空不可用原因分钟历史。
@@ -2414,20 +2513,26 @@ def run(raw):
                 # 后端 IP 端点：ep 登记的 (host, port)，未配置为 None；
                 # remove 后重加即回到未配，随 ce/ci 导出导入（version=6）。
                 "endpoint": None,
-                # 故障演练：fs 登记的 (k, a, z, v)，未登记为 None；remove/ci 清除。
-                "fault": None,
+                # 故障时间线：fp/fs 登记的段列表 [(k,a,z,v),...]，按 a 升序、
+                # [a,z) 互不重叠；fs 替换为单段、fb 替换全体（未列入清空），
+                # fp 原子替换该 id 全部段，remove/ci 清空。fault_a 为平行的
+                # 段起点列表，供 bisect O(log T_b) 取唯一活动段。
+                "faults": [],
+                "fault_a": [],
                 # 故障演练统计（fm）：按登记种类 D/F/S 各记
                 # affected/rejected/retries/remaps/recovered 五计数，封顶
-                # 10^18；fault_affected 为恢复判定基线（当前登记被观察为
-                # 受影响即置位，再观察为 N 时结算 recovered 并清除；fs/fb
-                # 异参替换或移除只清基线不清计数，同参不清）。remove 后重加
-                # 与 ci 成功随新记录清零。
+                # 10^18；fault_base 为按段的恢复判定基线集合（段被观察为
+                # 受影响即加入，首次再观察为 N——F 非故障相位、换段或落入
+                # 间隙——时按上段种类结算 recovered 并移除；fs/fb/fp 异参
+                # 替换只清基线不清计数，同参不清）。remove 后重加与 ci
+                # 成功随新记录清零。
                 "fault_stats": new_fault_stats(),
-                "fault_affected": False,
+                "fault_base": set(),
                 # 故障统计分钟历史（fh）：window=now//60 -> 当窗
                 # new_fault_stats 结构（D/F/S 各五计数），随记账与 fault_stats
-                # 同序双写，每后端仅保留最近 60 窗，空窗不预建；fs/fb 重报、
-                # 替换或移除不清历史，remove 后重加与 ci 成功随新记录清空。
+                # 同序双写，每后端仅保留最近 60 窗，空窗不预建；fs/fb/fp
+                # 重报、替换或移除不清历史，remove 后重加与 ci 成功随新记录
+                # 清空。
                 "fault_hist": {},
                 # 度量历史：window -> [requests, errors, retries, remaps,
                 # [五个延迟桶]]，仅保留最近 60 窗；空表示从未 mr。
@@ -3619,16 +3724,18 @@ def run(raw):
             )
 
         elif op[0] == "fs":
-            _, backend_id, k, a, z, v = op
+            _, backend_id, segment = op
             record = backends.get(backend_id)
             if record is None:
                 fail(EXIT_BACKEND, "BACKEND")
-            # 同参重报幂等（不改登记也不清恢复基线）；异参覆盖只清恢复判定
-            # 基线、不清计数；均返回 ok。
-            new_fault = (k, a, z, v)
-            if record["fault"] != new_fault:
-                record["fault_affected"] = False
-            record["fault"] = new_fault
+            # 把该 id 的故障时间线替换为单段：同参（同为该单段）重报幂等，
+            # 不改登记也不清恢复基线；异参覆盖只清按段恢复判定基线、不清
+            # 计数；均返回 ok。
+            new_faults = [segment]
+            if record["faults"] != new_faults:
+                record["fault_base"] = set()
+            record["faults"] = new_faults
+            record["fault_a"] = [segment[1]]
             results.append({"op": "fs", "ok": True})
 
         elif op[0] == "fb":
@@ -3637,50 +3744,73 @@ def run(raw):
             for item_id in plan:
                 if item_id not in backends:
                     fail(EXIT_BACKEND, "BACKEND")
-            # 与 fs 同源：按后端加入序一次替换全部登记（未列入的清除），
-            # 空计划即清空；整体替换使同计划重报天然幂等。异参替换或移除
-            # 只清恢复判定基线、不清计数，同参不动基线。
+            # 与 fs/fp 同源：按后端加入序把全体时间线一次替换为各 id 的单段
+            # （未列入的后端清空），空计划即清空；整体替换使同计划重报天然
+            # 幂等。异参替换或移除只清按段恢复判定基线、不清计数，同参不动
+            # 基线。
             for backend_id, record in backends.items():
                 new_fault = plan.get(backend_id)
-                if record["fault"] != new_fault:
-                    record["fault_affected"] = False
-                record["fault"] = new_fault
+                new_faults = [] if new_fault is None else [new_fault]
+                if record["faults"] != new_faults:
+                    record["fault_base"] = set()
+                record["faults"] = new_faults
+                record["fault_a"] = (
+                    [] if new_fault is None else [new_fault[1]]
+                )
             results.append({"op": "fb", "ok": True})
+
+        elif op[0] == "fp":
+            _, plan = op
+            # 未知 id 报 BACKEND，先于任何变更（INPUT 已在解析期判完）；失败
+            # 批次原子回滚。
+            for item_id in plan:
+                if item_id not in backends:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 原子替换各列入 id 的时间线（未列入的后端保持原样；items 为空
+            # 即无操作）。plan 内段已按 a 规范化（升序且不重叠）；fault_a
+            # 与 faults 平行更新，供活动段 O(log T_b) 查找。同计划重报列表
+            # 逐段相等，天然幂等；异参替换只清按段恢复判定基线、不清计数。
+            for backend_id, new_faults in plan.items():
+                record = backends[backend_id]
+                if record["faults"] != new_faults:
+                    record["fault_base"] = set()
+                record["faults"] = new_faults
+                record["fault_a"] = [segment[1] for segment in new_faults]
+            results.append({"op": "fp", "ok": True})
 
         elif op[0] == "fq":
             _, now = op
-            # 按加入序列出已登记后端；effect：窗口外 N，窗口内 D 为 D、
-            # F 按 ((now-a)//v)%2=0 取 D 否则 N、S 取 S。
+            # 按后端加入序、段 a 升序列出全部段；effect 按各段自身窗口
+            # [a,z) 计算：窗口外（含段间隙）N，窗口内 D 为 D、F 按
+            # ((now-a)//v)%2=0 取 D 否则 N、S 取 S。down/slow 计 effect 为
+            # D/S 的段数。结果快照随批次末尾序列化，此处构造的即全新对象。
             faults = []
             down = 0
             slow = 0
             for backend_id, record in backends.items():
-                fault = record["fault"]
-                if fault is None:
-                    continue
-                k, a, z, v = fault
-                if not a <= now < z:
-                    effect = "N"
-                elif k == "D":
-                    effect = "D"
-                elif k == "F":
-                    effect = "D" if ((now - a) // v) % 2 == 0 else "N"
-                else:  # S：窗口内仅变慢。
-                    effect = "S"
-                if effect == "D":
-                    down += 1
-                elif effect == "S":
-                    slow += 1
-                faults.append(
-                    {
-                        "id": backend_id,
-                        "k": k,
-                        "a": a,
-                        "z": z,
-                        "v": v,
-                        "effect": effect,
-                    }
-                )
+                for k, a, z, v in record["faults"]:
+                    if not a <= now < z:
+                        effect = "N"
+                    elif k == "D":
+                        effect = "D"
+                    elif k == "F":
+                        effect = "D" if ((now - a) // v) % 2 == 0 else "N"
+                    else:  # S：窗口内仅变慢。
+                        effect = "S"
+                    if effect == "D":
+                        down += 1
+                    elif effect == "S":
+                        slow += 1
+                    faults.append(
+                        {
+                            "id": backend_id,
+                            "k": k,
+                            "a": a,
+                            "z": z,
+                            "v": v,
+                            "effect": effect,
+                        }
+                    )
             results.append(
                 {"op": "fq", "faults": faults, "down": down, "slow": slow}
             )
@@ -3952,18 +4082,19 @@ def run(raw):
                     if first_id is None:
                         first_id = backend_id
                     record = backends[backend_id]
-                    fault = record["fault"]
-                    effect = fault_effect(fault, now)
-                    cost = fault[3] if effect == "S" else 0
+                    segment = active_fault(record, now)
+                    effect = fault_effect(segment, now)
+                    cost = segment[3] if effect == "S" else 0
                     if effect == "D":
                         # D/故障相位 F 不可用：受影响且 D 失败，跳过即 remap。
-                        observe_fault(record, effect, True, now)
-                        bump_fault(record, "remaps", now)
+                        observe_fault(record, segment, effect, True, now)
+                        bump_fault(record, segment, "remaps", now)
                         remaps += 1
                         continue
-                    # 可用后端：S 耗时超 timeout 记 rejected；effect N 只作
-                    # 恢复观察。首个可用后端即终止遍历，耗时超限不建连。
-                    observe_fault(record, effect, cost > timeout, now)
+                    # 可用后端：活动 S 段耗时超 timeout 记 rejected；effect N
+                    # （含段间隙与 F 非故障相位）只作恢复观察。首个可用后端即
+                    # 终止遍历，耗时超限不建连。
+                    observe_fault(record, segment, effect, cost > timeout, now)
                     chosen_id = backend_id
                     latency = cost
                     if cost <= timeout:
@@ -4023,21 +4154,22 @@ def run(raw):
                     continue
                 seen.add(backend_id)
                 record = backends[backend_id]
-                fault = record["fault"]
-                effect = fault_effect(fault, now)
-                cost = fault[3] if effect == "S" else 0
+                segment = active_fault(record, now)
+                effect = fault_effect(segment, now)
+                cost = segment[3] if effect == "S" else 0
                 if effect == "D":
                     # D/故障相位 F：本尝试失败、耗时 0；受影响且 D 失败。
-                    observe_fault(record, effect, True, now)
+                    observe_fault(record, segment, effect, True, now)
                     attempts_made.append((backend_id, 0))
                     continue
                 if cost > timeout:
                     # S 且 v>timeout：本尝试失败，耗时按 timeout 计后重试。
-                    observe_fault(record, effect, True, now)
+                    observe_fault(record, segment, effect, True, now)
                     attempts_made.append((backend_id, timeout))
                     continue
-                # 首个成功尝试即终止：耗时 v 或 0；effect N 只作恢复观察。
-                observe_fault(record, effect, False, now)
+                # 首个成功尝试即终止：耗时 v 或 0；effect N（含段间隙与 F
+                # 非故障相位）只作恢复观察。
+                observe_fault(record, segment, effect, False, now)
                 attempts_made.append((backend_id, cost))
                 chosen_id = backend_id
                 state = "A"
@@ -4045,13 +4177,14 @@ def run(raw):
             attempts = len(attempts_made)
             retries = max(attempts - 1, 0)
             latency = sum(cost for _, cost in attempts_made)
-            # fr 失败后确有下一尝试时，为失败后端的登记种类 retries、remaps
-            # 各加 1：即除末次尝试外的全部（失败）尝试，同请求同后端至多
-            # 一次（遍历本就去重）。
+            # fr 失败后确有下一尝试时，为失败后端该次活动段的种类 retries、
+            # remaps 各加 1：即除末次尝试外的全部（失败）尝试，同请求同后端
+            # 至多一次（遍历本就去重）。
             for attempt_index in range(attempts - 1):
                 attempt_record = backends[attempts_made[attempt_index][0]]
-                bump_fault(attempt_record, "retries", now)
-                bump_fault(attempt_record, "remaps", now)
+                attempt_segment = active_fault(attempt_record, now)
+                bump_fault(attempt_record, attempt_segment, "retries", now)
+                bump_fault(attempt_record, attempt_segment, "remaps", now)
             if state == "A":
                 # 成功按 open 建连（opened_at=now）；耗尽拒绝不建连。
                 establish_connection(cid, chosen_id, flow, now)
