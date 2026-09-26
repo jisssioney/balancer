@@ -293,6 +293,19 @@ op,id,D,F,S，D/F/S 各为键序 affected,rejected,retries,remaps,
 recovered 的非负整数对象。fm 与记账均 O(1)，空间 O(B)；失败批回滚统
 计与恢复状态；record/replay 逐字节覆盖 fm。
 
+故障统计历史：fx/fr 对 fm 的每笔增量按 window=now//60 归入对应窗，
+沿用 fm 的归属、单请求去重与 10^18 封顶，recovered 归首次观察到 N
+的请求窗；每后端按窗保留最近 60 窗。fh 精确键集 op,id,from,to,now，
+from/to/now 为 [0,10^9] 非 bool 整数，now 纳入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60；键集、类型、范围、关系或时钟非法报
+INPUT/2，未知 id 报 BACKEND/3，from 早于 max(0,now//60-59) 报
+STATE/4。结果键序 op,id,windows；windows 含 from 至 to 所有窗并升
+序，项键序 window,D,F,S，D/F/S 各为键序 affected,rejected,retries,
+remaps,recovered 的非负整数对象，空窗五项为 0。fh 只读；fs/fb 重报、
+替换或移除不清历史，remove 后重加及 ci 成功清空；失败批回滚历史与恢
+复状态；record/replay 逐字节覆盖 fh。记账 O(1)，fh 为 O(R)，空间
+O(60B)，仅用标准库。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -930,7 +943,7 @@ def parse_op(raw_op):
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
-        "hm", "fm",
+        "hm", "fm", "fh",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -1363,6 +1376,18 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("fm", parse_backend_id(raw_op["id"]))
 
+    if name == "fh":
+        # 故障统计历史查询：精确键集 op,id,from,to,now；窗关系同 mh。
+        if keys != {"op", "id", "from", "to", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fh", parse_backend_id(raw_op["id"]), start, end, now)
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1684,30 +1709,55 @@ def run(raw):
             return "D" if ((now - a) // v) % 2 == 0 else "N"
         return "S"
 
-    def observe_fault(record, effect, rejected):
+    def bump_fault_window(record, kind, field, now):
+        """故障统计的分钟历史（fh）：把一笔增量写入 window=now//60 所属窗，
+        每后端只保留最近 60 窗，各计数封顶 10^18。仅在确有增量时调用，
+        与 fm 的聚合增量一一对应。"""
+        history = record["fault_history"]
+        window = now // 60
+        stats = history.get(window)
+        if stats is None:
+            # 首次记账该窗：新建计数；时钟非递减，顺带丢弃 60 窗前的旧窗。
+            stats = new_fault_stats()
+            history[window] = stats
+            cutoff = window - 59
+            for old in [w for w in history if w < cutoff]:
+                del history[old]
+        entry = stats[kind]
+        entry[field] = min(METRIC_CAP, entry[field] + 1)
+
+    def observe_fault(record, effect, rejected, now):
         """fx/fr 访问后端的一次记账（O(1)），按登记种类归账：effect 为 D/S
         即受影响（affected+1 并置恢复基线），D 失败或 S 耗时超 timeout 另
         rejected+1；effect 为 N 且基线已置即恢复（recovered+1 并清基线，
-        连续 N 不重复）。各计数封顶 10^18。"""
+        连续 N 不重复，recovered 归首次观察到 N 的本请求窗）。各计数封顶
+        10^18；每笔增量同步写入 now//60 的分钟历史。"""
         fault = record["fault"]
         if fault is None:
             return
-        stats = record["fault_stats"][fault[0]]
+        kind = fault[0]
+        stats = record["fault_stats"][kind]
         if effect == "N":
             if record["fault_affected"]:
                 stats["recovered"] = min(METRIC_CAP, stats["recovered"] + 1)
+                bump_fault_window(record, kind, "recovered", now)
                 record["fault_affected"] = False
             return
         stats["affected"] = min(METRIC_CAP, stats["affected"] + 1)
+        bump_fault_window(record, kind, "affected", now)
         record["fault_affected"] = True
         if rejected:
             stats["rejected"] = min(METRIC_CAP, stats["rejected"] + 1)
+            bump_fault_window(record, kind, "rejected", now)
 
-    def bump_fault(record, field):
+    def bump_fault(record, field, now):
         """fx 跳过（remaps）与 fr 重试（retries/remaps）的计数：归失败后端
-        当前登记种类，封顶 10^18。仅在确有故障登记时被调用。"""
-        stats = record["fault_stats"][record["fault"][0]]
+        当前登记种类，封顶 10^18，并同步写入 now//60 的分钟历史。仅在确有
+        故障登记时被调用。"""
+        kind = record["fault"][0]
+        stats = record["fault_stats"][kind]
         stats[field] = min(METRIC_CAP, stats[field] + 1)
+        bump_fault_window(record, kind, field, now)
 
     def record_h_pick(chosen_id, old_entry, now):
         """H 模式 pick 成功后记一次账，归属返回 id chosen_id：仅在成功项调用
@@ -1749,7 +1799,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
-            "ms", "mx",
+            "ms", "mx", "fh",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick",
         ):
             now = op[-1]
@@ -1822,6 +1872,10 @@ def run(raw):
                 # 与 ci 成功随新记录清零。
                 "fault_stats": new_fault_stats(),
                 "fault_affected": False,
+                # 故障统计的分钟历史（fh）：window -> new_fault_stats()，
+                # 仅保留最近 60 窗；fx/fr 对 fm 的每笔增量按 now//60 归入
+                # 对应窗。remove 后重加与 ci 成功随新记录清空。
+                "fault_history": {},
                 # 度量历史：window -> [requests, errors, retries, remaps,
                 # [五个延迟桶]]，仅保留最近 60 窗；空表示从未 mr。
                 "metrics": {},
@@ -2932,6 +2986,8 @@ def run(raw):
                     # ci 成功清零故障演练统计与恢复判定基线。
                     "fault_stats": new_fault_stats(),
                     "fault_affected": False,
+                    # ci 成功清空故障统计的分钟历史。
+                    "fault_history": {},
                 }
 
             new_backends = {}
@@ -3079,6 +3135,36 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "fh":
+            # 故障统计的分钟历史只读查询：未知 id 报 BACKEND；from 早于最近
+            # 60 窗下界报 STATE（同 mh）。不改变任何计数、历史与恢复基线，
+            # 失败批次天然回滚。返回键序 op,id,windows；项键序
+            # window,D,F,S，空窗五项为 0。必须快照：结果在批次末尾才序列化，
+            # 直接引用会被后续记账污染。
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            if start < max(0, now // 60 - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = record["fault_history"]
+            windows = []
+            for window in range(start, end + 1):
+                stats = history.get(window)
+                if stats is None:
+                    # 空窗：D/F/S 各五项计数均为 0。
+                    stats = new_fault_stats()
+                windows.append(
+                    {
+                        "window": window,
+                        "D": dict(stats["D"]),
+                        "F": dict(stats["F"]),
+                        "S": dict(stats["S"]),
+                    }
+                )
+            results.append({"op": "fh", "id": backend_id, "windows": windows})
+
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
             if ring_vnodes is None:
@@ -3115,13 +3201,13 @@ def run(raw):
                     cost = fault[3] if effect == "S" else 0
                     if effect == "D":
                         # D/故障相位 F 不可用：受影响且 D 失败，跳过即 remap。
-                        observe_fault(record, effect, True)
-                        bump_fault(record, "remaps")
+                        observe_fault(record, effect, True, now)
+                        bump_fault(record, "remaps", now)
                         remaps += 1
                         continue
                     # 可用后端：S 耗时超 timeout 记 rejected；effect N 只作
                     # 恢复观察。首个可用后端即终止遍历，耗时超限不建连。
-                    observe_fault(record, effect, cost > timeout)
+                    observe_fault(record, effect, cost > timeout, now)
                     chosen_id = backend_id
                     latency = cost
                     if cost <= timeout:
@@ -3187,16 +3273,16 @@ def run(raw):
                 cost = fault[3] if effect == "S" else 0
                 if effect == "D":
                     # D/故障相位 F：本尝试失败、耗时 0；受影响且 D 失败。
-                    observe_fault(record, effect, True)
+                    observe_fault(record, effect, True, now)
                     attempts_made.append((backend_id, 0))
                     continue
                 if cost > timeout:
                     # S 且 v>timeout：本尝试失败，耗时按 timeout 计后重试。
-                    observe_fault(record, effect, True)
+                    observe_fault(record, effect, True, now)
                     attempts_made.append((backend_id, timeout))
                     continue
                 # 首个成功尝试即终止：耗时 v 或 0；effect N 只作恢复观察。
-                observe_fault(record, effect, False)
+                observe_fault(record, effect, False, now)
                 attempts_made.append((backend_id, cost))
                 chosen_id = backend_id
                 state = "A"
@@ -3209,8 +3295,8 @@ def run(raw):
             # 一次（遍历本就去重）。
             for attempt_index in range(attempts - 1):
                 attempt_record = backends[attempts_made[attempt_index][0]]
-                bump_fault(attempt_record, "retries")
-                bump_fault(attempt_record, "remaps")
+                bump_fault(attempt_record, "retries", now)
+                bump_fault(attempt_record, "remaps", now)
             if state == "A":
                 # 成功按 open 建连（opened_at=now）；耗尽拒绝不建连。
                 backends[chosen_id]["conns"] += 1
