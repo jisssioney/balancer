@@ -194,6 +194,14 @@ def config_v6(weight, **overrides):
     return config
 
 
+def config_v7(weight, faults=(), **overrides):
+    """最小 version=7 配置：单后端 a，九键同 v6 且末置 faults 数组。"""
+    config = config_v6(weight, **overrides)
+    config["version"] = 7
+    config["faults"] = list(faults)
+    return config
+
+
 class ConfigCommitTest(unittest.TestCase):
     """配置提交与回滚（ci 提交、cl 历史、cb 回滚）。"""
 
@@ -209,8 +217,9 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(list(result), ["op", "current", "commits"])
         self.assertEqual(result, {"op": "cl", "current": None, "commits": []})
 
-    def test_ci_commits_normalized_v6(self):
-        # version=1 旧结构成功加载后，提交为规范化 version=6 配置。
+    def test_ci_commits_normalized_v7(self):
+        # version=1 旧结构成功加载后，提交为规范化 version=7 配置
+        # （faults 空计划）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -240,7 +249,7 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(commit["rev"], 1)
         self.assertEqual(
             commit["config"],
-            config_v6(2),
+            config_v7(2),
         )
 
     def test_failed_ci_does_not_commit(self):
@@ -287,8 +296,8 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(
             results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
         )
-        # 回滚后当前配置即 rev=1 的快照。
-        self.assertEqual(results[3]["config"], config_v6(1))
+        # 回滚后当前配置即 rev=1 的规范化 v7 快照（faults 空计划）。
+        self.assertEqual(results[3]["config"], config_v7(1))
 
     def test_cb_restores_runtime_state(self):
         # 回滚按目标快照重建默认运行态：调度策略、限流桶、预热自 cb.now 起算。
@@ -362,6 +371,295 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(rep_code, record["exit"])
         self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
         self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+
+
+class FaultHotReloadTest(unittest.TestCase):
+    """version=7 faults 时间线纳入 ce/ci/cl/cb 热加载。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def seg(self, backend="a", k="D", a=0, z=10, v=0):
+        return {"id": backend, "k": k, "a": a, "z": z, "v": v}
+
+    def test_ce_exports_v7_with_empty_faults_last(self):
+        results = self.run_ops([{"op": "add", "id": "a", "weight": 1},
+                                {"op": "ce"}])
+        config = results[-1]["config"]
+        self.assertEqual(
+            list(config),
+            ["version", "backends", "vnodes", "limits", "overload", "sticky",
+             "idle", "backpressure", "scheduler", "faults"],
+        )
+        self.assertEqual(config["version"], 7)
+        self.assertEqual(config["faults"], [])
+
+    def test_ci_loads_faults_observed_by_fq(self):
+        # 乱序提交（段与后端），ce/fq 按后端加入序、段 a 升序规范化。
+        config = config_v7(
+            1,
+            vnodes=4,
+            faults=[
+                self.seg("b", "D", 0, 10),
+                self.seg("a", "S", 5, 20, 3),
+                self.seg("a", "D", 0, 5),
+            ],
+        )
+        config["backends"].append(
+            {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
+             "circuit": None, "drain": None, "endpoint": None}
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "fq", "now": 2},
+            {"op": "ce"},
+        ])
+        fq = results[1]
+        self.assertEqual(
+            [(f["id"], f["k"], f["a"]) for f in fq["faults"]],
+            [("a", "D", 0), ("a", "S", 5), ("b", "D", 0)],
+        )
+        self.assertEqual(
+            [f["effect"] for f in fq["faults"]], ["D", "N", "D"]
+        )
+        self.assertEqual((fq["down"], fq["slow"]), (2, 0))
+        # ce 不含 effect，纯登记段，顺序同 fq。
+        self.assertEqual(
+            [(f["id"], f["k"], f["a"], f["z"], f["v"])
+             for f in results[2]["config"]["faults"]],
+            [("a", "D", 0, 5, 0), ("a", "S", 5, 20, 3), ("b", "D", 0, 10, 0)],
+        )
+
+    def test_loaded_timeline_drives_fx_fr_fi(self):
+        config = config_v7(
+            1,
+            vnodes=8,
+            faults=[self.seg("a", "D", 0, 10)],
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "fx", "cid": "c1", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "now": 2},
+            {"op": "fr", "cid": "c2", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "max": 3, "now": 2},
+            {"op": "fi", "keys": ["x", "y"], "timeout": 9, "max": 3,
+             "now": 2},
+        ])
+        self.assertEqual(results[1]["state"], "R")
+        self.assertIsNone(results[1]["backend"])
+        self.assertEqual(results[2]["state"], "R")
+        self.assertIsNone(results[2]["backend"])
+        self.assertTrue(all(c["state"] == "R" for c in results[3]["cases"]))
+
+    def test_reload_resets_fault_runtime_but_keeps_timeline(self):
+        config = config_v7(1, vnodes=8, faults=[self.seg("a", "D", 0, 10)])
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "fx", "cid": "c1", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "now": 1},
+            {"op": "fm", "id": "a"},
+            {"op": "ci", "config": config, "now": 2},
+            {"op": "fm", "id": "a"},
+            {"op": "fq", "now": 3},
+        ])
+        self.assertEqual(results[2]["D"]["affected"], 1)
+        self.assertEqual(results[4]["D"]["affected"], 0)
+        self.assertEqual(results[5]["down"], 1)
+
+    def test_v6_and_below_clear_faults(self):
+        # 既有 fs 时间线在 version=6（无 faults 键）热加载后清空。
+        results = self.run_ops([
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 10, "v": 0},
+            {"op": "fq", "now": 0},
+            {"op": "ci", "config": config_v6(1), "now": 1},
+            {"op": "fq", "now": 2},
+        ])
+        self.assertEqual(results[2]["down"], 1)
+        self.assertEqual(results[4]["faults"], [])
+
+    def test_v7_requires_exact_faults_key(self):
+        # 十键结构但 version=6（v6 结构不含 faults）。
+        bad_version = config_v7(1)
+        bad_version["version"] = 6
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": bad_version, "now": 0}]),
+            2, "INPUT",
+        )
+        # version=7 缺 faults 键（九键）。
+        missing = config_v6(1)
+        missing["version"] = 7
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": missing, "now": 0}]),
+            2, "INPUT",
+        )
+
+    def test_faults_validation_errors(self):
+        cases = [
+            b'{"op":"ci","now":0,"config":' + self._raw(faults="{}") + b"}",
+            # 项键集缺 v。
+            b'{"op":"ci","now":0,"config":'
+            + self._raw(faults='[{"id":"a","k":"D","a":0,"z":5}]') + b"}",
+            # 项键序错误。
+            b'{"op":"ci","now":0,"config":'
+            + self._raw(faults='[{"id":"a","k":"D","z":5,"a":0,"v":0}]')
+            + b"}",
+            # k 越界。
+            self._enc([{"op": "ci", "now": 0, "config":
+                        config_v7(1, faults=[self.seg(k="X")])}]),
+            # D 须 v=0。
+            self._enc([{"op": "ci", "now": 0, "config":
+                        config_v7(1, faults=[self.seg(k="D", v=1)])}]),
+            # F 须 v>0。
+            self._enc([{"op": "ci", "now": 0, "config":
+                        config_v7(1, faults=[self.seg(k="F", v=0)])}]),
+            # a 为 bool。
+            self._enc([{"op": "ci", "now": 0, "config":
+                        config_v7(1, faults=[self.seg(a=True)])}]),
+            # a==z。
+            self._enc([{"op": "ci", "now": 0, "config":
+                        config_v7(1, faults=[self.seg(a=5, z=5)])}]),
+            # 同 id 段重叠。
+            self._enc([{"op": "ci", "now": 0, "config": config_v7(
+                1, faults=[self.seg(a=0, z=5), self.seg(a=4, z=9)])}]),
+            # 同 id 完全重复段。
+            self._enc([{"op": "ci", "now": 0, "config": config_v7(
+                1, faults=[self.seg(), self.seg()])}]),
+            # id 非 UTF-8（孤立代理）。
+            b'{"op":"ci","now":0,"config":'
+            + self._raw(faults='[{"id":"\\ud800","k":"D","a":0,"z":5,"v":0}]')
+            + b"}",
+        ]
+        for raw in cases:
+            self.assert_failure(raw, 2, "INPUT")
+
+    @staticmethod
+    def _raw(**fields):
+        # 构造一个嵌入 faults 原始 JSON 片段的 v7 config 字节。
+        parts = [
+            '"version":7',
+            '"backends":[{"id":"a","weight":1,"d":0,"fail":3,"success":2,'
+            '"circuit":null,"drain":null,"endpoint":null}]',
+            '"vnodes":null', '"limits":[]', '"overload":null',
+            '"sticky":null', '"idle":null', '"backpressure":null',
+            '"scheduler":{"pick":"W"}',
+        ]
+        for key, value in fields.items():
+            parts.append('"%s":%s' % (key, value))
+        return ("{" + ",".join(parts) + "}").encode("utf-8")
+
+    @staticmethod
+    def _enc(ops):
+        return encode_ops(ops)
+
+    def test_unknown_fault_backend_is_backend(self):
+        config = config_v7(
+            1, faults=[{"id": "ghost", "k": "D", "a": 0, "z": 5, "v": 0}]
+        )
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": config, "now": 0}]),
+            3, "BACKEND",
+        )
+        # INPUT 先于 BACKEND：未知 id 但 k 非法仍判 INPUT。
+        bad = self._raw(faults='[{"id":"ghost","k":"X","a":0,"z":5,"v":0}]')
+        self.assert_failure(
+            b'{"ops":[{"op":"ci","now":0,"config":' + bad + b"}]}",
+            2, "INPUT",
+        )
+
+    def test_backend_precedes_state_for_unknown_fault(self):
+        config = config_v7(
+            1, faults=[{"id": "ghost", "k": "D", "a": 0, "z": 5, "v": 0}]
+        )
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": config_v7(1), "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                {"op": "ci", "config": config, "now": 2},
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_active_connection_or_queue_is_state(self):
+        with_fault = config_v7(1, faults=[self.seg("a", "D", 0, 5)])
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": config_v7(1), "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                {"op": "ci", "config": with_fault, "now": 2},
+            ]),
+            4, "STATE",
+        )
+
+    def test_cb_restores_target_faults_and_resets_runtime(self):
+        seg = self.seg("a", "D", 0, 10)
+        with_fault = config_v7(1, faults=[seg])
+        results = self.run_ops([
+            {"op": "ci", "config": with_fault, "now": 0},
+            {"op": "ci", "config": config_v7(1), "now": 1},
+            {"op": "fq", "now": 2},
+            {"op": "cb", "rev": 1, "now": 3},
+            {"op": "fq", "now": 4},
+            {"op": "cl"},
+        ])
+        self.assertEqual(results[2]["faults"], [])
+        self.assertEqual(
+            results[3], {"op": "cb", "target": 1, "rev": 3, "ok": True}
+        )
+        self.assertEqual(results[4]["down"], 1)
+        commits = results[5]["commits"]
+        self.assertEqual(commits[0]["config"]["faults"],
+                         [{"id": "a", "k": "D", "a": 0, "z": 10, "v": 0}])
+        self.assertEqual(commits[2]["config"]["faults"],
+                         [{"id": "a", "k": "D", "a": 0, "z": 10, "v": 0}])
+
+    def test_repeated_load_builds_new_rev(self):
+        seg = self.seg("a", "D", 0, 10)
+        config = config_v7(1, faults=[seg])
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "ci", "config": config, "now": 1},
+            {"op": "cl"},
+        ])
+        self.assertEqual(
+            [c["rev"] for c in results[2]["commits"]], [1, 2]
+        )
+        self.assertEqual(results[2]["current"], 2)
+
+    def test_record_replay_covers_v7_faults(self):
+        config = config_v7(
+            1, vnodes=4,
+            faults=[self.seg("a", "D", 0, 5), self.seg("a", "S", 5, 20, 3)],
+        )
+        ops = [
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "fq", "now": 6},
+            {"op": "ce"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+        # ce 输出逐字节固定键序、紧凑、单换行。
+        self.assertEqual(run_stdout.count(b"\n"), 1)
+        self.assertIn(b'"version":7', run_stdout)
 
 
 class FaultTimelineTest(unittest.TestCase):
