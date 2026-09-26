@@ -350,6 +350,20 @@ backend 成功为 id 否则 null。未配环或环内无候选报 STATE/4 且先
 尝试 ok=true，ms 为该次耗时，首项的 retries/remaps 记总值、余项为 0。
 fr 时空 O(BV)；record/replay 照常覆盖 fr，其余契约不变。
 
+组合故障预演：fi 精确键序 op,keys,timeout,max,now（键须按此序出现）；
+keys 为 1..256 项数组，项沿用 route 的 key 校验（可重复），timeout/now
+∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数，now 纳入共用非递减时钟。
+按 keys 顺序在同一 now 独立模拟 fr 的哈希遍历与 D/F/S 规则，每 key 至多
+尝试 max 个不同后端（环同 route，仅健康、熔断 C、排空 A）；除时钟外不改
+运行态：不建连、不记度量、不记故障统计。结果键序 op,now,cases,summary；
+cases 项键序 key,state,backend,attempts,latency，值义同 fr（state 仅
+A/R，backend 成功为 id 否则 null，latency 为各次耗时之和）；summary
+键序 accepted,rejected,attempts,retries,remaps：前两项为 A/R 数，
+attempts 求和，retries 与 remaps 均求和 max(attempts-1,0)。非法键序、
+容器、项数、key、数值或时钟倒退报 INPUT/2；未配环或环内无合格候选报
+STATE/4；失败批回滚。fi 时间 O(KBV)、额外空间 O(K+BV)；record/replay
+照常覆盖 fi，其余契约不变。
+
 故障演练统计：fx/fr 访问后端时按 now 取唯一活动段，依 fq 的 effect 与
 活动段种类 D/F/S 记账：effect 为 D 或 S 则当前段种类 affected 加 1；D
 失败（fx 跳过、fr 尝试失败）或 S 耗时超 timeout 则 rejected 加 1。fx
@@ -1128,7 +1142,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "bp", "bq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma",
         "ce", "ci", "cl", "cb",
-        "fs", "fx", "fr",
+        "fs", "fx", "fr", "fi",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
@@ -1698,6 +1712,24 @@ def parse_op(raw_op):
             parse_cid(raw_op["cid"]),
             parse_flow(raw_op["flow"]),
             parse_key(raw_op["key"]),
+            parse_fault_num(raw_op["timeout"]),
+            parse_attempt_max(raw_op["max"]),
+            parse_fault_num(raw_op["now"]),
+        )
+
+    if name == "fi":
+        # 组合故障预演：精确键序 op,keys,timeout,max,now（键须按此序出现）；
+        # keys 为 1..256 项数组，项沿用 route 的 key 校验（可重复），
+        # timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数，now 纳入
+        # 共用非递减时钟（倒退在执行期与其余操作同序判 INPUT）。
+        if list(raw_op) != ["op", "keys", "timeout", "max", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        keys = raw_op["keys"]
+        if not isinstance(keys, list) or not 1 <= len(keys) <= 256:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "fi",
+            [parse_key(item) for item in keys],
             parse_fault_num(raw_op["timeout"]),
             parse_attempt_max(raw_op["max"]),
             parse_fault_num(raw_op["now"]),
@@ -2447,7 +2479,7 @@ def run(raw):
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
-            "ci", "cb", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "fx", "fr", "fi", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
         ):
             now = op[-1]
@@ -4213,6 +4245,88 @@ def run(raw):
                     attempt_retries,
                     now,
                 )
+
+        elif op[0] == "fi":
+            _, keys, timeout, max_attempts, now = op
+            if ring_vnodes is None:
+                # 未配环报 STATE（先于各 key 模拟）。
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                # 环内无合格候选同样报 STATE。
+                fail(EXIT_STATE, "STATE")
+            digests = [token[0] for token in tokens]
+            cases = []
+            total_attempts = 0
+            total_retries = 0
+            accepted = 0
+            for key in keys:
+                # 按 keys 顺序在同一 now 独立模拟 fr 的哈希遍历与 D/F/S
+                # 规则，至多尝试 max 个不同后端；只读运行态，不建连、不记
+                # 度量、不记故障统计。
+                key_hash = int.from_bytes(
+                    hashlib.sha256(key.encode("utf-8")).digest(), "big"
+                )
+                index = bisect.bisect_left(digests, key_hash)
+                if index == len(tokens):
+                    index = 0  # 越界回绕到环首
+                attempts = 0
+                latency = 0
+                state = "R"
+                chosen_id = None
+                seen = set()
+                for offset in range(len(tokens)):
+                    if attempts >= max_attempts:
+                        break
+                    backend_id = tokens[(index + offset) % len(tokens)][3]
+                    if backend_id in seen:
+                        continue
+                    seen.add(backend_id)
+                    record = backends[backend_id]
+                    segment = active_fault(record, now)
+                    effect = fault_effect(segment, now)
+                    cost = segment[3] if effect == "S" else 0
+                    attempts += 1
+                    if effect == "D":
+                        # D/故障相位 F：本尝试失败、耗时 0。
+                        continue
+                    if cost > timeout:
+                        # S 且 v>timeout：本尝试失败，耗时按 timeout 计。
+                        latency += timeout
+                        continue
+                    # 首个成功尝试即终止：耗时 v 或 0。
+                    latency += cost
+                    chosen_id = backend_id
+                    state = "A"
+                    break
+                retries = max(attempts - 1, 0)
+                total_attempts += attempts
+                total_retries += retries
+                if state == "A":
+                    accepted += 1
+                cases.append(
+                    {
+                        "key": key,
+                        "state": state,
+                        "backend": chosen_id,
+                        "attempts": attempts,
+                        "latency": latency,
+                    }
+                )
+            results.append(
+                {
+                    "op": "fi",
+                    "now": now,
+                    "cases": cases,
+                    "summary": {
+                        "accepted": accepted,
+                        "rejected": len(keys) - accepted,
+                        "attempts": total_attempts,
+                        "retries": total_retries,
+                        "remaps": total_retries,
+                    },
+                }
+            )
 
         elif op[0] == "ts":
             _, ttl = op
