@@ -107,7 +107,9 @@ op,ok，ok=true。qg 键集 op,scope,id,now：跨窗先置 window=now//span
 不限，在配配额先按跨窗规则推进；令牌与配额全足才原子扣减（配额 used
 加对应成本），否则 RATE/6。remove 同步删除其 B 配额，ci/cb 成功清空
 全部配额，ce 导出不变；非法键集、类型、范围、编码或时钟倒退报
-INPUT/2。qs/qg 与 la 的新增判定均 O(1)，空间 O(Q)。
+INPUT/2。qs 精确重报（limit、span、now 同上次配置）豁免时钟倒退：
+时钟已前进仍返回键序 op,ok（true），不回拨时钟并保留 window、used；
+其他旧时刻 qs/qg 仍报 INPUT/2。qs/qg 与 la 的新增判定均 O(1)，空间 O(Q)。
 
 排队接纳：os 键集 op,cap,q,ttl（均 1..10^6 非 bool 整数），依次为每后端
 连接上限、FIFO 容量、等待时限；首配或同参返回 op,ok，异参报 STATE。
@@ -146,6 +148,19 @@ available=os.q-queued。启用后 oa 可立即接纳时仍按原规则扣令牌�
 纳，处理完若 P 且队长 ≤low 则转 N，否则不变；oc 取消后 P 且队长 ≤low
 立即转 N，其他状态不变。bp 登记值随 ce/ci 导出导入，ci 未携带时取消、
 携带时置 N；bp、bq 及 oa 新增判定均 O(1)，ot 仍 O(q)，额外空间 O(1)。
+
+过载分钟历史：oh 精确键序 op,from,to,now（键须按此序出现）；三数为
+0..10^9 非 bool 整数，now 纳入共用非递减时钟，须 from≤to≤now//60 且
+to-from<60；未配置 os 报 STATE/4。按 window=now//60 记账，全池一份，
+只保留最近 60 窗，空窗不预建：oa 返回 A/Q 分别在其 now 窗增加
+immediate/queued；ot 每个接纳/过期项在其 now 窗增加 dequeued/expired；
+peak 取该窗入队后队长峰值。各计数为非负整数、封顶 10^18。返回键序
+op,windows；windows 覆盖 from 至 to 所有窗并升序，项键序
+window,immediate,queued,dequeued,expired,peak，空窗全 0。键序、类型、
+范围、关系或时钟倒退报 INPUT/2，from 早于 max(0,now//60-59) 报
+STATE/4。oh 只读；ci/cb 成功清历史，失败批回滚。记账 O(1)，ot 仍
+O(q)，oh 为 O(R) 时间、O(60) 空间，仅标准库；紧凑 UTF-8 固定键序
+JSON、末尾一换行及 record/replay 逐字节契约照常，其他子命令不变。
 
 请求度量：mr 键集 op,id,ok,ms,retries,remaps,now，id 须现存否则 BACKEND，
 ok 仅 bool，ms/retries/remaps/now 四数均为 [0,10^9] 非 bool 整数，now 纳入
@@ -1264,7 +1279,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "oa", "ot", "og", "oc", "bp", "bq",
+        "os", "oa", "ot", "og", "oc", "oh", "bp", "bq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr", "fi",
@@ -1579,6 +1594,19 @@ def parse_op(raw_op):
         if keys != {"op", "cid"}:
             fail(EXIT_INPUT, "INPUT")
         return ("oc", parse_cid(raw_op["cid"]))
+
+    if name == "oh":
+        # 过载分钟历史：精确键序 op,from,to,now（键须按此序出现），只读；
+        # 数值与窗关系约束同 ra/ma，未 os 与 from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("oh", start, end, now)
 
     if name == "bp":
         if keys != {"op", "low", "high"}:
@@ -2058,6 +2086,12 @@ def run(raw):
     # oa 查重与 oc 任意位置删除均 O(1) 且其余项 FIFO 相对次序不变。
     queue_cfg = None
     wait_queue = OrderedDict()
+    # 过载分钟历史（oh）：window=now//60 -> [immediate, queued, dequeued,
+    # expired, peak]，全池一份（不按后端分）。oa 返回 A/Q 在其 now 窗记
+    # immediate/queued，ot 的接纳/过期项在其 now 窗记 dequeued/expired，
+    # peak 为该窗入队后队长峰值；计数封顶 10^18，只保留最近 60 窗，空窗
+    # 不预建。ci/cb 成功清空；oh 只读。
+    overload_hist = {}
     # 确定性滞回背压：bp_cfg 未 bp 时为 None，否则为 (low, high)；bp_state
     # 为 N/P。首配或异参重配按当前队长 >=high 置 P，否则 N；同参幂等不改
     # 状态。low < high <= queue_cfg[1]（os.q）；登记值随 ce/ci 导出导入，
@@ -2284,6 +2318,20 @@ def run(raw):
             for old in [w for w in history if w < cutoff]:
                 del history[old]
         counts[reason] = min(METRIC_CAP, counts[reason] + 1)
+
+    def overload_window(now):
+        """取 now//60 窗的过载分钟历史计数行（惰性建窗，空窗不预建），只保留
+        最近 60 窗：时钟非递减，新建窗时丢弃下界之前的旧窗。行布局
+        [immediate, queued, dequeued, expired, peak]。记账 O(1)。"""
+        window = now // 60
+        row = overload_hist.get(window)
+        if row is None:
+            row = [0, 0, 0, 0, 0]
+            overload_hist[window] = row
+            cutoff = window - 59
+            for old in [w for w in overload_hist if w < cutoff]:
+                del overload_hist[old]
+        return row
 
     def active_fault(record, now):
         """按 now 在故障时间线中取唯一活动段：段按 a 升序且 [a,z) 互不
@@ -2600,7 +2648,7 @@ def run(raw):
         不再失败。"""
         nonlocal backends, buckets, quotas, ring_vnodes, queue_cfg, wait_queue
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
-        nonlocal sticky_map, alert, alert_events
+        nonlocal sticky_map, alert, alert_events, overload_hist
         nonlocal mo_seq, mo_cache
 
         def make_record(weight, d, fail_threshold, success_threshold,
@@ -2708,6 +2756,8 @@ def run(raw):
         ring_vnodes = config["vnodes"]
         queue_cfg = config["overload"]
         wait_queue = OrderedDict()
+        # ci/cb 成功清空过载分钟历史。
+        overload_hist = {}
         # 热加载三项：sticky/idle 取登记值（null 即未登记，idle 作用于
         # 此后新建连接）；backpressure 携带时置 N，未携带（含 v1）即取消。
         sticky_ttl = config["sticky"]
@@ -2735,14 +2785,26 @@ def run(raw):
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
             "ci", "cb", "fx", "fr", "fi", "tk", "tg", "tx", "route", "fq", "pick", "fh",
-            "fa", "fe", "ah",
+            "fa", "fe", "ah", "oh",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
             if now is not None:
                 if last_now is not None and now < last_now:
-                    fail(EXIT_INPUT, "INPUT")
-                last_now = now
+                    # qs 精确重报（limit/span/now 同上次配置）豁免时钟倒退：
+                    # 不回拨时钟，由处理分支幂等返回并保留 window/used；其余
+                    # 旧时刻操作（含 qg 与异参 qs）仍报 INPUT。
+                    if op[0] == "qs":
+                        _, qs_scope, qs_id, qs_limit, qs_span, _ = op
+                        quota = quotas.get((qs_scope, qs_id))
+                        if quota is None or quota["last"] != (
+                            qs_limit, qs_span, now
+                        ):
+                            fail(EXIT_INPUT, "INPUT")
+                    else:
+                        fail(EXIT_INPUT, "INPUT")
+                else:
+                    last_now = now
 
         if op[0] == "add":
             _, backend_id, weight, d, now = op
@@ -3581,6 +3643,9 @@ def run(raw):
                 routed[0], cid, flow, c, s, (bc, cc, sc), now
             )
             if status == "admit":
+                # 过载分钟历史：立即接纳计入本窗 immediate。
+                row = overload_window(now)
+                row[0] = min(METRIC_CAP, row[0] + 1)
                 results.append(
                     {"op": "oa", "cid": cid, "state": "A", "backend": backend_id}
                 )
@@ -3600,6 +3665,11 @@ def run(raw):
                 # 三项成本随请求入队，ot 重试时按此成本扣减。新键追加到
                 # OrderedDict 队尾，即 FIFO 入队（重复已在上方拒绝）。
                 wait_queue[cid] = (cid, flow, c, s, key, bc, cc, sc, now)
+                # 过载分钟历史：入队计入本窗 queued，并刷新该窗入队后队长峰值。
+                row = overload_window(now)
+                row[1] = min(METRIC_CAP, row[1] + 1)
+                if len(wait_queue) > row[4]:
+                    row[4] = len(wait_queue)
                 if bp_cfg is not None and len(wait_queue) >= bp_cfg[1]:
                     # N 态照常入队，队长达到 high 即转 P（滞回上沿）。
                     bp_state = "P"
@@ -3640,6 +3710,12 @@ def run(raw):
             if bp_cfg is not None and bp_state == "P" and len(wait_queue) <= bp_cfg[0]:
                 # 滞回下沿：过期与接纳处理完后，P 态队长 <=low 即转 N。
                 bp_state = "N"
+            if expired or admitted:
+                # 过载分钟历史：本次 ot 的过期/接纳项各计入本窗
+                # expired/dequeued（过期不扣令牌，仅计数）。
+                row = overload_window(now)
+                row[3] = min(METRIC_CAP, row[3] + len(expired))
+                row[2] = min(METRIC_CAP, row[2] + len(admitted))
             results.append(
                 {"op": "ot", "expired": expired, "admitted": admitted}
             )
@@ -4006,6 +4082,39 @@ def run(raw):
                     }
                 )
             results.append({"op": "ma", "windows": windows})
+
+        elif op[0] == "oh":
+            # 过载分钟历史（只读）：未 os 报 STATE；from 早于最近 60 窗下界
+            # 报 STATE（同 ra/ma）；不改任何计数，失败批次天然回滚。返回键序
+            # op,windows；windows 覆盖 from..to 并升序，项键序
+            # window,immediate,queued,dequeued,expired,peak，空窗全 0。
+            # 逐窗拷贝，避免结果被批次内后续记账污染。
+            _, start, end, now = op
+            if queue_cfg is None:
+                # 未配置 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            windows = []
+            for window in range(start, end + 1):
+                row = overload_hist.get(window)
+                if row is None:
+                    immediate = queued = dequeued = expired = peak = 0
+                else:
+                    immediate, queued, dequeued, expired, peak = row
+                windows.append(
+                    {
+                        "window": window,
+                        "immediate": immediate,
+                        "queued": queued,
+                        "dequeued": dequeued,
+                        "expired": expired,
+                        "peak": peak,
+                    }
+                )
+            results.append({"op": "oh", "windows": windows})
 
         elif op[0] == "mo":
             # 全池增量快照。同 seq、now 重报原样返回缓存结果，不推进时钟、

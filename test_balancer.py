@@ -1321,6 +1321,59 @@ class QuotaWindowTest(unittest.TestCase):
             2, "INPUT",
         )
 
+    def test_qs_exact_rereport_after_clock_advanced(self):
+        # qs 精确重报（limit/span/now 同上次配置）豁免时钟倒退：时钟已前进
+        # 仍返回 ok，不回拨时钟并保留 window/used。
+        ops = self.base_ops() + [
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 5, "span": 10, "now": 3},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 3},
+            # 时钟前进到 8（与配额同窗 0）。
+            {"op": "probe", "id": "a", "ok": True, "now": 8},
+            # 同 (limit,span,now) 精确重报：幂等返回 ok，不清 used。
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 5, "span": 10, "now": 3},
+            {"op": "qg", "scope": "B", "id": "a", "now": 9},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[5], {"op": "qs", "ok": True})
+        # used 保留为 1（重报未重配置、未清已用），窗口未被重报拨动。
+        self.assertEqual(results[6]["window"], 0)
+        self.assertEqual(results[6]["used"], 1)
+        # 时钟未回拨：重报后 last_now 仍为 8，now=4 的 qg 仍报 INPUT。
+        self.assert_failure(
+            self.base_ops() + [
+                {"op": "qs", "scope": "B", "id": "a",
+                 "limit": 5, "span": 10, "now": 3},
+                {"op": "probe", "id": "a", "ok": True, "now": 8},
+                {"op": "qs", "scope": "B", "id": "a",
+                 "limit": 5, "span": 10, "now": 3},
+                {"op": "qg", "scope": "B", "id": "a", "now": 4},
+            ],
+            2, "INPUT",
+        )
+
+    def test_qs_old_now_other_shapes_still_input(self):
+        # 其他旧时刻 qs/qg 仍报 INPUT：异参 qs（异 limit/span/now）与 qg。
+        for stale in (
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 6, "span": 10, "now": 3},
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 5, "span": 11, "now": 3},
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 5, "span": 10, "now": 2},
+            {"op": "qg", "scope": "B", "id": "a", "now": 3},
+        ):
+            self.assert_failure(
+                self.base_ops() + [
+                    {"op": "qs", "scope": "B", "id": "a",
+                     "limit": 5, "span": 10, "now": 3},
+                    {"op": "probe", "id": "a", "ok": True, "now": 8},
+                    stale,
+                ],
+                2, "INPUT",
+            )
+
     def test_remove_deletes_b_quota(self):
         ops = self.base_ops() + [
             {"op": "qs", "scope": "B", "id": "a",
@@ -1460,6 +1513,201 @@ class V7FaultNormalizationTest(unittest.TestCase):
                   "now": 0}],
                 2, "INPUT",
             )
+
+
+class OverloadHistoryTest(unittest.TestCase):
+    """oh 过载分钟历史：oa/ot 记账、只读查询、保留窗与清空规则。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self, ttl=10):
+        # 环上唯一后端 a，cap=1 便于制造入队。
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 4, "ttl": ttl},
+        ]
+
+    def oa(self, cid, now):
+        return {"op": "oa", "cid": cid, "flow": FLOW,
+                "c": "k", "s": "k", "key": "k", "now": now}
+
+    def test_oh_counts_peak_and_key_order(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),   # A：immediate+1
+            self.oa("c2", 0),   # Q：queued+1，peak=1
+            self.oa("c3", 1),   # Q：queued+1，peak=2
+            {"op": "oh", "from": 0, "to": 0, "now": 1},
+        ]
+        results = self.run_ops(ops)
+        oh = results[6]
+        self.assertEqual(list(oh), ["op", "windows"])
+        self.assertEqual(len(oh["windows"]), 1)
+        window = oh["windows"][0]
+        self.assertEqual(
+            list(window),
+            ["window", "immediate", "queued", "dequeued", "expired", "peak"],
+        )
+        self.assertEqual(
+            window,
+            {"window": 0, "immediate": 1, "queued": 2,
+             "dequeued": 0, "expired": 0, "peak": 2},
+        )
+
+    def test_oh_ot_dequeued_and_expired_in_ot_window(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),               # A
+            self.oa("c2", 0),               # Q
+            self.oa("c3", 1),               # Q
+            {"op": "close", "cid": "c1", "now": 2},
+            {"op": "ot", "now": 5},         # c2 接纳（dequeued），c3 阻塞
+            {"op": "ot", "now": 61},        # c3 过期（expired，归窗 1）
+            {"op": "oh", "from": 0, "to": 1, "now": 61},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[7]["admitted"], ["c2"])
+        self.assertEqual(results[8]["expired"], ["c3"])
+        windows = results[9]["windows"]
+        self.assertEqual(
+            windows[0],
+            {"window": 0, "immediate": 1, "queued": 2,
+             "dequeued": 1, "expired": 0, "peak": 2},
+        )
+        self.assertEqual(
+            windows[1],
+            {"window": 1, "immediate": 0, "queued": 0,
+             "dequeued": 0, "expired": 1, "peak": 0},
+        )
+
+    def test_oh_empty_windows_zero_and_readonly(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),
+            {"op": "oh", "from": 0, "to": 3, "now": 200},
+            {"op": "oh", "from": 0, "to": 3, "now": 200},
+        ]
+        results = self.run_ops(ops)
+        # 只读：两次查询逐字节一致。
+        self.assertEqual(results[4], results[5])
+        windows = results[4]["windows"]
+        self.assertEqual([w["window"] for w in windows], [0, 1, 2, 3])
+        self.assertEqual(
+            windows[0],
+            {"window": 0, "immediate": 1, "queued": 0,
+             "dequeued": 0, "expired": 0, "peak": 0},
+        )
+        for window in windows[1:]:
+            self.assertEqual(
+                window,
+                {"window": window["window"], "immediate": 0, "queued": 0,
+                 "dequeued": 0, "expired": 0, "peak": 0},
+            )
+
+    def test_oh_unconfigured_os_is_state(self):
+        self.assert_failure(
+            [{"op": "oh", "from": 0, "to": 0, "now": 0}], 4, "STATE"
+        )
+
+    def test_oh_premature_from_is_state(self):
+        # now=3600 时当前窗为 60，from 早于下界 1 报 STATE。
+        self.assert_failure(
+            self.base_ops() + [{"op": "oh", "from": 0, "to": 0, "now": 3600}],
+            4, "STATE",
+        )
+
+    def test_oh_input_violations(self):
+        bad_ops = [
+            # 键序不符（须 op,from,to,now）。
+            b'{"ops":[{"op":"oh","to":0,"from":0,"now":0}]}',
+            # 缺键、多键。
+            b'{"ops":[{"op":"oh","from":0,"to":0}]}',
+            b'{"ops":[{"op":"oh","from":0,"to":0,"now":0,"x":1}]}',
+            # bool 不是合法数值。
+            b'{"ops":[{"op":"oh","from":true,"to":0,"now":0}]}',
+            # 范围：now 超 10^9。
+            b'{"ops":[{"op":"oh","from":0,"to":0,"now":1000000001}]}',
+            # 关系：from>to、to-from>=60、to>now//60。
+            b'{"ops":[{"op":"oh","from":2,"to":1,"now":180}]}',
+            b'{"ops":[{"op":"oh","from":0,"to":60,"now":3600}]}',
+            b'{"ops":[{"op":"oh","from":0,"to":2,"now":60}]}',
+        ]
+        for raw in bad_ops:
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, b"")
+            self.assertEqual(stderr, b'{"error":"INPUT"}\n')
+        # 时钟倒退报 INPUT。
+        self.assert_failure(
+            self.base_ops() + [
+                {"op": "oh", "from": 0, "to": 1, "now": 120},
+                {"op": "oh", "from": 0, "to": 0, "now": 60},
+            ],
+            2, "INPUT",
+        )
+
+    def test_ci_cb_clear_history(self):
+        config = config_v7(
+            1, vnodes=1, overload={"cap": 1, "q": 4, "ttl": 100}
+        )
+        ops = self.base_ops(ttl=100) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "close", "cid": "c1", "now": 1},
+            {"op": "oc", "cid": "c2"},
+            {"op": "ci", "config": config, "now": 2},
+            {"op": "oh", "from": 0, "to": 0, "now": 2},
+        ]
+        results = self.run_ops(ops)
+        # ci 成功清空历史：窗 0 全 0。
+        self.assertEqual(
+            results[8]["windows"][0],
+            {"window": 0, "immediate": 0, "queued": 0,
+             "dequeued": 0, "expired": 0, "peak": 0},
+        )
+        # cb 成功同样清空历史。
+        ops = [
+            {"op": "ci", "config": config, "now": 0},
+            self.oa("c1", 1),
+            self.oa("c2", 1),
+            {"op": "close", "cid": "c1", "now": 2},
+            {"op": "oc", "cid": "c2"},
+            {"op": "cb", "rev": 1, "now": 3},
+            {"op": "oh", "from": 0, "to": 0, "now": 3},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            results[6]["windows"][0],
+            {"window": 0, "immediate": 0, "queued": 0,
+             "dequeued": 0, "expired": 0, "peak": 0},
+        )
+
+    def test_record_replay_covers_oh(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "ot", "now": 200},
+            {"op": "oh", "from": 0, "to": 3, "now": 200},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
 
 
 class RecordReplayTest(unittest.TestCase):
