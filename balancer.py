@@ -209,6 +209,20 @@ INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4。ra 只读；已删除后�
 原子回滚；ra 时空 O(BR)（B 为现存后端数、R 为窗数），仅用标准库；
 record/replay 逐字节覆盖 ra。
 
+全池请求指标历史：ma 精确键序 op,from,to,now（键须按此序出现），
+from/to/now 为 0..10^9 非 bool 整数，now 纳入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60。ma 只读汇总全池现存后端同窗 mh
+数据，返回键序 op,windows；windows 覆盖 from 至 to 所有窗并升序，
+项键序 window,requests,qps,errors,error_rate,latency,retries,
+remaps：四项计数与五个 latency 桶逐项为全池求和并封顶 10^18，
+qps=requests/60、error_rate=100*errors/requests（零请求为 0）均按
+mh 口径下截为两位小数字符串；缺窗或空池计数与桶为 0、两字符串为
+0.00。键序、类型、范围、关系或时钟倒退报 INPUT/2；from 早于
+max(0,now//60-59) 报 STATE/4。已删除后端不汇总，同 id 重加只计新
+实例，ci 成功清空历史；失败批次天然回滚；ma 时空 O(BR)（B 为现存
+后端数、R 为窗数），仅用标准库，record/replay 逐字节覆盖 ma；
+mr/mg/mh 行为不变。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler}：
 version=6；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
@@ -1078,7 +1092,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "ra",
+        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr",
         "fb", "fq",
@@ -1460,6 +1474,19 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("ra", start, end, now)
+
+    if name == "ma":
+        # 全池请求指标历史：精确键序 op,from,to,now（键须按此序出现），
+        # 只读；数值与窗关系约束同 ra，from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ma", start, end, now)
 
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
@@ -2320,7 +2347,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
-            "ms", "mx", "rh", "ra",
+            "ms", "mx", "rh", "ra", "ma",
             "ci", "cb", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
         ):
@@ -3461,6 +3488,59 @@ def run(raw):
                     }
                 )
             results.append({"op": "ra", "windows": windows})
+
+        elif op[0] == "ma":
+            # 全池请求指标历史（只读）：from 早于最近 60 窗下界报 STATE
+            # （同 ra）；不改任何度量，失败批次天然回滚。返回键序
+            # op,windows；windows 覆盖 from..to 并升序，项键序
+            # window,requests,qps,errors,error_rate,latency,retries,
+            # remaps：四项计数与五 latency 桶为全部现存后端同窗 mh 数据逐项
+            # 求和并封顶 10^18（已删除后端随记录消失不汇总，同 id 重加只含
+            # 新实例的空历史，ci 重建已清度量）；qps、error_rate 按 mh 口径
+            # 下截两位；缺窗或空池计数与桶为 0、两字符串为 0.00。逐项拷贝，
+            # 避免结果被批次内后续记账污染。
+            _, start, end, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            windows = []
+            for window in range(start, end + 1):
+                requests = errors = retries = remaps = 0
+                latency = [0, 0, 0, 0, 0]
+                for record in backends.values():
+                    metrics = record["metrics"].get(window)
+                    if metrics is None:
+                        # 缺窗：该后端本窗不计入。
+                        continue
+                    requests = min(METRIC_CAP, requests + metrics[0])
+                    errors = min(METRIC_CAP, errors + metrics[1])
+                    retries = min(METRIC_CAP, retries + metrics[2])
+                    remaps = min(METRIC_CAP, remaps + metrics[3])
+                    for i in range(5):
+                        latency[i] = min(
+                            METRIC_CAP, latency[i] + metrics[4][i]
+                        )
+                # qps=requests/60、error_rate=100*errors/requests 均下截两位。
+                qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
+                if requests == 0:
+                    error_rate = "0.00"
+                else:
+                    rate = errors * 10000 // requests
+                    error_rate = "%d.%02d" % divmod(rate, 100)
+                windows.append(
+                    {
+                        "window": window,
+                        "requests": requests,
+                        "qps": qps,
+                        "errors": errors,
+                        "error_rate": error_rate,
+                        "latency": latency,
+                        "retries": retries,
+                        "remaps": remaps,
+                    }
+                )
+            results.append({"op": "ma", "windows": windows})
 
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
