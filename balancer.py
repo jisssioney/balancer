@@ -105,8 +105,9 @@ op,ok，ok=true。qg 键集 op,scope,id,now：跨窗先置 window=now//span
 并清 used，返回键序 op,scope,id,limit,span,window,used,remaining；
 查未配置配额报 STATE。la 另按 bc/cc/sc 检查对应 B/C/S 配额：未配置
 不限，在配配额先按跨窗规则推进；令牌与配额全足才原子扣减（配额 used
-加对应成本），否则 RATE/6。remove 同步删除其 B 配额，ci/cb 成功清空
-全部配额，ce 导出不变；非法键集、类型、范围、编码或时钟倒退报
+加对应成本），否则 RATE/6。remove 同步删除其 B 配额；ci/cb 成功按
+配置 quotas 原子重建（v1..v7 视为空即清空，ce 导出与 ci/cb 载入见
+配置热加载与提交回滚段）；非法键集、类型、范围、编码或时钟倒退报
 INPUT/2。qs 精确重报（limit、span、now 同上次配置）豁免时钟倒退：
 时钟已前进仍返回键序 op,ok（true），不回拨时钟并保留 window、used；
 其他旧时刻 qs/qg 仍报 INPUT/2。qs/qg 与 la 的新增判定均 O(1)，空间 O(Q)。
@@ -277,8 +278,8 @@ record/replay 逐字节契约，其余子命令与既有操作行为不变。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,
-scheduler,faults}：
-version=7；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
+scheduler,faults,quotas}：
+version=8；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
 endpoint}，circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，endpoint
 为 null 或键序 {host,port} 的登记端点，均只含登记值不含运行态；
 vnodes=null 或整数；limits 项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的
@@ -291,24 +292,33 @@ scheduler 精确为 {"pick":"W"}、{"pick":"R"}、{"pick":"L"} 或
 L 为最少连接，H 为一致性哈希；faults 为数组，项键序 id,k,a,z,v（id 引用
 现存后端，k 仅 D/F/S，a/z/v 为 0..10^9 非 bool 整数，a<z，D 须 v=0、
 F/S 须 v>0），同 id 各段 [a,z) 不重叠（相邻端点可接），按后端加入序、
-段 a 升序输出，空计划为 []，不含 effect 或运行态。ci 精确键集
+段 a 升序输出，空计划为 []，不含 effect 或运行态；quotas 为数组，项
+键序 scope,id,limit,span（scope 仅 B/C/S，id 为非空 UTF-8 串，limit
+∈ [1,10^18]、span ∈ [1,10^9] 非 bool 整数），按 scope 的 B/C/S 序、
+id 的 UTF-8 字节升序输出，只含登记值，不含 window、used。ci 精确键集
 op,config,now，结果 op,ok=true；now 为非负非 bool 整数并纳入共用非递减
 时钟，亦接受 version=1 原结构（仅前五键）与 version=2 结构（追加三键），
 两者 scheduler 缺省等价于 W；version=3 同为九键但 scheduler 仅收 W/R，
 version=4 须含 scheduler 并收 W/R/L，version=5 收 W/R/L/H 且选 H 时
 vnodes 须非 null；version=6 同 v5，且 backends 项须在既有七键后含
 endpoint（v1..v5 不含该键，一律视为 null）；version=7 在既有九键末追加
-faults 且须精确含该键（v1..v6 一律视 faults=[]），backends 项同 v6。
+faults 且须精确含该键（v1..v6 一律视 faults=[]），backends 项同 v6；
+version=8 在既有十键末追加 quotas 且须精确含该键（v1..v7 一律视
+quotas=[]），backends 项同 v6。
 各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp 与 fs/fp 的类型与范围。
 scheduler
 缺失（v1/v2）合法，v3 多键、类型错误或 pick 非 W/R，v4 的 pick 非 W/R/L，
-v5/v6/v7 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
-连同其余非法结构、键集、版本、类型、范围、重复后端/限流项/故障段、编码、
+v5..v8 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
+连同其余非法结构、键集、键序、版本、类型、范围、重复后端/限流项/故障段/
+配额项、编码、
 交叉约束（含同 id 段重叠）或时钟倒退判
-INPUT/2，B 限流或 faults 引用未知后端判 BACKEND/3，有活动连接或排队项
+INPUT/2，B 限流、B 配额或 faults 引用未知后端判 BACKEND/3，有活动连接或
+排队项
 判 STATE/4，依次判错。成功时原子替换配置并以 now 重建默认运行态（全部
 healthy、d>0
-自 now 起算预热、熔断 C 空窗、排空 A、桶满、队空、粘性清空、度量归零、
+自 now 起算预热、熔断 C 空窗、排空 A、桶满、配额按 quotas 重建
+（window=now//span、used=0，v1..v7 为空即清空）、队空、粘性清空、度量
+归零、
 平滑 current 与轮询 ticket=0），并按 faults 载入各后端故障时间线
 （fq/fx/fr/fi 立即按其生效；统计、分钟历史与恢复基线等运行态仍重置）：
 sticky/idle 以登记值作用于新连接（idle
@@ -329,22 +339,24 @@ key 沿用 route 校验。H 共享既有环与粘性映射：首次按环选，�
 依环迁移且不迁回；改 vnodes 不主动迁移；三键沿用到期规则。二键结果键序
 op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配环、
 三键未 ss 或无合格后端报 STATE/4。H 不改连接数及 W/R/L 运行态。ce/ci
-均 O(B+M+T) 时空（M 为限流项数、T 为故障段数）；R/L 的 pick 均为 O(B)
+均 O(B+M+T+Q) 时空（M 为限流项数、T 为故障段数、Q 为配额项数）；R/L 的 pick 均为 O(B)
 时间、O(1) 额外
 空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
-配置提交与回滚：ci 成功后把规范化 version=7 配置存为提交，rev 从 1 起
+配置提交与回滚：ci 成功后把规范化 version=8 配置存为提交，rev 从 1 起
 递增，仅保留最近 16 条；失败不分配、不改历史，初始无提交。cl 精确键集
 仅 op，返回键序 op,current,commits：current 为最新 rev 或 null，
 commits 按 rev 升序，项键序 rev,config，config 复用 ce 的逐层键序与
-值格式（含 faults）。cb 精确键集 op,rev,now：rev 为 1..10^18 非 bool
+值格式（含 faults 与 quotas）。cb 精确键集 op,rev,now：rev 为 1..10^18
+非 bool
 整数且须仍被保留，now 沿用 ci 并进入共用非递减时钟；按目标快照执行 ci
-的原子替换与默认运行态重建（恢复目标 faults 时间线并重置故障运行态），
+的原子替换与默认运行态重建（恢复目标 faults 时间线并重置故障运行态，
+恢复目标 quotas 并以 cb.now 重置各配额 window=now//span、used=0），
 成功另建新 rev，返回键序 op,target,rev,ok（ok=true），
 原历史保留后再按 16 条淘汰。目标不存在或 rev 耗尽（下一个 rev 将超过
 10^18）报 STATE/4；键集、rev 类型/范围或时钟非法报 INPUT/2；有活动
 连接或排队项报 STATE/4。失败回滚时钟、配置、运行态、rev 与历史。
-record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16(B+M+T))；其余
+record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16(B+M+T+Q))；其余
 子命令与既有操作行为不变。
 
 H pick 记账：扩展 H 模式 pick，调度与映射行为不变，成功项仅记一次并归属
@@ -1089,7 +1101,9 @@ def parse_config(value):
     backends 项在既有七键后须含 endpoint（null 或精确 {host,port} 对象），
     v1..v5 项不含该键、一律视为 null。version=7 在既有九键末追加 faults
     （数组，项键序 id,k,a,z,v，同 id 段不重叠），backends 项同 v6；
-    v1..v6 一律视 faults 为空。"""
+    v1..v6 一律视 faults 为空。version=8 在既有十键末追加 quotas（数组，
+    项精确键序 scope,id,limit,span，按 B/C/S 及 id 的 UTF-8 字节升序），
+    backends 项同 v6；v1..v7 一律视 quotas 为空。"""
     if not isinstance(value, dict):
         fail(EXIT_INPUT, "INPUT")
     config_keys = set(value)
@@ -1098,6 +1112,8 @@ def parse_config(value):
     v3_keys = v2_keys | {"scheduler"}
     # v7 在既有九键末追加 faults；十键结构只可能为 v7。
     v7_keys = v3_keys | {"faults"}
+    # v8 在既有十键末追加 quotas；十一键结构只可能为 v8。
+    v8_keys = v7_keys | {"quotas"}
     if config_keys == v1_keys:
         version = 1
     elif config_keys == v2_keys:
@@ -1107,6 +1123,8 @@ def parse_config(value):
         version = None
     elif config_keys == v7_keys:
         version = 7
+    elif config_keys == v8_keys:
+        version = 8
     else:
         fail(EXIT_INPUT, "INPUT")
     raw_version = value["version"]
@@ -1126,8 +1144,8 @@ def parse_config(value):
     seen_backend_ids = set()
     for item in raw_backends:
         item_keys = {"id", "weight", "d", "fail", "success", "circuit", "drain"}
-        if version in (6, 7):
-            # v6/v7 项在既有七键后追加 endpoint；v1..v5 项精确为七键。
+        if version >= 6:
+            # v6/v7/v8 项在既有七键后追加 endpoint；v1..v5 项精确为七键。
             item_keys = item_keys | {"endpoint"}
         if not isinstance(item, dict) or set(item) != item_keys:
             fail(EXIT_INPUT, "INPUT")
@@ -1160,7 +1178,7 @@ def parse_config(value):
             circuit_params = (n, m, r, w, q)
         raw_drain = item["drain"]
         drain_t = None if raw_drain is None else parse_drain_timeout(raw_drain)
-        if version in (6, 7):
+        if version >= 6:
             raw_endpoint = item["endpoint"]
             if raw_endpoint is None:
                 endpoint = None
@@ -1270,7 +1288,7 @@ def parse_config(value):
     if version >= 3:
         # scheduler 精确为 {"pick":...} 单键对象：缺失（v1/v2 键集不含该
         # 键，已在上文分流）不会出现；多键、非对象、键名错误或 pick 非
-        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5/v6/v7 收
+        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5..v8 收
         # W/R/L/H。
         raw_scheduler = value["scheduler"]
         if (
@@ -1286,16 +1304,48 @@ def parse_config(value):
         if raw_scheduler["pick"] not in allowed:
             fail(EXIT_INPUT, "INPUT")
         scheduler = raw_scheduler["pick"]
-        # v5/v6/v7 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
+        # v5..v8 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
         if scheduler == "H" and vnodes is None:
             fail(EXIT_INPUT, "INPUT")
     else:
         # v1/v2 旧结构等价于既有平滑加权 W。
         scheduler = "W"
 
-    # faults：仅 version=7 的结构含该键且精确为数组；v1..v6 一律视为空
+    # faults：version>=7 的结构含该键且精确为数组；v1..v6 一律视为空
     # 计划（不校验段，不载入时间线）。
-    faults_plan = parse_config_faults(value["faults"]) if version == 7 else {}
+    faults_plan = parse_config_faults(value["faults"]) if version >= 7 else {}
+
+    if version == 8:
+        # quotas 精确为数组，项精确键序 scope,id,limit,span（键须按此序
+        # 出现）：scope 仅 B/C/S，id 为非空 UTF-8 串，limit ∈ [1,10^18]、
+        # span ∈ [1,10^9] 非 bool 整数；数组按 scope 的 B/C/S 序、id 的
+        # UTF-8 字节升序（重复 (scope,id) 亦被严格升序拒绝），不含
+        # window、used。结构、键序、类型、范围、编码或顺序非法判 INPUT；
+        # B 项引用未知后端留执行期判 BACKEND（同 B 限流）。
+        raw_quotas = value["quotas"]
+        if not isinstance(raw_quotas, list):
+            fail(EXIT_INPUT, "INPUT")
+        normalized_quotas = []
+        previous_quota_key = None
+        for item in raw_quotas:
+            if not isinstance(item, dict) or list(item) != [
+                "scope", "id", "limit", "span",
+            ]:
+                fail(EXIT_INPUT, "INPUT")
+            scope = item["scope"]
+            if scope not in scope_rank:
+                fail(EXIT_INPUT, "INPUT")
+            quota_id = parse_key(item["id"])
+            limit = parse_quota_limit(item["limit"])
+            span = parse_quota_span(item["span"])
+            order_key = (scope_rank[scope], quota_id.encode("utf-8"))
+            if previous_quota_key is not None and not previous_quota_key < order_key:
+                fail(EXIT_INPUT, "INPUT")
+            previous_quota_key = order_key
+            normalized_quotas.append((scope, quota_id, limit, span))
+    else:
+        # v1..v7 结构不含 quotas，一律视为空（成功即清空全部配额）。
+        normalized_quotas = []
 
     return {
         "backends": normalized_backends,
@@ -1307,6 +1357,7 @@ def parse_config(value):
         "backpressure": backpressure,
         "scheduler": scheduler,
         "faults": faults_plan,
+        "quotas": normalized_quotas,
     }
 
 
@@ -2830,11 +2881,13 @@ def run(raw):
 
     def export_config():
         """ce 与提交快照共用的配置导出：纯登记值、不含任何运行态，逐层键序
-        固定（version=7；backends 按加入序，项 id,weight,d,fail,success,
+        固定（version=8；backends 按加入序，项 id,weight,d,fail,success,
         circuit,drain,endpoint；limits 按 scope 的 B/C/S 序、id 的 UTF-8
         字节升序；overload/sticky/idle/backpressure 为 null 或登记值；
-        scheduler 精确为 {"pick":...}；faults 末置，按后端加入序、段 a
-        升序，项键序 id,k,a,z,v，空计划为 []，不含 effect 或运行态）。
+        scheduler 精确为 {"pick":...}；faults 按后端加入序、段 a 升序，
+        项键序 id,k,a,z,v，空计划为 []，不含 effect 或运行态；quotas 末置，
+        项键序 scope,id,limit,span，按 scope 的 B/C/S 序、id 的 UTF-8 字节
+        升序，不含 window、used）。
         返回全新结构，调用方可安全存为快照（不随后续运行态变化）。"""
         exported_backends = []
         for backend_id, record in backends.items():
@@ -2894,8 +2947,25 @@ def run(raw):
                 exported_faults.append(
                     {"id": backend_id, "k": k, "a": a, "z": z, "v": v}
                 )
+        # quotas 末置：仅登记值（limit/span），不含 window、used 运行态；
+        # 按 (scope 秩, id UTF-8 字节) 升序输出，同 limits。
+        exported_quotas = [
+            {
+                "scope": scope,
+                "id": quota_id,
+                "limit": quota["limit"],
+                "span": quota["span"],
+            }
+            for (scope, quota_id), quota in sorted(
+                quotas.items(),
+                key=lambda item: (
+                    {"B": 0, "C": 1, "S": 2}[item[0][0]],
+                    item[0][1].encode("utf-8"),
+                ),
+            )
+        ]
         return {
-            "version": 7,
+            "version": 8,
             "backends": exported_backends,
             "vnodes": ring_vnodes,
             "limits": exported_limits,
@@ -2909,14 +2979,16 @@ def run(raw):
             ),
             "scheduler": {"pick": pick_mode},
             "faults": exported_faults,
+            "quotas": exported_quotas,
         }
 
     def apply_config(config, now):
         """ci/cb 共用的原子替换：以 now 重建默认运行态（全部 healthy、d>0
-        自 now 起算预热、熔断 C 空窗、排空 A、桶满、配额清空、队空、粘性清空、
+        自 now 起算预热、熔断 C 空窗、排空 A、桶满、配额按 quotas 重建
+        （window=now//span、used=0，v1..v7 为空即清空）、队空、粘性清空、
         度量归零、平滑 current 与轮询 ticket=0；sticky/idle 取登记值作用于新
         连接，backpressure 携带时置 N、未携带时取消；fe/ah 告警状态与历史
-        清除；故障统计、分钟历史与恢复基线重置），并按 v7 faults 载入各后端
+        清除；故障统计、分钟历史与恢复基线重置），并按 v7+ faults 载入各后端
         登记时间线（v1..v6 为空计划）。调用方须已完成全部校验，本函数自身
         不再失败。"""
         nonlocal backends, buckets, quotas, ring_vnodes, queue_cfg, wait_queue
@@ -3024,8 +3096,19 @@ def run(raw):
             }
         backends = new_backends
         buckets = new_buckets
-        # ci/cb 成功清空全部固定窗口配额（ce 不导出配额，配置不携带）。
-        quotas = {}
+        # 固定窗口配额随配置原子替换：v8 按 quotas 载入，各配额置
+        # window=now//span、used=0（last 置空，qs 精确重报豁免不跨热加载
+        # 保留）；v1..v7 已规范化为空，即清空全部配额。
+        new_quotas = {}
+        for scope, quota_id, limit, span in config["quotas"]:
+            new_quotas[(scope, quota_id)] = {
+                "limit": limit,
+                "span": span,
+                "window": now // span,
+                "used": 0,
+                "last": None,
+            }
+        quotas = new_quotas
         ring_vnodes = config["vnodes"]
         queue_cfg = config["overload"]
         wait_queue = OrderedDict()
@@ -4500,10 +4583,14 @@ def run(raw):
 
         elif op[0] == "ci":
             _, config, now = op
-            # B 限流与 faults 引用未知后端：BACKEND，先于活动状态判定。
+            # B 限流、B 配额与 faults 引用未知后端：BACKEND，先于活动状态
+            # 判定。
             config_backend_ids = {entry[0] for entry in config["backends"]}
             for scope, bucket_id, _, _ in config["limits"]:
                 if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
             for fault_id in config["faults"]:
                 if fault_id not in config_backend_ids:
