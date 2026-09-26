@@ -212,6 +212,19 @@ def config_v8(weight, faults=(), quotas=(), **overrides):
     return config
 
 
+_QUEUE_DEFAULT = object()
+
+
+def config_v9(weight, faults=(), quotas=(), queue=_QUEUE_DEFAULT, **overrides):
+    """最小 version=9 配置：单后端 a，十一键同 v8 且末置 queue 对象。"""
+    config = config_v8(weight, faults, quotas, **overrides)
+    config["version"] = 9
+    config["queue"] = (
+        {"dequeue": "F", "full": "T"} if queue is _QUEUE_DEFAULT else queue
+    )
+    return config
+
+
 class ConfigCommitTest(unittest.TestCase):
     """配置提交与回滚（ci 提交、cl 历史、cb 回滚）。"""
 
@@ -227,9 +240,9 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(list(result), ["op", "current", "commits"])
         self.assertEqual(result, {"op": "cl", "current": None, "commits": []})
 
-    def test_ci_commits_normalized_v8(self):
-        # version=1 旧结构成功加载后，提交为规范化 version=8 配置
-        # （faults 空计划、quotas 空数组）。
+    def test_ci_commits_normalized_v9(self):
+        # version=1 旧结构成功加载后，提交为规范化 version=9 配置
+        # （faults 空计划、quotas 空数组、queue 默认 F/T）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -259,7 +272,7 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(commit["rev"], 1)
         self.assertEqual(
             commit["config"],
-            config_v8(2),
+            config_v9(2),
         )
 
     def test_failed_ci_does_not_commit(self):
@@ -306,8 +319,9 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(
             results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
         )
-        # 回滚后当前配置即 rev=1 的规范化 v8 快照（faults、quotas 均空）。
-        self.assertEqual(results[3]["config"], config_v8(1))
+        # 回滚后当前配置即 rev=1 的规范化 v9 快照（faults、quotas 均空、
+        # queue 默认 F/T）。
+        self.assertEqual(results[3]["config"], config_v9(1))
 
     def test_cb_restores_runtime_state(self):
         # 回滚按目标快照重建默认运行态：调度策略、限流桶、预热自 cb.now 起算。
@@ -405,18 +419,20 @@ class FaultHotReloadTest(unittest.TestCase):
     def seg(self, backend="a", k="D", a=0, z=10, v=0):
         return {"id": backend, "k": k, "a": a, "z": z, "v": v}
 
-    def test_ce_exports_v8_with_faults_and_quotas_last(self):
+    def test_ce_exports_v9_with_queue_last(self):
         results = self.run_ops([{"op": "add", "id": "a", "weight": 1},
                                 {"op": "ce"}])
         config = results[-1]["config"]
         self.assertEqual(
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
-             "idle", "backpressure", "scheduler", "faults", "quotas"],
+             "idle", "backpressure", "scheduler", "faults", "quotas", "queue"],
         )
-        self.assertEqual(config["version"], 8)
+        self.assertEqual(config["version"], 9)
         self.assertEqual(config["faults"], [])
         self.assertEqual(config["quotas"], [])
+        self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
+        self.assertEqual(list(config["queue"]), ["dequeue", "full"])
 
     def test_ci_loads_faults_observed_by_fq(self):
         # 乱序提交（段与后端），ce/fq 按后端加入序、段 a 升序规范化。
@@ -670,7 +686,7 @@ class FaultHotReloadTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
         # ce 输出逐字节固定键序、紧凑、单换行。
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":8', run_stdout)
+        self.assertIn(b'"version":9', run_stdout)
 
 
 class FaultTimelineTest(unittest.TestCase):
@@ -1402,14 +1418,14 @@ class QuotaWindowTest(unittest.TestCase):
             {"op": "ce"},
         ]
         results = self.run_ops(ops)
-        # ce 导出 version=8：精确十一键，quotas 末置；v1..v7 热加载视
+        # ce 导出 version=9：精确十二键，queue 末置；v1..v7 热加载视
         # quotas=[]，故此处为空。
         self.assertEqual(
             list(results[4]["config"]),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
-             "idle", "backpressure", "scheduler", "faults", "quotas"],
+             "idle", "backpressure", "scheduler", "faults", "quotas", "queue"],
         )
-        self.assertEqual(results[4]["config"]["version"], 8)
+        self.assertEqual(results[4]["config"]["version"], 9)
         self.assertEqual(results[4]["config"]["quotas"], [])
         # ci（v7）成功后配额已清空。
         self.assert_failure(
@@ -1489,7 +1505,7 @@ class QuotaHotReloadTest(unittest.TestCase):
             {"op": "ce"},
         ])
         config = results[-1]["config"]
-        self.assertEqual(config["version"], 8)
+        self.assertEqual(config["version"], 9)
         # 按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；项键序
         # scope,id,limit,span，不含 window、used。
         self.assertEqual(
@@ -1665,7 +1681,7 @@ class QuotaHotReloadTest(unittest.TestCase):
         self.assertEqual(
             commits[2]["config"]["quotas"], [self.quota("C", "c", 5, 10)]
         )
-        self.assertEqual(commits[2]["config"]["version"], 8)
+        self.assertEqual(commits[2]["config"]["version"], 9)
 
     def test_record_replay_covers_v8_quotas(self):
         config = config_v8(
@@ -1687,7 +1703,7 @@ class QuotaHotReloadTest(unittest.TestCase):
             (run_code, run_stdout, run_stderr),
         )
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":8', run_stdout)
+        self.assertIn(b'"version":9', run_stdout)
         self.assertIn(b'"quotas":[{', run_stdout)
 
     @staticmethod
@@ -3151,6 +3167,257 @@ class FullQueuePolicyTest(unittest.TestCase):
             (rep_code, rep_stdout, rep_stderr),
             (run_code, run_stdout, run_stderr),
         )
+
+
+class QueuePolicyHotReloadTest(unittest.TestCase):
+    """version=9 queue（qp/rp 策略）纳入 ce/ci/cl/cb 热加载与回滚。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self, q=2):
+        # 环上唯一后端 a，cap=1 便于制造入队与满载。
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": q, "ttl": 10},
+        ]
+
+    def oa(self, cid, now):
+        return {"op": "oa", "cid": cid, "flow": FLOW,
+                "c": "k", "s": "k", "key": "k", "now": now}
+
+    def queued_config(self, queue=None):
+        # 带环与排队配置的 v9 配置，便于 ci/cb 后直接 oa。
+        kwargs = {"vnodes": 1, "overload": {"cap": 1, "q": 2, "ttl": 10}}
+        if queue is not None:
+            kwargs["queue"] = queue
+        return config_v9(1, **kwargs)
+
+    def test_ce_exports_registered_queue_policy(self):
+        results = self.run_ops(self.base_ops() + [
+            {"op": "qp", "mode": "S"},
+            {"op": "rp", "mode": "H"},
+            {"op": "ce"},
+        ])
+        config = results[-1]["config"]
+        self.assertEqual(config["version"], 9)
+        self.assertEqual(list(config)[-1], "queue")
+        # 仅登记策略，不含等待项、evicted 或 last。
+        self.assertEqual(list(config["queue"]), ["dequeue", "full"])
+        self.assertEqual(config["queue"], {"dequeue": "S", "full": "H"})
+
+    def test_ci_v9_loads_queue_policy(self):
+        results = self.run_ops([
+            {"op": "ci", "config": self.queued_config(
+                {"dequeue": "S", "full": "H"}), "now": 0},
+            {"op": "rg"},
+            {"op": "ce"},
+        ])
+        self.assertEqual(results[0], {"op": "ci", "ok": True})
+        self.assertEqual(
+            results[1], {"op": "rg", "mode": "H", "evicted": 0, "last": None}
+        )
+        self.assertEqual(
+            results[2]["config"]["queue"], {"dequeue": "S", "full": "H"}
+        )
+
+    def test_ci_v8_and_below_default_queue_policy(self):
+        # qp/rp 登记值在 v1..v8 热加载后回到默认 F/T。
+        for config in (config_v8(1), config_v7(1), config_v6(1)):
+            results = self.run_ops(self.base_ops() + [
+                {"op": "qp", "mode": "S"},
+                {"op": "rp", "mode": "H"},
+                {"op": "ci", "config": config, "now": 1},
+                {"op": "rg"},
+                {"op": "ce"},
+            ])
+            self.assertEqual(
+                results[6],
+                {"op": "rg", "mode": "T", "evicted": 0, "last": None},
+            )
+            self.assertEqual(
+                results[7]["config"]["queue"],
+                {"dequeue": "F", "full": "T"},
+            )
+
+    def test_v9_requires_exact_queue_key(self):
+        # 十一键结构但 version=9（缺 queue 键）。
+        missing = config_v8(1)
+        missing["version"] = 9
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": missing, "now": 0}]),
+            2, "INPUT",
+        )
+        # 十二键结构但 version=8。
+        bad_version = config_v9(1)
+        bad_version["version"] = 8
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": bad_version, "now": 0}]),
+            2, "INPUT",
+        )
+        # queue 未末置（quotas 与 queue 交换，原始 JSON 构造）。
+        raw = (
+            b'{"ops":[{"op":"ci","now":0,"config":'
+            + self._raw_v9(queue_first=True) + b"}]}"
+        )
+        self.assert_failure(raw, 2, "INPUT")
+
+    def test_queue_validation_errors(self):
+        cases = [
+            # queue 非对象。
+            "F", [], None, 1,
+            # 缺键、多键（含 evicted/last 等运行态键）。
+            {"dequeue": "F"},
+            {"dequeue": "F", "full": "T", "evicted": 0},
+            {"dequeue": "F", "full": "T", "last": None},
+            # 键序错误（须 dequeue,full）。
+            {"full": "T", "dequeue": "F"},
+            # dequeue 枚举值或类型非法。
+            {"dequeue": "X", "full": "T"},
+            {"dequeue": "T", "full": "T"},
+            {"dequeue": "f", "full": "T"},
+            {"dequeue": 1, "full": "T"},
+            {"dequeue": True, "full": "T"},
+            {"dequeue": None, "full": "T"},
+            # full 枚举值或类型非法。
+            {"dequeue": "F", "full": "X"},
+            {"dequeue": "F", "full": "F"},
+            {"dequeue": "F", "full": "h"},
+            {"dequeue": "F", "full": 1},
+            {"dequeue": "F", "full": False},
+        ]
+        for queue in cases:
+            self.assert_failure(
+                encode_ops([{"op": "ci",
+                             "config": config_v9(1, queue=queue), "now": 0}]),
+                2, "INPUT",
+            )
+
+    def test_cb_restores_queue_policy_and_clears_eviction(self):
+        config_sh = self.queued_config({"dequeue": "S", "full": "H"})
+        config_ft = self.queued_config()
+        ops = [
+            {"op": "ci", "config": config_sh, "now": 0},   # rev1：S/H
+            {"op": "ci", "config": config_ft, "now": 1},   # rev2：F/T
+            {"op": "cb", "rev": 1, "now": 2},              # 恢复 S/H
+            {"op": "rg"},
+            self.oa("x1", 2),   # A
+            self.oa("x2", 2),   # Q
+            self.oa("x3", 2),   # Q，队满
+            self.oa("x4", 2),   # 头淘汰 x2
+            {"op": "rg"},
+            {"op": "oc", "cid": "x3"},
+            {"op": "oc", "cid": "x4"},
+            {"op": "close", "cid": "x1", "now": 2},
+            {"op": "cb", "rev": 2, "now": 3},              # 恢复 F/T，清淘汰态
+            {"op": "rg"},
+            {"op": "cl"},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
+        )
+        self.assertEqual(
+            results[3], {"op": "rg", "mode": "H", "evicted": 0, "last": None}
+        )
+        self.assertEqual(results[7]["evicted"], "x2")
+        self.assertEqual(
+            results[8],
+            {"op": "rg", "mode": "H", "evicted": 1, "last": "x2"},
+        )
+        self.assertEqual(
+            results[12], {"op": "cb", "target": 2, "rev": 4, "ok": True}
+        )
+        # cb 恢复目标 queue 策略并清零淘汰态。
+        self.assertEqual(
+            results[13],
+            {"op": "rg", "mode": "T", "evicted": 0, "last": None},
+        )
+        commits = results[14]["commits"]
+        self.assertEqual([c["rev"] for c in commits], [1, 2, 3, 4])
+        self.assertEqual(
+            [c["config"]["queue"] for c in commits],
+            [{"dequeue": "S", "full": "H"}, {"dequeue": "F", "full": "T"},
+             {"dequeue": "S", "full": "H"}, {"dequeue": "F", "full": "T"}],
+        )
+        for commit in commits:
+            self.assertEqual(commit["config"]["version"], 9)
+
+    def test_qp_rp_after_ci_only_affect_current_ce(self):
+        # rp/qp 后续修改仅影响当前 ce，不改已存提交。
+        results = self.run_ops([
+            {"op": "ci", "config": config_v9(1), "now": 0},
+            {"op": "qp", "mode": "S"},
+            {"op": "rp", "mode": "H"},
+            {"op": "ce"},
+            {"op": "cl"},
+        ])
+        self.assertEqual(
+            results[3]["config"]["queue"], {"dequeue": "S", "full": "H"}
+        )
+        commits = results[4]["commits"]
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(
+            commits[0]["config"]["queue"], {"dequeue": "F", "full": "T"}
+        )
+
+    def test_ci_with_queued_items_is_state(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),   # A
+            self.oa("c2", 0),   # Q
+            {"op": "ci", "config": self.queued_config(), "now": 1},
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_record_replay_covers_v9_queue(self):
+        ops = [
+            {"op": "ci", "config": self.queued_config(
+                {"dequeue": "S", "full": "H"}), "now": 0},
+            {"op": "rg"},
+            {"op": "ce"},
+            {"op": "cl"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+        self.assertEqual(run_stdout.count(b"\n"), 1)
+        self.assertIn(b'"version":9', run_stdout)
+        self.assertIn(b'"queue":{"dequeue":"S","full":"H"}', run_stdout)
+
+    @staticmethod
+    def _raw_v9(queue_first=False):
+        # 构造 v9 config 原始 JSON 字节；queue_first=True 时 queue 置于
+        # quotas 前（乱序）。
+        parts = [
+            '"version":9',
+            '"backends":[{"id":"a","weight":1,"d":0,"fail":3,"success":2,'
+            '"circuit":null,"drain":null,"endpoint":null}]',
+            '"vnodes":null', '"limits":[]', '"overload":null',
+            '"sticky":null', '"idle":null', '"backpressure":null',
+            '"scheduler":{"pick":"W"}', '"faults":[]',
+        ]
+        queue = '"queue":{"dequeue":"F","full":"T"}'
+        quotas = '"quotas":[]'
+        parts.extend([queue, quotas] if queue_first else [quotas, queue])
+        return ("{" + ",".join(parts) + "}").encode("utf-8")
 
 
 if __name__ == "__main__":
