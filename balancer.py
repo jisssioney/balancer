@@ -211,8 +211,9 @@ record/replay 逐字节覆盖 ra。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler}：
-version=5；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
-circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，均只含登记值不含运行态；
+version=6；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
+endpoint}，circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，endpoint
+为 null 或键序 {host,port} 的登记端点，均只含登记值不含运行态；
 vnodes=null 或整数；limits 项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的
 UTF-8 字节升序；overload=null 或 {cap,q,ttl}；sticky/idle 为 null 或
 {"ttl":整数}（ttl ∈ [1,10^9] 非 bool 整数，登记 ss/ts 才非 null）；
@@ -225,7 +226,8 @@ op,config,now，结果 op,ok=true；now 为非负非 bool 整数并纳入共用�
 时钟，亦接受 version=1 原结构（仅前五键）与 version=2 结构（追加三键），
 两者 scheduler 缺省等价于 W；version=3 同为九键但 scheduler 仅收 W/R，
 version=4 须含 scheduler 并收 W/R/L，version=5 收 W/R/L/H 且选 H 时
-vnodes 须非 null。
+vnodes 须非 null；version=6 同 v5，且 backends 项须在既有七键后含
+endpoint（v1..v5 不含该键，一律视为 null）。
 各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp 的类型与范围。scheduler
 缺失（v1/v2）合法，v3 多键、类型错误或 pick 非 W/R，v4 的 pick 非 W/R/L，
 v5 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
@@ -388,11 +390,25 @@ replay 只接受该精确键集且拒绝重复键；类型、版本、退出码�
 stdin 并逐字节比较退出码、stdout、stderr；不符时 stderr 写
 {"error":"REPLAY"} 加换行、退出 8、无 stdout；一致时原样写出记录的
 stdout、stderr 并采用记录退出码。两者额外时空 O(I+O)。
+
+后端端点与连接转发快照：ep 键集 op,id,host,port 为后端登记 IP 端点；
+host 须为无区域标识（不含 %）的 IP 字面量且满足
+str(ipaddress.ip_address(host))==host，port 为 1..65535 非 bool 整数；
+同参重报幂等、异参覆盖，返回 op,ok=true；未知 id 报 BACKEND/3，非法
+键或字段报 INPUT/2。open、oa、ot、fx、fr 成功建连时快照该后端当时的
+endpoint（未配置仍建连、无快照）。fw 键集 op,cid，返回键序
+op,cid,backend,host,port，取建连时的快照、不受后续 ep 变更影响；无快
+照报 STATE/4，未知 cid 报 CONNECTION/5；删除连接（close/dg/tx）同步
+删除快照。ce 顶层键序不变、version=6，backends 项在既有七键后追加
+endpoint（null 或键序 host,port）；ci 兼容 version1..5 并视
+endpoint=null，version6 须含 endpoint，成功原子重建、失败回滚。ep/fw
+为 O(1)，额外空间 O(B+C)，仅用标准库；其余子命令与既有操作行为不变。
 """
 
 import base64
 import bisect
 import hashlib
+import ipaddress
 import json
 import json.scanner
 import re
@@ -787,6 +803,32 @@ def parse_flow(value):
     return [src_ip, src_port, dst_ip, dst_port, protocol]
 
 
+def parse_endpoint_host(value):
+    # ep/ci 的 host：无区域标识（不含 %）的 IP 字面量，且规范化形式与
+    # 原文逐字节相同（拒绝前导零、非常规缩写等写法）；非字符串、非
+    # IP 字面量或含区域标识均判 INPUT。
+    if not isinstance(value, str) or "%" in value:
+        fail(EXIT_INPUT, "INPUT")
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        fail(EXIT_INPUT, "INPUT")
+    if str(parsed) != value:
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_endpoint_port(value):
+    # ep/ci 的 port ∈ [1, 65535]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 65535
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_config(value):
     """校验 ci 的 config 并返回规范化结构；结构、键集、版本、类型、范围、
     编码、重复项或交叉约束一律 INPUT。B 限流对后端的引用在执行期判 BACKEND。
@@ -795,9 +837,11 @@ def parse_config(value):
     sticky/idle/backpressure 一律视为 null；version=2 须精确含追加三键，
     sticky/idle 为 null 或 {"ttl":整数}，backpressure 为 null 或 {"low",
     "high"}，非 null 时 overload 必非 null 且 low<high≤overload.q；
-    version=3/4/5 在 v2 八键末追加 scheduler，须精确为 {"pick":...} 单键
-    对象，v3 仅收 W/R，v4 收 W/R/L，v5 收 W/R/L/H；v5 选 H 时 vnodes 须
-    非 null。v1/v2 的 scheduler 缺省等价于 W。"""
+    version=3/4/5/6 在 v2 八键末追加 scheduler，须精确为 {"pick":...} 单键
+    对象，v3 仅收 W/R，v4 收 W/R/L，v5/v6 收 W/R/L/H；v5/v6 选 H 时
+    vnodes 须非 null。v1/v2 的 scheduler 缺省等价于 W。version=6 的
+    backends 项在既有七键后须含 endpoint（null 或精确 {host,port} 对象），
+    v1..v5 项不含该键、一律视为 null。"""
     if not isinstance(value, dict):
         fail(EXIT_INPUT, "INPUT")
     config_keys = set(value)
@@ -809,7 +853,7 @@ def parse_config(value):
     elif config_keys == v2_keys:
         version = 2
     elif config_keys == v3_keys:
-        # 九键结构为 v3/v4/v5 共用，具体版本由 version 字段区分。
+        # 九键结构为 v3/v4/v5/v6 共用，具体版本由 version 字段区分。
         version = None
     else:
         fail(EXIT_INPUT, "INPUT")
@@ -817,7 +861,7 @@ def parse_config(value):
     if not isinstance(raw_version, int) or isinstance(raw_version, bool):
         fail(EXIT_INPUT, "INPUT")
     if version is None:
-        if raw_version not in (3, 4, 5):
+        if raw_version not in (3, 4, 5, 6):
             fail(EXIT_INPUT, "INPUT")
         version = raw_version
     elif raw_version != version:
@@ -829,9 +873,11 @@ def parse_config(value):
     normalized_backends = []
     seen_backend_ids = set()
     for item in raw_backends:
-        if not isinstance(item, dict) or set(item) != {
-            "id", "weight", "d", "fail", "success", "circuit", "drain",
-        }:
+        item_keys = {"id", "weight", "d", "fail", "success", "circuit", "drain"}
+        if version == 6:
+            # v6 项在既有七键后追加 endpoint；v1..v5 项精确为七键。
+            item_keys = item_keys | {"endpoint"}
+        if not isinstance(item, dict) or set(item) != item_keys:
             fail(EXIT_INPUT, "INPUT")
         backend_id = parse_backend_id(item["id"])
         # 后端 id 须 UTF-8 可编码（建环与输出排序都会用到其字节）。
@@ -862,6 +908,23 @@ def parse_config(value):
             circuit_params = (n, m, r, w, q)
         raw_drain = item["drain"]
         drain_t = None if raw_drain is None else parse_drain_timeout(raw_drain)
+        if version == 6:
+            raw_endpoint = item["endpoint"]
+            if raw_endpoint is None:
+                endpoint = None
+            else:
+                # 精确 {host,port} 对象，校验同 ep。
+                if not isinstance(raw_endpoint, dict) or set(raw_endpoint) != {
+                    "host", "port",
+                }:
+                    fail(EXIT_INPUT, "INPUT")
+                endpoint = (
+                    parse_endpoint_host(raw_endpoint["host"]),
+                    parse_endpoint_port(raw_endpoint["port"]),
+                )
+        else:
+            # v1..v5 结构不含 endpoint，一律视为 null。
+            endpoint = None
         normalized_backends.append(
             (
                 backend_id,
@@ -871,6 +934,7 @@ def parse_config(value):
                 success_threshold,
                 circuit_params,
                 drain_t,
+                endpoint,
             )
         )
 
@@ -954,7 +1018,7 @@ def parse_config(value):
     if version >= 3:
         # scheduler 精确为 {"pick":...} 单键对象：缺失（v1/v2 键集不含该
         # 键，已在上文分流）不会出现；多键、非对象、键名错误或 pick 非
-        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5 收 W/R/L/H。
+        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5/v6 收 W/R/L/H。
         raw_scheduler = value["scheduler"]
         if (
             not isinstance(raw_scheduler, dict)
@@ -969,7 +1033,7 @@ def parse_config(value):
         if raw_scheduler["pick"] not in allowed:
             fail(EXIT_INPUT, "INPUT")
         scheduler = raw_scheduler["pick"]
-        # v5 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
+        # v5/v6 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
         if scheduler == "H" and vnodes is None:
             fail(EXIT_INPUT, "INPUT")
     else:
@@ -1008,6 +1072,7 @@ def parse_op(raw_op):
         "hm", "fm", "fh",
         "fa", "fe", "ah",
         "ts", "tk", "tg", "tx",
+        "ep", "fw",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -1576,6 +1641,25 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("tx", parse_now(raw_op["now"]))
 
+    if name == "ep":
+        # 后端 IP 端点登记：精确键集 op,id,host,port；未知 id 留执行期判
+        # BACKEND。
+        if keys != {"op", "id", "host", "port"}:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "ep",
+            parse_backend_id(raw_op["id"]),
+            parse_endpoint_host(raw_op["host"]),
+            parse_endpoint_port(raw_op["port"]),
+        )
+
+    if name == "fw":
+        # 连接转发快照查询：精确键集 op,cid，无 now；未知 cid 与无快照
+        # 均留执行期判定。
+        if keys != {"op", "cid"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fw", parse_cid(raw_op["cid"]))
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
@@ -1635,6 +1719,11 @@ def run(raw):
     # 可复用。last 为最近活动时刻（建连时置 opened_at，tk 未到期时置 now），
     # 供 ts/tk/tg/tx 的空闲超时判定；dict 保序即建连顺序。
     connections = {}
+    # 连接转发快照：cid -> (host, port)，仅在成功建连（open/oa/ot/fx/fr）
+    # 当时后端已 ep 登记 endpoint 时写入；删除连接（close/dg/tx）同步删除。
+    # fw 只读快照，不受后续 ep 变更影响；键集恒为 connections 键集的子集。
+    # 额外空间 O(C)。
+    conn_endpoints = {}
     # 一致性哈希：ring_vnodes 未 chash 时为 None；粘性映射 key -> [backend_id,
     # expires]，只在目标不可用（三键还包括到期）时依环改写（不迁回），增删
     # 后端或改 vnodes 均不动它。expires 为 None 表示无到期（未 ss 或二键
@@ -1764,6 +1853,17 @@ def run(raw):
         )
         bucket["at"] = now
 
+    def establish_connection(cid, backend_id, flow, now):
+        """成功建连（open/oa/ot/fx/fr 共用）：后端并发加一、登记连接
+        （opened_at=now）；后端当时已 ep 登记 endpoint 时快照其
+        (host, port)，未配置仍建连（无快照，fw 报 STATE）。"""
+        record = backends[backend_id]
+        record["conns"] += 1
+        connections[cid] = [backend_id, flow, now, now]
+        endpoint = record["endpoint"]
+        if endpoint is not None:
+            conn_endpoints[cid] = endpoint
+
     def evaluate_admit(backend_id, cid, flow, c, s, costs, now):
         """对已路由的后端按 la 规则补充检查但不消费；令牌不足、目标非 A 或
         连接数达 cap 时返回 ("block", id)，全部满足才按成本耗令牌、建连接
@@ -1789,8 +1889,7 @@ def run(raw):
         # 接纳才按成本耗令牌并按 open 建连接。
         for bucket, cost in chosen:
             bucket["t"] -= cost
-        record["conns"] += 1
-        connections[cid] = [backend_id, flow, now, now]
+        establish_connection(cid, backend_id, flow, now)
         return "admit", backend_id
 
     def try_admit(cid, flow, c, s, key, costs, now):
@@ -2053,6 +2152,9 @@ def run(raw):
                     "forced": 0,
                 },
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
+                # 后端 IP 端点：ep 登记的 (host, port)，未配置为 None；
+                # remove 后重加即回到未配，随 ce/ci 导出导入（version=6）。
+                "endpoint": None,
                 # 故障演练：fs 登记的 (k, a, z, v)，未登记为 None；remove/ci 清除。
                 "fault": None,
                 # 故障演练统计（fm）：按登记种类 D/F/S 各记
@@ -2247,8 +2349,7 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             if cid in connections:
                 fail(EXIT_CONNECTION, "CONNECTION")
-            backends[chosen_id]["conns"] += 1
-            connections[cid] = [chosen_id, flow, now, now]
+            establish_connection(cid, chosen_id, flow, now)
             results.append({"op": "open", "cid": cid, "backend": chosen_id})
 
         elif op[0] == "close":
@@ -2259,6 +2360,8 @@ def run(raw):
             record = backends[connection[0]]
             record["conns"] -= 1
             del connections[cid]
+            # 删除连接时同步删除其转发快照。
+            conn_endpoints.pop(cid, None)
             drain = record["drain"]
             if drain["state"] == "D" and record["conns"] == 0:
                 # 排空中最后连接关闭即转 X，end 取本次 close 的 now。
@@ -2630,6 +2733,7 @@ def run(raw):
                 for cid, connection in list(connections.items()):
                     if connection[0] == backend_id:
                         del connections[cid]
+                        conn_endpoints.pop(cid, None)
                         forced += 1
                 record["conns"] = 0
                 drain["forced"] = forced
@@ -3131,6 +3235,7 @@ def run(raw):
             exported_backends = []
             for backend_id, record in backends.items():
                 circuit = record["circuit"]
+                endpoint = record["endpoint"]
                 exported_backends.append(
                     {
                         "id": backend_id,
@@ -3150,6 +3255,12 @@ def run(raw):
                             }
                         ),
                         "drain": record["drain"]["t"],
+                        # 既有七键后追加 endpoint：null 或键序 host,port。
+                        "endpoint": (
+                            None
+                            if endpoint is None
+                            else {"host": endpoint[0], "port": endpoint[1]}
+                        ),
                     }
                 )
             exported_limits = [
@@ -3175,7 +3286,7 @@ def run(raw):
                 {
                     "op": "ce",
                     "config": {
-                        "version": 5,
+                        "version": 6,
                         "backends": exported_backends,
                         "vnodes": ring_vnodes,
                         "limits": exported_limits,
@@ -3209,7 +3320,7 @@ def run(raw):
 
             # 校验全部通过，原子替换配置并以 now 重建默认运行态。
             def make_record(weight, d, fail_threshold, success_threshold,
-                            circuit_params, drain_t):
+                            circuit_params, drain_t, endpoint):
                 if d == 0:
                     stage = "steady"
                     warm_from = warm_start = warm_end = None
@@ -3258,6 +3369,8 @@ def run(raw):
                     },
                     # 热加载不携带历史写操作形状。
                     "last_op": None,
+                    # 后端 IP 端点登记值（v1..v5 已规范化为 None）。
+                    "endpoint": endpoint,
                     "metrics": {},
                     # ci 成功清零 H pick 记账。
                     "pick_counts": {
@@ -3279,10 +3392,11 @@ def run(raw):
 
             new_backends = {}
             for (backend_id, weight, d, fail_threshold,
-                 success_threshold, circuit_params, drain_t) in config_backends:
+                 success_threshold, circuit_params, drain_t,
+                 endpoint) in config_backends:
                 new_backends[backend_id] = make_record(
                     weight, d, fail_threshold, success_threshold,
-                    circuit_params, drain_t,
+                    circuit_params, drain_t, endpoint,
                 )
             # 新桶满令牌起步，at=now。
             new_buckets = {}
@@ -3667,8 +3781,7 @@ def run(raw):
                     break
             if state == "A":
                 # 按 open 建连（opened_at=now）。
-                backends[chosen_id]["conns"] += 1
-                connections[cid] = [chosen_id, flow, now, now]
+                establish_connection(cid, chosen_id, flow, now)
             results.append(
                 {
                     "op": "fx",
@@ -3751,8 +3864,7 @@ def run(raw):
                 bump_fault(attempt_record, "remaps", now)
             if state == "A":
                 # 成功按 open 建连（opened_at=now）；耗尽拒绝不建连。
-                backends[chosen_id]["conns"] += 1
-                connections[cid] = [chosen_id, flow, now, now]
+                establish_connection(cid, chosen_id, flow, now)
             results.append(
                 {
                     "op": "fr",
@@ -3833,6 +3945,7 @@ def run(raw):
                 if now >= connection[3] + ttl_cfg:
                     expired.append(cid)
                     del connections[cid]
+                    conn_endpoints.pop(cid, None)
                     record = backends[connection[0]]
                     record["conns"] -= 1
                     drain = record["drain"]
@@ -3841,6 +3954,35 @@ def run(raw):
                         drain["state"] = "X"
                         drain["end"] = now
             results.append({"op": "tx", "expired": expired})
+
+        elif op[0] == "ep":
+            # 登记后端 IP 端点：同参幂等、异参覆盖，均返回 ok；O(1)。
+            _, backend_id, host, port = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            record["endpoint"] = (host, port)
+            results.append({"op": "ep", "ok": True})
+
+        elif op[0] == "fw":
+            # 连接转发快照查询（只读）：取建连时的快照，不受后续 ep 影响；
+            # 未知 cid 报 CONNECTION，无快照报 STATE；O(1)。
+            _, cid = op
+            connection = connections.get(cid)
+            if connection is None:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            endpoint = conn_endpoints.get(cid)
+            if endpoint is None:
+                fail(EXIT_STATE, "STATE")
+            results.append(
+                {
+                    "op": "fw",
+                    "cid": cid,
+                    "backend": connection[0],
+                    "host": endpoint[0],
+                    "port": endpoint[1],
+                }
+            )
 
         else:  # get
             _, cid = op
