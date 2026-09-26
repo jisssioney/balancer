@@ -306,6 +306,27 @@ recovered 的非负整数对象，空窗五项为 0。键集、类型、范围�
 报 STATE/4。fh 只读，不改计数与恢复基线，失败批次天然回滚；记账 O(1)，
 fh 为 O(R)（R 为窗数），额外空间 O(60B)，record/replay 逐字节覆盖。
 
+全池故障汇总与阈值告警：fa 精确键序 op,from,to,now（键须按此序出现），
+from/to/now 为 [0,10^9] 非 bool 整数，now 纳入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60；fa 只读汇总全池 fh 分钟窗，返回键序
+op,windows；windows 覆盖 from 至 to 所有窗并升序，项键序
+window,backends,total；backends 按加入序列出全部现存后端，项键序
+id,D,F,S，三类各为 fh 同款五键对象，缺窗各项为 0；total 键序 D,F,S，
+为全池逐项求和并封顶 10^18；空池 backends 为空、total 各项为 0。
+fe 精确键序 op,w,hi,lo,n,now（键须按此序出现）：w/now 为 [0,10^9]
+非 bool 整数，hi ∈ [1,10^18]、0≤lo<hi、n ∈ [1,60] 均非 bool 整数，
+now 纳入共用非递减时钟；首评固化 (hi,lo,n) 并自 N 态起评，此后阈值
+须相同且 w 仅同前（同窗原样返回首评结果，不推进状态机）或 +1；w 窗
+须已结束（w<now//60）。v 为全池现存后端 w 窗三类 rejected 的逐项
+封顶和；N 态连续 n 窗 v≥hi 转 A，A 态连续 n 窗 v≤lo 转 N，否则连续
+计数归零；返回键序 op,w,state,v,run,changed，state ∈ N/A，run 为
+连续计数，changed 仅转换时为 true 且转换后 run=0。非法键（含键
+序）、类型、范围、关系或时钟倒退报 INPUT/2；from/w 早于
+max(0,now//60-59) 的保留窗下界、fe 窗未结束、跳窗（含回退）或变阈
+值报 STATE/4。fa 只读；remove 的后端不计入、重加无历史；ci 成功清
+空历史与告警状态；失败批次原子回滚；fa 时空 O(BR)（R 为窗数），fe
+时间 O(B)、额外空间 O(1)；record/replay 逐字节覆盖。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -945,6 +966,7 @@ def parse_op(raw_op):
         "fs", "fx", "fr",
         "fb", "fq",
         "hm", "fm", "fh",
+        "fa", "fe",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -1390,6 +1412,50 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("fh", parse_backend_id(raw_op["id"]), start, end, now)
 
+    if name == "fa":
+        # 全池故障汇总：精确键序 op,from,to,now（键须按此序出现），只读；
+        # 数值与窗关系约束同 fh，from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fa", start, end, now)
+
+    if name == "fe":
+        # 全池故障阈值告警：精确键序 op,w,hi,lo,n,now（键须按此序出现）；
+        # w/now ∈ [0,10^9]，hi ∈ [1,10^18]，0≤lo<hi，n ∈ [1,60]，均非
+        # bool 整数；窗未结束/跳窗/变阈值的 STATE 留执行期判。
+        if list(raw_op) != ["op", "w", "hi", "lo", "n", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        w = parse_metric_num(raw_op["w"])
+        hi = raw_op["hi"]
+        # bool 是 int 的子类，必须显式排除。
+        if (
+            not isinstance(hi, int)
+            or isinstance(hi, bool)
+            or not 1 <= hi <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        lo = raw_op["lo"]
+        if (
+            not isinstance(lo, int)
+            or isinstance(lo, bool)
+            or not 0 <= lo < hi
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        n = raw_op["n"]
+        if (
+            not isinstance(n, int)
+            or isinstance(n, bool)
+            or not 1 <= n <= 60
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("fe", w, hi, lo, n, parse_metric_num(raw_op["now"]))
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1525,6 +1591,11 @@ def run(raw):
     pick_mode = "W"
     rr_ticket = 0
     last_now = None
+    # 全池故障阈值告警（fe）：未首评为 None，否则为 {"hi","lo","n",
+    # "state","run","w","result"}——(hi,lo,n) 为首评固化的阈值，state ∈
+    # N/A，run 为当前连续计数，w 为最近已评窗，result 为该窗结果（同窗
+    # 重报原样返回，不推进状态机）。ci 成功即清除。
+    alert = None
     results = []
 
     def backend_routable(record, drain_strict=False):
@@ -1815,6 +1886,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
             "ms", "mx",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "fa", "fe",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -3037,6 +3109,8 @@ def run(raw):
             pick_mode = config["scheduler"]
             rr_ticket = 0
             sticky_map = {}
+            # ci 成功清除全池故障告警状态（fe 回到未首评）。
+            alert = None
             results.append({"op": "ci", "ok": True})
 
         elif op[0] == "fs":
@@ -3189,6 +3263,119 @@ def run(raw):
                         }
                     )
             results.append({"op": "fh", "id": backend_id, "windows": windows})
+
+        elif op[0] == "fa":
+            # 全池故障汇总（只读）：from 早于最近 60 窗下界报 STATE（同
+            # fh）；不改任何计数，失败批次天然回滚。返回键序 op,windows；
+            # windows 覆盖 from..to 并升序，项键序 window,backends,total；
+            # backends 按加入序列全部现存后端，项键序 id,D,F,S（fh 同款五
+            # 键对象，缺窗为 0）；total 键序 D,F,S，为全池逐项求和并封顶
+            # 10^18。逐窗逐类拷贝，避免结果被批次内后续记账污染。
+            _, start, end, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            windows = []
+            for window in range(start, end + 1):
+                total = new_fault_stats()
+                entries = []
+                for backend_id, record in backends.items():
+                    stats = record["fault_hist"].get(window)
+                    if stats is None:
+                        # 缺窗：各项为 0，求和不受影响。
+                        stats = new_fault_stats()
+                    entry = {"id": backend_id}
+                    for kind in "DFS":
+                        counts = stats[kind]
+                        entry[kind] = dict(counts)
+                        for field, value in counts.items():
+                            total[kind][field] = min(
+                                METRIC_CAP, total[kind][field] + value
+                            )
+                    entries.append(entry)
+                windows.append(
+                    {
+                        "window": window,
+                        "backends": entries,
+                        "total": total,
+                    }
+                )
+            results.append({"op": "fa", "windows": windows})
+
+        elif op[0] == "fe":
+            # 全池故障阈值告警：首评固化 (hi,lo,n) 并自 N 态起评；此后阈值
+            # 须相同且 w 仅同前（同窗原样返回首评结果，不推进状态机）或
+            # +1，变阈值或跳窗（含回退）报 STATE。w 窗须已结束且在 fh 保留
+            # 窗内。v 为全池现存后端 w 窗三类 rejected 的逐项封顶和；N 态
+            # 连续 n 窗 v>=hi 转 A，A 态连续 n 窗 v<=lo 转 N，否则连续计数
+            # 归零；转换时 changed=true 且 run 归零。返回键序
+            # op,w,state,v,run,changed。
+            _, w, hi, lo, n, now = op
+            current = now // 60
+            if w >= current or w < max(0, current - 59):
+                # 窗未结束（含未来窗），或已超出最近 60 窗的保留下界。
+                fail(EXIT_STATE, "STATE")
+            if alert is not None:
+                if (hi, lo, n) != (alert["hi"], alert["lo"], alert["n"]):
+                    # 变阈值。
+                    fail(EXIT_STATE, "STATE")
+                if w == alert["w"]:
+                    # 同窗重报：原样返回首评结果，不推进状态机。
+                    results.append(dict(alert["result"]))
+                    continue
+                if w != alert["w"] + 1:
+                    # 跳窗（含回退）。
+                    fail(EXIT_STATE, "STATE")
+            v = 0
+            for record in backends.values():
+                stats = record["fault_hist"].get(w)
+                if stats is not None:
+                    for kind in "DFS":
+                        v = min(METRIC_CAP, v + stats[kind]["rejected"])
+            if alert is None:
+                state = "N"
+                run_count = 0
+            else:
+                state = alert["state"]
+                run_count = alert["run"]
+            changed = False
+            if state == "N":
+                if v >= hi:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "A"
+                        run_count = 0
+                        changed = True
+                else:
+                    run_count = 0
+            else:
+                if v <= lo:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "N"
+                        run_count = 0
+                        changed = True
+                else:
+                    run_count = 0
+            result = {
+                "op": "fe",
+                "w": w,
+                "state": state,
+                "v": v,
+                "run": run_count,
+                "changed": changed,
+            }
+            alert = {
+                "hi": hi,
+                "lo": lo,
+                "n": n,
+                "state": state,
+                "run": run_count,
+                "w": w,
+                "result": dict(result),
+            }
+            results.append(result)
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
