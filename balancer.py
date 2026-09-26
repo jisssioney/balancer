@@ -306,6 +306,27 @@ recovered 的非负整数对象，空窗五项为 0。键集、类型、范围�
 报 STATE/4。fh 只读，不改计数与恢复基线，失败批次天然回滚；记账 O(1)，
 fh 为 O(R)（R 为窗数），额外空间 O(60B)，record/replay 逐字节覆盖。
 
+全池故障汇总：fa 精确键序 op,from,to,now，数值、关系与时钟约束同 fh
+（from/to/now ∈ [0,10^9] 非 bool 整数，now 共用非递减时钟，须
+from≤to≤now//60 且 to-from<60），非法键/值或时钟倒退报 INPUT/2，
+from 早于 max(0,now//60-59) 报 STATE/4；fa 只读。返回键序
+op,windows；windows 含 from 至 to 所有窗并升序，项键序
+window,backends,total：backends 按后端加入序列列全部现存后端，项键序
+id,D,F,S（值为该后端该窗该类的 rejected，同 fh 对象取值；缺窗、
+remove 后重加无历史及空池均为 0），total 键序 D,F,S 为按加入序逐项
+求和并封顶 10^18 的全池合计。fe 精确键序 op,w,hi,lo,n,now：w/now
+同 fa 三数，hi ∈ [1,10^18]、0≤lo<hi、n ∈ [1,60]，均非 bool 整数。
+首评固化阈值与 N 态（run=0）并即评 w 窗；此后须同阈值且 w 仅同前或
++1，同窗原样返回，变阈值或跳窗（含 w 倒退、跨多窗）报 STATE/4；
+w≥now//60（当前窗未结束或未来窗）或超出 fh 保留窗同样报 STATE/4。v 为该窗全
+池后端三类 rejected 的封顶和；N 态连续 n 窗 v≥hi 转 A，A 态连续
+n 窗 v≤lo 转 N，转换窗 changed=true 且转换后 run=0，未转换则 run
+为当前连续数（条件不满足归 0）。返回键序 op,w,state,v,run,changed，
+state ∈ N/A。remove 不计入汇总、重加无历史；ci 清历史与告警（回到
+未首评）；失败批回滚。record/replay 逐字节覆盖。fa 时间 O(BR)
+（B 为后端数、R 为窗数），fe 时间 O(B)、额外空间 O(1)，仅标准库，
+旧行为不变。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -576,6 +597,39 @@ def parse_cost(value):
         not isinstance(value, int)
         or isinstance(value, bool)
         or not 0 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_fe_hi(value):
+    # fe 的 hi ∈ [1, 10^18]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 18
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_fe_lo(value):
+    # fe 的 lo ∈ [0, 10^18)，非 bool 整数；lo<hi 的交叉关系在 parse_op 判。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value < 10 ** 18
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_fe_n(value):
+    # fe 的 n（连续窗数）∈ [1, 60]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 60
     ):
         fail(EXIT_INPUT, "INPUT")
     return value
@@ -944,7 +998,7 @@ def parse_op(raw_op):
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
-        "hm", "fm", "fh",
+        "hm", "fm", "fh", "fa", "fe",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -1390,6 +1444,33 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("fh", parse_backend_id(raw_op["id"]), start, end, now)
 
+    if name == "fa":
+        # 全池故障汇总：精确键序 op,from,to,now，数值与关系约束同 fh；
+        # from 过早的 STATE 留执行期判。只读。
+        if keys != {"op", "from", "to", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fa", start, end, now)
+
+    if name == "fe":
+        # 全池故障告警：精确键序 op,w,hi,lo,n,now。w/now ∈ [0,10^9]，
+        # hi ∈ [1,10^18]、0≤lo<hi、n ∈ [1,60]，均非 bool 整数；窗未结束、
+        # 跳窗/变阈值、超出保留窗的 STATE 留执行期判。
+        if keys != {"op", "w", "hi", "lo", "n", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        w = parse_metric_num(raw_op["w"])
+        hi = parse_fe_hi(raw_op["hi"])
+        lo = parse_fe_lo(raw_op["lo"])
+        n = parse_fe_n(raw_op["n"])
+        now = parse_metric_num(raw_op["now"])
+        if not lo < hi:
+            fail(EXIT_INPUT, "INPUT")
+        return ("fe", w, hi, lo, n, now)
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1515,6 +1596,13 @@ def run(raw):
     # ci 携带时置 N、未携带时取消。
     bp_cfg = None
     bp_state = "N"
+    # 全池故障告警（fe）：fe_alert 未首评为 None，否则为
+    # [hi, lo, n, last_w, state, run, changed, v]——首评固化阈值与 N 态
+    # （run=0），此后同阈值且 w 仅同前或 +1 才合法，同窗原样返回；
+    # state ∈ N/A，run 为当前态方向的连续窗数，转换时 run=0 且
+    # changed=true，v 为最近评估窗的全池三类 rejected 封顶和。ci 成功即
+    # 回到未首评。
+    fe_alert = None
     # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
     # 异值重配报 STATE，登记值随 ce/ci 导出导入（ci 后作用于新连接）。
     ttl_cfg = None
@@ -1763,6 +1851,23 @@ def run(raw):
                 METRIC_CAP, window_stats["rejected"] + 1
             )
 
+    def pool_window_rejected(window):
+        """全池在 window 窗的三类 rejected 封顶和：按后端加入序逐项累加其
+        fault_hist 中该窗 D/F/S 的 rejected，缺窗或重加无历史按 0；每类与
+        总和均封顶 10^18。remove 后现存池不含已删后端（不计入）。空池为
+        {"D":0,"F":0,"S":0}。O(B) 时间、O(1) 额外空间。"""
+        totals = {"D": 0, "F": 0, "S": 0}
+        for record in backends.values():
+            stats = record["fault_hist"].get(window)
+            if stats is None:
+                continue
+            for kind in "DFS":
+                totals[kind] = min(
+                    METRIC_CAP,
+                    totals[kind] + stats[kind]["rejected"],
+                )
+        return totals
+
     def bump_fault(record, field, now):
         """fx 跳过（remaps）与 fr 重试（retries/remaps）的计数：归失败后端
         当前登记种类，fm 累计与 now//60 窗各加 1，封顶 10^18。仅在确有故障
@@ -1815,6 +1920,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
             "ms", "mx",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "fa", "fe",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -3037,6 +3143,8 @@ def run(raw):
             pick_mode = config["scheduler"]
             rr_ticket = 0
             sticky_map = {}
+            # ci 清历史与告警：fe 回到未首评（阈值不再固化）。
+            fe_alert = None
             results.append({"op": "ci", "ok": True})
 
         elif op[0] == "fs":
@@ -3189,6 +3297,99 @@ def run(raw):
                         }
                     )
             results.append({"op": "fh", "id": backend_id, "windows": windows})
+
+        elif op[0] == "fa":
+            # 全池故障汇总（只读）：from 早于最近 60 窗下界报 STATE（同 fh）。
+            # 逐窗按后端加入序列列全部现存后端的该窗 D/F/S rejected（取
+            # fault_hist 同 fh 对象，缺窗/重加无历史为 0），total 按加入序逐
+            # 项求和封顶 10^18；空池 backends 为空、total 三类 0。失败批次
+            # 天然回滚。
+            _, start, end, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                fail(EXIT_STATE, "STATE")
+            windows = []
+            for window in range(start, end + 1):
+                items = []
+                total = {"D": 0, "F": 0, "S": 0}
+                for backend_id, record in backends.items():
+                    stats = record["fault_hist"].get(window)
+                    if stats is None:
+                        d = f = s = 0
+                    else:
+                        d = stats["D"]["rejected"]
+                        f = stats["F"]["rejected"]
+                        s = stats["S"]["rejected"]
+                    items.append({"id": backend_id, "D": d, "F": f, "S": s})
+                    total["D"] = min(METRIC_CAP, total["D"] + d)
+                    total["F"] = min(METRIC_CAP, total["F"] + f)
+                    total["S"] = min(METRIC_CAP, total["S"] + s)
+                windows.append(
+                    {"window": window, "backends": items, "total": total}
+                )
+            results.append({"op": "fa", "windows": windows})
+
+        elif op[0] == "fe":
+            # 全池故障告警：w 须为已结束窗（now//60 > w，保证窗数据此后只读
+            # 不可变）且在 fh 保留窗内，否则 STATE；首评固化阈值并以 N 态
+            # run=0 为基线即评本窗，此后须同阈值且 w 仅同前或 +1：同窗原样
+            # 返回，变阈值或跳窗（倒退/跨多窗）报 STATE。v 为该窗全池三类
+            # rejected 的封顶和；N 态连续 n 窗 v≥hi 转 A、A 态连续 n 窗
+            # v≤lo 转 N，转换窗 changed=true 且 run=0，否则条件不满足即
+            # run=0。ci 清告警（fe_alert 回 None）。
+            _, w, hi, lo, n, now = op
+            current = now // 60
+            if w >= current or w < max(0, current - 59):
+                # 窗未结束（w>=now//60）或超出 fh 保留窗。
+                fail(EXIT_STATE, "STATE")
+            if fe_alert is not None:
+                (prev_hi, prev_lo, prev_n, prev_w,
+                 state, run, changed, prev_v) = fe_alert
+                if (hi, lo, n) != (prev_hi, prev_lo, prev_n):
+                    # 变阈值报 STATE：不固化、不推进，失败批次回滚。
+                    fail(EXIT_STATE, "STATE")
+                if w == prev_w:
+                    # 同窗原样返回（已结束窗 v 不可变，直接回存值）。
+                    results.append(
+                        {
+                            "op": "fe", "w": w, "state": state, "v": prev_v,
+                            "run": run, "changed": changed,
+                        }
+                    )
+                    continue
+                if w != prev_w + 1:
+                    # 跳窗（倒退或跨多窗）报 STATE。
+                    fail(EXIT_STATE, "STATE")
+            else:
+                # 首评基线：N 态、连续数 0；changed 随下方评估确定。
+                state, run = "N", 0
+            totals = pool_window_rejected(w)
+            v = min(METRIC_CAP, totals["D"] + totals["F"] + totals["S"])
+            if state == "N":
+                if v >= hi:
+                    run += 1
+                    if run >= n:
+                        state, run, changed = "A", 0, True
+                    else:
+                        changed = False
+                else:
+                    run, changed = 0, False
+            else:  # state == "A"
+                if v <= lo:
+                    run += 1
+                    if run >= n:
+                        state, run, changed = "N", 0, True
+                    else:
+                        changed = False
+                else:
+                    run, changed = 0, False
+            fe_alert = [hi, lo, n, w, state, run, changed, v]
+            results.append(
+                {
+                    "op": "fe", "w": w, "state": state, "v": v,
+                    "run": run, "changed": changed,
+                }
+            )
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
