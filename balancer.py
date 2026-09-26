@@ -181,6 +181,21 @@ fault,none 的非负整数计数对象，removed=null 的样本计入 none。mx 
 清空采样历史。ms 为 O(1)，mx 为 O(R+S)（R 为窗数、S 为区间内样本数），
 仅用标准库，其余子命令与既有操作行为不变。
 
+不可用原因分钟历史：按 window=now//60 记账，各后端只保留最近 60 窗，
+空窗不预建。probe 使 healthy 转 unhealthy 时该后端 health 加 1；dr 使 A
+转 D/X 时 drain 加 1；cr 使 C/H 转 O 时 circuit 加 1；oa 返回 Q 且所选
+后端 conns≥os.cap 时该后端 overload 加 1（同次过载与其它原因重叠只记
+overload 一次）。重报（probe/cr 幂等重报、D/X 再 dr）与无状态转换一律
+不记；oa 报 OVERLOAD/7（P 态背压或队满尾拒绝）回滚整批且不记。各计数
+封顶 10^18。rh 精确键序 op,id,from,to,now；from/to/now 为 0..10^9 非
+bool 整数，now 进入共用非递减时钟，须 from≤to≤now//60 且 to-from<60。
+返回键序 op,id,windows；windows 含 from 至 to 所有窗并按窗升序，项键序
+window,health,drain,circuit,overload，值为非负整数，空窗全 0。键集、
+类型、范围、关系或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，from 早于
+max(0,now//60-59) 报 STATE/4。rh 只读，失败批次天然回滚；remove 后重加
+与 ci 成功清空历史。记账 O(1)，rh 时间 O(R)（R 为窗数）、空间 O(60B)，
+record/replay 逐字节覆盖；其他子命令行为不变。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler}：
 version=5；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
@@ -973,7 +988,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh", "ms", "mx",
+        "mr", "mg", "mh", "ms", "mx", "rh",
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
@@ -1327,6 +1342,20 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("mx", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "rh":
+        # 不可用原因分钟历史：精确键序 op,id,from,to,now（键须按此序出现），
+        # 只读；数值与关系约束同 mh/mx/fh，from 过早的 STATE 留执行期判
+        # （未知 id 先 BACKEND）。
+        if list(raw_op) != ["op", "id", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("rh", parse_backend_id(raw_op["id"]), start, end, now)
 
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
@@ -1775,6 +1804,24 @@ def run(raw):
         bucket = bisect.bisect_left((1, 10, 100, 1000), ms)
         metrics[4][bucket] = min(METRIC_CAP, metrics[4][bucket] + 1)
 
+    def record_reason(backend_id, reason, now):
+        """不可用原因分钟历史记账（O(1)）：reason ∈ health/drain/circuit/
+        overload，归属后端 backend_id 的 window=now//60 窗，对应计数加 1 并
+        封顶 10^18。仅在确有状态转换（probe h→u、dr A→D/X、cr C/H→O）或
+        oa 因连接达 cap 入队 Q 时由调用方调用；重报、无转换与 oa 的
+        OVERLOAD 回滚均不调用。每后端只保留最近 60 窗，空窗不预建。"""
+        history = backends[backend_id]["reason_hist"]
+        window = now // 60
+        counts = history.get(window)
+        if counts is None:
+            # 首次记账该窗：新建四项计数；时钟非递减，顺带丢弃 60 窗前旧窗。
+            counts = {"health": 0, "drain": 0, "circuit": 0, "overload": 0}
+            history[window] = counts
+            cutoff = window - 59
+            for old in [w for w in history if w < cutoff]:
+                del history[old]
+        counts[reason] = min(METRIC_CAP, counts[reason] + 1)
+
     def fault_active(record, now):
         """mg 的 removed=fault 判定：fs 登记且 now ∈ [a,z) 窗口内时，D 恒为
         故障，F 仅 ((now-a)//v)%2=0 相位为故障；S（仅变慢）与非故障相位
@@ -1916,7 +1963,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
-            "ms", "mx",
+            "ms", "mx", "rh",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
         ):
@@ -2010,6 +2057,11 @@ def run(raw):
                 # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
                 # ci 成功即清空。
                 "samples": {},
+                # 不可用原因分钟历史（rh）：window -> 固定键序
+                # health,drain,circuit,overload 的计数对象，仅保留最近 60
+                # 窗，空窗不预建；各计数封顶 10^18，仅在状态转换或 oa 因
+                # 连接达 cap 入队时记账。remove 后重加与 ci 成功即清空。
+                "reason_hist": {},
             }
             results.append({"op": "add", "ok": True})
 
@@ -2239,6 +2291,9 @@ def run(raw):
                         record["successes"] = 0
                         record["failures"] = 0
                         record["current"] = 0
+                        # 不可用原因历史：仅 healthy→unhealthy 的转换记 health；
+                        # 同 (id,now,ok) 重报在上方已幂等返回，不会至此。
+                        record_reason(backend_id, "health", now)
                 record["probe_now"] = now
                 record["probe_ok"] = ok
             results.append({"op": "probe", "ok": True})
@@ -2431,6 +2486,8 @@ def run(raw):
                     circuit["state"] = "O"
                     circuit["next"] = now + w
                     circuit["used"] = 0
+                    # 不可用原因历史：仅 C→O 的熔断打开记 circuit。
+                    record_reason(backend_id, "circuit", now)
             else:  # H
                 if ok:
                     circuit["used"] += 1
@@ -2444,6 +2501,8 @@ def run(raw):
                     circuit["state"] = "O"
                     circuit["next"] = now + w
                     circuit["used"] = 0
+                    # 不可用原因历史：H→O 的重开同样记 circuit。
+                    record_reason(backend_id, "circuit", now)
             circuit["cr_now"] = now
             circuit["cr_ok"] = ok
             results.append({"op": "cr", "ok": True})
@@ -2511,6 +2570,9 @@ def run(raw):
                 else:
                     drain["state"] = "X"
                     drain["end"] = now
+                # 不可用原因历史：A→D/X 的转换记 drain（一次 dr 至多一次）；
+                # D/X 再 dr 幂等返回，不记。
+                record_reason(backend_id, "drain", now)
             # D/X 再 dr 幂等，不改状态。
             results.append({"op": "dr", "ok": True})
 
@@ -2675,6 +2737,12 @@ def run(raw):
                 if len(wait_queue) >= queue_cfg[1]:
                     # FIFO 已满，尾拒绝。
                     fail(EXIT_OVERLOAD, "OVERLOAD")
+                # 不可用原因历史：Q 入队且所选后端连接数已达 os.cap 时记
+                # overload（所选后端来自只含 healthy/C/A 的环，阻塞在此只可能
+                # 因令牌不足或连接达 cap）；P 态/队满的 OVERLOAD 已在上方回滚，
+                # 不记。同次至多记一次。
+                if backends[routed[0]]["conns"] >= queue_cfg[0]:
+                    record_reason(routed[0], "overload", now)
                 # 三项成本随请求入队，ot 重试时按此成本扣减。新键追加到
                 # OrderedDict 队尾，即 FIFO 入队（重复已在上方拒绝）。
                 wait_queue[cid] = (cid, flow, c, s, key, bc, cc, sc, now)
@@ -2960,6 +3028,42 @@ def run(raw):
                 )
             results.append({"op": "mx", "id": backend_id, "windows": windows})
 
+        elif op[0] == "rh":
+            # 不可用原因分钟历史只读查询：未知 id 报 BACKEND，from 早于最近
+            # 60 窗下界报 STATE（与 mh/mx/fh 同序）；不改任何计数，失败批次
+            # 天然回滚。返回键序 op,id,windows；windows 覆盖 from..to 并升序，
+            # 项键序 window,health,drain,circuit,overload，值为非负整数，
+            # 空窗全 0。逐窗拷贝，避免结果被批次内后续记账污染。
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = record["reason_hist"]
+            windows = []
+            for window in range(start, end + 1):
+                counts = history.get(window)
+                if counts is None:
+                    health = drain = circuit = overload = 0
+                else:
+                    health = counts["health"]
+                    drain = counts["drain"]
+                    circuit = counts["circuit"]
+                    overload = counts["overload"]
+                windows.append(
+                    {
+                        "window": window,
+                        "health": health,
+                        "drain": drain,
+                        "circuit": circuit,
+                        "overload": overload,
+                    }
+                )
+            results.append({"op": "rh", "id": backend_id, "windows": windows})
+
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
             exported_backends = []
@@ -3107,6 +3211,8 @@ def run(raw):
                     "fault_affected": False,
                     # ci 成功清空故障统计分钟历史。
                     "fault_hist": {},
+                    # ci 成功清空不可用原因分钟历史。
+                    "reason_hist": {},
                 }
 
             new_backends = {}
