@@ -257,6 +257,25 @@ op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配�
 均 O(B+M) 时空（M 为限流项数）；R/L 的 pick 均为 O(B) 时间、O(1) 额外
 空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
+配置提交、列表与回滚：ci 成功后把当时 ce 导出的规范化 version=6 配置
+存为一个提交（深拷贝，只含登记值），分配从 1 起严格递增的 rev，仅保留
+最近 16 条（超出即从最旧 rev 端淘汰）；ci 失败不分配 rev、不改历史，
+初始无提交（提交历史为批内状态，随进程结束而消失）。cl 精确键集仅 op，
+只读；返回键序 op,current,commits：current 为最新提交的 rev 或 null
+（无提交），commits 按 rev 升序，项键序 rev,config，config 复用 ce 的
+逐层键序和值格式（version=6）。cb 精确键集 op,rev,now：rev 为
+1..10^18 非 bool 整数，now 沿用 ci（非负非 bool 整数）并进入共用非
+递减时钟；目标 rev 必须仍被保留。cb 按目标快照执行 ci 的原子替换与
+默认运行态重建（快照为 v6 JSON，经与 ci 同源规范化后生效），成功后
+另建新 rev（原历史先保留，再按 16 条淘汰），返回键序
+op,target,rev,ok，ok=true，其中 rev 为新建提交的 rev。目标不存在
+（含已被淘汰）或 rev 耗尽（下一 rev 超过 10^18）报 STATE/4；键集、
+rev 类型/范围或时钟非法报 INPUT/2；活动连接或排队项存在报 STATE/4
+（与 ci 同序，先于任何变更）。任何失败都在状态变更前抛出，整批原子：
+时钟、配置、运行态、rev 与提交历史一并回滚。cl 与 cb 额外时空上界
+O(16(B+M))（cb 的目标查找在至多 16 条内）；record/replay 逐字节覆盖
+cl/cb，其他子命令行为不变。
+
 H pick 记账：扩展 H 模式 pick，调度与映射行为不变，成功项仅记一次并归属
 返回 id。无旧映射记 first；旧目标合格且本次未判到期记 sticky；三键旧映射
 e 非 null 且 now≥e 记 expired（重选回原 id 也算 expired）；否则按旧目标
@@ -407,6 +426,7 @@ endpoint=null，version6 须含 endpoint，成功原子重建、失败回滚。e
 
 import base64
 import bisect
+import copy
 import hashlib
 import ipaddress
 import json
@@ -1066,7 +1086,7 @@ def parse_op(raw_op):
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra",
-        "ce", "ci",
+        "ce", "ci", "cl", "cb",
         "fs", "fx", "fr",
         "fb", "fq",
         "hm", "fm", "fh",
@@ -1614,11 +1634,32 @@ def parse_op(raw_op):
             parse_fault_num(raw_op["now"]),
         )
 
-    if name in ("ce", "ci"):
+    if name in ("ce", "ci", "cl", "cb"):
         if name == "ce":
             if keys != {"op"}:
                 fail(EXIT_INPUT, "INPUT")
             return ("ce",)
+        if name == "cl":
+            # 提交历史列表：精确键集仅 op，只读。
+            if keys != {"op"}:
+                fail(EXIT_INPUT, "INPUT")
+            return ("cl",)
+        if name == "cb":
+            # 配置回滚/检出：精确键集 op,rev,now。rev ∈ [1,10^18] 非 bool
+            # 整数（bool 是 int 子类须显式排除）；now 为非负非 bool 整数，
+            # 时钟倒退在执行期与其余操作同序判定。目标是否仍保留、rev 是否
+            # 耗尽及活动状态均留执行期判 STATE。
+            if keys != {"op", "rev", "now"}:
+                fail(EXIT_INPUT, "INPUT")
+            rev = raw_op["rev"]
+            if (
+                not isinstance(rev, int)
+                or isinstance(rev, bool)
+                or not 1 <= rev <= 10 ** 18
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            now = parse_now(raw_op["now"])
+            return ("cb", rev, now)
         if keys != {"op", "config", "now"}:
             fail(EXIT_INPUT, "INPUT")
         # now 为非负非 bool 整数，时钟倒退在执行期与其余操作同序判定。
@@ -1773,6 +1814,13 @@ def run(raw):
     # （仅改变后续 fe 的 v），ci 成功清空。
     alert_events = deque()
     results = []
+    # 配置热加载提交历史（cl/cb）：commits 按 rev 升序保存 ci/cb 成功后
+    # 的规范化 version=6 配置快照（deepcopy），每项 (rev, config)；初始无
+    # 提交，next_rev 为下一成功提交的 rev（从 1 起严格递增），仅保留最近
+    # 16 条（超出即从最旧端淘汰）。cb 成功另建新 rev；失败批次不分配 rev、
+    # 不改历史。批内状态随进程结束而消失，record/replay 经 run 逐字节覆盖。
+    commits = deque(maxlen=16)
+    next_rev = 1
 
     def backend_routable(record, drain_strict=False):
         """粘性沿用条件：现存、healthy、熔断 C 且未摘除到 X（D 态原粘性仍
@@ -2082,6 +2130,204 @@ def run(raw):
         counts["total"] = min(METRIC_CAP, counts["total"] + 1)
         counts[category] = min(METRIC_CAP, counts[category] + 1)
 
+    def export_config():
+        """构造当前登记配置的规范化 version=6 对象（ce 与提交快照共用），
+        只含登记值、不含任何运行态；逐层键序与 ce 完全一致。"""
+        exported_backends = []
+        for backend_id, record in backends.items():
+            circuit = record["circuit"]
+            endpoint = record["endpoint"]
+            exported_backends.append(
+                {
+                    "id": backend_id,
+                    "weight": record["weight"],
+                    "d": record["warm_d"],
+                    "fail": record["fail"],
+                    "success": record["success"],
+                    "circuit": (
+                        None
+                        if circuit is None
+                        else {
+                            "n": circuit["params"][0],
+                            "m": circuit["params"][1],
+                            "r": circuit["params"][2],
+                            "w": circuit["params"][3],
+                            "q": circuit["params"][4],
+                        }
+                    ),
+                    "drain": record["drain"]["t"],
+                    # 既有七键后追加 endpoint：null 或键序 host,port。
+                    "endpoint": (
+                        None
+                        if endpoint is None
+                        else {"host": endpoint[0], "port": endpoint[1]}
+                    ),
+                }
+            )
+        exported_limits = [
+            {"scope": scope, "id": bucket_id, "r": bucket["r"], "b": bucket["b"]}
+            # 仅遍历不消费：按 (scope 秩, id UTF-8 字节) 升序输出。
+            for (scope, bucket_id), bucket in sorted(
+                buckets.items(),
+                key=lambda item: (
+                    {"B": 0, "C": 1, "S": 2}[item[0][0]],
+                    item[0][1].encode("utf-8"),
+                ),
+            )
+        ]
+        exported_overload = (
+            None
+            if queue_cfg is None
+            else {"cap": queue_cfg[0], "q": queue_cfg[1], "ttl": queue_cfg[2]}
+        )
+        # 三项均只导出登记值：sticky/idle 为 null 或 {"ttl":整数}，
+        # backpressure 为 null 或 {low,high}（不含 bp_state 运行态）；
+        # scheduler 精确为 {"pick":"W"/"R"/"L"/"H"}（不含 ticket 运行态）。
+        return {
+            "version": 6,
+            "backends": exported_backends,
+            "vnodes": ring_vnodes,
+            "limits": exported_limits,
+            "overload": exported_overload,
+            "sticky": (
+                None if sticky_ttl is None else {"ttl": sticky_ttl}
+            ),
+            "idle": None if ttl_cfg is None else {"ttl": ttl_cfg},
+            "backpressure": (
+                None
+                if bp_cfg is None
+                else {"low": bp_cfg[0], "high": bp_cfg[1]}
+            ),
+            "scheduler": {"pick": pick_mode},
+        }
+
+    def apply_config(config, now):
+        """ci/cb 共用：校验通过后原子替换配置并以 now 重建默认运行态
+        （全部 healthy、d>0 自 now 起算预热、熔断 C 空窗、排空 A、桶满、
+        队空、粘性清空、度量归零、平滑 current 与轮询 ticket=0）。
+        sticky/idle 取登记值（idle 作用于此后新建连接），backpressure
+        携带时置 N、未携带时取消；不触碰提交历史与 rev（由调用方处理）。"""
+        nonlocal backends, buckets, ring_vnodes, queue_cfg, wait_queue
+        nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
+        nonlocal sticky_map, alert, alert_events
+
+        # 校验全部通过，原子替换配置并以 now 重建默认运行态。
+        def make_record(weight, d, fail_threshold, success_threshold,
+                        circuit_params, drain_t, endpoint):
+            if d == 0:
+                stage = "steady"
+                warm_from = warm_start = warm_end = None
+            else:
+                # 预热自本次 now 起算。
+                stage = "warm"
+                warm_from = 100
+                warm_start = now
+                warm_end = now + d
+            return {
+                "weight": weight,
+                "current": 0,
+                "conns": 0,
+                "healthy": True,
+                "fail": fail_threshold,
+                "success": success_threshold,
+                "failures": 0,
+                "successes": 0,
+                "probe_now": None,
+                "probe_ok": None,
+                "stage": stage,
+                "warm_d": d,
+                "warm_from": warm_from,
+                "warm_start": warm_start,
+                "warm_end": warm_end,
+                "circuit": (
+                    None
+                    if circuit_params is None
+                    else {
+                        "params": circuit_params,
+                        "state": "C",
+                        "window": deque(maxlen=circuit_params[0]),
+                        "next": None,
+                        "used": 0,
+                        "cr_now": None,
+                        "cr_ok": None,
+                    }
+                ),
+                "drain": {
+                    "t": drain_t,
+                    "state": "A",
+                    "start": None,
+                    "end": None,
+                    "deadline": None,
+                    "forced": 0,
+                },
+                # 热加载不携带历史写操作形状。
+                "last_op": None,
+                # 后端 IP 端点登记值（v1..v5 已规范化为 None）。
+                "endpoint": endpoint,
+                "metrics": {},
+                # 热加载成功清零 H pick 记账。
+                "pick_counts": {
+                    "total": 0, "first": 0, "sticky": 0, "expired": 0,
+                    "removed": 0, "health": 0, "circuit": 0, "drain": 0,
+                },
+                # 热加载以默认运行态重建，采样历史清空。
+                "samples": {},
+                # 热加载以默认运行态重建，不携带故障演练。
+                "fault": None,
+                # 热加载成功清零故障演练统计与恢复判定基线。
+                "fault_stats": new_fault_stats(),
+                "fault_affected": False,
+                # 热加载成功清空故障统计分钟历史。
+                "fault_hist": {},
+                # 热加载成功清空不可用原因分钟历史。
+                "reason_hist": {},
+            }
+
+        new_backends = {}
+        for (backend_id, weight, d, fail_threshold,
+             success_threshold, circuit_params, drain_t,
+             endpoint) in config["backends"]:
+            new_backends[backend_id] = make_record(
+                weight, d, fail_threshold, success_threshold,
+                circuit_params, drain_t, endpoint,
+            )
+        # 新桶满令牌起步，at=now。
+        new_buckets = {}
+        for scope, bucket_id, r, b in config["limits"]:
+            new_buckets[(scope, bucket_id)] = {
+                "r": r,
+                "b": b,
+                "t": b,
+                "at": now,
+                "last": None,
+            }
+        backends = new_backends
+        buckets = new_buckets
+        ring_vnodes = config["vnodes"]
+        queue_cfg = config["overload"]
+        wait_queue = OrderedDict()
+        # 热加载三项：sticky/idle 取登记值（null 即未登记，idle 作用于
+        # 此后新建连接）；backpressure 携带时置 N，未携带（含 v1）即取消。
+        sticky_ttl = config["sticky"]
+        ttl_cfg = config["idle"]
+        bp_cfg = config["backpressure"]
+        bp_state = "N"
+        # 调度策略随配置原子替换（v1/v2 已规范化为 W），轮询游标复位。
+        pick_mode = config["scheduler"]
+        rr_ticket = 0
+        sticky_map = {}
+        # 热加载成功清除全池故障告警状态（fe 回到未首评）与转换历史。
+        alert = None
+        alert_events = deque()
+
+    def add_commit(snapshot):
+        """ci/cb 成功后保存一个规范化 version=6 配置快照为提交：rev 从 1
+        起严格递增，仅保留最近 16 条（deque maxlen 自动从最旧端淘汰）。
+        快照深拷贝，与后续运行态/配置变更完全隔离。"""
+        nonlocal next_rev
+        commits.append((next_rev, copy.deepcopy(snapshot)))
+        next_rev += 1
+
     for raw_op in ops:
         op = parse_op(raw_op)
 
@@ -2089,7 +2335,7 @@ def run(raw):
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
             "ms", "mx", "rh", "ra",
-            "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
         ):
             now = op[-1]
@@ -3231,79 +3477,8 @@ def run(raw):
             results.append({"op": "ra", "windows": windows})
 
         elif op[0] == "ce":
-            # 导出纯配置（登记值），不含任何运行态。
-            exported_backends = []
-            for backend_id, record in backends.items():
-                circuit = record["circuit"]
-                endpoint = record["endpoint"]
-                exported_backends.append(
-                    {
-                        "id": backend_id,
-                        "weight": record["weight"],
-                        "d": record["warm_d"],
-                        "fail": record["fail"],
-                        "success": record["success"],
-                        "circuit": (
-                            None
-                            if circuit is None
-                            else {
-                                "n": circuit["params"][0],
-                                "m": circuit["params"][1],
-                                "r": circuit["params"][2],
-                                "w": circuit["params"][3],
-                                "q": circuit["params"][4],
-                            }
-                        ),
-                        "drain": record["drain"]["t"],
-                        # 既有七键后追加 endpoint：null 或键序 host,port。
-                        "endpoint": (
-                            None
-                            if endpoint is None
-                            else {"host": endpoint[0], "port": endpoint[1]}
-                        ),
-                    }
-                )
-            exported_limits = [
-                {"scope": scope, "id": bucket_id, "r": bucket["r"], "b": bucket["b"]}
-                # 仅遍历不消费：按 (scope 秩, id UTF-8 字节) 升序输出。
-                for (scope, bucket_id), bucket in sorted(
-                    buckets.items(),
-                    key=lambda item: (
-                        {"B": 0, "C": 1, "S": 2}[item[0][0]],
-                        item[0][1].encode("utf-8"),
-                    ),
-                )
-            ]
-            exported_overload = (
-                None
-                if queue_cfg is None
-                else {"cap": queue_cfg[0], "q": queue_cfg[1], "ttl": queue_cfg[2]}
-            )
-            # 三项均只导出登记值：sticky/idle 为 null 或 {"ttl":整数}，
-            # backpressure 为 null 或 {low,high}（不含 bp_state 运行态）；
-            # scheduler 精确为 {"pick":"W"/"R"/"L"/"H"}（不含 ticket 运行态）。
-            results.append(
-                {
-                    "op": "ce",
-                    "config": {
-                        "version": 6,
-                        "backends": exported_backends,
-                        "vnodes": ring_vnodes,
-                        "limits": exported_limits,
-                        "overload": exported_overload,
-                        "sticky": (
-                            None if sticky_ttl is None else {"ttl": sticky_ttl}
-                        ),
-                        "idle": None if ttl_cfg is None else {"ttl": ttl_cfg},
-                        "backpressure": (
-                            None
-                            if bp_cfg is None
-                            else {"low": bp_cfg[0], "high": bp_cfg[1]}
-                        ),
-                        "scheduler": {"pick": pick_mode},
-                    },
-                }
-            )
+            # 导出纯配置（登记值），不含任何运行态；与提交快照同一构造。
+            results.append({"op": "ce", "config": export_config()})
 
         elif op[0] == "ci":
             _, config, now = op
@@ -3318,115 +3493,59 @@ def run(raw):
             if connections or wait_queue:
                 fail(EXIT_STATE, "STATE")
 
-            # 校验全部通过，原子替换配置并以 now 重建默认运行态。
-            def make_record(weight, d, fail_threshold, success_threshold,
-                            circuit_params, drain_t, endpoint):
-                if d == 0:
-                    stage = "steady"
-                    warm_from = warm_start = warm_end = None
-                else:
-                    # 预热自本次 now 起算。
-                    stage = "warm"
-                    warm_from = 100
-                    warm_start = now
-                    warm_end = now + d
-                return {
-                    "weight": weight,
-                    "current": 0,
-                    "conns": 0,
-                    "healthy": True,
-                    "fail": fail_threshold,
-                    "success": success_threshold,
-                    "failures": 0,
-                    "successes": 0,
-                    "probe_now": None,
-                    "probe_ok": None,
-                    "stage": stage,
-                    "warm_d": d,
-                    "warm_from": warm_from,
-                    "warm_start": warm_start,
-                    "warm_end": warm_end,
-                    "circuit": (
-                        None
-                        if circuit_params is None
-                        else {
-                            "params": circuit_params,
-                            "state": "C",
-                            "window": deque(maxlen=circuit_params[0]),
-                            "next": None,
-                            "used": 0,
-                            "cr_now": None,
-                            "cr_ok": None,
-                        }
-                    ),
-                    "drain": {
-                        "t": drain_t,
-                        "state": "A",
-                        "start": None,
-                        "end": None,
-                        "deadline": None,
-                        "forced": 0,
-                    },
-                    # 热加载不携带历史写操作形状。
-                    "last_op": None,
-                    # 后端 IP 端点登记值（v1..v5 已规范化为 None）。
-                    "endpoint": endpoint,
-                    "metrics": {},
-                    # ci 成功清零 H pick 记账。
-                    "pick_counts": {
-                        "total": 0, "first": 0, "sticky": 0, "expired": 0,
-                        "removed": 0, "health": 0, "circuit": 0, "drain": 0,
-                    },
-                    # ci 成功清空采样历史，默认运行态为空。
-                    "samples": {},
-                    # 热加载以默认运行态重建，不携带故障演练。
-                    "fault": None,
-                    # ci 成功清零故障演练统计与恢复判定基线。
-                    "fault_stats": new_fault_stats(),
-                    "fault_affected": False,
-                    # ci 成功清空故障统计分钟历史。
-                    "fault_hist": {},
-                    # ci 成功清空不可用原因分钟历史。
-                    "reason_hist": {},
-                }
-
-            new_backends = {}
-            for (backend_id, weight, d, fail_threshold,
-                 success_threshold, circuit_params, drain_t,
-                 endpoint) in config_backends:
-                new_backends[backend_id] = make_record(
-                    weight, d, fail_threshold, success_threshold,
-                    circuit_params, drain_t, endpoint,
-                )
-            # 新桶满令牌起步，at=now。
-            new_buckets = {}
-            for scope, bucket_id, r, b in config_limits:
-                new_buckets[(scope, bucket_id)] = {
-                    "r": r,
-                    "b": b,
-                    "t": b,
-                    "at": now,
-                    "last": None,
-                }
-            backends = new_backends
-            buckets = new_buckets
-            ring_vnodes = config["vnodes"]
-            queue_cfg = config["overload"]
-            wait_queue = OrderedDict()
-            # 热加载三项：sticky/idle 取登记值（null 即未登记，idle 作用于
-            # 此后新建连接）；backpressure 携带时置 N，未携带（含 v1）即取消。
-            sticky_ttl = config["sticky"]
-            ttl_cfg = config["idle"]
-            bp_cfg = config["backpressure"]
-            bp_state = "N"
-            # 调度策略随配置原子替换（v1/v2 已规范化为 W），轮询游标复位。
-            pick_mode = config["scheduler"]
-            rr_ticket = 0
-            sticky_map = {}
-            # ci 成功清除全池故障告警状态（fe 回到未首评）与转换历史。
-            alert = None
-            alert_events = deque()
+            # 校验全部通过：原子替换配置并以 now 重建默认运行态，随后把规范
+            # 化 version=6 配置存为提交（rev 从 1 起递增，仅留最近 16 条）。
+            # 所有失败均在上述变更前抛出，故配置、运行态、时钟、rev 与提交
+            # 历史整批不变（天然回滚）。
+            apply_config(config, now)
+            add_commit(export_config())
             results.append({"op": "ci", "ok": True})
+
+        elif op[0] == "cl":
+            # 提交历史只读列表，返回键序 op,current,commits：current 为
+            # 最新 rev 或 null（初始无提交）；commits 按 rev 升序，项键序
+            # rev,config，config 复用 ce 的逐层键序与值格式。已保存快照为
+            # 不可变的规范化 version=6 深拷贝，可直接引用，时空 O(16(B+M))。
+            results.append(
+                {
+                    "op": "cl",
+                    "current": commits[-1][0] if commits else None,
+                    "commits": [
+                        {"rev": rev, "config": snapshot}
+                        for rev, snapshot in commits
+                    ],
+                }
+            )
+
+        elif op[0] == "cb":
+            # 配置回滚/检出：精确键集 op,rev,now。rev 为 1..10^18 非 bool
+            # 整数（解析期已校验类型与范围），now 已纳入共用非递减时钟；
+            # 目标 rev 必须仍被保留。按目标快照执行 ci 的原子替换与默认
+            # 运行态重建，成功另建新 rev（原历史保留后再按 16 条淘汰），
+            # 返回键序 op,target,rev,ok，ok=true。目标不存在（含已淘汰）
+            # 或 rev 耗尽、有活动连接或排队项报 STATE/4。所有失败均在变更
+            # 前抛出：时钟、配置、运行态、rev 与提交历史整批回滚。
+            _, target_rev, now = op
+            target_snapshot = None
+            for rev, snapshot in commits:
+                if rev == target_rev:
+                    target_snapshot = snapshot
+                    break
+            if target_snapshot is None or next_rev > 10 ** 18:
+                # 目标不存在（含已被 16 条淘汰）或 rev 耗尽：STATE。
+                fail(EXIT_STATE, "STATE")
+            # 活动连接或排队项存在：STATE（与 ci 同序，先于任何变更）。
+            if connections or wait_queue:
+                fail(EXIT_STATE, "STATE")
+            # 目标快照是 ce 导出的规范化 version=6 JSON 形状，须与 ci 同源
+            # 经 parse_config 转为内部元组结构（规范化产物必然通过校验）。
+            normalized_target = parse_config(target_snapshot)
+            new_rev = next_rev
+            apply_config(normalized_target, now)
+            add_commit(target_snapshot)
+            results.append(
+                {"op": "cb", "target": target_rev, "rev": new_rev, "ok": True}
+            )
 
         elif op[0] == "fs":
             _, backend_id, k, a, z, v = op
