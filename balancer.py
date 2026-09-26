@@ -1264,7 +1264,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "oa", "ot", "og", "oc", "bp", "bq",
+        "os", "oa", "ot", "og", "oc", "oh", "bp", "bq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr", "fi",
@@ -1579,6 +1579,19 @@ def parse_op(raw_op):
         if keys != {"op", "cid"}:
             fail(EXIT_INPUT, "INPUT")
         return ("oc", parse_cid(raw_op["cid"]))
+
+    if name == "oh":
+        # 过载分钟历史：精确键序 op,from,to,now（键须按此序出现），只读；
+        # 数值与窗关系约束同 ra，未配置 os 与 from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("oh", start, end, now)
 
     if name == "bp":
         if keys != {"op", "low", "high"}:
@@ -2058,6 +2071,12 @@ def run(raw):
     # oa 查重与 oc 任意位置删除均 O(1) 且其余项 FIFO 相对次序不变。
     queue_cfg = None
     wait_queue = OrderedDict()
+    # 过载分钟历史（oh）：window=now//60 -> [immediate, queued, dequeued,
+    # expired, peak]，仅保留最近 60 窗，空窗不预建，各计数封顶 10^18。
+    # oa 返回 A/Q 分别在其 now 窗记 immediate/queued（Q 同时以入队后队长
+    # 刷新 peak 峰值）；ot 每个接纳/过期项在其 now 窗记 dequeued/expired。
+    # oc、bp 与 OVERLOAD 失败回滚均不记账；oh 只读；ci/cb 成功清空。
+    overload_hist = {}
     # 确定性滞回背压：bp_cfg 未 bp 时为 None，否则为 (low, high)；bp_state
     # 为 N/P。首配或异参重配按当前队长 >=high 置 P，否则 N；同参幂等不改
     # 状态。low < high <= queue_cfg[1]（os.q）；登记值随 ce/ci 导出导入，
@@ -2284,6 +2303,20 @@ def run(raw):
             for old in [w for w in history if w < cutoff]:
                 del history[old]
         counts[reason] = min(METRIC_CAP, counts[reason] + 1)
+
+    def overload_window(now):
+        """取 window=now//60 的过载分钟历史计数项 [immediate, queued,
+        dequeued, expired, peak]（无则新建；时钟非递减，顺带丢弃 60 窗前
+        旧窗）。仅 oa/ot 记账调用，oh 只读不建窗。O(1)。"""
+        window = now // 60
+        counts = overload_hist.get(window)
+        if counts is None:
+            counts = [0, 0, 0, 0, 0]
+            overload_hist[window] = counts
+            cutoff = window - 59
+            for old in [w for w in overload_hist if w < cutoff]:
+                del overload_hist[old]
+        return counts
 
     def active_fault(record, now):
         """按 now 在故障时间线中取唯一活动段：段按 a 升序且 [a,z) 互不
@@ -2601,7 +2634,7 @@ def run(raw):
         nonlocal backends, buckets, quotas, ring_vnodes, queue_cfg, wait_queue
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal sticky_map, alert, alert_events
-        nonlocal mo_seq, mo_cache
+        nonlocal mo_seq, mo_cache, overload_hist
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -2708,6 +2741,8 @@ def run(raw):
         ring_vnodes = config["vnodes"]
         queue_cfg = config["overload"]
         wait_queue = OrderedDict()
+        # ci/cb 成功清空过载分钟历史（oh 自空历史重新累计）。
+        overload_hist = {}
         # 热加载三项：sticky/idle 取登记值（null 即未登记，idle 作用于
         # 此后新建连接）；backpressure 携带时置 N，未携带（含 v1）即取消。
         sticky_ttl = config["sticky"]
@@ -2731,7 +2766,7 @@ def run(raw):
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
+            "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot", "oh",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
             "ci", "cb", "fx", "fr", "fi", "tk", "tg", "tx", "route", "fq", "pick", "fh",
@@ -2740,9 +2775,20 @@ def run(raw):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
             if now is not None:
-                if last_now is not None and now < last_now:
-                    fail(EXIT_INPUT, "INPUT")
-                last_now = now
+                # qs 精确重报（limit、span、now 同上次配置）免时钟倒退判定：
+                # 时钟已前进仍由执行期幂等返回 ok，不回拨时钟、不动 window
+                # 与 used（与 mo 缓存重报同式）；其余旧时刻 qs/qg 照常 INPUT。
+                qs_rereport = False
+                if op[0] == "qs":
+                    quota = quotas.get((op[1], op[2]))
+                    qs_rereport = (
+                        quota is not None
+                        and quota["last"] == (op[3], op[4], op[5])
+                    )
+                if not qs_rereport:
+                    if last_now is not None and now < last_now:
+                        fail(EXIT_INPUT, "INPUT")
+                    last_now = now
 
         if op[0] == "add":
             _, backend_id, weight, d, now = op
@@ -3581,6 +3627,9 @@ def run(raw):
                 routed[0], cid, flow, c, s, (bc, cc, sc), now
             )
             if status == "admit":
+                # 过载分钟历史：立即接纳在其 now 窗记 immediate。
+                counts = overload_window(now)
+                counts[0] = min(METRIC_CAP, counts[0] + 1)
                 results.append(
                     {"op": "oa", "cid": cid, "state": "A", "backend": backend_id}
                 )
@@ -3600,6 +3649,12 @@ def run(raw):
                 # 三项成本随请求入队，ot 重试时按此成本扣减。新键追加到
                 # OrderedDict 队尾，即 FIFO 入队（重复已在上方拒绝）。
                 wait_queue[cid] = (cid, flow, c, s, key, bc, cc, sc, now)
+                # 过载分钟历史：入队在其 now 窗记 queued，并以入队后队长
+                # 刷新该窗 peak 峰值。
+                counts = overload_window(now)
+                counts[1] = min(METRIC_CAP, counts[1] + 1)
+                if len(wait_queue) > counts[4]:
+                    counts[4] = len(wait_queue)
                 if bp_cfg is not None and len(wait_queue) >= bp_cfg[1]:
                     # N 态照常入队，队长达到 high 即转 P（滞回上沿）。
                     bp_state = "P"
@@ -3640,6 +3695,14 @@ def run(raw):
             if bp_cfg is not None and bp_state == "P" and len(wait_queue) <= bp_cfg[0]:
                 # 滞回下沿：过期与接纳处理完后，P 态队长 <=low 即转 N。
                 bp_state = "N"
+            if expired or admitted:
+                # 过载分钟历史：每个过期/接纳项在 ot 的 now 窗记
+                # expired/dequeued（逐项 +1 封顶，等价于按个数累加封顶）。
+                counts = overload_window(now)
+                if expired:
+                    counts[3] = min(METRIC_CAP, counts[3] + len(expired))
+                if admitted:
+                    counts[2] = min(METRIC_CAP, counts[2] + len(admitted))
             results.append(
                 {"op": "ot", "expired": expired, "admitted": admitted}
             )
@@ -3673,6 +3736,38 @@ def run(raw):
                 # 取消后滞回下沿：P 态队长 <=low 立即转 N；N 态等其余情形不变。
                 bp_state = "N"
             results.append({"op": "oc", "cid": cid, "ok": True})
+
+        elif op[0] == "oh":
+            # 过载分钟历史（只读）：未配置 os 报 STATE；from 早于最近 60 窗
+            # 下界报 STATE（同 ra）；不改任何计数，失败批次天然回滚。返回键序
+            # op,windows；windows 覆盖 from..to 并升序，项键序
+            # window,immediate,queued,dequeued,expired,peak（缺窗全 0）。
+            # O(R) 时间、O(60) 空间。
+            _, start, end, now = op
+            if queue_cfg is None:
+                # 未 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            windows = []
+            for window in range(start, end + 1):
+                counts = overload_hist.get(window)
+                if counts is None:
+                    # 空窗：五项计数全 0。
+                    counts = (0, 0, 0, 0, 0)
+                windows.append(
+                    {
+                        "window": window,
+                        "immediate": counts[0],
+                        "queued": counts[1],
+                        "dequeued": counts[2],
+                        "expired": counts[3],
+                        "peak": counts[4],
+                    }
+                )
+            results.append({"op": "oh", "windows": windows})
 
         elif op[0] == "bp":
             _, low, high = op
