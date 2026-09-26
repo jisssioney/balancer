@@ -5,6 +5,8 @@ JSON，断言退出码、stdout、stderr。不修改被测程序的任何行为�
 """
 
 import base64
+import bisect
+import hashlib
 import json
 import os
 import subprocess
@@ -1740,6 +1742,345 @@ class RecordReplayTest(unittest.TestCase):
         self.assertEqual(rep_code, run_code)
         self.assertEqual(rep_stdout, run_stdout)
         self.assertEqual(rep_stderr, run_stderr)
+
+
+class OiDryRunTest(unittest.TestCase):
+    """oi 只读接纳预演：fr 环序遍历，fault/slow/capacity/quota 判失败。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if err:
+            self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def setup(self, ids=("a", "b", "c"), vnodes=8):
+        ops = [{"op": "add", "id": backend_id, "weight": 1}
+               for backend_id in ids]
+        ops.append({"op": "chash", "vnodes": vnodes})
+        ops.append({"op": "os", "cap": 1, "q": 2, "ttl": 10})
+        return ops
+
+    def oi(self, **overrides):
+        op = {
+            "op": "oi", "key": "k1", "c": "c1", "s": "s1",
+            "bc": 1, "cc": 1, "sc": 1,
+            "timeout": 5, "max": 3, "now": 10,
+        }
+        op.update(overrides)
+        return op
+
+    def ring_order(self, ids, vnodes, key):
+        """复刻 build_ring 自 key 哈希点的去重后端遍历序。"""
+        tokens = []
+        for join_index, backend_id in enumerate(ids):
+            encoded = backend_id.encode("utf-8")
+            for i in range(vnodes):
+                digest = hashlib.sha256(
+                    encoded + b"\x00" + str(i).encode("ascii")
+                ).digest()
+                tokens.append(
+                    (int.from_bytes(digest, "big"), join_index, i, backend_id)
+                )
+        tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+        digests = [token[0] for token in tokens]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash) % len(tokens)
+        order = []
+        for offset in range(len(tokens)):
+            backend_id = tokens[(index + offset) % len(tokens)][3]
+            if backend_id not in order:
+                order.append(backend_id)
+        return order
+
+    def result(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def test_success_on_first_candidate(self):
+        result = self.result(self.setup() + [self.oi(now=0)])
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["backend"], "c")
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(result["latency"], 0)
+        self.assertEqual(result["retries"], 0)
+        self.assertEqual(result["remaps"], 0)
+        self.assertEqual(
+            [result[k] for k in
+             ("fault", "slow", "capacity", "quota")],
+            [0, 0, 0, 0],
+        )
+
+    def test_fault_then_accept(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "fs", "id": order[0], "k": "D",
+                    "a": 0, "z": 100, "v": 0})
+        ops.append(self.oi(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["backend"], order[1])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["retries"], 1)
+        self.assertEqual(result["remaps"], 1)
+        self.assertEqual(result["fault"], 1)
+        self.assertEqual(result["latency"], 0)
+
+    def test_all_faults_exhaust(self):
+        ops = self.setup()
+        for backend_id in ("a", "b", "c"):
+            ops.append({"op": "fs", "id": backend_id, "k": "D",
+                        "a": 0, "z": 100, "v": 0})
+        ops.append(self.oi(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "R")
+        self.assertIsNone(result["backend"])
+        self.assertEqual(result["attempts"], 3)
+        self.assertEqual(result["retries"], 2)
+        self.assertEqual(result["remaps"], 2)
+        self.assertEqual(result["fault"], 3)
+
+    def test_slow_latency_is_timeout(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "fs", "id": order[0], "k": "S",
+                    "a": 0, "z": 100, "v": 9})
+        ops.append(self.oi(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["slow"], 1)
+        # S 且 v>timeout：尝试耗时按 timeout 计。
+        self.assertEqual(result["latency"], 5)
+
+    def test_s_within_timeout_passes_with_v(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "fs", "id": order[0], "k": "S",
+                    "a": 0, "z": 100, "v": 3})
+        ops.append(self.oi(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["backend"], order[0])
+        self.assertEqual(result["latency"], 3)
+
+    def test_capacity_failure_latency_follows_s_rule(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        # fr max=1 成功必在 order[0] 建连，占满 os.cap=1。
+        ops.append({"op": "fr", "cid": "x", "flow": self.FLOW,
+                    "key": "k1", "timeout": 9, "max": 1, "now": 0})
+        # 同候选处 S v=3≤timeout：capacity 失败但尝试耗时仍为 v。
+        ops.append({"op": "fs", "id": order[0], "k": "S",
+                    "a": 0, "z": 100, "v": 3})
+        ops.append(self.oi(now=1))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["backend"], order[1])
+        self.assertEqual(result["capacity"], 1)
+        self.assertEqual(result["latency"], 3)
+
+    def test_bucket_shortage_is_quota(self):
+        ops = self.setup()
+        ops.append({"op": "ls", "scope": "C", "id": "c1",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append(self.oi(cc=2, now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "R")
+        self.assertEqual(result["quota"], 3)
+        self.assertEqual(result["attempts"], 3)
+
+    def test_fixed_window_quota_shortage_is_quota(self):
+        ops = self.setup()
+        ops.append({"op": "qs", "scope": "C", "id": "c1",
+                    "limit": 1, "span": 10, "now": 0})
+        # la 在路由后端真实耗掉窗内唯一配额。
+        ops.append({"op": "la", "c": "c1", "s": "s1", "key": "k1",
+                    "now": 0})
+        ops.append(self.oi(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "R")
+        self.assertEqual(result["quota"], 3)
+
+    def test_priority_fault_over_quota(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "ls", "scope": "C", "id": "c1",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append({"op": "fs", "id": order[0], "k": "D",
+                    "a": 0, "z": 100, "v": 0})
+        ops.append(self.oi(cc=2, now=0))
+        result = self.result(ops)
+        # 首候选 D 计 fault（不查桶），后两候选桶不足计 quota。
+        self.assertEqual(result["fault"], 1)
+        self.assertEqual(result["quota"], 2)
+
+    def test_read_only_does_not_consume_or_connect_or_account(self):
+        ops = self.setup()
+        ops.append({"op": "ls", "scope": "C", "id": "c1",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append(self.oi(cc=1, now=0))
+        # 预演成功未耗令牌：随后真实 la 同成本仍成功。
+        ops.append({"op": "la", "c": "c1", "s": "s1", "key": "k1",
+                    "now": 0})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-2]["state"], "A")
+        self.assertEqual(results[-1], {"op": "la", "backend": "c",
+                                       "ok": True})
+        # 预演不建连：cap=1 下随后 oa 仍直接 A。
+        ops.append({"op": "oa", "cid": "x", "flow": self.FLOW,
+                    "c": "c1", "s": "s1", "key": "k1", "now": 1})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["state"], "A")
+        # 预演访问故障段不记 fm。
+        for backend_id in ("a", "b", "c"):
+            ops.append({"op": "fs", "id": backend_id, "k": "D",
+                        "a": 100, "z": 200, "v": 0})
+        ops.append(self.oi(now=100))
+        ops.append({"op": "fm", "id": "a"})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["D"]["affected"], 0)
+
+    def test_projected_refill_without_state_change(self):
+        ops = self.setup()
+        ops.append({"op": "ls", "scope": "C", "id": "c1",
+                    "r": 1, "b": 2, "now": 0})
+        # 真实耗空到 t=0（la 成本 2）。
+        ops.append({"op": "la", "c": "c1", "s": "s1", "key": "k1",
+                    "bc": 1, "cc": 2, "sc": 1, "now": 0})
+        ops.append(self.oi(cc=2, now=0))
+        ops.append(self.oi(cc=2, now=1))
+        results = self.run_ops(ops)
+        # now=0 投影仍为 0：全部 quota 失败；now=1 投影补到 1 仍不足；
+        # now=2 投影补到 2 通过。
+        ops.append(self.oi(cc=2, now=2))
+        results = self.run_ops(ops)
+        self.assertEqual(results[-3]["state"], "R")
+        self.assertEqual(results[-2]["state"], "R")
+        self.assertEqual(results[-1]["state"], "A")
+
+    def test_max_bounds_distinct_attempts(self):
+        ops = self.setup()
+        for backend_id in ("a", "b", "c"):
+            ops.append({"op": "fs", "id": backend_id, "k": "D",
+                        "a": 0, "z": 100, "v": 0})
+        ops.append(self.oi(max=2, now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "R")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(result["fault"], 2)
+
+    def test_clock_advances_and_regression_is_input(self):
+        ops = self.setup()
+        ops.append(self.oi(now=10))
+        ops.append({"op": "la", "c": "c1", "s": "s1", "key": "k1",
+                    "now": 9})
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_state_errors_precede_clock(self):
+        # 未 chash：STATE，即便 now 相对前序倒退（无前序，仍先于时钟）。
+        ops = [{"op": "add", "id": "a", "weight": 1},
+               {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+               self.oi()]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+        # 已 chash 未 os：STATE。
+        ops = [{"op": "add", "id": "a", "weight": 1},
+               {"op": "chash", "vnodes": 1}, self.oi()]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+        # 环内无合格候选（唯一后端不健康）：STATE。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            self.oi(now=0),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_input_errors(self):
+        setup = self.setup()
+
+        def raw_of(op_obj):
+            return encode_ops(setup + [op_obj])
+
+        # 键序错误（c 先于 key）。
+        self.assert_failure(
+            b'{"ops":[{"op":"oi","c":"c1","key":"k1","s":"s1",'
+            b'"bc":1,"cc":1,"sc":1,"timeout":5,"max":3,"now":0}]}',
+            2, "INPUT",
+        )
+        # 三项成本全零。
+        self.assert_failure(raw_of(self.oi(bc=0, cc=0, sc=0, now=0)),
+                            2, "INPUT")
+        # bool 混入 max。
+        self.assert_failure(raw_of(self.oi(max=True, now=0)), 2, "INPUT")
+        # timeout 越界。
+        self.assert_failure(raw_of(self.oi(timeout=-1, now=0)),
+                            2, "INPUT")
+        # 多键。
+        extra = self.oi(now=0)
+        extra["x"] = 1
+        self.assert_failure(raw_of(extra), 2, "INPUT")
+        # 缺键。
+        missing = self.oi(now=0)
+        del missing["sc"]
+        self.assert_failure(raw_of(missing), 2, "INPUT")
+        # 空 key。
+        self.assert_failure(raw_of(self.oi(key="", now=0)), 2, "INPUT")
+
+    def test_exact_result_key_order_bytes(self):
+        raw = encode_ops(self.setup() + [self.oi(now=0)])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        line = next(line for line in out.split(b"\n")
+                    if b'"op":"oi"' in line)
+        expected = (
+            b'{"op":"oi","state":"A","backend":"c","attempts":1,'
+            b'"latency":0,"retries":0,"remaps":0,"fault":0,"slow":0,'
+            b'"capacity":0,"quota":0}'
+        )
+        self.assertIn(expected, line)
+
+    def test_record_replay_round_trip(self):
+        raw = encode_ops(self.setup() + [self.oi(now=0)])
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+    def test_record_replay_covers_exhaustion(self):
+        ops = self.setup()
+        for backend_id in ("a", "b", "c"):
+            ops.append({"op": "fs", "id": backend_id, "k": "D",
+                        "a": 0, "z": 100, "v": 0})
+        ops.append(self.oi(now=0))
+        raw = encode_ops(ops)
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, b"")
 
 
 if __name__ == "__main__":
