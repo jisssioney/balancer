@@ -224,6 +224,24 @@ max(0,now//60-59) 报 STATE/4。已删除后端不汇总，同 id 重加只计�
 后端数、R 为窗数），仅用标准库，record/replay 逐字节覆盖 ma；
 mr/mg/mh 行为不变。
 
+全池增量快照：mo 精确键序 op,seq,now（键须按此序出现），seq 为
+1..10^18、now 为 0..10^9 的非 bool 整数，now 纳入共用非递减时钟。
+首次 seq=1，此后须逐次递增 1；同 seq、now 重报原样返回缓存结果且不
+推进时钟与游标，同 seq 异 now、倒序或跳号报 STATE/4。按
+window=now//60 返回上次 mo 之后的增量：首次或与上次跨窗时各后端基线
+为零，成功后按现存后端把当前窗 mr 累计存为新基线。结果键序
+op,seq,window,backends；backends 按现存加入序排列，空池为 []；项键
+序
+id,requests,qps,concurrency,errors,error_rate,latency,retries,remaps,
+removed：requests/errors/retries/remaps 四计数与五整数 latency 桶为
+当前窗 mr 累计减基线，concurrency、removed 取同 now 的 mg 现值
+（removed 沿用 drain/health/circuit/fault 优先级，无则 null），
+qps=requests/60、error_rate=100*errors/requests（零请求为 0）均下截
+为两位小数字符串。键序、类型、范围或时钟倒退报 INPUT/2。remove 后同
+id 重加按新实例从零计（基线清空）；ci/cb 清游标与缓存、seq 重置为
+1；失败批次回滚游标、缓存和时钟。mo 时空 O(B)，沿用既有 JSON 与
+record/replay 逐字节契约，其余子命令与既有操作行为不变。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,
 scheduler,faults}：
@@ -1198,7 +1216,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma",
+        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr", "fi",
         "fb", "fp", "fq",
@@ -1594,6 +1612,21 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("ma", start, end, now)
 
+    if name == "mo":
+        # 全池增量快照：精确键序 op,seq,now（键须按此序出现），seq 为
+        # 1..10^18 非 bool 整数，now 为 0..10^9 非 bool 整数；时钟倒退、
+        # seq 序列关系（首项=1、逐次 +1、同 seq 异 now）留执行期判定。
+        if list(raw_op) != ["op", "seq", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        seq = raw_op["seq"]
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or not 1 <= seq <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("mo", seq, parse_metric_num(raw_op["now"]))
+
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1959,6 +1992,15 @@ def run(raw):
     pick_mode = "W"
     rr_ticket = 0
     last_now = None
+    # 全池增量快照（mo）游标：mo_seq 为下一次成功 mo 应有的 seq（首项
+    # 必须为 1，成功后递增；ci/cb 成功重置为 1）；mo_cache 为最近一次
+    # 成功 mo 的 (seq, now, 结果对象)，同 seq、now 重报原样返回且不推进
+    # 时钟、不重存基线。每后端的 mo_base 为上次成功 mo 时该后端当前窗
+    # mr 累计快照（首元素为基线窗，None 为初始），随 add/make_record
+    # 初始化为零（remove 后重加即从零），仅在与本次同窗时作为基线，故
+    # 无需额外的全局窗游标。
+    mo_seq = 1
+    mo_cache = None
     # 全池故障阈值告警（fe）：未首评为 None，否则为 {"hi","lo","n",
     # "state","run","w","result"}——(hi,lo,n) 为首评固化的阈值，state ∈
     # N/A，run 为当前连续计数，w 为最近已评窗，result 为该窗结果（同窗
@@ -2469,6 +2511,7 @@ def run(raw):
         nonlocal backends, buckets, ring_vnodes, queue_cfg, wait_queue
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal sticky_map, alert, alert_events
+        nonlocal mo_seq, mo_cache
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -2523,6 +2566,8 @@ def run(raw):
                 # 后端 IP 端点登记值（v1..v5 已规范化为 None）。
                 "endpoint": endpoint,
                 "metrics": {},
+                # ci/cb 重建默认运行态：mo 增量基线清零。
+                "mo_base": [None, 0, 0, 0, 0, [0, 0, 0, 0, 0]],
                 # ci 成功清零 H pick 记账。
                 "pick_counts": {
                     "total": 0, "first": 0, "sticky": 0, "expired": 0,
@@ -2584,6 +2629,10 @@ def run(raw):
         # ci 成功清除全池故障告警状态（fe 回到未首评）与转换历史。
         alert = None
         alert_events = deque()
+        # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
+        # 清零）；失败时调用方根本不会进入本函数，天然回滚。
+        mo_seq = 1
+        mo_cache = None
 
     for raw_op in ops:
         op = parse_op(raw_op)
@@ -2684,6 +2733,11 @@ def run(raw):
                 # 度量历史：window -> [requests, errors, retries, remaps,
                 # [五个延迟桶]]，仅保留最近 60 窗；空表示从未 mr。
                 "metrics": {},
+                # mo 增量基线：[window, requests, errors, retries, remaps,
+                # [五延迟桶]]，window 为基线所属窗；上次 mo 与本次同窗时
+                # 作为减数，跨窗或初始（window=None）增量按零。add 与
+                # remove 后重加均从零起步，ci/cb 重建默认运行态时清零。
+                "mo_base": [None, 0, 0, 0, 0, [0, 0, 0, 0, 0]],
                 # H pick 记账：total/first/sticky/expired/removed/health/
                 # circuit/drain 七计数，各封顶 10^18；remove 后重加即随新记录
                 # 清零。hm 只读查询。
@@ -3793,6 +3847,106 @@ def run(raw):
                     }
                 )
             results.append({"op": "ma", "windows": windows})
+
+        elif op[0] == "mo":
+            # 全池增量快照。同 seq、now 重报原样返回缓存结果，不推进时钟、
+            # 不重存基线（重报可能晚于推进时钟的其它操作，故须在共用时钟
+            # 倒退判定之前 continue，与 ls 同参重报同式）。
+            _, seq, now = op
+            if (
+                mo_cache is not None
+                and mo_cache[0] == seq
+                and mo_cache[1] == now
+            ):
+                results.append(mo_cache[2])
+                continue
+            # 时钟倒退先于 seq 序列关系，与其余 now 操作同序判 INPUT。
+            if last_now is not None and now < last_now:
+                fail(EXIT_INPUT, "INPUT")
+            # seq 序列：首次必须为 1，此后逐次递增 1；同 seq 异 now（重报
+            # 未命中上方缓存）、倒序或跳号均 STATE。
+            if seq != mo_seq:
+                fail(EXIT_STATE, "STATE")
+            window = now // 60
+            # 先按当前状态构造完整结果：四项计数与五延迟桶为当前窗 mr
+            # 累计减基线（mo_base.window 与本窗相同才作基线，首次或跨窗
+            # 基线为零）；concurrency、removed 取同 now 的 mg 现值。
+            items = []
+            for backend_id, record in backends.items():
+                metrics = record["metrics"].get(window)
+                if metrics is None:
+                    cur_req = cur_err = cur_retries = cur_remaps = 0
+                    cur_latency = [0, 0, 0, 0, 0]
+                else:
+                    cur_req = metrics[0]
+                    cur_err = metrics[1]
+                    cur_retries = metrics[2]
+                    cur_remaps = metrics[3]
+                    cur_latency = metrics[4]
+                base = record["mo_base"]
+                if base[0] == window:
+                    requests = cur_req - base[1]
+                    errors = cur_err - base[2]
+                    retries = cur_retries - base[3]
+                    remaps = cur_remaps - base[4]
+                    latency = [
+                        cur_latency[i] - base[5][i] for i in range(5)
+                    ]
+                else:
+                    # 首次快照或与上次 mo 跨窗：增量按零基线。
+                    requests = cur_req
+                    errors = cur_err
+                    retries = cur_retries
+                    remaps = cur_remaps
+                    latency = list(cur_latency)
+                # qps=requests/60、error_rate=100*errors/requests 均下截两位。
+                qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
+                if requests == 0:
+                    error_rate = "0.00"
+                else:
+                    rate = errors * 10000 // requests
+                    error_rate = "%d.%02d" % divmod(rate, 100)
+                items.append(
+                    {
+                        "id": backend_id,
+                        "requests": requests,
+                        "qps": qps,
+                        "concurrency": record["conns"],
+                        "errors": errors,
+                        "error_rate": error_rate,
+                        "latency": latency,
+                        "retries": retries,
+                        "remaps": remaps,
+                        "removed": removed_reason(record, now),
+                    }
+                )
+            result = {
+                "op": "mo",
+                "seq": seq,
+                "window": window,
+                "backends": items,
+            }
+            # 构造成功后提交：推进共用时钟，按现存后端把当前窗 mr 累计
+            # （缺窗为零）存为新基线，推进游标并缓存结果。
+            last_now = now
+            for backend_id, record in backends.items():
+                metrics = record["metrics"].get(window)
+                if metrics is None:
+                    record["mo_base"] = [
+                        window, 0, 0, 0, 0, [0, 0, 0, 0, 0]
+                    ]
+                else:
+                    record["mo_base"] = [
+                        window,
+                        metrics[0],
+                        metrics[1],
+                        metrics[2],
+                        metrics[3],
+                        list(metrics[4]),
+                    ]
+            mo_cache = (seq, now, result)
+            mo_seq = seq + 1
+            results.append(result)
 
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。

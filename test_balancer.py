@@ -883,6 +883,234 @@ class FaultTimelineTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
 
 
+class MoSnapshotTest(unittest.TestCase):
+    """全池增量快照 mo：游标、缓存、基线、跨窗与重置契约。"""
+
+    def run_ops(self, ops):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        if code != 0:
+            self.fail("run failed: %d %r" % (code, stderr))
+        return json.loads(stdout.decode("utf-8"))["results"]
+
+    def assert_fails(self, ops, exit_code):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr,
+            ('{"error":"%s"}\n' % ("INPUT" if exit_code == 2 else "STATE")).encode(),
+        )
+
+    @staticmethod
+    def mo(seq, now):
+        return {"op": "mo", "seq": seq, "now": now}
+
+    @staticmethod
+    def mr(backend_id, ok, ms, now, retries=0, remaps=0):
+        return {
+            "op": "mr", "id": backend_id, "ok": ok, "ms": ms,
+            "retries": retries, "remaps": remaps, "now": now,
+        }
+
+    def test_empty_pool_first_snapshot(self):
+        results = self.run_ops([self.mo(1, 0)])
+        self.assertEqual(results[-1], {"op": "mo", "seq": 1, "window": 0,
+                                       "backends": []})
+        self.assertEqual(
+            list(results[-1]), ["op", "seq", "window", "backends"]
+        )
+
+    def test_first_snapshot_zero_baseline_and_key_order(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("a", True, 1, 0, retries=2, remaps=1),
+            self.mr("a", False, 50, 0),
+            self.mo(1, 0),
+        ]
+        item = self.run_ops(ops)[-1]["backends"][0]
+        self.assertEqual(
+            list(item),
+            ["id", "requests", "qps", "concurrency", "errors", "error_rate",
+             "latency", "retries", "remaps", "removed"],
+        )
+        self.assertEqual(item["requests"], 2)
+        self.assertEqual(item["errors"], 1)
+        self.assertEqual(item["qps"], "0.03")
+        self.assertEqual(item["error_rate"], "50.00")
+        # ms=1 落 ≤1 桶，ms=50 落 ≤100 桶。
+        self.assertEqual(item["latency"], [1, 0, 1, 0, 0])
+        self.assertEqual(item["retries"], 2)
+        self.assertEqual(item["remaps"], 1)
+        self.assertEqual(item["concurrency"], 0)
+        self.assertIsNone(item["removed"])
+        # backends 按现存加入序。
+        self.assertEqual(
+            [b["id"] for b in self.run_ops(ops)[-1]["backends"]], ["a", "b"]
+        )
+
+    def test_replay_same_seq_now_returns_cache_without_advance(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            self.mr("a", True, 1, 0),
+            self.mo(1, 0),
+            self.mo(1, 0),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-2], results[-1])
+        # 缓存重报不推进时钟：其后 now=0 的 mr 合法，且下一次 mo 仍是 seq=2。
+        ops.append(self.mr("a", True, 1, 0))
+        ops.append(self.mo(2, 0))
+        results = self.run_ops(ops)
+        # 增量仅含基线之后的一次 mr。
+        self.assertEqual(results[-1]["backends"][0]["requests"], 1)
+
+    def test_replay_after_clock_advanced_still_cached(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            self.mr("a", True, 1, 0),
+            self.mo(1, 0),
+            self.mr("a", True, 1, 200),
+            self.mo(1, 0),
+        ]
+        results = self.run_ops(ops)
+        # ops 索引：0 add、1 mr、2 mo(1,0)、3 mr now=200、4 mo(1,0) 重报。
+        self.assertEqual(results[-1], results[2])
+        # 时钟未被重报回退：now=150 的 mr 倒退报 INPUT。
+        self.assert_fails(ops + [self.mr("a", True, 1, 150)], 2)
+
+    def test_increment_same_window(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            self.mr("a", True, 1, 0),
+            self.mr("a", True, 1, 0),
+            self.mo(1, 0),
+            self.mr("a", False, 5000, 59, retries=3),
+            self.mo(2, 59),
+        ]
+        item = self.run_ops(ops)[-1]["backends"][0]
+        self.assertEqual(item["requests"], 1)
+        self.assertEqual(item["errors"], 1)
+        self.assertEqual(item["retries"], 3)
+        self.assertEqual(item["latency"], [0, 0, 0, 0, 1])
+        self.assertEqual(item["qps"], "0.01")
+        self.assertEqual(item["error_rate"], "100.00")
+
+    def test_cross_window_baseline_zero(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            self.mr("a", True, 1, 0),
+            self.mo(1, 0),
+            self.mr("a", True, 100, 60),
+            self.mo(2, 60),
+        ]
+        result = self.run_ops(ops)[-1]
+        self.assertEqual(result["window"], 1)
+        self.assertEqual(result["backends"][0]["requests"], 1)
+        self.assertEqual(result["backends"][0]["latency"], [0, 0, 1, 0, 0])
+
+    def test_concurrency_and_removed_present_values(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "open", "cid": "c", "flow": FLOW, "now": 0},
+            self.mo(1, 0),
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            self.mo(2, 1),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-3]["backends"][0]["concurrency"], 1)
+        self.assertIsNone(results[-3]["backends"][0]["removed"])
+        self.assertEqual(results[-1]["backends"][0]["concurrency"], 1)
+        self.assertEqual(results[-1]["backends"][0]["removed"], "health")
+
+    def test_remove_readd_counts_from_zero(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            self.mr("a", True, 1, 0),
+            self.mr("a", True, 1, 0),
+            self.mo(1, 0),
+            {"op": "remove", "id": "a"},
+            {"op": "add", "id": "a", "weight": 1},
+            self.mo(2, 0),
+        ]
+        self.assertEqual(self.run_ops(ops)[-1]["backends"][0]["requests"], 0)
+
+    def test_ci_resets_cursor_and_baseline(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            self.mr("a", True, 1, 0),
+            self.mo(1, 0),
+            {"op": "ce"},
+        ]
+        results = self.run_ops(ops)
+        config = results[-1]["config"]
+        ops.append({"op": "ci", "config": config, "now": 1})
+        ops.append(self.mo(1, 1))
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["seq"], 1)
+        self.assertEqual(results[-1]["backends"][0]["requests"], 0)
+        # ci 后 seq 重置：seq=2 跳号报 STATE。
+        self.assert_fails(ops[:-1] + [self.mo(2, 1)], 4)
+
+    def test_seq_violations_are_state(self):
+        self.assert_fails([self.mo(2, 0)], 4)          # 首次非 1
+        self.assert_fails([self.mo(1, 0), self.mo(3, 1)], 4)   # 跳号
+        self.assert_fails([self.mo(1, 0), self.mo(1, 1)], 4)   # 同 seq 异 now
+        self.assert_fails(                                         # 旧 seq、时钟不倒退
+            [self.mo(1, 0), self.mo(2, 1), self.mo(2, 2)], 4
+        )
+
+    def test_input_violations(self):
+        cases = [
+            b'{"ops":[{"op":"mo","now":0,"seq":1}]}',          # 键序
+            b'{"ops":[{"op":"mo","seq":1}]}',                  # 缺键
+            b'{"ops":[{"op":"mo","seq":1,"now":0,"x":1}]}',    # 多键
+            b'{"ops":[{"op":"mo","seq":true,"now":0}]}',       # bool seq
+            b'{"ops":[{"op":"mo","seq":1,"now":true}]}',       # bool now
+            b'{"ops":[{"op":"mo","seq":0,"now":0}]}',          # seq 越界
+            b'{"ops":[{"op":"mo","seq":1,"now":-1}]}',         # now 越界
+            b'{"ops":[{"op":"mo","seq":1,"now":1000000001}]}',
+        ]
+        for raw in cases:
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual((code, stdout, stderr),
+                             (2, b"", b'{"error":"INPUT"}\n'), raw)
+
+    def test_clock_regression_is_input_before_seq(self):
+        # seq 同时失配，但时钟倒退优先报 INPUT。
+        self.assert_fails([self.mo(1, 5), self.mo(2, 4)], 2)
+        self.assert_fails([self.mo(1, 5), self.mo(1, 4)], 2)
+
+    def test_failed_batch_rolls_back_cursor_and_clock(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            self.mr("a", True, 1, 0),
+            self.mo(1, 0),
+            {"op": "get", "cid": "missing"},
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (5, b""))
+
+    def test_record_replay_covers_mo(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            self.mr("a", False, 10, 0),
+            self.mo(1, 0),
+            self.mo(1, 0),
+            self.mr("a", True, 100, 60),
+            self.mo(2, 60),
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 class RecordReplayTest(unittest.TestCase):
     """核心输入经 record、replay 逐字节复现退出码、stdout、stderr。"""
 
