@@ -447,6 +447,23 @@ quota 为对应失败原因的失败尝试数，retries=remaps=max(attempts-1,0)
 O(BV)、额外空间 O(BV)；紧凑 UTF-8 固定键序 JSON、单换行及
 record/replay 逐字节行为照常，仅用标准库，其他子命令行为不变。
 
+只读接纳明细：od 精确键序 op,key,c,s,bc,cc,sc,timeout,max,now（键须
+按此序出现），字段校验、成本约束、共用非递减时钟与 STATE 前置（未配
+环、未 os、环内无合格候选）均同 oi。自 key 哈希点按 fr 顺序遍历环上
+不同后端至多 max 个，按 fault、slow、capacity、quota 优先判定，首个
+全部通过的后端即 A 并停止，耗尽全部尝试为 R；除共用时钟按 now 推进
+外不改任何运行态（桶补充与固定窗推进仅在只读投影上计算，不补充、不
+扣减、不回写），失败批次天然回滚。结果键序 op,state,backend,trace：
+state ∈ A/R，backend 仅 A 为 id 否则 null；trace 按尝试序，项键序
+id,effect,latency,result,blocked：effect 为该候选 now 时刻的 N/D/S，
+latency 为 S 时 min(v,timeout)、否则 0，result 为 F（故障）/S（超
+时）/C（满载）/Q（限额）/A（接纳），blocked 仅 Q 时按
+BT,BQ,CT,CQ,ST,SQ 序列出不足项（T 为按 now 只读补充后的令牌桶，Q
+为推进窗口后的固定配额），否则为空数组。非法键（含键序）、字段、编
+码、成本或时钟倒退报 INPUT/2；未配置环、os 或无合格候选报 STATE/4。
+od 时间 O(BV)、额外空间 O(BV)；紧凑 UTF-8 固定键序 JSON、单换行及
+record/replay 逐字节行为照常，仅用标准库，其他子命令行为不变。
+
 故障演练统计：fx/fr 访问后端时按 now 取唯一活动段，依 fq 的 effect 与
 活动段种类 D/F/S 记账：effect 为 D 或 S 则当前段种类 affected 加 1；D
 失败（fx 跳过、fr 尝试失败）或 S 耗时超 timeout 则 rejected 加 1。fx
@@ -1303,7 +1320,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
-        "fs", "fx", "fr", "fi", "oi",
+        "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
@@ -1934,11 +1951,11 @@ def parse_op(raw_op):
             parse_fault_num(raw_op["now"]),
         )
 
-    if name == "oi":
-        # 只读接纳预演：精确键序 op,key,c,s,bc,cc,sc,timeout,max,now（键须
-        # 按此序出现）；key/c/s 与三项成本沿用 la 新键集校验（成本不全为 0），
-        # timeout/max/now 沿用 fr；未配环或 os、环内无合格候选的 STATE 留
-        # 执行期判（先于时钟）。
+    if name in ("oi", "od"):
+        # 只读接纳预演（oi）与只读接纳明细（od）：精确键序
+        # op,key,c,s,bc,cc,sc,timeout,max,now（键须按此序出现）；key/c/s 与
+        # 三项成本沿用 la 新键集校验（成本不全为 0），timeout/max/now 沿用
+        # fr；未配环或 os、环内无合格候选的 STATE 留执行期判（先于时钟）。
         if list(raw_op) != [
             "op", "key", "c", "s", "bc", "cc", "sc", "timeout", "max", "now",
         ]:
@@ -1950,7 +1967,7 @@ def parse_op(raw_op):
             # 三项成本全零非法（同 la 新键集）。
             fail(EXIT_INPUT, "INPUT")
         return (
-            "oi",
+            name,
             parse_key(raw_op["key"]),
             parse_key(raw_op["c"]),
             parse_key(raw_op["s"]),
@@ -2572,6 +2589,98 @@ def run(raw):
             break
         return state, chosen_id, attempts, latency, counts
 
+    def simulate_od(tokens, digests, key, c, s, costs, timeout,
+                    max_attempts, now):
+        """只读模拟一次 od 接纳明细，返回 (state, backend, trace)：遍历与
+        fault、slow、capacity、quota 优先判定同 oi，首个全部通过的后端即
+        A 并停止，耗尽为 R。trace 按尝试序，项键序
+        id,effect,latency,result,blocked：effect 为该候选 now 时刻的
+        N/D/S；latency 为 S 时 min(v,timeout)、否则 0；result 为
+        F（故障）/S（超时）/C（满载）/Q（限额）/A（接纳）；blocked 仅 Q
+        时按 BT,BQ,CT,CQ,ST,SQ 序列出不足项（T 为按 now 只读补充后的令
+        牌桶，Q 为推进窗口后的固定配额），否则为空数组。只读投影同 oi：
+        不补充、不扣减、不回写，不读写粘性、不建连、不记 mr/fm/fh。
+        tokens 非空（空环由调用方先报 STATE）。"""
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash)
+        if index == len(tokens):
+            index = 0  # 越界回绕到环首
+        bc, cc, sc = costs
+        trace = []
+        chosen_id = None
+        state = "R"
+        seen = set()
+        attempts = 0
+        for offset in range(len(tokens)):
+            if attempts >= max_attempts:
+                break
+            backend_id = tokens[(index + offset) % len(tokens)][3]
+            if backend_id in seen:
+                continue
+            seen.add(backend_id)
+            attempts += 1
+            record = backends[backend_id]
+            segment = active_fault(record, now)
+            effect = fault_effect(segment, now)
+            # N（段间隙、未登记或 F 非故障相位）耗时 0；S 耗时
+            # min(v,timeout)；D 耗时 0。
+            cost = segment[3] if effect == "S" else 0
+            latency = min(cost, timeout)
+            entry = {
+                "id": backend_id,
+                "effect": effect,
+                "latency": latency,
+                "result": None,
+                "blocked": [],
+            }
+            trace.append(entry)
+            if effect == "D":
+                # D/故障相位 F：本尝试失败。
+                entry["result"] = "F"
+                continue
+            if cost > timeout:
+                # S 且 v>timeout：本尝试失败。
+                entry["result"] = "S"
+                continue
+            if record["conns"] >= queue_cfg[0]:
+                # 连接数达 os 的 cap：capacity 失败。
+                entry["result"] = "C"
+                continue
+            # 三桶三配额：以 now 只读补充/推进（每次尝试独立投影，不回写
+            # 真实桶/配额）；按 BT,BQ,CT,CQ,ST,SQ 序收集全部不足项。
+            blocked = entry["blocked"]
+            for scope, bucket_id, demand, t_label, q_label in (
+                ("B", backend_id, bc, "BT", "BQ"),
+                ("C", c, cc, "CT", "CQ"),
+                ("S", s, sc, "ST", "SQ"),
+            ):
+                bucket = buckets.get((scope, bucket_id))
+                if bucket is not None:
+                    projected = min(
+                        bucket["b"],
+                        bucket["t"] + (now - bucket["at"]) * bucket["r"],
+                    )
+                    if projected < demand:
+                        blocked.append(t_label)
+                quota = quotas.get((scope, bucket_id))
+                if quota is not None:
+                    window = now // quota["span"]
+                    used = 0 if window != quota["window"] else quota["used"]
+                    if used + demand > quota["limit"]:
+                        blocked.append(q_label)
+            if blocked:
+                # 任一桶或配额不足：quota 失败。
+                entry["result"] = "Q"
+                continue
+            # 全部通过：A 并停止，不补充、不扣减、不建连。
+            entry["result"] = "A"
+            chosen_id = backend_id
+            state = "A"
+            break
+        return state, chosen_id, trace
+
     def fault_window_stats(record, now):
         """取 now//60 窗的故障记账计数组（惰性建窗），并只保留最近 60 窗。
         时钟非递减，新建窗时丢弃 cutoff 之前的旧窗；空窗不预建。fm 累计与
@@ -2926,7 +3035,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
-            "ci", "cb", "fx", "fr", "fi", "oi", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh",
         ):
             now = op[-1]
@@ -5033,6 +5142,43 @@ def run(raw):
                     "slow": counts["slow"],
                     "capacity": counts["capacity"],
                     "quota": counts["quota"],
+                }
+            )
+
+        elif op[0] == "od":
+            # 只读接纳明细：遍历、判定优先级与 STATE 前置（未配环、未 os、
+            # 环内无合格候选）同 oi；除共用时钟按 now 推进外不改任何运行
+            # 态，桶补充与固定窗推进只在只读投影上进行，失败批天然回滚。
+            # 结果键序 op,state,backend,trace；时间 O(BV)、额外空间 O(BV)。
+            _, key, c, s, bc, cc, sc, timeout, max_attempts, now = op
+            if ring_vnodes is None:
+                # 未配环报 STATE，同 oi。
+                fail(EXIT_STATE, "STATE")
+            if queue_cfg is None:
+                # 未 os 报 STATE（capacity 判定依赖 os.cap）。
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                # 环内无合格候选同样报 STATE（同 oi）。
+                fail(EXIT_STATE, "STATE")
+            digests = [token[0] for token in tokens]
+            state, chosen_id, trace = simulate_od(
+                tokens,
+                digests,
+                key,
+                c,
+                s,
+                (bc, cc, sc),
+                timeout,
+                max_attempts,
+                now,
+            )
+            results.append(
+                {
+                    "op": "od",
+                    "state": state,
+                    "backend": chosen_id,
+                    "trace": trace,
                 }
             )
 

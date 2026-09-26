@@ -2083,5 +2083,355 @@ class OiDryRunTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class OdTraceTest(unittest.TestCase):
+    """od 只读接纳明细：遍历与判定同 oi，逐尝试输出 trace。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if err:
+            self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def setup(self, ids=("a", "b", "c"), vnodes=8):
+        ops = [{"op": "add", "id": backend_id, "weight": 1}
+               for backend_id in ids]
+        ops.append({"op": "chash", "vnodes": vnodes})
+        ops.append({"op": "os", "cap": 1, "q": 2, "ttl": 10})
+        return ops
+
+    def od(self, **overrides):
+        op = {
+            "op": "od", "key": "k1", "c": "c1", "s": "s1",
+            "bc": 1, "cc": 1, "sc": 1,
+            "timeout": 5, "max": 3, "now": 10,
+        }
+        op.update(overrides)
+        return op
+
+    def ring_order(self, ids, vnodes, key):
+        """复刻 build_ring 自 key 哈希点的去重后端遍历序。"""
+        tokens = []
+        for join_index, backend_id in enumerate(ids):
+            encoded = backend_id.encode("utf-8")
+            for i in range(vnodes):
+                digest = hashlib.sha256(
+                    encoded + b"\x00" + str(i).encode("ascii")
+                ).digest()
+                tokens.append(
+                    (int.from_bytes(digest, "big"), join_index, i, backend_id)
+                )
+        tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+        digests = [token[0] for token in tokens]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash) % len(tokens)
+        order = []
+        for offset in range(len(tokens)):
+            backend_id = tokens[(index + offset) % len(tokens)][3]
+            if backend_id not in order:
+                order.append(backend_id)
+        return order
+
+    def result(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def test_accept_first_candidate_trace(self):
+        result = self.result(self.setup() + [self.od(now=0)])
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["backend"], "c")
+        self.assertEqual(
+            result["trace"],
+            [{"id": "c", "effect": "N", "latency": 0,
+              "result": "A", "blocked": []}],
+        )
+
+    def test_fault_then_accept_trace(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "fs", "id": order[0], "k": "D",
+                    "a": 0, "z": 100, "v": 0})
+        ops.append(self.od(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["backend"], order[1])
+        self.assertEqual(
+            result["trace"],
+            [{"id": order[0], "effect": "D", "latency": 0,
+              "result": "F", "blocked": []},
+             {"id": order[1], "effect": "N", "latency": 0,
+              "result": "A", "blocked": []}],
+        )
+
+    def test_f_phase_effect_and_recovery(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        # F 段 v=2：now=0 为故障相位（effect D），now=2 为非故障相位
+        # （effect N）。
+        ops.append({"op": "fs", "id": order[0], "k": "F",
+                    "a": 0, "z": 100, "v": 2})
+        ops.append(self.od(now=0))
+        ops.append(self.od(now=2))
+        results = self.run_ops(ops)
+        self.assertEqual(results[-2]["trace"][0]["effect"], "D")
+        self.assertEqual(results[-2]["trace"][0]["result"], "F")
+        self.assertEqual(results[-1]["trace"][0]["effect"], "N")
+        self.assertEqual(results[-1]["trace"][0]["result"], "A")
+
+    def test_slow_timeout_entry_latency(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "fs", "id": order[0], "k": "S",
+                    "a": 0, "z": 100, "v": 9})
+        ops.append(self.od(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        # S 且 v>timeout：result=S，latency=min(v,timeout)=timeout。
+        self.assertEqual(
+            result["trace"][0],
+            {"id": order[0], "effect": "S", "latency": 5,
+             "result": "S", "blocked": []},
+        )
+
+    def test_s_within_timeout_accepts_with_v(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "fs", "id": order[0], "k": "S",
+                    "a": 0, "z": 100, "v": 3})
+        ops.append(self.od(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(
+            result["trace"],
+            [{"id": order[0], "effect": "S", "latency": 3,
+              "result": "A", "blocked": []}],
+        )
+
+    def test_capacity_entry(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        # fr max=1 成功必在 order[0] 建连，占满 os.cap=1。
+        ops.append({"op": "fr", "cid": "x", "flow": self.FLOW,
+                    "key": "k1", "timeout": 9, "max": 1, "now": 0})
+        # 同候选处 S v=3≤timeout：capacity 失败但 latency 仍为 v。
+        ops.append({"op": "fs", "id": order[0], "k": "S",
+                    "a": 0, "z": 100, "v": 3})
+        ops.append(self.od(now=1))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["backend"], order[1])
+        self.assertEqual(
+            result["trace"][0],
+            {"id": order[0], "effect": "S", "latency": 3,
+             "result": "C", "blocked": []},
+        )
+
+    def test_bucket_shortage_blocked_label(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        # B 桶挂在首候选后端：b=1 而 bc=2，投影不足。
+        ops.append({"op": "ls", "scope": "B", "id": order[0],
+                    "r": 1, "b": 1, "now": 0})
+        ops.append(self.od(bc=2, now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["backend"], order[1])
+        self.assertEqual(
+            result["trace"][0],
+            {"id": order[0], "effect": "N", "latency": 0,
+             "result": "Q", "blocked": ["BT"]},
+        )
+        self.assertEqual(result["trace"][1]["result"], "A")
+
+    def test_blocked_sequence_order(self):
+        ops = self.setup()
+        # C 桶投影不足（cc=2>b=1）且 S 配额窗内已耗尽：同尝试两项不足，
+        # 按 BT,BQ,CT,CQ,ST,SQ 序列出。
+        ops.append({"op": "ls", "scope": "C", "id": "c1",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append({"op": "qs", "scope": "S", "id": "s1",
+                    "limit": 1, "span": 10, "now": 0})
+        ops.append({"op": "la", "c": "c1", "s": "s1", "key": "k9",
+                    "now": 0})
+        ops.append(self.od(cc=2, now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "R")
+        self.assertIsNone(result["backend"])
+        self.assertEqual(len(result["trace"]), 3)
+        for entry in result["trace"]:
+            self.assertEqual(entry["result"], "Q")
+            self.assertEqual(entry["blocked"], ["CT", "SQ"])
+
+    def test_fixed_window_rolls_projection_only(self):
+        ops = self.setup()
+        ops.append({"op": "qs", "scope": "C", "id": "c1",
+                    "limit": 1, "span": 10, "now": 0})
+        ops.append({"op": "la", "c": "c1", "s": "s1", "key": "k1",
+                    "now": 0})
+        # now=0 窗内配额已尽：CQ；now=10 窗口推进后投影重置：通过。
+        ops.append(self.od(now=0))
+        ops.append(self.od(now=10))
+        results = self.run_ops(ops)
+        self.assertEqual(results[-2]["state"], "R")
+        self.assertEqual(results[-2]["trace"][0]["blocked"], ["CQ"])
+        self.assertEqual(results[-1]["state"], "A")
+        self.assertEqual(results[-1]["trace"][0]["blocked"], [])
+
+    def test_exhaustion_trace_covers_all_attempts(self):
+        ops = self.setup()
+        for backend_id in ("a", "b", "c"):
+            ops.append({"op": "fs", "id": backend_id, "k": "D",
+                        "a": 0, "z": 100, "v": 0})
+        ops.append(self.od(now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "R")
+        self.assertIsNone(result["backend"])
+        self.assertEqual(len(result["trace"]), 3)
+        for entry in result["trace"]:
+            self.assertEqual(entry["effect"], "D")
+            self.assertEqual(entry["result"], "F")
+            self.assertEqual(entry["blocked"], [])
+
+    def test_max_bounds_distinct_attempts(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        for backend_id in ("a", "b", "c"):
+            ops.append({"op": "fs", "id": backend_id, "k": "D",
+                        "a": 0, "z": 100, "v": 0})
+        ops.append(self.od(max=2, now=0))
+        result = self.result(ops)
+        self.assertEqual(result["state"], "R")
+        self.assertEqual(
+            [entry["id"] for entry in result["trace"]],
+            [order[0], order[1]],
+        )
+
+    def test_read_only_does_not_consume_or_connect_or_account(self):
+        ops = self.setup()
+        ops.append({"op": "ls", "scope": "C", "id": "c1",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append(self.od(cc=1, now=0))
+        # 预演成功未耗令牌：随后真实 la 同成本仍成功。
+        ops.append({"op": "la", "c": "c1", "s": "s1", "key": "k1",
+                    "now": 0})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-2]["state"], "A")
+        self.assertEqual(results[-1], {"op": "la", "backend": "c",
+                                       "ok": True})
+        # 预演不建连：cap=1 下随后 oa 仍直接 A。
+        ops.append({"op": "oa", "cid": "x", "flow": self.FLOW,
+                    "c": "c1", "s": "s1", "key": "k1", "now": 1})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["state"], "A")
+        # 预演访问故障段不记 fm。
+        for backend_id in ("a", "b", "c"):
+            ops.append({"op": "fs", "id": backend_id, "k": "D",
+                        "a": 100, "z": 200, "v": 0})
+        ops.append(self.od(now=100))
+        ops.append({"op": "fm", "id": "a"})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["D"]["affected"], 0)
+
+    def test_clock_advances_and_regression_is_input(self):
+        ops = self.setup()
+        ops.append(self.od(now=10))
+        ops.append({"op": "la", "c": "c1", "s": "s1", "key": "k1",
+                    "now": 9})
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_state_errors(self):
+        # 未 chash：STATE。
+        ops = [{"op": "add", "id": "a", "weight": 1},
+               {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+               self.od()]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+        # 已 chash 未 os：STATE。
+        ops = [{"op": "add", "id": "a", "weight": 1},
+               {"op": "chash", "vnodes": 1}, self.od()]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+        # 环内无合格候选（唯一后端不健康）：STATE。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            self.od(now=0),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_input_errors(self):
+        setup = self.setup()
+
+        def raw_of(op_obj):
+            return encode_ops(setup + [op_obj])
+
+        # 键序错误（c 先于 key）。
+        self.assert_failure(
+            b'{"ops":[{"op":"od","c":"c1","key":"k1","s":"s1",'
+            b'"bc":1,"cc":1,"sc":1,"timeout":5,"max":3,"now":0}]}',
+            2, "INPUT",
+        )
+        # 三项成本全零。
+        self.assert_failure(raw_of(self.od(bc=0, cc=0, sc=0, now=0)),
+                            2, "INPUT")
+        # bool 混入 max。
+        self.assert_failure(raw_of(self.od(max=True, now=0)), 2, "INPUT")
+        # timeout 越界。
+        self.assert_failure(raw_of(self.od(timeout=-1, now=0)),
+                            2, "INPUT")
+        # 多键。
+        extra = self.od(now=0)
+        extra["x"] = 1
+        self.assert_failure(raw_of(extra), 2, "INPUT")
+        # 缺键。
+        missing = self.od(now=0)
+        del missing["sc"]
+        self.assert_failure(raw_of(missing), 2, "INPUT")
+        # 空 key。
+        self.assert_failure(raw_of(self.od(key="", now=0)), 2, "INPUT")
+
+    def test_exact_result_key_order_bytes(self):
+        raw = encode_ops(self.setup() + [self.od(now=0)])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        line = next(line for line in out.split(b"\n")
+                    if b'"op":"od"' in line)
+        expected = (
+            b'{"op":"od","state":"A","backend":"c","trace":['
+            b'{"id":"c","effect":"N","latency":0,"result":"A",'
+            b'"blocked":[]}]}'
+        )
+        self.assertIn(expected, line)
+
+    def test_record_replay_round_trip(self):
+        ops = self.setup()
+        ops.append({"op": "ls", "scope": "C", "id": "c1",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append(self.od(cc=2, now=0))
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
