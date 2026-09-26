@@ -209,6 +209,19 @@ INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4。ra 只读；已删除后�
 原子回滚；ra 时空 O(BR)（B 为现存后端数、R 为窗数），仅用标准库；
 record/replay 逐字节覆盖 ra。
 
+全池请求指标历史：ma 精确键序 op,from,to,now（键须按此序出现），
+from/to/now 为 0..10^9 非 bool 整数，now 纳入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60；ma 只读汇总全池现存后端的 mh 分钟窗，
+返回键序 op,windows；windows 覆盖 from 至 to 所有窗并升序，项键序
+window,requests,qps,errors,error_rate,latency,retries,remaps；四项
+计数及五个 latency 桶为全池逐项求和并封顶 10^18，qps=requests/60、
+error_rate=100*errors/requests（零请求为 0）均下截为两位小数字符串；
+缺窗或空池均返回零计数、零桶和 0.00。键序、类型、范围、关系或时钟
+倒退报 INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4。ma 只读；
+已删除后端不汇总，同 id 重加只计新实例历史，ci 成功清空历史；失败
+批次原子回滚；ma 时空 O(BR)（B 为现存后端数、R 为窗数），仅用标准
+库；record/replay 逐字节覆盖 ma。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler}：
 version=6；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
@@ -1078,7 +1091,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "ra",
+        "mr", "mg", "mh", "ma", "ms", "mx", "rh", "ra",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr",
         "fb", "fq",
@@ -1416,6 +1429,19 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("mh", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "ma":
+        # 全池请求指标历史：精确键序 op,from,to,now（键须按此序出现），
+        # 只读；数值与窗关系约束同 ra/fa，from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ma", start, end, now)
 
     if name == "ms":
         if keys != {"op", "id", "now"}:
@@ -2320,7 +2346,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
-            "ms", "mx", "rh", "ra",
+            "ma", "ms", "mx", "rh", "ra",
             "ci", "cb", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
         ):
@@ -3310,6 +3336,59 @@ def run(raw):
                     }
                 )
             results.append({"op": "mh", "id": backend_id, "windows": windows})
+
+        elif op[0] == "ma":
+            # 全池请求指标历史（只读）：from 早于最近 60 窗下界报 STATE
+            # （同 mh）；不改任何度量，失败批次天然回滚。返回键序
+            # op,windows；windows 覆盖 from..to 并升序，项键序
+            # window,requests,qps,errors,error_rate,latency,retries,remaps；
+            # 四项计数与五延迟桶为全池现存后端同窗 mh 值逐项求和并封顶
+            # 10^18；qps=requests/60、error_rate=100*errors/requests（零请求
+            # 为 0）均下截两位小数字符串；缺窗或空池全为零计数、零桶与
+            # 0.00。逐项拷贝求和，避免结果被批次内后续记账污染。
+            _, start, end, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            windows = []
+            for window in range(start, end + 1):
+                requests = errors = retries = remaps = 0
+                latency = [0, 0, 0, 0, 0]
+                for record in backends.values():
+                    metrics = record["metrics"].get(window)
+                    if metrics is None:
+                        # 缺窗后端贡献全零，跳过求和。
+                        continue
+                    requests = min(METRIC_CAP, requests + metrics[0])
+                    errors = min(METRIC_CAP, errors + metrics[1])
+                    retries = min(METRIC_CAP, retries + metrics[2])
+                    remaps = min(METRIC_CAP, remaps + metrics[3])
+                    for bucket_index in range(5):
+                        latency[bucket_index] = min(
+                            METRIC_CAP,
+                            latency[bucket_index] + metrics[4][bucket_index],
+                        )
+                # qps=requests/60、error_rate=100*errors/requests 均下截两位。
+                qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
+                if requests == 0:
+                    error_rate = "0.00"
+                else:
+                    rate = errors * 10000 // requests
+                    error_rate = "%d.%02d" % divmod(rate, 100)
+                windows.append(
+                    {
+                        "window": window,
+                        "requests": requests,
+                        "qps": qps,
+                        "errors": errors,
+                        "error_rate": error_rate,
+                        "latency": latency,
+                        "retries": retries,
+                        "remaps": remaps,
+                    }
+                )
+            results.append({"op": "ma", "windows": windows})
 
         elif op[0] == "ms":
             _, backend_id, now = op
