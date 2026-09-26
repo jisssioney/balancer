@@ -1111,6 +1111,357 @@ class MoSnapshotTest(unittest.TestCase):
         )
 
 
+class QuotaWindowTest(unittest.TestCase):
+    """qs/qg 固定窗口配额与 la 的配额判定。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self):
+        # 环上唯一后端 a，供 la 路由。
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+        ]
+
+    def test_qs_qg_basic_flow_and_key_order(self):
+        results = self.run_ops([
+            {"op": "qs", "scope": "C", "id": "c1",
+             "limit": 5, "span": 10, "now": 7},
+            {"op": "qg", "scope": "C", "id": "c1", "now": 8},
+        ])
+        self.assertEqual(results[0], {"op": "qs", "ok": True})
+        self.assertEqual(
+            list(results[1]),
+            ["op", "scope", "id", "limit", "span",
+             "window", "used", "remaining"],
+        )
+        self.assertEqual(
+            results[1],
+            {"op": "qg", "scope": "C", "id": "c1", "limit": 5, "span": 10,
+             "window": 0, "used": 0, "remaining": 5},
+        )
+
+    def test_qs_idempotent_reconfigure_resets(self):
+        ops = self.base_ops() + [
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+            # 同 (limit,span,now) 重报幂等：used 保持 1。
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 5, "span": 10, "now": 0},
+            {"op": "qg", "scope": "B", "id": "a", "now": 0},
+            # 异参重配置：window=now//span、used=0。
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 5, "span": 10, "now": 1},
+            {"op": "qg", "scope": "B", "id": "a", "now": 1},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[5]["used"], 1)
+        self.assertEqual(results[7]["used"], 0)
+        self.assertEqual(results[7]["window"], 0)
+
+    def test_la_consumes_quota_then_rate(self):
+        ops = self.base_ops() + [
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 1, "span": 10, "now": 0},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+            # 配额已尽：RATE/6，整批无 stdout。
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 1},
+        ]
+        self.assert_failure(ops, 6, "RATE")
+
+    def test_la_unconfigured_quota_unlimited(self):
+        ops = self.base_ops() + [
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 1},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[2], {"op": "la", "backend": "a", "ok": True})
+        self.assertEqual(results[3], {"op": "la", "backend": "a", "ok": True})
+
+    def test_la_cost_based_quota_deduction(self):
+        ops = self.base_ops() + [
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 10, "span": 100, "now": 0},
+            {"op": "qs", "scope": "C", "id": "c1",
+             "limit": 3, "span": 100, "now": 0},
+            {"op": "qs", "scope": "S", "id": "s1",
+             "limit": 100, "span": 100, "now": 0},
+            {"op": "la", "c": "c1", "s": "s1", "key": "k",
+             "bc": 4, "cc": 2, "sc": 7, "now": 0},
+            {"op": "qg", "scope": "B", "id": "a", "now": 0},
+            {"op": "qg", "scope": "C", "id": "c1", "now": 0},
+            {"op": "qg", "scope": "S", "id": "s1", "now": 0},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[6]["used"], 4)
+        self.assertEqual(results[7]["used"], 2)
+        self.assertEqual(results[7]["remaining"], 1)
+        self.assertEqual(results[8]["used"], 7)
+
+    def test_la_token_and_quota_both_required(self):
+        # 令牌足、配额不足：RATE。
+        ops = self.base_ops() + [
+            {"op": "ls", "scope": "B", "id": "a", "r": 1, "b": 100, "now": 0},
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 1, "span": 10, "now": 0},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+        ]
+        self.assert_failure(ops, 6, "RATE")
+        # 配额足、令牌不足：RATE（既有行为不变）。
+        ops = self.base_ops() + [
+            {"op": "ls", "scope": "B", "id": "a", "r": 1, "b": 1, "now": 0},
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 100, "span": 10, "now": 0},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+        ]
+        self.assert_failure(ops, 6, "RATE")
+
+    def test_window_crossing_resets_used(self):
+        ops = self.base_ops() + [
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 1, "span": 10, "now": 0},
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 0},
+            # 跨窗（now//span 0→1）：used 清零，本窗可再扣一次。
+            {"op": "la", "c": "c", "s": "s", "key": "k", "now": 10},
+            {"op": "qg", "scope": "B", "id": "a", "now": 19},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[4], {"op": "la", "backend": "a", "ok": True})
+        self.assertEqual(
+            results[5],
+            {"op": "qg", "scope": "B", "id": "a", "limit": 1, "span": 10,
+             "window": 1, "used": 1, "remaining": 0},
+        )
+
+    def test_qg_unconfigured_is_state(self):
+        self.assert_failure(
+            [{"op": "qg", "scope": "C", "id": "c1", "now": 0}], 4, "STATE"
+        )
+
+    def test_qs_unknown_backend_is_backend(self):
+        self.assert_failure(
+            [{"op": "qs", "scope": "B", "id": "ghost",
+              "limit": 1, "span": 1, "now": 0}],
+            3, "BACKEND",
+        )
+        # C/S 作用域不引用后端，任意 id 均可配置。
+        results = self.run_ops([
+            {"op": "qs", "scope": "S", "id": "ghost",
+             "limit": 1, "span": 1, "now": 0},
+        ])
+        self.assertEqual(results[0], {"op": "qs", "ok": True})
+
+    def test_input_violations(self):
+        bad_ops = [
+            # 键集不符。
+            {"op": "qs", "scope": "C", "id": "c", "limit": 1, "span": 1},
+            {"op": "qs", "scope": "C", "id": "c", "limit": 1, "span": 1,
+             "now": 0, "x": 1},
+            {"op": "qg", "scope": "C", "id": "c"},
+            {"op": "qg", "scope": "C", "id": "c", "now": 0, "limit": 1},
+            # scope 非法。
+            {"op": "qs", "scope": "X", "id": "c", "limit": 1, "span": 1,
+             "now": 0},
+            {"op": "qg", "scope": "b", "id": "c", "now": 0},
+            # id 非法（空串、非字符串）。
+            {"op": "qs", "scope": "C", "id": "", "limit": 1, "span": 1,
+             "now": 0},
+            {"op": "qg", "scope": "C", "id": 1, "now": 0},
+            # limit/span/now 类型与范围。
+            {"op": "qs", "scope": "C", "id": "c", "limit": 0, "span": 1,
+             "now": 0},
+            {"op": "qs", "scope": "C", "id": "c", "limit": 10 ** 18 + 1,
+             "span": 1, "now": 0},
+            {"op": "qs", "scope": "C", "id": "c", "limit": True, "span": 1,
+             "now": 0},
+            {"op": "qs", "scope": "C", "id": "c", "limit": 1, "span": 0,
+             "now": 0},
+            {"op": "qs", "scope": "C", "id": "c", "limit": 1,
+             "span": 10 ** 9 + 1, "now": 0},
+            {"op": "qs", "scope": "C", "id": "c", "limit": 1, "span": 1,
+             "now": -1},
+            {"op": "qs", "scope": "C", "id": "c", "limit": 1, "span": 1,
+             "now": 10 ** 9 + 1},
+            {"op": "qg", "scope": "C", "id": "c", "now": False},
+        ]
+        for bad in bad_ops:
+            self.assert_failure([bad], 2, "INPUT")
+
+    def test_clock_regression_is_input(self):
+        # qs/qg 的 now 纳入共用非递减时钟。
+        self.assert_failure(
+            [
+                {"op": "qs", "scope": "C", "id": "c",
+                 "limit": 1, "span": 1, "now": 5},
+                {"op": "qg", "scope": "C", "id": "c", "now": 4},
+            ],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            self.base_ops() + [
+                {"op": "la", "c": "c", "s": "s", "key": "k", "now": 5},
+                {"op": "qs", "scope": "C", "id": "c",
+                 "limit": 1, "span": 1, "now": 4},
+            ],
+            2, "INPUT",
+        )
+
+    def test_remove_deletes_b_quota(self):
+        ops = self.base_ops() + [
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 1, "span": 1, "now": 0},
+            {"op": "remove", "id": "a"},
+            {"op": "qg", "scope": "B", "id": "a", "now": 0},
+        ]
+        self.assert_failure(ops, 4, "STATE")
+
+    def test_ci_clears_quotas_and_ce_unchanged(self):
+        ops = self.base_ops() + [
+            {"op": "qs", "scope": "C", "id": "c",
+             "limit": 1, "span": 1, "now": 0},
+            {"op": "ci", "config": config_v7(1), "now": 1},
+            {"op": "ce"},
+        ]
+        results = self.run_ops(ops)
+        # ce 导出不变：精确十键、无配额内容。
+        self.assertEqual(
+            list(results[4]["config"]),
+            ["version", "backends", "vnodes", "limits", "overload", "sticky",
+             "idle", "backpressure", "scheduler", "faults"],
+        )
+        # ci 成功后配额已清空。
+        self.assert_failure(
+            self.base_ops() + [
+                {"op": "qs", "scope": "C", "id": "c",
+                 "limit": 1, "span": 1, "now": 0},
+                {"op": "ci", "config": config_v7(1), "now": 1},
+                {"op": "qg", "scope": "C", "id": "c", "now": 1},
+            ],
+            4, "STATE",
+        )
+
+    def test_cb_clears_quotas(self):
+        ops = [
+            {"op": "ci", "config": config_v7(1), "now": 0},
+            {"op": "qs", "scope": "C", "id": "c",
+             "limit": 1, "span": 1, "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},
+            {"op": "qg", "scope": "C", "id": "c", "now": 2},
+        ]
+        self.assert_failure(ops, 4, "STATE")
+
+    def test_record_replay_covers_quotas(self):
+        ops = self.base_ops() + [
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 2, "span": 10, "now": 0},
+            {"op": "qs", "scope": "C", "id": "c1",
+             "limit": 5, "span": 3, "now": 0},
+            {"op": "la", "c": "c1", "s": "s", "key": "k", "now": 0},
+            {"op": "qg", "scope": "B", "id": "a", "now": 1},
+            {"op": "qg", "scope": "C", "id": "c1", "now": 4},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
+class V7FaultNormalizationTest(unittest.TestCase):
+    """v7 faults 规范化：乱序提交按 a 升序输出，重叠判定不变。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def seg(self, backend="a", k="D", a=0, z=10, v=0):
+        return {"id": backend, "k": k, "a": a, "z": z, "v": v}
+
+    def test_shuffled_segments_normalized_by_start(self):
+        # 多后端、多段乱序提交：ce 按后端加入序、段 a 升序输出。
+        faults = [
+            self.seg("b", "S", 50, 60, 2),
+            self.seg("a", "D", 20, 30),
+            self.seg("b", "D", 0, 10),
+            self.seg("a", "F", 0, 20, 5),
+            self.seg("a", "D", 30, 40),
+        ]
+        config = config_v7(1, faults=faults)
+        config["backends"].append(
+            {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
+             "circuit": None, "drain": None, "endpoint": None}
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "ce"},
+        ])
+        self.assertEqual(
+            [(f["id"], f["k"], f["a"], f["z"], f["v"])
+             for f in results[1]["config"]["faults"]],
+            [("a", "F", 0, 20, 5), ("a", "D", 20, 30, 0),
+             ("a", "D", 30, 40, 0), ("b", "D", 0, 10, 0),
+             ("b", "S", 50, 60, 2)],
+        )
+
+    def test_adjacent_endpoints_accepted(self):
+        # 相邻端点可接（z_i == a_{i+1}）。
+        config = config_v7(1, faults=[
+            self.seg("a", "D", 10, 20),
+            self.seg("a", "D", 0, 10),
+        ])
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "ce"},
+        ])
+        self.assertEqual(
+            [f["a"] for f in results[1]["config"]["faults"]], [0, 10]
+        )
+
+    def test_overlap_and_same_start_rejected(self):
+        for faults in (
+            # 相交。
+            [self.seg("a", "D", 0, 10), self.seg("a", "D", 5, 15)],
+            # 同起点。
+            [self.seg("a", "D", 0, 10), self.seg("a", "D", 0, 5)],
+            # 乱序提交的重叠同样拒绝。
+            [self.seg("a", "D", 5, 15), self.seg("a", "D", 0, 10)],
+        ):
+            self.assert_failure(
+                [{"op": "ci", "config": config_v7(1, faults=faults),
+                  "now": 0}],
+                2, "INPUT",
+            )
+
+
 class RecordReplayTest(unittest.TestCase):
     """核心输入经 record、replay 逐字节复现退出码、stdout、stderr。"""
 
