@@ -224,6 +224,22 @@ max(0,now//60-59) 报 STATE/4。已删除后端不汇总，同 id 重加只计�
 后端数、R 为窗数），仅用标准库，record/replay 逐字节覆盖 ma；
 mr/mg/mh 行为不变。
 
+全池增量快照：mo 精确键序 op,seq,now（键须按此序出现），seq 为
+1..10^18、now 为 0..10^9 的非 bool 整数，now 纳入共用非递减时钟。
+首次 mo 须 seq=1，此后每次递增 1；同 (seq,now) 重报返回缓存结果且
+不推进游标与基线，同 seq 异 now、倒序或跳号报 STATE/4。按
+window=now//60 返回上次 mo 后的增量：首次或跨窗基线为零，成功后
+保存当窗计数为下次基线。结果键序 op,seq,window,backends；backends
+按现存加入序，项键序
+id,requests,qps,concurrency,errors,error_rate,latency,retries,
+remaps,removed：四项计数与五整数 latency 为当前窗 mr 值减基线，
+concurrency 与 removed 取同 now 的 mg 现值；qps=requests/60、
+error_rate=100*errors/requests（零请求为 0）均下截为两位小数字符
+串；空池 backends 为 []。键序、类型、范围或时钟倒退报 INPUT/2。
+remove 后同 id 重加按新实例从零计；ci/cb 成功清游标（seq 重置为
+1）与基线；失败批回滚游标、缓存与时钟。mo 时空 O(B)，
+record/replay 逐字节覆盖；其余子命令行为不变。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,
 scheduler,faults}：
@@ -1198,7 +1214,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma",
+        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr", "fi",
         "fb", "fp", "fq",
@@ -1594,6 +1610,22 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("ma", start, end, now)
 
+    if name == "mo":
+        # 全池增量快照：精确键序 op,seq,now（键须按此序出现）；seq 为
+        # 1..10^18、now 为 0..10^9 的非 bool 整数，now 纳入共用非递减
+        # 时钟；seq 连续性（首次为 1、逐次加一、同参重报幂等）留执行期
+        # 判 STATE。
+        if list(raw_op) != ["op", "seq", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        seq = raw_op["seq"]
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or not 1 <= seq <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("mo", seq, parse_metric_num(raw_op["now"]))
+
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1978,6 +2010,14 @@ def run(raw):
     # 变化。额外时空 O(16(B+M+T))。
     commit_history = []
     next_rev = 1
+    # 全池增量快照（mo）：mo_seq 为最近一次成功 mo 的 seq（None 表示尚无
+    # 成功 mo 或已被 ci/cb 清除，下次须 seq=1），mo_now 为其 now，
+    # mo_cache 为其结果（同 (seq,now) 重报原样返回，不推进游标与基线）。
+    # 各后端记录内的 mo_base 为上次成功 mo 保存的当窗计数基线（按窗打标，
+    # 跨窗视为零；remove 后重加随新记录为 None，从零计）。
+    mo_seq = None
+    mo_now = None
+    mo_cache = None
     results = []
 
     def backend_routable(record, drain_strict=False):
@@ -2468,7 +2508,7 @@ def run(raw):
         不再失败。"""
         nonlocal backends, buckets, ring_vnodes, queue_cfg, wait_queue
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
-        nonlocal sticky_map, alert, alert_events
+        nonlocal sticky_map, alert, alert_events, mo_seq, mo_now, mo_cache
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -2545,6 +2585,10 @@ def run(raw):
                 "fault_hist": {},
                 # ci 成功清空不可用原因分钟历史。
                 "reason_hist": {},
+                # 全池增量快照（mo）基线：上次成功 mo 保存的
+                # (window, requests, errors, retries, remaps, latency五桶)，
+                # 按窗打标、跨窗视为零；ci/cb 成功随新记录归零。
+                "mo_base": None,
             }
 
         new_backends = {}
@@ -2584,6 +2628,11 @@ def run(raw):
         # ci 成功清除全池故障告警状态（fe 回到未首评）与转换历史。
         alert = None
         alert_events = deque()
+        # ci/cb 成功清 mo 游标与缓存（seq 重置为 1）；各后端 mo_base
+        # 基线随新记录归零。
+        mo_seq = None
+        mo_now = None
+        mo_cache = None
 
     for raw_op in ops:
         op = parse_op(raw_op)
@@ -2591,7 +2640,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
-            "ms", "mx", "rh", "ra", "ma",
+            "ms", "mx", "rh", "ra", "ma", "mo",
             "ci", "cb", "fx", "fr", "fi", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
         ):
@@ -2701,6 +2750,11 @@ def run(raw):
                 # 窗，空窗不预建；各计数封顶 10^18，仅在状态转换或 oa 因
                 # 连接达 cap 入队时记账。remove 后重加与 ci 成功即清空。
                 "reason_hist": {},
+                # 全池增量快照（mo）基线：上次成功 mo 保存的
+                # (window, requests, errors, retries, remaps, latency五桶)，
+                # 按窗打标、跨窗视为零；remove 后同 id 重加随新记录为
+                # None，按新实例从零计。
+                "mo_base": None,
             }
             results.append({"op": "add", "ok": True})
 
@@ -3793,6 +3847,82 @@ def run(raw):
                     }
                 )
             results.append({"op": "ma", "windows": windows})
+
+        elif op[0] == "mo":
+            # 全池增量快照：seq 连续性校验——首次须 seq=1，此后逐次 +1；
+            # 同 (seq,now) 重报返回缓存且不推进游标与基线；同 seq 异
+            # now、倒序或跳号报 STATE。四项计数与五整数 latency 为当前窗
+            # mr 值减上次成功 mo 保存的基线（首次或跨窗基线为零；remove
+            # 后同 id 重加的后端 mo_base 随新记录为 None，从零计），
+            # concurrency 与 removed 取同 now 的 mg 现值。成功后保存当窗
+            # 计数为下次基线并缓存结果。O(B) 时空。
+            _, seq, now = op
+            if mo_seq is None:
+                if seq != 1:
+                    fail(EXIT_STATE, "STATE")
+            elif seq == mo_seq:
+                if now != mo_now:
+                    # 同 seq 异 now：冲突重报。
+                    fail(EXIT_STATE, "STATE")
+                results.append(mo_cache)
+                continue
+            elif seq != mo_seq + 1:
+                # 倒序或跳号。
+                fail(EXIT_STATE, "STATE")
+            window = now // 60
+            snapshot = []
+            for backend_id, record in backends.items():
+                metrics = record["metrics"].get(window)
+                if metrics is None:
+                    current = (0, 0, 0, 0, (0, 0, 0, 0, 0))
+                else:
+                    current = (
+                        metrics[0], metrics[1], metrics[2], metrics[3],
+                        tuple(metrics[4]),
+                    )
+                base = record["mo_base"]
+                if base is None or base[0] != window:
+                    # 首次或跨窗：基线为零。
+                    base = (window, 0, 0, 0, 0, (0, 0, 0, 0, 0))
+                requests = current[0] - base[1]
+                errors = current[1] - base[2]
+                retries = current[2] - base[3]
+                remaps = current[3] - base[4]
+                latency = [current[4][i] - base[5][i] for i in range(5)]
+                # qps=requests/60、error_rate=100*errors/requests（零请求
+                # 为 0）均下截为两位小数字符串，口径同 mg。
+                qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
+                if requests == 0:
+                    error_rate = "0.00"
+                else:
+                    rate = errors * 10000 // requests
+                    error_rate = "%d.%02d" % divmod(rate, 100)
+                snapshot.append(
+                    {
+                        "id": backend_id,
+                        "requests": requests,
+                        "qps": qps,
+                        "concurrency": record["conns"],
+                        "errors": errors,
+                        "error_rate": error_rate,
+                        "latency": latency,
+                        "retries": retries,
+                        "remaps": remaps,
+                        "removed": removed_reason(record, now),
+                    }
+                )
+                # 成功后保存当窗计数为下次基线（按窗打标，跨窗即零基线）。
+                record["mo_base"] = (window,) + current
+            result = {
+                "op": "mo",
+                "seq": seq,
+                "window": window,
+                "backends": snapshot,
+            }
+            mo_seq = seq
+            mo_now = now
+            mo_cache = result
+            results.append(result)
 
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
