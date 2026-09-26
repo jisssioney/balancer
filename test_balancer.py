@@ -166,6 +166,204 @@ class RaRejectionTest(unittest.TestCase):
         )
 
 
+def config_v6(weight, **overrides):
+    """最小 version=6 配置：单后端 a，可按键覆盖顶层字段。"""
+    config = {
+        "version": 6,
+        "backends": [
+            {
+                "id": "a",
+                "weight": weight,
+                "d": 0,
+                "fail": 3,
+                "success": 2,
+                "circuit": None,
+                "drain": None,
+                "endpoint": None,
+            }
+        ],
+        "vnodes": None,
+        "limits": [],
+        "overload": None,
+        "sticky": None,
+        "idle": None,
+        "backpressure": None,
+        "scheduler": {"pick": "W"},
+    }
+    config.update(overrides)
+    return config
+
+
+class ConfigCommitTest(unittest.TestCase):
+    """配置提交与回滚（ci 提交、cl 历史、cb 回滚）。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        return code, out
+
+    def test_cl_initially_empty(self):
+        code, out = self.run_ops([{"op": "cl"}])
+        self.assertEqual(code, 0)
+        result = json.loads(out)["results"][0]
+        self.assertEqual(list(result), ["op", "current", "commits"])
+        self.assertEqual(result, {"op": "cl", "current": None, "commits": []})
+
+    def test_ci_commits_normalized_v6(self):
+        # version=1 旧结构成功加载后，提交为规范化 version=6 配置。
+        config_v1 = {
+            "version": 1,
+            "backends": [
+                {
+                    "id": "a",
+                    "weight": 2,
+                    "d": 0,
+                    "fail": 3,
+                    "success": 2,
+                    "circuit": None,
+                    "drain": None,
+                }
+            ],
+            "vnodes": None,
+            "limits": [],
+            "overload": None,
+        }
+        code, out = self.run_ops(
+            [{"op": "ci", "config": config_v1, "now": 5}, {"op": "cl"}]
+        )
+        self.assertEqual(code, 0)
+        result = json.loads(out)["results"][1]
+        self.assertEqual(result["current"], 1)
+        self.assertEqual(len(result["commits"]), 1)
+        commit = result["commits"][0]
+        self.assertEqual(list(commit), ["rev", "config"])
+        self.assertEqual(commit["rev"], 1)
+        self.assertEqual(
+            commit["config"],
+            config_v6(2),
+        )
+
+    def test_failed_ci_does_not_commit(self):
+        # B 限流引用未知后端：ci 失败（BACKEND），整批无 stdout。
+        bad = config_v6(1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}])
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(
+                [
+                    {"op": "ci", "config": config_v6(1), "now": 0},
+                    {"op": "ci", "config": bad, "now": 1},
+                ]
+            ),
+        )
+        self.assertEqual((code, out, err), (3, b"", b'{"error":"BACKEND"}\n'))
+
+    def test_eviction_keeps_recent_16(self):
+        ops = [
+            {"op": "ci", "config": config_v6(i), "now": i} for i in range(1, 21)
+        ]
+        ops.append({"op": "cl"})
+        code, out = self.run_ops(ops)
+        self.assertEqual(code, 0)
+        result = json.loads(out)["results"][-1]
+        self.assertEqual(result["current"], 20)
+        self.assertEqual(
+            [commit["rev"] for commit in result["commits"]],
+            list(range(5, 21)),
+        )
+        self.assertEqual(
+            result["commits"][0]["config"]["backends"][0]["weight"], 5
+        )
+
+    def test_cb_rollback_creates_new_rev(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},
+            {"op": "ce"},
+        ]
+        code, out = self.run_ops(ops)
+        self.assertEqual(code, 0)
+        results = json.loads(out)["results"]
+        self.assertEqual(
+            results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
+        )
+        # 回滚后当前配置即 rev=1 的快照。
+        self.assertEqual(results[3]["config"], config_v6(1))
+
+    def test_cb_restores_runtime_state(self):
+        # 回滚按目标快照重建默认运行态：调度策略、限流桶、预热自 cb.now 起算。
+        config = config_v6(
+            1,
+            vnodes=5,
+            limits=[{"scope": "B", "id": "a", "r": 3, "b": 9}],
+            scheduler={"pick": "R"},
+        )
+        config["backends"][0]["d"] = 100
+        ops = [
+            {"op": "ci", "config": config, "now": 10},
+            {"op": "ci", "config": config_v6(1), "now": 20},
+            {"op": "cb", "rev": 1, "now": 50},
+            {"op": "wg", "id": "a", "now": 50},
+            {"op": "lg", "scope": "B", "id": "a", "now": 50},
+        ]
+        code, out = self.run_ops(ops)
+        self.assertEqual(code, 0)
+        results = json.loads(out)["results"]
+        self.assertEqual(results[3]["stage"], "warm")
+        self.assertEqual((results[3]["start"], results[3]["end"]), (50, 150))
+        self.assertEqual((results[4]["t"], results[4]["at"]), (9, 50))
+
+    def test_cb_unknown_or_evicted_rev_is_state(self):
+        ops = [
+            {"op": "ci", "config": config_v6(i), "now": i} for i in range(1, 21)
+        ]
+        ops.append({"op": "cb", "rev": 4, "now": 20})
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_with_active_connection_is_state(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_invalid_rev_is_input(self):
+        for rev in (0, -1, 10 ** 18 + 1, True, "1", 1.5):
+            code, out, err = run_balancer(
+                "run", encode_ops([{"op": "cb", "rev": rev, "now": 0}])
+            )
+            self.assertEqual(
+                (code, out, err), (2, b"", b'{"error":"INPUT"}\n'), rev
+            )
+
+    def test_cb_clock_regression_is_input(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 10},
+            {"op": "cb", "rev": 1, "now": 5},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_record_replay_covers_cl_cb(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},
+            {"op": "cl"},
+        ]
+        raw = encode_ops(ops)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+
+
 class RecordReplayTest(unittest.TestCase):
     """核心输入经 record、replay 逐字节复现退出码、stdout、stderr。"""
 
