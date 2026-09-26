@@ -196,6 +196,19 @@ max(0,now//60-59) 报 STATE/4。rh 只读，失败批次天然回滚；remove �
 与 ci 成功清空历史。记账 O(1)，rh 时间 O(R)（R 为窗数）、空间 O(60B)，
 record/replay 逐字节覆盖；其他子命令行为不变。
 
+全池不可用原因汇总：ra 精确键序 op,from,to,now（键须按此序出现），
+from/to/now 为 0..10^9 非 bool 整数，now 纳入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60；ra 只读汇总全池 rh 分钟窗，返回键序
+op,windows；windows 覆盖 from 至 to 所有窗并升序，项键序
+window,backends,total；backends 按当前后端加入序列出全部现存后端，
+项键序 id,health,drain,circuit,overload，取该后端该窗非负整数计数，
+缺窗全 0；total 键序 health,drain,circuit,overload，为全池逐项求和
+并封顶 10^18；空池各窗 backends 为空数组、total 全 0。非法键序、
+类型、范围、关系或时钟倒退报 INPUT/2；from 早于 max(0,now//60-59)
+报 STATE/4。ra 只读；已删除后端不列入也不汇总，同 id 重加只含新实例
+历史，ci 成功清空历史；失败批次原子回滚。ra 时空 O(BR)（B 为现存
+后端数、R 为窗数）；record/replay 逐字节覆盖。
+
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler}：
 version=5；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain}，
@@ -988,7 +1001,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg",
         "os", "oa", "ot", "og", "oc", "bp", "bq",
-        "mr", "mg", "mh", "ms", "mx", "rh",
+        "mr", "mg", "mh", "ms", "mx", "rh", "ra",
         "ce", "ci",
         "fs", "fx", "fr",
         "fb", "fq",
@@ -1356,6 +1369,19 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("rh", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "ra":
+        # 全池不可用原因汇总：精确键序 op,from,to,now（键须按此序出现），
+        # 只读；数值与窗关系约束同 rh，from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ra", start, end, now)
 
     if name == "fs":
         if keys != {"op", "id", "k", "a", "z", "v"}:
@@ -1963,7 +1989,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
-            "ms", "mx", "rh",
+            "ms", "mx", "rh", "ra",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah",
         ):
@@ -3063,6 +3089,42 @@ def run(raw):
                     }
                 )
             results.append({"op": "rh", "id": backend_id, "windows": windows})
+
+        elif op[0] == "ra":
+            # 全池不可用原因汇总（只读）：from 早于最近 60 窗下界报 STATE
+            # （同 rh）；不改任何计数，失败批次天然回滚。返回键序
+            # op,windows；windows 覆盖 from..to 并升序，项键序
+            # window,backends,total；backends 按加入序列全部现存后端，项
+            # 键序 id,health,drain,circuit,overload（缺窗全 0）；total 键序
+            # health,drain,circuit,overload，为全池逐项求和并封顶 10^18；
+            # 空池 backends 为空、total 全 0。逐窗逐项拷贝，避免结果被
+            # 批次内后续记账污染。时空 O(BR)。
+            _, start, end, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            windows = []
+            for window in range(start, end + 1):
+                total = {"health": 0, "drain": 0, "circuit": 0, "overload": 0}
+                entries = []
+                for backend_id, record in backends.items():
+                    counts = record["reason_hist"].get(window)
+                    entry = {"id": backend_id}
+                    for reason in ("health", "drain", "circuit", "overload"):
+                        # 缺窗：四项为 0，求和不受影响。
+                        value = 0 if counts is None else counts[reason]
+                        entry[reason] = value
+                        total[reason] = min(METRIC_CAP, total[reason] + value)
+                    entries.append(entry)
+                windows.append(
+                    {
+                        "window": window,
+                        "backends": entries,
+                        "total": total,
+                    }
+                )
+            results.append({"op": "ra", "windows": windows})
 
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
