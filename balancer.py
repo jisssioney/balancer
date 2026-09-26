@@ -1395,7 +1395,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp",
+        "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -1748,6 +1748,22 @@ def parse_op(raw_op):
         if not isinstance(mode, str) or mode not in ("F", "S"):
             fail(EXIT_INPUT, "INPUT")
         return ("qp", mode)
+
+    if name == "rp":
+        # 满载策略：精确键序 op,mode（键须按此序出现）；mode 仅 T/H
+        # （尾拒绝/头淘汰），键序、类型或值非法报 INPUT。
+        if list(raw_op) != ["op", "mode"]:
+            fail(EXIT_INPUT, "INPUT")
+        mode = raw_op["mode"]
+        if not isinstance(mode, str) or mode not in ("T", "H"):
+            fail(EXIT_INPUT, "INPUT")
+        return ("rp", mode)
+
+    if name == "rg":
+        # 满载策略查询：精确键集 op，只读。
+        if keys != {"op"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("rg",)
 
     if name == "mr":
         if keys != {"op", "id", "ok", "ms", "retries", "remaps", "now"}:
@@ -2256,6 +2272,14 @@ def run(raw):
     # 各项按 FIFO 各检查一次、阻塞项移至队尾并保持相对次序。同值幂等，
     # ci/cb 成功重置为 F；不随 ce/cl 导出（格式不变）。
     queue_mode = "F"
+    # 满载策略（rp/rg）：T 为队满尾拒绝（默认），H 为队满淘汰 FIFO 队首并
+    # 把新项放队尾；同值幂等。evicted_count 为累计淘汰数（封顶 10^18），
+    # evicted_last 为最近淘汰的 cid（从未淘汰为 None）。被淘汰项不耗或
+    # 返还令牌、配额，入队路由已产生的粘性保留；淘汰 cid 可立即复用。
+    # ci/cb 成功重置为 T/0/None；不随 ce/cl 导出（格式不变）。
+    evict_mode = "T"
+    evicted_count = 0
+    evicted_last = None
     # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
     # 异值重配报 STATE，登记值随 ce/ci 导出导入（ci 后作用于新连接）。
     ttl_cfg = None
@@ -3024,7 +3048,8 @@ def run(raw):
         （window=now//span、used=0，v1..v7 为空即清空）、队空、粘性清空、
         度量归零、平滑 current 与轮询 ticket=0；sticky/idle 取登记值作用于新
         连接，backpressure 携带时置 N、未携带时取消；队列出队策略（qp）重置
-        为默认 F；fe/ah 告警状态与历史
+        为默认 F，满载策略（rp）重置为默认 T、淘汰计数与最近淘汰 cid 清零；
+        fe/ah 告警状态与历史
         清除；故障统计、分钟历史与恢复基线重置），并按 v7+ faults 载入各后端
         登记时间线（v1..v6 为空计划）。调用方须已完成全部校验，本函数自身
         不再失败。"""
@@ -3032,6 +3057,7 @@ def run(raw):
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal sticky_map, alert, alert_events, overload_hist
         nonlocal mo_seq, mo_cache, queue_mode
+        nonlocal evict_mode, evicted_count, evicted_last
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -3159,6 +3185,10 @@ def run(raw):
         bp_state = "N"
         # ci/cb 成功将队列出队策略重置为默认 F。
         queue_mode = "F"
+        # ci/cb 成功将满载策略重置为默认 T，淘汰计数与最近淘汰 cid 清零。
+        evict_mode = "T"
+        evicted_count = 0
+        evicted_last = None
         # 调度策略随配置原子替换（v1/v2 已规范化为 W），轮询游标复位。
         pick_mode = config["scheduler"]
         rr_ticket = 0
@@ -4041,16 +4071,33 @@ def run(raw):
                 # 过载分钟历史：立即接纳计入本窗 immediate。
                 row = overload_window(now)
                 row[0] = min(METRIC_CAP, row[0] + 1)
-                results.append(
-                    {"op": "oa", "cid": cid, "state": "A", "backend": backend_id}
-                )
+                if evict_mode == "H":
+                    # H 模式五键形式：立即接纳无淘汰，evicted=null。
+                    results.append(
+                        {"op": "oa", "cid": cid, "state": "A",
+                         "backend": backend_id, "evicted": None}
+                    )
+                else:
+                    results.append(
+                        {"op": "oa", "cid": cid, "state": "A",
+                         "backend": backend_id}
+                    )
             else:
                 if bp_cfg is not None and bp_state == "P":
                     # P 态本应排队即报 OVERLOAD：不耗令牌、不入队、无其他变更。
                     fail(EXIT_OVERLOAD, "OVERLOAD")
+                evicted_cid = None
                 if len(wait_queue) >= queue_cfg[1]:
-                    # FIFO 已满，尾拒绝。
-                    fail(EXIT_OVERLOAD, "OVERLOAD")
+                    if evict_mode == "T":
+                        # FIFO 已满，尾拒绝。
+                        fail(EXIT_OVERLOAD, "OVERLOAD")
+                    # H 模式队满：淘汰 FIFO 队首（OrderedDict 头部弹出 O(1)），
+                    # 其余项 FIFO 相对次序不变。被淘汰项不耗或返还令牌、配额，
+                    # 入队路由已产生的粘性保留；淘汰 cid 自键集移除即可立即
+                    # 复用。计数封顶累加并更新最近淘汰 cid。
+                    evicted_cid, _ = wait_queue.popitem(last=False)
+                    evicted_count = min(METRIC_CAP, evicted_count + 1)
+                    evicted_last = evicted_cid
                 # 不可用原因历史：Q 入队且所选后端连接数已达 os.cap 时记
                 # overload（所选后端来自只含 healthy/C/A 的环，阻塞在此只可能
                 # 因令牌不足、固定窗配额不足或连接达 cap；配额不足只入队，
@@ -4069,9 +4116,16 @@ def run(raw):
                 if bp_cfg is not None and len(wait_queue) >= bp_cfg[1]:
                     # N 态照常入队，队长达到 high 即转 P（滞回上沿）。
                     bp_state = "P"
-                results.append(
-                    {"op": "oa", "cid": cid, "state": "Q", "backend": None}
-                )
+                if evict_mode == "H":
+                    # H 模式五键形式：普通入队 evicted=null，淘汰时为旧 cid。
+                    results.append(
+                        {"op": "oa", "cid": cid, "state": "Q",
+                         "backend": None, "evicted": evicted_cid}
+                    )
+                else:
+                    results.append(
+                        {"op": "oa", "cid": cid, "state": "Q", "backend": None}
+                    )
 
         elif op[0] == "ot":
             _, now = op
@@ -4206,6 +4260,25 @@ def run(raw):
             # 不动队列、背压与任何运行态，不要求已 os。
             queue_mode = mode
             results.append({"op": "qp", "ok": True})
+
+        elif op[0] == "rp":
+            _, mode = op
+            # 登记满载策略：默认 T，同值幂等，异值切换；仅改策略，不动
+            # 队列、背压、淘汰计数与任何运行态，不要求已 os。
+            evict_mode = mode
+            results.append({"op": "rp", "ok": True})
+
+        elif op[0] == "rg":
+            # 满载策略查询（只读）：evicted 为累计淘汰数（0..10^18），
+            # last 为最近淘汰 cid 或 null。
+            results.append(
+                {
+                    "op": "rg",
+                    "mode": evict_mode,
+                    "evicted": evicted_count,
+                    "last": evicted_last,
+                }
+            )
 
         elif op[0] == "mr":
             _, backend_id, ok, ms, retries, remaps, now = op
