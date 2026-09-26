@@ -105,7 +105,9 @@ op,ok，ok=true。qg 键集 op,scope,id,now：跨窗先置 window=now//span
 并清 used，返回键序 op,scope,id,limit,span,window,used,remaining；
 查未配置配额报 STATE。la 另按 bc/cc/sc 检查对应 B/C/S 配额：未配置
 不限，在配配额先按跨窗规则推进；令牌与配额全足才原子扣减（配额 used
-加对应成本），否则 RATE/6。remove 同步删除其 B 配额，ci/cb 成功清空
+加对应成本），否则 RATE/6。oa/ot 的接纳判定同样纳入在配配额：与令牌
+桶一并按 B、C、S 序检查，配额不足与令牌不足一样阻塞入队（Q），接纳
+才增加 used。remove 同步删除其 B 配额，ci/cb 成功清空
 全部配额，ce 导出不变；非法键集、类型、范围、编码或时钟倒退报
 INPUT/2。qs 精确重报（limit、span、now 同上次配置）豁免时钟倒退：
 时钟已前进仍返回键序 op,ok（true），不回拨时钟并保留 window、used；
@@ -117,10 +119,12 @@ oa 键集 op,cid,flow,c,s,key,now 或
 op,cid,flow,c,s,key,bc,cc,sc,now：cid/flow 同 open，c/s/key 同 la，
 bc/cc/sc 同 la 的成本校验（旧键集等价于三项均为 1），now
 纳入共用非递减时钟。活动或排队中 cid 重复报 CONNECTION。先按 la 的路由
-语义选后端（未 chash 或无可选后端报 STATE），再对在配桶补充检查但不消费，
-目标另须排空 A 且连接数 < cap；令牌不足或目标不满足均阻塞入队（三项
+语义选后端（未 chash 或无可选后端报 STATE），再对在配桶与在配配额补充
+检查但不消费，
+目标另须排空 A 且连接数 < cap；令牌或配额不足、目标不满足均阻塞入队（三项
 成本随请求入队），返回键序
-op,cid,state,backend：接纳为 A 加后端 id（此时才按成本耗令牌并按 open
+op,cid,state,backend：接纳为 A 加后端 id（此时才按成本耗令牌、增加配额
+used 并按 open
 建连接，
 opened_at=now），阻塞为 Q 加 null；队满尾拒绝报 OVERLOAD/7。ot 键集
 op,now：先删除全部 now ≥ 入队 now+ttl 的排队项，再自队首逐项按 oa 规则
@@ -2303,10 +2307,14 @@ def run(raw):
             conn_endpoints[cid] = endpoint
 
     def evaluate_admit(backend_id, cid, flow, c, s, costs, now):
-        """对已路由的后端按 la 规则补充检查但不消费；令牌不足、目标非 A 或
-        连接数达 cap 时返回 ("block", id)，全部满足才按成本耗令牌、建连接
+        """对已路由的后端按 la 规则补充检查但不消费：依次检查 B 后端、C
+        客户端、S 服务类的在配令牌桶与固定窗口配额（未配置不限；配额按
+        window=now//span 推进、跨窗清 used）。令牌不足、配额
+        used+成本>limit、目标非 A 或连接数达 cap 时返回 ("block", id)，
+        全部满足才原子按成本耗令牌、增加配额 used 并建连接
         （opened_at=now），返回 ("admit", id)。costs 为 (bc, cc, sc)。"""
         chosen = []
+        chosen_quotas = []
         for scope, bucket_id, cost in (
             ("B", backend_id, costs[0]),
             ("C", c, costs[1]),
@@ -2315,18 +2323,29 @@ def run(raw):
             bucket = buckets.get((scope, bucket_id))
             if bucket is not None:
                 chosen.append((bucket, cost))
+            quota = quotas.get((scope, bucket_id))
+            if quota is not None:
+                chosen_quotas.append((quota, cost))
         for bucket, _ in chosen:
             refill(bucket, now)
+        for quota, _ in chosen_quotas:
+            roll_quota(quota, now)
         record = backends[backend_id]
         if (
             not all(bucket["t"] >= cost for bucket, cost in chosen)
+            or not all(
+                quota["used"] + cost <= quota["limit"]
+                for quota, cost in chosen_quotas
+            )
             or record["drain"]["state"] != "A"
             or record["conns"] >= queue_cfg[0]
         ):
             return "block", backend_id
-        # 接纳才按成本耗令牌并按 open 建连接。
+        # 接纳才按成本耗令牌、增加配额 used 并按 open 建连接。
         for bucket, cost in chosen:
             bucket["t"] -= cost
+        for quota, cost in chosen_quotas:
+            quota["used"] += cost
         establish_connection(cid, backend_id, flow, now)
         return "admit", backend_id
 
