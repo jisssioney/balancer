@@ -141,7 +141,14 @@ chash）；oc 非法键集或 cid 报 INPUT/2，cid 不在队列（活动中或�
 CONNECTION/5，按 INPUT、STATE、CONNECTION 顺序判定。失败批次回滚队列顺序、
 成员索引与背压状态；入队、ot 接纳或过期、oc 取消及 ci 成功清队列均同步成员
 索引，oa 查重与 oc 删除均 O(1)，og 仍 O(q)。非法键、类型、范围、编码或时钟
-倒退报 INPUT。
+倒退报 INPUT。qp 精确键序 op,mode（键须按此序出现），mode 仅 F/S：登记 ot
+的出队策略，默认 F，同值幂等，返回键序 op,ok（ok=true）；键序、类型或值
+非法报 INPUT/2。F 保持 ot 遇首个阻塞项即停；S 模式 ot 先按原规则删除到期
+项，再将其余项按 FIFO 各检查一次：可接纳项沿用路由、容量、令牌桶与配额
+规则扣减并建连，阻塞项移至队尾并保持相对次序、继续检查后项；expired、
+admitted 按原 FIFO 顺序，各项使用同一 ot.now，前项扣减对后项可见，失败批
+回滚运行态。ci/cb 成功重置为 F；ce/cl 格式不变；record/replay 逐字节覆盖。
+S 模式 ot 时间 O(qBV log(BV))、额外空间 O(q)。
 
 确定性滞回背压：bp 键集 op,low,high，low/high 为 [0,10^6] 非 bool 整数且
 low<high≤os.q，未 os 报 STATE/4，非法键集、类型、范围或阈值关系报
@@ -1103,7 +1110,11 @@ def parse_config(value):
     （数组，项键序 id,k,a,z,v，同 id 段不重叠），backends 项同 v6；
     v1..v6 一律视 faults 为空。version=8 在既有十键末追加 quotas（数组，
     项精确键序 scope,id,limit,span，按 B/C/S 及 id 的 UTF-8 字节升序），
-    backends 项同 v6；v1..v7 一律视 quotas 为空。"""
+    backends 项同 v6；v1..v7 一律视 quotas 为空。v8 十一键另须严格按
+    version,backends,vnodes,limits,overload,sticky,idle,backpressure,
+    scheduler,faults,quotas 顺序出现，乱序（含交换 faults/quotas）报
+    INPUT。limits/quotas 项的 scope 先验证为字符串再判断 B/C/S，数组或
+    对象等同报 INPUT。"""
     if not isinstance(value, dict):
         fail(EXIT_INPUT, "INPUT")
     config_keys = set(value)
@@ -1124,6 +1135,14 @@ def parse_config(value):
     elif config_keys == v7_keys:
         version = 7
     elif config_keys == v8_keys:
+        # v8 十一键须严格按声明顺序出现：交换 faults/quotas 等任何乱序
+        # 均报 INPUT（dict 保序即 JSON 键出现顺序）。
+        if list(value) != [
+            "version", "backends", "vnodes", "limits", "overload",
+            "sticky", "idle", "backpressure", "scheduler", "faults",
+            "quotas",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
         version = 8
     else:
         fail(EXIT_INPUT, "INPUT")
@@ -1221,7 +1240,9 @@ def parse_config(value):
         if not isinstance(item, dict) or set(item) != {"scope", "id", "r", "b"}:
             fail(EXIT_INPUT, "INPUT")
         scope = item["scope"]
-        if scope not in scope_rank:
+        # 先验证为字符串再判断 B/C/S：数组或对象等不可哈希值同报 INPUT，
+        # 不得落入 unhashable 的 traceback。
+        if not isinstance(scope, str) or scope not in scope_rank:
             fail(EXIT_INPUT, "INPUT")
         bucket_id = parse_key(item["id"])
         r = parse_rate(item["r"])
@@ -1333,7 +1354,8 @@ def parse_config(value):
             ]:
                 fail(EXIT_INPUT, "INPUT")
             scope = item["scope"]
-            if scope not in scope_rank:
+            # 同 limits：先验证为字符串再判断 B/C/S，数组或对象同报 INPUT。
+            if not isinstance(scope, str) or scope not in scope_rank:
                 fail(EXIT_INPUT, "INPUT")
             quota_id = parse_key(item["id"])
             limit = parse_quota_limit(item["limit"])
@@ -1373,7 +1395,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "oa", "ot", "og", "oc", "oh", "bp", "bq",
+        "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -1716,6 +1738,16 @@ def parse_op(raw_op):
         if keys != {"op"}:
             fail(EXIT_INPUT, "INPUT")
         return ("bq",)
+
+    if name == "qp":
+        # 队列出队策略：精确键序 op,mode（键须按此序出现）；mode 仅 F/S，
+        # 键序、类型或值非法报 INPUT。
+        if list(raw_op) != ["op", "mode"]:
+            fail(EXIT_INPUT, "INPUT")
+        mode = raw_op["mode"]
+        if not isinstance(mode, str) or mode not in ("F", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        return ("qp", mode)
 
     if name == "mr":
         if keys != {"op", "id", "ok", "ms", "retries", "remaps", "now"}:
@@ -2220,6 +2252,10 @@ def run(raw):
     # ci 携带时置 N、未携带时取消。
     bp_cfg = None
     bp_state = "N"
+    # 队列出队策略（qp）：F 为 ot 遇首个阻塞项即停（默认），S 为 ot 将其余
+    # 各项按 FIFO 各检查一次、阻塞项移至队尾并保持相对次序。同值幂等，
+    # ci/cb 成功重置为 F；不随 ce/cl 导出（格式不变）。
+    queue_mode = "F"
     # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
     # 异值重配报 STATE，登记值随 ce/ci 导出导入（ci 后作用于新连接）。
     ttl_cfg = None
@@ -2987,14 +3023,15 @@ def run(raw):
         自 now 起算预热、熔断 C 空窗、排空 A、桶满、配额按 quotas 重建
         （window=now//span、used=0，v1..v7 为空即清空）、队空、粘性清空、
         度量归零、平滑 current 与轮询 ticket=0；sticky/idle 取登记值作用于新
-        连接，backpressure 携带时置 N、未携带时取消；fe/ah 告警状态与历史
+        连接，backpressure 携带时置 N、未携带时取消；队列出队策略（qp）重置
+        为默认 F；fe/ah 告警状态与历史
         清除；故障统计、分钟历史与恢复基线重置），并按 v7+ faults 载入各后端
         登记时间线（v1..v6 为空计划）。调用方须已完成全部校验，本函数自身
         不再失败。"""
         nonlocal backends, buckets, quotas, ring_vnodes, queue_cfg, wait_queue
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal sticky_map, alert, alert_events, overload_hist
-        nonlocal mo_seq, mo_cache
+        nonlocal mo_seq, mo_cache, queue_mode
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -3120,6 +3157,8 @@ def run(raw):
         ttl_cfg = config["idle"]
         bp_cfg = config["backpressure"]
         bp_state = "N"
+        # ci/cb 成功将队列出队策略重置为默认 F。
+        queue_mode = "F"
         # 调度策略随配置原子替换（v1/v2 已规范化为 W），轮询游标复位。
         pick_mode = config["scheduler"]
         rr_ticket = 0
@@ -4047,27 +4086,43 @@ def run(raw):
                 if now >= item[8] + ttl:
                     expired.append(queued_cid)
                     wait_queue.pop(queued_cid)
-            # 再自队首重试接纳，至首个阻塞即停（每个键至多一次 route）。
-            # 逐项以本次 ot 的 now 补充桶并按 window=now//span 推进固定窗，
-            # 接纳才扣令牌、增 used 并建连；前序接纳的扣减对后续项可见，首个
-            # 阻塞项连同其（已推进但未扣减的）桶/配额状态保留在队内。
             admitted = []
-            while wait_queue:
-                queued_cid, item = wait_queue.popitem(last=False)
-                # 接纳时刻为本次 ot 的 now（opened_at=now），入队时刻仅用于过期；
-                # 按入队时登记的三项成本扣减，过期不扣。
-                status, _ = try_admit(
-                    item[0], item[1], item[2], item[3], item[4],
-                    (item[5], item[6], item[7]), now,
-                )
-                if status == "admit":
-                    admitted.append(queued_cid)
-                else:
-                    # 阻塞（含路由不可用）：连同该项整体放回队首后停止。
-                    # 追加到队尾再移至队首，其余项次序保持不变。
-                    wait_queue[queued_cid] = item
-                    wait_queue.move_to_end(queued_cid, last=False)
-                    break
+            if queue_mode == "S":
+                # S 模式：其余各项按 FIFO 各检查一次（逐项快照遍历，各项使用
+                # 同一 ot.now，前项扣减对后项可见）。可接纳项沿用路由、容量、
+                # 令牌桶与配额规则扣减并建连；阻塞项移至队尾并保持相对次序
+                # ——阻塞项原地保留与之等价：被移项按遇到顺序依次落尾，最终
+                # 仍按原相对次序排列。路由不可用同视为阻塞，继续检查后项。
+                for queued_cid, item in list(wait_queue.items()):
+                    status, _ = try_admit(
+                        item[0], item[1], item[2], item[3], item[4],
+                        (item[5], item[6], item[7]), now,
+                    )
+                    if status == "admit":
+                        wait_queue.pop(queued_cid)
+                        admitted.append(queued_cid)
+            else:
+                # F 模式：自队首重试接纳，至首个阻塞即停（每个键至多一次
+                # route）。逐项以本次 ot 的 now 补充桶并按 window=now//span
+                # 推进固定窗，接纳才扣令牌、增 used 并建连；前序接纳的扣减对
+                # 后续项可见，首个阻塞项连同其（已推进但未扣减的）桶/配额
+                # 状态保留在队内。
+                while wait_queue:
+                    queued_cid, item = wait_queue.popitem(last=False)
+                    # 接纳时刻为本次 ot 的 now（opened_at=now），入队时刻仅用于过期；
+                    # 按入队时登记的三项成本扣减，过期不扣。
+                    status, _ = try_admit(
+                        item[0], item[1], item[2], item[3], item[4],
+                        (item[5], item[6], item[7]), now,
+                    )
+                    if status == "admit":
+                        admitted.append(queued_cid)
+                    else:
+                        # 阻塞（含路由不可用）：连同该项整体放回队首后停止。
+                        # 追加到队尾再移至队首，其余项次序保持不变。
+                        wait_queue[queued_cid] = item
+                        wait_queue.move_to_end(queued_cid, last=False)
+                        break
             if bp_cfg is not None and bp_state == "P" and len(wait_queue) <= bp_cfg[0]:
                 # 滞回下沿：过期与接纳处理完后，P 态队长 <=low 即转 N。
                 bp_state = "N"
@@ -4144,6 +4199,13 @@ def run(raw):
                     "available": queue_cfg[1] - queued,
                 }
             )
+
+        elif op[0] == "qp":
+            _, mode = op
+            # 登记 ot 的出队策略：默认 F，同值幂等，异值切换；仅改策略，
+            # 不动队列、背压与任何运行态，不要求已 os。
+            queue_mode = mode
+            results.append({"op": "qp", "ok": True})
 
         elif op[0] == "mr":
             _, backend_id, ok, ms, retries, remaps, now = op
