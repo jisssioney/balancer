@@ -225,8 +225,9 @@ max(0,now//60-59) 报 STATE/4。已删除后端不汇总，同 id 重加只计�
 mr/mg/mh 行为不变。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
-{version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler}：
-version=6；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
+{version,backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler,
+faults}：
+version=7；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
 endpoint}，circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，endpoint
 为 null 或键序 {host,port} 的登记端点，均只含登记值不含运行态；
 vnodes=null 或整数；limits 项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的
@@ -236,25 +237,35 @@ backpressure=null 或键序 {low,high}（low/high ∈ [0,10^6] 非 bool 整数�
 登记 bp 才非 null，此时 overload 必非 null 且 low<high≤overload.q）；
 scheduler 精确为 {"pick":"W"}、{"pick":"R"}、{"pick":"L"} 或
 {"pick":"H"}（只含登记值不含运行态），W 为既有平滑加权，R 为轮询，
-L 为最少连接，H 为一致性哈希。ci 精确键集
+L 为最少连接，H 为一致性哈希；faults 为九键后追加的数组，项键序
+id,k,a,z,v，id 引用现存后端，k 仅 D/F/S，a/z/v 为 0..10^9 非 bool 整数
+且 a<z，D 须 v=0、F/S 须 v>0，同 id 各段 [a,z) 互不重叠；ce 按后端
+加入序、段 a 升序输出，空计划为 []，不含 effect 或运行态。ci 精确键集
 op,config,now，结果 op,ok=true；now 为非负非 bool 整数并纳入共用非递减
 时钟，亦接受 version=1 原结构（仅前五键）与 version=2 结构（追加三键），
-两者 scheduler 缺省等价于 W；version=3 同为九键但 scheduler 仅收 W/R，
+两者 scheduler 缺省等价于 W、faults 缺省为空；version=3 同为九键但
+scheduler 仅收 W/R，
 version=4 须含 scheduler 并收 W/R/L，version=5 收 W/R/L/H 且选 H 时
 vnodes 须非 null；version=6 同 v5，且 backends 项须在既有七键后含
-endpoint（v1..v5 不含该键，一律视为 null）。
-各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp 的类型与范围。scheduler
+endpoint（v1..v5 不含该键，一律视为 null）；version=7 须在九键后精确
+追加 faults（v1..v6 不含该键，一律视为空计划）。
+各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp 与 fs/fp 的类型与范围。
+scheduler
 缺失（v1/v2）合法，v3 多键、类型错误或 pick 非 W/R，v4 的 pick 非 W/R/L，
 v5 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
-连同其余非法结构、键集、版本、类型、范围、重复后端/限流项、编码、交叉
+连同 faults 非数组、项键集/类型/范围/编码非法、同 id 段重叠，及其余
+非法结构、键集、版本、重复后端/限流项、交叉
 约束或时钟倒退判
-INPUT/2，B 限流引用未知后端判 BACKEND/3，有活动连接或排队项判 STATE/4，
-依次判错。成功时原子替换配置并以 now 重建默认运行态（全部 healthy、d>0
+INPUT/2，B 限流或 faults 引用未知后端判 BACKEND/3，有活动连接或排队项
+判 STATE/4，依次判错。成功时原子替换配置、以 now 重建默认运行态
+（全部 healthy、d>0
 自 now 起算预热、熔断 C 空窗、排空 A、桶满、队空、粘性清空、度量归零、
-平滑 current 与轮询 ticket=0）：sticky/idle 以登记值作用于新连接（idle
+平滑 current 与轮询 ticket=0），并载入 faults 登记时间线（fq/fx/fr/fi
+即时生效，统计等运行态仍全部重置）：sticky/idle 以登记值作用于新连接（idle
 为新连接的空闲
-时限，无连接故仅登记），backpressure 携带时置 N、未携带时取消；失败回滚
-不变更。R 模式 pick 按既有健康、熔断闭合、排空 A 条件取得按加入序排列
+时限，无连接故仅登记），backpressure 携带时置 N、未携带时取消；失败
+回滚时钟、配置、运行态、rev 与历史，不变更。R 模式 pick 按既有健康、
+熔断闭合、排空 A 条件取得按加入序排列
 的可选列表 E，E 空报 STATE/4，否则返回 E[ticket%len(E)] 并将 ticket 加
 一；R 忽略权重且不改平滑 current，结果仍键序 op,id。add/remove 或健康、
 熔断、排空状态迁移均不重置 ticket；W 及其余旧操作不变。L 模式 pick 仅
@@ -269,20 +280,23 @@ key 沿用 route 校验。H 共享既有环与粘性映射：首次按环选，�
 依环迁移且不迁回；改 vnodes 不主动迁移；三键沿用到期规则。二键结果键序
 op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配环、
 三键未 ss 或无合格后端报 STATE/4。H 不改连接数及 W/R/L 运行态。ce/ci
-均 O(B+M) 时空（M 为限流项数）；R/L 的 pick 均为 O(B) 时间、O(1) 额外
+均 O(B+M+T) 时空（M 为限流项数、T 为 faults 总段数）；R/L 的 pick 均为
+O(B) 时间、O(1) 额外
 空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
-配置提交与回滚：ci 成功后把规范化 version=6 配置存为提交，rev 从 1 起
-递增，仅保留最近 16 条；失败不分配、不改历史，初始无提交。cl 精确键集
+配置提交与回滚：ci 成功后把规范化 version=7 配置存为提交，rev 从 1 起
+递增，仅保留最近 16 条；失败不分配、不改历史，初始无提交。重复加载
+（含与当前配置相同）仍分配并追加新 rev。cl 精确键集
 仅 op，返回键序 op,current,commits：current 为最新 rev 或 null，
 commits 按 rev 升序，项键序 rev,config，config 复用 ce 的逐层键序与
 值格式。cb 精确键集 op,rev,now：rev 为 1..10^18 非 bool 整数且须仍被
 保留，now 沿用 ci 并进入共用非递减时钟；按目标快照执行 ci 的原子替换
-与默认运行态重建，成功另建新 rev，返回键序 op,target,rev,ok（ok=true），
+与默认运行态重建，恢复目标 faults 并重置运行态，成功另建新 rev，返回
+键序 op,target,rev,ok（ok=true），
 原历史保留后再按 16 条淘汰。目标不存在或 rev 耗尽（下一个 rev 将超过
 10^18）报 STATE/4；键集、rev 类型/范围或时钟非法报 INPUT/2；有活动
 连接或排队项报 STATE/4。失败回滚时钟、配置、运行态、rev 与历史。
-record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16(B+M))；其余
+record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16(B+M+T))；其余
 子命令与既有操作行为不变。
 
 H pick 记账：扩展 H 模式 pick，调度与映射行为不变，成功项仅记一次并归属
@@ -456,9 +470,11 @@ str(ipaddress.ip_address(host))==host，port 为 1..65535 非 bool 整数；
 endpoint（未配置仍建连、无快照）。fw 键集 op,cid，返回键序
 op,cid,backend,host,port，取建连时的快照、不受后续 ep 变更影响；无快
 照报 STATE/4，未知 cid 报 CONNECTION/5；删除连接（close/dg/tx）同步
-删除快照。ce 顶层键序不变、version=6，backends 项在既有七键后追加
+删除快照。ep 登记后 ce 的 backends 项在既有七键后追加
 endpoint（null 或键序 host,port）；ci 兼容 version1..5 并视
-endpoint=null，version6 须含 endpoint，成功原子重建、失败回滚。ep/fw
+endpoint=null，version6 起须含 endpoint；ce 现导出 version=7，version7
+另在九键后追加 faults（见配置导出与热加载段），成功原子重建、失败回滚。
+ep/fw
 为 O(1)，额外空间 O(B+C)，仅用标准库；其余子命令与既有操作行为不变。
 """
 
@@ -919,31 +935,46 @@ def parse_config(value):
     对象，v3 仅收 W/R，v4 收 W/R/L，v5/v6 收 W/R/L/H；v5/v6 选 H 时
     vnodes 须非 null。v1/v2 的 scheduler 缺省等价于 W。version=6 的
     backends 项在既有七键后须含 endpoint（null 或精确 {host,port} 对象），
-    v1..v5 项不含该键、一律视为 null。"""
+    v1..v5 项不含该键、一律视为 null。version=7 在九键末追加 faults：
+    数组，项键集 id,k,a,z,v（同 fs/fp 字段约束），id 引用现存后端，同
+    id 各段按 a 升序且 [a,z) 互不重叠；v1..v6 不含该键、一律视为空计划。
+    faults 内结构非法判 INPUT；id 引用未知后端的交叉判定留执行期报
+    BACKEND（与 B 限流同源）。"""
     if not isinstance(value, dict):
         fail(EXIT_INPUT, "INPUT")
     config_keys = set(value)
     v1_keys = {"version", "backends", "vnodes", "limits", "overload"}
     v2_keys = v1_keys | {"sticky", "idle", "backpressure"}
     v3_keys = v2_keys | {"scheduler"}
+    v7_keys = v3_keys | {"faults"}
     if config_keys == v1_keys:
         version = 1
     elif config_keys == v2_keys:
         version = 2
     elif config_keys == v3_keys:
         # 九键结构为 v3/v4/v5/v6 共用，具体版本由 version 字段区分。
-        version = None
+        shape_version = None
+    elif config_keys == v7_keys:
+        # 十键结构仅 v7；version 字段须同为 7。
+        shape_version = 7
     else:
         fail(EXIT_INPUT, "INPUT")
     raw_version = value["version"]
     if not isinstance(raw_version, int) or isinstance(raw_version, bool):
         fail(EXIT_INPUT, "INPUT")
-    if version is None:
+    if config_keys in (v1_keys, v2_keys):
+        if raw_version != version:
+            fail(EXIT_INPUT, "INPUT")
+    elif shape_version is None:
+        # 九键形状仅 v3/v4/v5/v6；version=7 须精确含 faults 十键。
         if raw_version not in (3, 4, 5, 6):
             fail(EXIT_INPUT, "INPUT")
         version = raw_version
-    elif raw_version != version:
-        fail(EXIT_INPUT, "INPUT")
+    else:
+        # 十键形状必须配 version=7；其余版本须精确为九键。
+        if raw_version != shape_version:
+            fail(EXIT_INPUT, "INPUT")
+        version = shape_version
 
     raw_backends = value["backends"]
     if not isinstance(raw_backends, list):
@@ -952,8 +983,8 @@ def parse_config(value):
     seen_backend_ids = set()
     for item in raw_backends:
         item_keys = {"id", "weight", "d", "fail", "success", "circuit", "drain"}
-        if version == 6:
-            # v6 项在既有七键后追加 endpoint；v1..v5 项精确为七键。
+        if version >= 6:
+            # v6 起项在既有七键后追加 endpoint；v1..v5 项精确为七键。
             item_keys = item_keys | {"endpoint"}
         if not isinstance(item, dict) or set(item) != item_keys:
             fail(EXIT_INPUT, "INPUT")
@@ -986,7 +1017,7 @@ def parse_config(value):
             circuit_params = (n, m, r, w, q)
         raw_drain = item["drain"]
         drain_t = None if raw_drain is None else parse_drain_timeout(raw_drain)
-        if version == 6:
+        if version >= 6:
             raw_endpoint = item["endpoint"]
             if raw_endpoint is None:
                 endpoint = None
@@ -1096,7 +1127,7 @@ def parse_config(value):
     if version >= 3:
         # scheduler 精确为 {"pick":...} 单键对象：缺失（v1/v2 键集不含该
         # 键，已在上文分流）不会出现；多键、非对象、键名错误或 pick 非
-        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5/v6 收 W/R/L/H。
+        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5/v6/v7 收 W/R/L/H。
         raw_scheduler = value["scheduler"]
         if (
             not isinstance(raw_scheduler, dict)
@@ -1111,12 +1142,41 @@ def parse_config(value):
         if raw_scheduler["pick"] not in allowed:
             fail(EXIT_INPUT, "INPUT")
         scheduler = raw_scheduler["pick"]
-        # v5/v6 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
+        # v5/v6/v7 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
         if scheduler == "H" and vnodes is None:
             fail(EXIT_INPUT, "INPUT")
     else:
         # v1/v2 旧结构等价于既有平滑加权 W。
         scheduler = "W"
+
+    if version == 7:
+        # faults 为数组：项键集 id,k,a,z,v，字段约束同 fs/fp；按 id 分组
+        # 后同 id 各段按 a 升序、半开区间 [a,z) 互不重叠（相邻可接）。
+        # 空计划为 []。id 是否引用现存后端属交叉约束，留执行期报 BACKEND。
+        raw_faults = value["faults"]
+        if not isinstance(raw_faults, list) or isinstance(raw_faults, bool):
+            fail(EXIT_INPUT, "INPUT")
+        grouped_faults = OrderedDict()
+        for item in raw_faults:
+            if not isinstance(item, dict) or set(item) != {
+                "id", "k", "a", "z", "v",
+            }:
+                fail(EXIT_INPUT, "INPUT")
+            item_id = parse_backend_id(item["id"])
+            grouped_faults.setdefault(item_id, []).append(
+                parse_fault_segment(item)
+            )
+        faults = {}
+        for item_id, segments in grouped_faults.items():
+            # 同 fp 规范化：先按 a 升序，再校验不重叠（z_i<=a_{i+1}）。
+            segments.sort(key=lambda segment: segment[1])
+            for idx in range(len(segments) - 1):
+                if segments[idx][2] > segments[idx + 1][1]:
+                    fail(EXIT_INPUT, "INPUT")
+            faults[item_id] = segments
+    else:
+        # v1..v6 结构不含 faults，一律视为空计划。
+        faults = {}
 
     return {
         "backends": normalized_backends,
@@ -1127,6 +1187,7 @@ def parse_config(value):
         "idle": idle_ttl,
         "backpressure": backpressure,
         "scheduler": scheduler,
+        "faults": faults,
     }
 
 
@@ -1916,7 +1977,7 @@ def run(raw):
     # 同窗重报不推进状态机，自然不重复追加；remove 及同 id 重加不影响
     # （仅改变后续 fe 的 v），ci 成功清空。
     alert_events = deque()
-    # 配置提交历史（cl/cb）：(rev, 规范化 version=6 配置快照) 按 rev 升序，
+    # 配置提交历史（cl/cb）：(rev, 规范化 version=7 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
     # export_config 产出的全新结构，不随后续运行态变化。额外时空
@@ -2322,12 +2383,15 @@ def run(raw):
 
     def export_config():
         """ce 与提交快照共用的配置导出：纯登记值、不含任何运行态，逐层键序
-        固定（version=6；backends 按加入序，项 id,weight,d,fail,success,
+        固定（version=7；backends 按加入序，项 id,weight,d,fail,success,
         circuit,drain,endpoint；limits 按 scope 的 B/C/S 序、id 的 UTF-8
         字节升序；overload/sticky/idle/backpressure 为 null 或登记值；
-        scheduler 精确为 {"pick":...}）。返回全新结构，调用方可安全存为
-        快照（不随后续运行态变化）。"""
+        scheduler 精确为 {"pick":...}；faults 为九键后追加的扁平数组，按
+        后端加入序、同后端段 a 升序，项键序 id,k,a,z,v，空计划为 []，
+        不含 effect 或运行态）。返回全新结构，调用方可安全存为快照（不随
+        后续运行态变化）。"""
         exported_backends = []
+        exported_faults = []
         for backend_id, record in backends.items():
             circuit = record["circuit"]
             endpoint = record["endpoint"]
@@ -2358,6 +2422,11 @@ def run(raw):
                     ),
                 }
             )
+            # faults 随登记原样导出（已按 a 升序），只含登记五键、无 effect。
+            for k, a, z, v in record["faults"]:
+                exported_faults.append(
+                    {"id": backend_id, "k": k, "a": a, "z": z, "v": v}
+                )
         exported_limits = [
             {"scope": scope, "id": bucket_id, "r": bucket["r"], "b": bucket["b"]}
             # 仅遍历不消费：按 (scope 秩, id UTF-8 字节) 升序输出。
@@ -2377,8 +2446,9 @@ def run(raw):
         # 三项均只导出登记值：sticky/idle 为 null 或 {"ttl":整数}，
         # backpressure 为 null 或 {low,high}（不含 bp_state 运行态）；
         # scheduler 精确为 {"pick":"W"/"R"/"L"/"H"}（不含 ticket 运行态）。
+        # 九键末追加 faults：扁平段数组，按后端加入序、段 a 升序，空为 []。
         return {
-            "version": 6,
+            "version": 7,
             "backends": exported_backends,
             "vnodes": ring_vnodes,
             "limits": exported_limits,
@@ -2391,6 +2461,7 @@ def run(raw):
                 else {"low": bp_cfg[0], "high": bp_cfg[1]}
             ),
             "scheduler": {"pick": pick_mode},
+            "faults": exported_faults,
         }
 
     def apply_config(config, now):
@@ -2404,7 +2475,7 @@ def run(raw):
         nonlocal sticky_map, alert, alert_events
 
         def make_record(weight, d, fail_threshold, success_threshold,
-                        circuit_params, drain_t, endpoint):
+                        circuit_params, drain_t, endpoint, fault_segments):
             if d == 0:
                 stage = "steady"
                 warm_from = warm_start = warm_end = None
@@ -2463,11 +2534,13 @@ def run(raw):
                 },
                 # ci 成功清空采样历史，默认运行态为空。
                 "samples": {},
-                # 热加载以默认运行态重建，不携带故障时间线。
-                "faults": [],
+                # 故障时间线随热加载载入（v7 faults，已按 a 升序、互不
+                # 重叠；v1..v6 为空），只载登记段而不含 effect 或运行态：
+                # fault_stats/fault_base/fault_hist 等运行态仍全部重置。
+                "faults": list(fault_segments),
                 # 与 faults 平行的段起点 a 列表，供 bisect O(log T_b) 取
-                # 唯一活动段，随 fs/fb/fp 的原子替换一并更新。
-                "fault_a": [],
+                # 唯一活动段。
+                "fault_a": [segment[1] for segment in fault_segments],
                 # ci 成功清零故障演练统计与恢复判定基线。
                 "fault_stats": new_fault_stats(),
                 # 恢复判定基线：已被观察为受影响（D/S）的段元组集合；该段
@@ -2487,6 +2560,7 @@ def run(raw):
             new_backends[backend_id] = make_record(
                 weight, d, fail_threshold, success_threshold,
                 circuit_params, drain_t, endpoint,
+                config["faults"].get(backend_id, []),
             )
         # 新桶满令牌起步，at=now。
         new_buckets = {}
@@ -3735,6 +3809,10 @@ def run(raw):
             for scope, bucket_id, _, _ in config["limits"]:
                 if scope == "B" and bucket_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
+            # v7 faults 的 id 亦须引用配置内现存后端：BACKEND。
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
             # 有活动连接或排队项时拒绝热加载：STATE。
             if connections or wait_queue:
                 fail(EXIT_STATE, "STATE")
@@ -3743,7 +3821,7 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             # 校验全部通过，原子替换配置并以 now 重建默认运行态。
             apply_config(config, now)
-            # 成功后把规范化 version=6 配置存为提交：rev 从 1 起递增，
+            # 成功后把规范化 version=7 配置存为提交：rev 从 1 起递增，
             # 仅保留最近 16 条；失败不分配、不改历史。
             commit_history.append((next_rev, export_config()))
             next_rev += 1
@@ -3754,7 +3832,7 @@ def run(raw):
         elif op[0] == "cl":
             # 配置提交历史（只读）：current 为最新 rev 或 null，commits 按
             # rev 升序（历史本就按分配序追加），项键序 rev,config，config
-            # 复用 ce 的逐层键序与值格式。O(16(B+M))。
+            # 复用 ce 的逐层键序与值格式。O(16(B+M+T))。
             results.append(
                 {
                     "op": "cl",
@@ -3787,7 +3865,7 @@ def run(raw):
             # 有活动连接或排队项时拒绝回滚：STATE。
             if connections or wait_queue:
                 fail(EXIT_STATE, "STATE")
-            # 快照即规范化 version=6 配置，重解析后沿用 ci 的替换语义；
+            # 快照即规范化 version=7 配置，重解析后沿用 ci 的替换语义；
             # 快照来自 export_config，必然合法，不会抛 INPUT。
             apply_config(parse_config(snapshot), now)
             # 原历史保留，追加新 rev 后再按 16 条淘汰。

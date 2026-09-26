@@ -166,10 +166,10 @@ class RaRejectionTest(unittest.TestCase):
         )
 
 
-def config_v6(weight, **overrides):
-    """最小 version=6 配置：单后端 a，可按键覆盖顶层字段。"""
+def config_v7(weight, faults=None, **overrides):
+    """最小 version=7 配置：单后端 a，可按键覆盖顶层字段。"""
     config = {
-        "version": 6,
+        "version": 7,
         "backends": [
             {
                 "id": "a",
@@ -189,6 +189,7 @@ def config_v6(weight, **overrides):
         "idle": None,
         "backpressure": None,
         "scheduler": {"pick": "W"},
+        "faults": [] if faults is None else faults,
     }
     config.update(overrides)
     return config
@@ -209,8 +210,8 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(list(result), ["op", "current", "commits"])
         self.assertEqual(result, {"op": "cl", "current": None, "commits": []})
 
-    def test_ci_commits_normalized_v6(self):
-        # version=1 旧结构成功加载后，提交为规范化 version=6 配置。
+    def test_ci_commits_normalized_v7(self):
+        # version=1 旧结构成功加载后，提交为规范化 version=7 配置。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -240,17 +241,17 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(commit["rev"], 1)
         self.assertEqual(
             commit["config"],
-            config_v6(2),
+            config_v7(2),
         )
 
     def test_failed_ci_does_not_commit(self):
         # B 限流引用未知后端：ci 失败（BACKEND），整批无 stdout。
-        bad = config_v6(1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}])
+        bad = config_v7(1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}])
         code, out, err = run_balancer(
             "run",
             encode_ops(
                 [
-                    {"op": "ci", "config": config_v6(1), "now": 0},
+                    {"op": "ci", "config": config_v7(1), "now": 0},
                     {"op": "ci", "config": bad, "now": 1},
                 ]
             ),
@@ -259,7 +260,7 @@ class ConfigCommitTest(unittest.TestCase):
 
     def test_eviction_keeps_recent_16(self):
         ops = [
-            {"op": "ci", "config": config_v6(i), "now": i} for i in range(1, 21)
+            {"op": "ci", "config": config_v7(i), "now": i} for i in range(1, 21)
         ]
         ops.append({"op": "cl"})
         code, out = self.run_ops(ops)
@@ -276,8 +277,8 @@ class ConfigCommitTest(unittest.TestCase):
 
     def test_cb_rollback_creates_new_rev(self):
         ops = [
-            {"op": "ci", "config": config_v6(1), "now": 0},
-            {"op": "ci", "config": config_v6(2), "now": 1},
+            {"op": "ci", "config": config_v7(1), "now": 0},
+            {"op": "ci", "config": config_v7(2), "now": 1},
             {"op": "cb", "rev": 1, "now": 2},
             {"op": "ce"},
         ]
@@ -288,11 +289,11 @@ class ConfigCommitTest(unittest.TestCase):
             results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
         )
         # 回滚后当前配置即 rev=1 的快照。
-        self.assertEqual(results[3]["config"], config_v6(1))
+        self.assertEqual(results[3]["config"], config_v7(1))
 
     def test_cb_restores_runtime_state(self):
         # 回滚按目标快照重建默认运行态：调度策略、限流桶、预热自 cb.now 起算。
-        config = config_v6(
+        config = config_v7(
             1,
             vnodes=5,
             limits=[{"scope": "B", "id": "a", "r": 3, "b": 9}],
@@ -301,7 +302,7 @@ class ConfigCommitTest(unittest.TestCase):
         config["backends"][0]["d"] = 100
         ops = [
             {"op": "ci", "config": config, "now": 10},
-            {"op": "ci", "config": config_v6(1), "now": 20},
+            {"op": "ci", "config": config_v7(1), "now": 20},
             {"op": "cb", "rev": 1, "now": 50},
             {"op": "wg", "id": "a", "now": 50},
             {"op": "lg", "scope": "B", "id": "a", "now": 50},
@@ -315,7 +316,7 @@ class ConfigCommitTest(unittest.TestCase):
 
     def test_cb_unknown_or_evicted_rev_is_state(self):
         ops = [
-            {"op": "ci", "config": config_v6(i), "now": i} for i in range(1, 21)
+            {"op": "ci", "config": config_v7(i), "now": i} for i in range(1, 21)
         ]
         ops.append({"op": "cb", "rev": 4, "now": 20})
         code, out, err = run_balancer("run", encode_ops(ops))
@@ -323,7 +324,7 @@ class ConfigCommitTest(unittest.TestCase):
 
     def test_cb_with_active_connection_is_state(self):
         ops = [
-            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v7(1), "now": 0},
             {"op": "open", "cid": "x", "flow": FLOW, "now": 1},
             {"op": "cb", "rev": 1, "now": 2},
         ]
@@ -341,7 +342,7 @@ class ConfigCommitTest(unittest.TestCase):
 
     def test_cb_clock_regression_is_input(self):
         ops = [
-            {"op": "ci", "config": config_v6(1), "now": 10},
+            {"op": "ci", "config": config_v7(1), "now": 10},
             {"op": "cb", "rev": 1, "now": 5},
         ]
         code, out, err = run_balancer("run", encode_ops(ops))
@@ -349,14 +350,306 @@ class ConfigCommitTest(unittest.TestCase):
 
     def test_record_replay_covers_cl_cb(self):
         ops = [
-            {"op": "ci", "config": config_v6(1), "now": 0},
-            {"op": "ci", "config": config_v6(2), "now": 1},
+            {"op": "ci", "config": config_v7(1), "now": 0},
+            {"op": "ci", "config": config_v7(2), "now": 1},
             {"op": "cb", "rev": 1, "now": 2},
             {"op": "cl"},
         ]
         raw = encode_ops(ops)
         rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
         self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+
+
+class FaultHotReloadTest(unittest.TestCase):
+    """version=7：faults 随 ce/ci/cl/cb 导出、热加载与回滚（故障操作不变）。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (exit_code, b""))
+        self.assertEqual(stderr, ('{"error":"%s"}\n' % label).encode("utf-8"))
+
+    def seg(self, id_, k="D", a=0, z=10, v=None):
+        if v is None:
+            v = 0 if k == "D" else 2
+        return {"id": id_, "k": k, "a": a, "z": z, "v": v}
+
+    def test_ce_exports_version7_empty_faults_and_key_order(self):
+        results = self.run_ops([{"op": "add", "id": "a", "weight": 1}, {"op": "ce"}])
+        config = results[-1]["config"]
+        self.assertEqual(list(config), [
+            "version", "backends", "vnodes", "limits", "overload",
+            "sticky", "idle", "backpressure", "scheduler", "faults",
+        ])
+        self.assertEqual(config["version"], 7)
+        self.assertEqual(config["faults"], [])
+        self.assertEqual(
+            list(config["backends"][0]),
+            ["id", "weight", "d", "fail", "success", "circuit", "drain",
+             "endpoint"],
+        )
+
+    def test_ci_loads_faults_and_fq_observes(self):
+        config = config_v7(1, faults=[self.seg("a", "S", 0, 100, 5)])
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "fq", "now": 10},
+        ])
+        self.assertEqual(results[0], {"op": "ci", "ok": True})
+        fq = results[1]
+        self.assertEqual(fq["faults"], [{
+            "id": "a", "k": "S", "a": 0, "z": 100, "v": 5, "effect": "S",
+        }])
+        self.assertEqual((fq["down"], fq["slow"]), (0, 1))
+
+    def test_ce_normalizes_segment_order_without_effect(self):
+        # 段可乱序提交；ce 按后端加入序、同后端段 a 升序，且无 effect。
+        config = config_v7(1, faults=[
+            self.seg("a", "S", 20, 30, 2),
+            self.seg("a", "D", 0, 10, 0),
+            self.seg("a", "F", 10, 20, 4),
+        ])
+        config["vnodes"] = 1
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0}, {"op": "ce"}
+        ])
+        faults = results[-1]["config"]["faults"]
+        self.assertEqual(
+            [(f["k"], f["a"], f["z"], f["v"]) for f in faults],
+            [("D", 0, 10, 0), ("F", 10, 20, 4), ("S", 20, 30, 2)],
+        )
+        self.assertEqual([list(f) for f in faults], [["id", "k", "a", "z", "v"]] * 3)
+
+    def test_ce_orders_faults_by_backend_join_order(self):
+        config = {
+            "version": 7,
+            "backends": [
+                {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                 "circuit": None, "drain": None, "endpoint": None},
+                {"id": "a", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                 "circuit": None, "drain": None, "endpoint": None},
+            ],
+            "vnodes": None, "limits": [], "overload": None,
+            "sticky": None, "idle": None, "backpressure": None,
+            "scheduler": {"pick": "W"},
+            "faults": [
+                self.seg("a", "D", 5, 9, 0),
+                self.seg("b", "D", 0, 5, 0),
+                self.seg("a", "D", 0, 4, 0),
+            ],
+        }
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0}, {"op": "ce"}
+        ])
+        self.assertEqual(
+            [(f["id"], f["a"]) for f in results[-1]["config"]["faults"]],
+            [("b", 0), ("a", 0), ("a", 5)],
+        )
+
+    def test_legacy_versions_treat_faults_as_empty(self):
+        for version in (1, 2, 3, 4, 5, 6):
+            config = config_v7(1)
+            del config["faults"]
+            if version < 6:
+                del config["backends"][0]["endpoint"]
+            if version < 3:
+                del config["scheduler"]
+            if version < 2:
+                del config["sticky"]
+                del config["idle"]
+                del config["backpressure"]
+            config["version"] = version
+            results = self.run_ops([
+                {"op": "ci", "config": config, "now": 0}, {"op": "fq", "now": 0}
+            ])
+            self.assertEqual(results[-1]["faults"], [], version)
+
+    def test_v7_requires_exact_faults_key(self):
+        # 九键但 version=7：缺少 faults，INPUT。
+        missing = config_v7(1)
+        del missing["faults"]
+        self.assert_failure([{"op": "ci", "config": missing, "now": 0}], 2, "INPUT")
+        # 十键但 version=6：多余 faults，INPUT。
+        extra = config_v7(1)
+        extra["version"] = 6
+        self.assert_failure([{"op": "ci", "config": extra, "now": 0}], 2, "INPUT")
+
+    def test_invalid_faults_are_input(self):
+        cases = {
+            "not_array": "x",
+            "item_not_object": [self.seg("a"), "x"],
+            "bad_item_keys": [{"id": "a", "k": "D", "a": 0, "z": 10}],
+            "extra_item_key": [
+                {"id": "a", "k": "D", "a": 0, "z": 10, "v": 0, "x": 1}
+            ],
+            "bad_kind": [self.seg("a", "X")],
+            "d_nonzero_v": [self.seg("a", "D", v=1)],
+            "f_zero_v": [self.seg("a", "F", v=0)],
+            "s_zero_v": [self.seg("a", "S", v=0)],
+            "bool_a": [self.seg("a", "D", a=True, z=10, v=0)],
+            "a_equals_z": [self.seg("a", "D", a=5, z=5, v=0)],
+            "z_out_of_range": [self.seg("a", "D", z=10 ** 9 + 1, v=0)],
+            "negative_v": [self.seg("a", "F", v=-1)],
+            "overlap": [
+                self.seg("a", "D", 0, 10, 0),
+                self.seg("a", "D", 9, 20, 0),
+            ],
+            "same_a": [
+                self.seg("a", "D", 0, 10, 0),
+                self.seg("a", "S", 0, 20, 1),
+            ],
+        }
+        for label, faults in cases.items():
+            config = config_v7(1)
+            config["faults"] = faults
+            self.assert_failure(
+                [{"op": "ci", "config": config, "now": 0}], 2, "INPUT",
+            )
+
+    def test_adjacent_segments_accepted(self):
+        config = config_v7(1, faults=[
+            self.seg("a", "D", 0, 10, 0),
+            self.seg("a", "S", 10, 20, 1),
+        ])
+        results = self.run_ops([{"op": "ci", "config": config, "now": 0}])
+        self.assertEqual(results[-1], {"op": "ci", "ok": True})
+
+    def test_unknown_fault_backend_is_backend(self):
+        config = config_v7(1, faults=[self.seg("ghost")])
+        self.assert_failure(
+            [{"op": "ci", "config": config, "now": 0}], 3, "BACKEND"
+        )
+
+    def test_backend_precedes_state(self):
+        # 未知后端与活动连接并存：依次判定，BACKEND 先于 STATE。
+        config = config_v7(1, faults=[self.seg("ghost")])
+        self.assert_failure(
+            [
+                {"op": "ci", "config": config_v7(1), "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                {"op": "ci", "config": config, "now": 2},
+            ],
+            3, "BACKEND",
+        )
+
+    def test_active_connection_is_state(self):
+        config = config_v7(1, faults=[self.seg("a")])
+        self.assert_failure(
+            [
+                {"op": "ci", "config": config_v7(1), "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                {"op": "ci", "config": config, "now": 2},
+            ],
+            4, "STATE",
+        )
+
+    def test_loaded_timeline_drives_fx(self):
+        config = config_v7(1, faults=[self.seg("a", "S", 0, 100, 5)])
+        config["vnodes"] = 3
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "fx", "cid": "c1", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "now": 3},
+        ])
+        self.assertEqual(results[1], {
+            "op": "fx", "cid": "c1", "state": "A", "backend": "a",
+            "latency": 5, "remaps": 0,
+        })
+
+    def test_ci_resets_fault_runtime_stats(self):
+        # 时间线仍登记，但 fm 运行态统计随热加载清零。
+        config = config_v7(1, faults=[self.seg("a")])
+        config["vnodes"] = 1
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "fx", "cid": "c1", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "now": 0},
+            {"op": "fm", "id": "a"},
+            {"op": "ci", "config": config, "now": 1},
+            {"op": "fm", "id": "a"},
+        ])
+        self.assertGreater(results[2]["D"]["affected"], 0)
+        self.assertEqual(results[4]["D"]["affected"], 0)
+
+    def test_repeated_load_makes_new_rev(self):
+        results = self.run_ops([
+            {"op": "ci", "config": config_v7(1), "now": 0},
+            {"op": "ci", "config": config_v7(1), "now": 1},
+            {"op": "cl"},
+        ])
+        self.assertEqual(
+            [c["rev"] for c in results[-1]["commits"]], [1, 2]
+        )
+
+    def test_cl_snapshots_contain_faults(self):
+        seg = self.seg("a", "D", 0, 10, 0)
+        results = self.run_ops([
+            {"op": "ci", "config": config_v7(1, faults=[seg]), "now": 0},
+            {"op": "cl"},
+        ])
+        snapshot = results[-1]["commits"][0]["config"]
+        self.assertEqual(snapshot["version"], 7)
+        self.assertEqual(snapshot["faults"], [seg])
+
+    def test_cb_restores_target_faults(self):
+        with_fault = config_v7(1, faults=[self.seg("a", "S", 0, 100, 5)])
+        results = self.run_ops([
+            {"op": "ci", "config": with_fault, "now": 0},
+            {"op": "ci", "config": config_v7(1), "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},
+            {"op": "fq", "now": 10},
+        ])
+        self.assertEqual(
+            results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
+        )
+        self.assertEqual(results[3]["faults"], [{
+            "id": "a", "k": "S", "a": 0, "z": 100, "v": 5, "effect": "S",
+        }])
+
+    def test_cb_rollback_resets_runtime_and_reloads_timeline(self):
+        # rev1 带 D 段且 vnodes；rev2 清空。回滚到 rev1 后时间线恢复、
+        # fm 运行态重置，fx 重新按 D 段拒绝。
+        with_fault = config_v7(1, faults=[self.seg("a")])
+        with_fault["vnodes"] = 1
+        results = self.run_ops([
+            {"op": "ci", "config": with_fault, "now": 0},
+            {"op": "fx", "cid": "c1", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "now": 0},
+            {"op": "ci", "config": config_v7(1), "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},
+            {"op": "fm", "id": "a"},
+            {"op": "fx", "cid": "c2", "flow": self.FLOW, "key": "k",
+             "timeout": 9, "now": 2},
+        ])
+        self.assertEqual(results[4]["D"]["affected"], 0)
+        self.assertEqual(results[5]["state"], "R")
+        self.assertIsNone(results[5]["backend"])
+
+    def test_record_replay_covers_v7_faults(self):
+        config = config_v7(1, faults=[
+            self.seg("a", "D", 0, 10, 0),
+            self.seg("a", "S", 10, 20, 1),
+        ])
+        ops = [
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "fq", "now": 5},
+            {"op": "cl"},
+        ]
+        raw = encode_ops(ops)
+        code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((code, rec_stderr), (0, b""))
         record = json.loads(rec_stdout.decode("utf-8"))
         rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
         self.assertEqual(rep_code, record["exit"])
