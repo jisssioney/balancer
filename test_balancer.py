@@ -2965,5 +2965,193 @@ class OaQuotaAdmissionTest(unittest.TestCase):
         )
 
 
+class FullQueuePolicyTest(unittest.TestCase):
+    """rp/rg FIFO 满载策略：T 尾拒绝（默认）、H 头淘汰、计数与重置规则。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self, q=2):
+        # 环上唯一后端 a，cap=1 便于制造入队与满载。
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": q, "ttl": 10},
+        ]
+
+    def oa(self, cid, now):
+        return {"op": "oa", "cid": cid, "flow": FLOW,
+                "c": "k", "s": "k", "key": "k", "now": now}
+
+    def test_default_tail_reject_and_rg_initial(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),   # A
+            self.oa("c2", 0),   # Q
+            self.oa("c3", 0),   # Q，队满
+            {"op": "rg"},
+            self.oa("c4", 0),   # 默认 T：尾拒绝 OVERLOAD/7
+        ]
+        results = self.run_ops(ops[:-1])
+        rg = results[6]
+        self.assertEqual(list(rg), ["op", "mode", "evicted", "last"])
+        self.assertEqual(
+            rg, {"op": "rg", "mode": "T", "evicted": 0, "last": None}
+        )
+        # T 模式 oa 结果保持原四键。
+        self.assertEqual(list(results[3]), ["op", "cid", "state", "backend"])
+        self.assert_failure(ops, 7, "OVERLOAD")
+
+    def test_rp_idempotent_and_input_violations(self):
+        ops = [{"op": "rp", "mode": "H"}, {"op": "rp", "mode": "H"},
+               {"op": "rg"}]
+        results = self.run_ops(ops)
+        self.assertEqual(results[0], {"op": "rp", "ok": True})
+        self.assertEqual(results[1], {"op": "rp", "ok": True})
+        self.assertEqual(results[2]["mode"], "H")
+        # 键序、类型或值非法均报 INPUT/2。
+        self.assert_failure([{"mode": "H", "op": "rp"}], 2, "INPUT")
+        self.assert_failure([{"op": "rp"}], 2, "INPUT")
+        self.assert_failure([{"op": "rp", "mode": "X"}], 2, "INPUT")
+        self.assert_failure([{"op": "rp", "mode": "h"}], 2, "INPUT")
+        self.assert_failure([{"op": "rp", "mode": 1}], 2, "INPUT")
+        self.assert_failure([{"op": "rp", "mode": True}], 2, "INPUT")
+        self.assert_failure([{"op": "rp", "mode": "H", "x": 1}], 2, "INPUT")
+        self.assert_failure([{"op": "rg", "x": 1}], 2, "INPUT")
+        self.assert_failure([{"op": "rg", "mode": "T"}], 2, "INPUT")
+
+    def test_head_eviction_flow_and_cid_reuse(self):
+        ops = self.base_ops() + [
+            {"op": "rp", "mode": "H"},
+            self.oa("c1", 0),   # A：evicted=null
+            self.oa("c2", 0),   # 普通入队：evicted=null
+            self.oa("c3", 0),   # 普通入队，队满：evicted=null
+            self.oa("c4", 0),   # 头淘汰 c2，新项落队尾
+            {"op": "og"},
+            {"op": "rg"},
+            self.oa("c2", 0),   # 淘汰 cid 立即复用：头淘汰 c3
+            {"op": "og"},
+            {"op": "rg"},
+        ]
+        results = self.run_ops(ops)
+        # H 模式结果键序 op,cid,state,backend,evicted。
+        self.assertEqual(
+            list(results[4]), ["op", "cid", "state", "backend", "evicted"]
+        )
+        self.assertEqual(
+            results[4],
+            {"op": "oa", "cid": "c1", "state": "A", "backend": "a",
+             "evicted": None},
+        )
+        self.assertEqual(results[6]["evicted"], None)
+        self.assertEqual(
+            results[7],
+            {"op": "oa", "cid": "c4", "state": "Q", "backend": None,
+             "evicted": "c2"},
+        )
+        self.assertEqual(results[8], {"op": "og", "queue": ["c3", "c4"]})
+        self.assertEqual(
+            results[9], {"op": "rg", "mode": "H", "evicted": 1, "last": "c2"}
+        )
+        self.assertEqual(results[10]["evicted"], "c3")
+        self.assertEqual(results[11], {"op": "og", "queue": ["c4", "c2"]})
+        self.assertEqual(
+            results[12],
+            {"op": "rg", "mode": "H", "evicted": 2, "last": "c3"},
+        )
+
+    def test_eviction_keeps_oh_peak_and_backpressure(self):
+        # 淘汰后新入队照常更新 oh 的 queued 与 peak；背压滞回上沿照常触发。
+        ops = self.base_ops() + [
+            {"op": "bp", "low": 0, "high": 2},
+            {"op": "rp", "mode": "H"},
+            self.oa("c1", 0),   # A
+            self.oa("c2", 0),   # Q
+            self.oa("c3", 0),   # Q，队长达 high 转 P
+            {"op": "bq"},
+            {"op": "oh", "from": 0, "to": 0, "now": 0},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[8]["state"], "P")
+        self.assertEqual(
+            results[9]["windows"][0],
+            {"window": 0, "immediate": 1, "queued": 2,
+             "dequeued": 0, "expired": 0, "peak": 2},
+        )
+
+    def test_h_mode_p_state_is_overload_without_change(self):
+        ops = self.base_ops() + [
+            {"op": "bp", "low": 0, "high": 1},
+            {"op": "rp", "mode": "H"},
+            self.oa("c1", 0),   # A
+            self.oa("c2", 0),   # Q，队长达 high 转 P
+            self.oa("c3", 0),   # P 态本应排队：OVERLOAD/7，无变更
+        ]
+        self.assert_failure(ops, 7, "OVERLOAD")
+        # 失败批之前的运行态：无淘汰、队列完整。
+        results = self.run_ops(ops[:-1] + [{"op": "rg"}, {"op": "og"}])
+        self.assertEqual(
+            results[7], {"op": "rg", "mode": "H", "evicted": 0, "last": None}
+        )
+        self.assertEqual(results[8], {"op": "og", "queue": ["c2"]})
+
+    def test_ci_resets_policy_and_counters(self):
+        setup = self.base_ops() + [
+            {"op": "rp", "mode": "H"},
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            self.oa("c3", 0),
+            self.oa("c4", 0),   # 头淘汰 c2
+        ]
+        config = self.run_ops(self.base_ops() + [{"op": "ce"}])[3]["config"]
+        ops = setup + [
+            {"op": "oc", "cid": "c3"},
+            {"op": "oc", "cid": "c4"},
+            {"op": "close", "cid": "c1", "now": 1},
+            {"op": "ci", "config": config, "now": 2},
+            {"op": "rg"},
+            self.oa("x1", 2),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[11], {"op": "ci", "ok": True})
+        self.assertEqual(
+            results[12], {"op": "rg", "mode": "T", "evicted": 0, "last": None}
+        )
+        # ci 后 oa 恢复 T 模式四键结果。
+        self.assertEqual(list(results[13]), ["op", "cid", "state", "backend"])
+
+    def test_record_replay_round_trip(self):
+        ops = self.base_ops() + [
+            {"op": "rp", "mode": "H"},
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            self.oa("c3", 0),
+            self.oa("c4", 0),
+            {"op": "rg"},
+            {"op": "og"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
