@@ -327,6 +327,19 @@ max(0,now//60-59) 的保留窗下界、fe 窗未结束、跳窗（含回退）�
 空历史与告警状态；失败批次原子回滚；fa 时空 O(BR)（R 为窗数），fe
 时间 O(B)、额外空间 O(1)；record/replay 逐字节覆盖。
 
+告警转换历史：fe 使状态在 N/A 间转换时追加一条事件，事件键序
+window,from,to,v,hi,lo,n，记录触发窗、转换前后状态（from/to 仅 N
+或 A）、该次 v 及固化阈值 (hi,lo,n)，window/v/hi/lo/n 为整数；同窗
+重报不重复追加，未转换不记录；每次评估后删除早于 w-59 的事件。ah
+精确键序 op,from,to,now（键须按此序出现）：三数为 [0,10^9] 非
+bool 整数，now 纳入共用非递减时钟，须 from≤to≤now//60 且
+to-from<60；返回键序 op,events，events 仅含 window ∈ [from,to]
+的事件并按窗升序，项采用上述事件键序，无转换返回空数组。ah 只读，
+不推进告警状态机也不清理历史。键序、类型、范围、关系或时钟倒退报
+INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4。ci 成功清空告警
+现态与历史，失败回滚；remove 及同 id 重加不清历史，仅影响后续 fe
+的 v；批内失败回滚事件。fe 记账 O(1)，ah 时间 O(60)、空间 O(60)。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -966,7 +979,7 @@ def parse_op(raw_op):
         "fs", "fx", "fr",
         "fb", "fq",
         "hm", "fm", "fh",
-        "fa", "fe",
+        "fa", "fe", "ah",
         "ts", "tk", "tg", "tx",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -1456,6 +1469,19 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("fe", w, hi, lo, n, parse_metric_num(raw_op["now"]))
 
+    if name == "ah":
+        # 告警转换历史查询：精确键序 op,from,to,now（键须按此序出现），
+        # 只读；数值与窗关系约束同 fa，from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ah", start, end, now)
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -1596,6 +1622,11 @@ def run(raw):
     # N/A，run 为当前连续计数，w 为最近已评窗，result 为该窗结果（同窗
     # 重报原样返回，不推进状态机）。ci 成功即清除。
     alert = None
+    # 告警转换历史（fe/ah）：fe 每次状态转换追加一条事件（键序
+    # window,from,to,v,hi,lo,n），fe 的窗严格递增故队列按窗升序；每次
+    # 评估后删除早于 w-59 的事件，至多保留 60 窗。同窗重报不追加，未
+    # 转换不记录。ci 成功即清空；remove 及同 id 重加不影响历史。
+    alert_events = deque()
     results = []
 
     def backend_routable(record, drain_strict=False):
@@ -1886,7 +1917,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "oa", "ot", "mr", "mg", "mh",
             "ms", "mx",
             "ci", "fx", "fr", "tk", "tg", "tx", "route", "fq", "pick", "fh",
-            "fa", "fe",
+            "fa", "fe", "ah",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -3109,8 +3140,9 @@ def run(raw):
             pick_mode = config["scheduler"]
             rr_ticket = 0
             sticky_map = {}
-            # ci 成功清除全池故障告警状态（fe 回到未首评）。
+            # ci 成功清除全池故障告警状态（fe 回到未首评）与转换历史。
             alert = None
+            alert_events = deque()
             results.append({"op": "ci", "ok": True})
 
         elif op[0] == "fs":
@@ -3340,6 +3372,7 @@ def run(raw):
                 state = alert["state"]
                 run_count = alert["run"]
             changed = False
+            previous = state
             if state == "N":
                 if v >= hi:
                     run_count += 1
@@ -3375,7 +3408,44 @@ def run(raw):
                 "w": w,
                 "result": dict(result),
             }
+            if changed:
+                # 状态转换追加事件：触发窗、转换前后状态、该次 v 与固化
+                # 阈值；同窗重报走上方缓存路径，不会重复追加。
+                alert_events.append(
+                    {
+                        "window": w,
+                        "from": previous,
+                        "to": state,
+                        "v": v,
+                        "hi": hi,
+                        "lo": lo,
+                        "n": n,
+                    }
+                )
+            # 评估后删除早于 w-59 的事件（队列按窗升序，自头部弹出；
+            # 每窗至多一条事件，摊还 O(1)）。
+            cutoff = w - 59
+            while alert_events and alert_events[0]["window"] < cutoff:
+                alert_events.popleft()
             results.append(result)
+
+        elif op[0] == "ah":
+            # 告警转换历史只读查询：from 早于最近 60 窗下界报 STATE（同
+            # fa）；不推进告警状态机也不清理历史，失败批次天然回滚。返回
+            # 键序 op,events；events 仅含 window ∈ [from,to] 的事件，存储
+            # 即按窗升序，项键序 window,from,to,v,hi,lo,n；无转换为空
+            # 数组。逐条拷贝，避免结果被批次内后续操作污染。
+            _, start, end, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            events = [
+                dict(event)
+                for event in alert_events
+                if start <= event["window"] <= end
+            ]
+            results.append({"op": "ah", "events": events})
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
