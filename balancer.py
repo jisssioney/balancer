@@ -1596,7 +1596,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
-        "ce", "ci", "cl", "cb", "cv", "ct",
+        "ce", "ci", "cl", "cb", "cv", "ct", "cd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
@@ -2315,14 +2315,17 @@ def parse_op(raw_op):
         if keys == {"op", "config", "now"}:
             # 原三键形式：仅键集匹配（键序不限），不带 base。
             base = None
+            # now 为非负非 bool 整数，时钟倒退在执行期与其余操作同序判定。
+            parse_now(raw_op["now"])
         elif list(raw_op) == ["op", "config", "base", "now"]:
             # 乐观并发形式：精确键序 op,config,base,now；base 须为小写
             # 64 位十六进制串（ct 输出的配置指纹），格式非法报 INPUT。
             base = parse_base(raw_op["base"])
+            # 带 base 的 now 仅收 [0,10^9] 非 bool 整数（同 cv/cd），越界
+            # 报 INPUT/2 并整批回滚。
+            parse_warm_now(raw_op["now"])
         else:
             fail(EXIT_INPUT, "INPUT")
-        # now 为非负非 bool 整数，时钟倒退在执行期与其余操作同序判定。
-        parse_now(raw_op["now"])
         config = parse_config(raw_op["config"])
         return ("ci", config, base, raw_op["now"])
 
@@ -2336,6 +2339,17 @@ def parse_op(raw_op):
         parse_warm_now(raw_op["now"])
         config = parse_config(raw_op["config"])
         return ("cv", config, raw_op["now"])
+
+    if name == "cd":
+        # 后端配置变更预览：精确键序 op,config,now（键须按此序出现，乱序
+        # 报 INPUT）；config 校验与规范化同 cv/ci，now ∈ [0,10^9] 非 bool
+        # 整数，进入共用非递减时钟（倒退在执行期与其余操作同序判 INPUT）。
+        # B 限流/配额与 faults 引用未知后端留执行期判 BACKEND；不应用配置。
+        if list(raw_op) != ["op", "config", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        parse_warm_now(raw_op["now"])
+        config = parse_config(raw_op["config"])
+        return ("cd", config, raw_op["now"])
 
     if name == "ct":
         # 配置指纹查询：精确键序仅 op，只读且不推进时钟。
@@ -3490,7 +3504,7 @@ def run(raw):
             "oq",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
-            "ci", "cb", "cv", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cv", "cd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh",
         ):
             now = op[-1]
@@ -5182,6 +5196,63 @@ def run(raw):
                     "connections": len(connections),
                     "queued": len(wait_queue),
                     "config": export_normalized_config(config),
+                }
+            )
+
+        elif op[0] == "cd":
+            _, config, now = op
+            # B 限流、B 配额与 faults 引用未知后端：BACKEND（错误类型与优先
+            # 级同 cv/ci）；活动连接或排队项不报错。
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 预览不应用候选：仅比较当前 ce.config 与候选规范化配置的
+            # backends。base/target 为两侧规范化 version=9 对象的 ct 摘要；
+            # added/removed 分别按候选/当前加入序；changed 按候选序含共有
+            # 且变化者，fields 按 weight,d,fail,success,circuit,drain,
+            # endpoint 顺序列差异；order 为两侧完整 id 序列是否不同。成功
+            # 仅推进时钟（已在共用时钟块完成），配置与运行态均不变。
+            current_exported = export_config()
+            target_exported = export_normalized_config(config)
+            current_backends = current_exported["backends"]
+            target_backends = target_exported["backends"]
+            current_ids = [entry["id"] for entry in current_backends]
+            target_ids = [entry["id"] for entry in target_backends]
+            current_by_id = {entry["id"]: entry for entry in current_backends}
+            target_id_set = set(target_ids)
+            added = [bid for bid in target_ids if bid not in current_by_id]
+            removed = [bid for bid in current_ids if bid not in target_id_set]
+            changed = []
+            for entry in target_backends:
+                old = current_by_id.get(entry["id"])
+                if old is None:
+                    continue
+                fields = [
+                    field
+                    for field in (
+                        "weight", "d", "fail", "success",
+                        "circuit", "drain", "endpoint",
+                    )
+                    if entry[field] != old[field]
+                ]
+                if fields:
+                    changed.append({"id": entry["id"], "fields": fields})
+            results.append(
+                {
+                    "op": "cd",
+                    "base": config_digest(current_exported),
+                    "target": config_digest(target_exported),
+                    "added": added,
+                    "removed": removed,
+                    "changed": changed,
+                    "order": current_ids != target_ids,
                 }
             )
 
