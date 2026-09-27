@@ -5928,6 +5928,406 @@ class BrSnapshotTest(unittest.TestCase):
         )
 
 
+class RuUnavailabilityTest(unittest.TestCase):
+    """不可用时长查询 ru：四类原因 since/duration、起算与清除、输入校验。"""
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def assert_failure_raw(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def ru_of(self, ops, backend_id, now):
+        code, stdout, stderr = run_balancer(
+            "run",
+            encode_ops(ops + [{"op": "ru", "id": backend_id, "now": now}]),
+        )
+        self.assertEqual((code, stderr), (0, b""))
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        return results[-1]
+
+    def test_healthy_backend_has_empty_reasons(self):
+        result = self.ru_of(
+            [{"op": "add", "id": "a", "weight": 1}], "a", 7
+        )
+        self.assertEqual(
+            result,
+            {"op": "ru", "id": "a", "now": 7, "reasons": []},
+        )
+
+    def test_result_byte_layout(self):
+        raw = encode_ops([
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 2},
+            {"op": "ru", "id": "a", "now": 10},
+        ])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertIn(
+            b'{"op":"ru","id":"a","now":10,"reasons":[{"reason":"health",'
+            b'"since":2,"duration":8}]}',
+            out,
+        )
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertNotIn(b"\n", out[:-1])
+
+    def test_health_since_and_recovery_clear(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 10},
+        ]
+        self.assertEqual(
+            self.ru_of(ops, "a", 25)["reasons"],
+            [{"reason": "health", "since": 10, "duration": 15}],
+        )
+        # 转 unhealthy 之后的失败/成功未达阈值探测不改变 since。
+        ops += [
+            {"op": "probe", "id": "a", "ok": False, "now": 11},
+            {"op": "probe", "id": "a", "ok": False, "now": 12},
+        ]
+        self.assertEqual(
+            self.ru_of(ops, "a", 25)["reasons"],
+            [{"reason": "health", "since": 10, "duration": 15}],
+        )
+        # 同参 probe 重报不重置 since。
+        ops += [{"op": "probe", "id": "a", "ok": False, "now": 12}]
+        self.assertEqual(
+            self.ru_of(ops, "a", 25)["reasons"],
+            [{"reason": "health", "since": 10, "duration": 15}],
+        )
+        # 恢复 healthy：since 清除；再次转换自新 probe 的 now 起算。
+        ops += [
+            {"op": "probe", "id": "a", "ok": True, "now": 20},
+        ]
+        self.assertEqual(self.ru_of(ops, "a", 25)["reasons"], [])
+        ops += [
+            {"op": "probe", "id": "a", "ok": False, "now": 30},
+        ]
+        self.assertEqual(
+            self.ru_of(ops, "a", 35)["reasons"],
+            [{"reason": "health", "since": 30, "duration": 5}],
+        )
+
+    def test_drain_since_d_x_keep_and_du_clear(self):
+        # dr 时持有连接转 D；末连 close 使 D→X 不重置 since。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "ds", "id": "a", "t": 10},
+            {"op": "dr", "id": "a", "now": 10},
+        ]
+        self.assertEqual(
+            self.ru_of(ops, "a", 15)["reasons"],
+            [{"reason": "drain", "since": 10, "duration": 5}],
+        )
+        # dr 在 D 态重报（now 相同或更新）幂等，不重置 since。
+        ops += [
+            {"op": "dr", "id": "a", "now": 10},
+            {"op": "dr", "id": "a", "now": 14},
+        ]
+        ops += [{"op": "close", "cid": "x", "now": 20}]
+        self.assertEqual(
+            self.ru_of(ops, "a", 30)["reasons"],
+            [{"reason": "drain", "since": 10, "duration": 20}],
+        )
+        # du 清除；新一轮 dr 自新 now 起算（无连接直接转 X）。
+        ops += [{"op": "du", "id": "a", "now": 40}]
+        self.assertEqual(self.ru_of(ops, "a", 40)["reasons"], [])
+        ops += [{"op": "dr", "id": "a", "now": 50}]
+        self.assertEqual(
+            self.ru_of(ops, "a", 55)["reasons"],
+            [{"reason": "drain", "since": 50, "duration": 5}],
+        )
+
+    def test_drain_since_survives_dg_deadline(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "ds", "id": "a", "t": 5},
+            {"op": "dr", "id": "a", "now": 0},
+            {"op": "dg", "id": "a", "now": 5},
+        ]
+        # dg 到期强关转 X（end=deadline=5），drain since 仍为 0。
+        self.assertEqual(
+            self.ru_of(ops, "a", 9)["reasons"],
+            [{"reason": "drain", "since": 0, "duration": 9}],
+        )
+
+    def test_circuit_since_open_half_reopen_close(self):
+        # w=10：0 转 O，10 到期后 cr 先转 H；H 失败重开 O 不重置；
+        # 成功达 q=1 回 C 清除。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "cs", "id": "a", "n": 2, "m": 1, "r": 1, "w": 10,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 0},
+        ]
+        self.assertEqual(
+            self.ru_of(ops, "a", 5)["reasons"],
+            [{"reason": "circuit", "since": 0, "duration": 5}],
+        )
+        # now=10 到期，本条失败：先 O→H 再 H→O，since 不重置。
+        ops += [{"op": "cr", "id": "a", "ok": False, "now": 10}]
+        self.assertEqual(
+            self.ru_of(ops, "a", 12)["reasons"],
+            [{"reason": "circuit", "since": 0, "duration": 12}],
+        )
+        # cg 在 now=20 触发 O→H（新恢复窗 10..20），仍不重置 since。
+        ops += [{"op": "cg", "id": "a", "now": 20}]
+        self.assertEqual(
+            self.ru_of(ops, "a", 20)["reasons"],
+            [{"reason": "circuit", "since": 0, "duration": 20}],
+        )
+        # H 成功回 C：清除。
+        ops += [{"op": "cr", "id": "a", "ok": True, "now": 20}]
+        self.assertEqual(self.ru_of(ops, "a", 21)["reasons"], [])
+
+    def test_circuit_replay_no_reset_and_cs_clear(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 0},
+            {"op": "cr", "id": "a", "ok": False, "now": 0},
+        ]
+        self.assertEqual(
+            self.ru_of(ops, "a", 7)["reasons"],
+            [{"reason": "circuit", "since": 0, "duration": 7}],
+        )
+        # cs 异参重配置 C：清除。
+        ops += [
+            {"op": "cs", "id": "a", "n": 2, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+        ]
+        self.assertEqual(self.ru_of(ops, "a", 8)["reasons"], [])
+
+    def test_fault_d_segment_since_is_a(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "D", "a": 10, "z": 100, "v": 0},
+        ]
+        self.assertEqual(
+            self.ru_of(ops, "a", 35)["reasons"],
+            [{"reason": "fault", "since": 10, "duration": 25}],
+        )
+        # 段前与段间隙均无 fault。
+        self.assertEqual(self.ru_of(ops, "a", 9)["reasons"], [])
+        ops2 = ops + [
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 3, "v": 0},
+        ]
+        self.assertEqual(self.ru_of(ops2, "a", 50)["reasons"], [])
+
+    def test_fault_f_flapping_phase_since(self):
+        # a=10,v=5：下线相位 [10,15)、[20,25)、[30,35)，上线相位居中。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "F", "a": 10, "z": 100, "v": 5},
+        ]
+        cases = [
+            (10, 10, 0), (14, 10, 4),
+            (15, None, None), (19, None, None),
+            (20, 20, 0), (22, 20, 2), (24, 20, 4),
+            (25, None, None),
+            (30, 30, 0), (31, 30, 1), (34, 30, 4),
+        ]
+        for now, since, duration in cases:
+            result = self.ru_of(ops, "a", now)
+            if since is None:
+                self.assertEqual(result["reasons"], [], now)
+            else:
+                self.assertEqual(
+                    result["reasons"],
+                    [{"reason": "fault", "since": since,
+                      "duration": duration}],
+                    now,
+                )
+
+    def test_fault_s_never_listed(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "S", "a": 0, "z": 100, "v": 7},
+        ]
+        self.assertEqual(self.ru_of(ops, "a", 50)["reasons"], [])
+
+    def test_reasons_fixed_order_drain_health_circuit_fault(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 2},
+            {"op": "ds", "id": "a", "t": 100},
+            {"op": "dr", "id": "a", "now": 3},
+            {"op": "fs", "id": "a", "k": "D", "a": 4, "z": 100, "v": 0},
+        ]
+        self.assertEqual(
+            self.ru_of(ops, "a", 10)["reasons"],
+            [
+                {"reason": "drain", "since": 3, "duration": 7},
+                {"reason": "health", "since": 1, "duration": 9},
+                {"reason": "circuit", "since": 2, "duration": 8},
+                {"reason": "fault", "since": 4, "duration": 6},
+            ],
+        )
+
+    def test_remove_readd_clears_all_since(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 2},
+            {"op": "ds", "id": "a", "t": 100},
+            {"op": "dr", "id": "a", "now": 3},
+            {"op": "close", "cid": "x", "now": 4},
+            {"op": "remove", "id": "a"},
+            {"op": "add", "id": "a", "weight": 1},
+        ]
+        self.assertEqual(self.ru_of(ops, "a", 50)["reasons"], [])
+
+    def test_ci_cb_clear_all_since(self):
+        base = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 5, "v": 0},
+        ]
+        # ci 成功：随默认运行态重建清除 health since（fault 时间线亦不载入，
+        # 因为配置无 faults）。
+        ops = base + [
+            {"op": "ci", "config": config_v10(1), "now": 1},
+        ]
+        self.assertEqual(self.ru_of(ops, "a", 2)["reasons"], [])
+        # cb 成功同样清除。
+        ops = base + [
+            {"op": "ci", "config": config_v10(1), "now": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 2},
+            {"op": "cb", "rev": 1, "now": 3},
+        ]
+        self.assertEqual(self.ru_of(ops, "a", 4)["reasons"], [])
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1},
+             {"op": "ru", "id": "b", "now": 0}],
+            3, "BACKEND",
+        )
+        self.assert_failure([{"op": "ru", "id": "a", "now": 0}],
+                            3, "BACKEND")
+
+    def test_input_errors(self):
+        base = [{"op": "add", "id": "a", "weight": 1}]
+        # 键序反、多键、缺键。
+        self.assert_failure_raw(
+            b'{"ops":[{"now":0,"id":"a","op":"ru"}]}', 2, "INPUT"
+        )
+        self.assert_failure(
+            base + [{"op": "ru", "id": "a", "now": 0, "x": 1}],
+            2, "INPUT",
+        )
+        self.assert_failure(base + [{"op": "ru", "id": "a"}],
+                            2, "INPUT")
+        # id：空串与非 UTF-8（孤立代理）。
+        self.assert_failure(base + [{"op": "ru", "id": "", "now": 0}],
+                            2, "INPUT")
+        self.assert_failure_raw(
+            b'{"ops":[{"op":"add","id":"a","weight":1},'
+            b'{"op":"ru","id":"\\ud800","now":0}]}',
+            2, "INPUT",
+        )
+        # now：bool、负数、超 10^9、字符串、浮点、null。
+        for bad in (True, False, -1, 10 ** 9 + 1, "0", 1.0, None):
+            self.assert_failure(
+                base + [{"op": "ru", "id": "a", "now": bad}],
+                2, "INPUT",
+            )
+
+    def test_clock_regression_is_input_and_rollback(self):
+        # ru 时钟倒退整批回滚：前序 add 不落任何输出。
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "ru", "id": "a", "now": 5},
+                {"op": "ru", "id": "a", "now": 4},
+            ],
+            2, "INPUT",
+        )
+        # 与其他 now 操作共用同一时钟。
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "probe", "id": "a", "ok": True, "now": 9},
+                {"op": "ru", "id": "a", "now": 8},
+            ],
+            2, "INPUT",
+        )
+
+    def test_equal_now_does_not_regress(self):
+        result = self.ru_of(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "probe", "id": "a", "ok": True, "now": 5},
+            ],
+            "a", 5,
+        )
+        self.assertEqual(result["now"], 5)
+        self.assertEqual(result["reasons"], [])
+
+    def test_record_replay_byte_identical(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 2},
+            {"op": "ds", "id": "a", "t": 100},
+            {"op": "dr", "id": "a", "now": 3},
+            {"op": "fs", "id": "a", "k": "F", "a": 0, "z": 100, "v": 5},
+            {"op": "ru", "id": "a", "now": 12},
+            {"op": "ru", "id": "a", "now": 18},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+        # now=12 落在 F 下线相位（[10,15)），now=18 落在上线相位。
+        results = json.loads(run_stdout.decode("utf-8"))["results"]
+        self.assertEqual(
+            results[-2]["reasons"][-1],
+            {"reason": "fault", "since": 10, "duration": 2},
+        )
+        reasons18 = results[-1]["reasons"]
+        self.assertNotIn(
+            "fault", [item["reason"] for item in reasons18]
+        )
+
+
 class HashDryRunTest(unittest.TestCase):
     """哈希配置预演 hd：以当前/候选配置的 backends、vnodes 建环（忽略运行态
     与粘性），按 keys 原序预演 chash 映射，不应用配置。"""

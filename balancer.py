@@ -711,6 +711,24 @@ backends 项保持在既有七键后追加 endpoint（null 或键序 host,port�
 faults，version7 在九键后追加 faults 且项按 fp 同款校验，成功原子重建并
 载入目标时间线、失败回滚。ep/fw
 为 O(1)，额外空间 O(B+C)，仅用标准库；其余子命令与既有操作行为不变。
+
+不可用时长查询：ru 精确键序 op,id,now（键须按此序出现），id 为非空
+UTF-8 串，now 为 0..10^9 非 bool 整数并进入共用非递减时钟。结果键序
+op,id,now,reasons：reasons 列出该后端在 now 时刻的阻断原因，按
+drain,health,circuit,fault 排序，无原因时为 []，项键序
+reason,since,duration，since 为该原因连续生效起点，duration=now-since。
+health 在 probe 转 unhealthy 时起算、恢复 healthy 时清除；drain 在 dr
+使 A 转 D/X 时起算（start=now），其后 D 转 X（末连 close、dg 到期强关、
+tx）不重置，du 清除；circuit 从 C 首次转 O 起算，O 到期转 H 或 H 失败
+重开 O 均不重置，连续 q 次成功回 C 或 cs 重配清除；fault 只读故障时间
+线：now 落在 D 段时 since=a，落在 F 下线相位（((now-a)//v)%2=0）时
+since=a+2*v*((now-a)//(2*v))，F 上线相位与 S 段不列入。同参重报
+（probe/cr/dr）或无迁移（dr 时已在 D/X）不重置 since；remove 后同 id
+重加、ci/cb 成功均清除全部 since。未知 id 报 BACKEND/3，键序、id、now
+非法或时钟倒退报 INPUT/2。ru 除推进时钟外只读，失败批回滚；时间
+O(log(T+1))、空间 O(1)（T 为故障段数），仅用标准库；沿用紧凑 UTF-8
+固定键序 JSON、单换行及 record/replay 逐字节契约，其他子命令不变且不
+属本题范围。
 """
 
 import base64
@@ -1761,6 +1779,7 @@ def parse_op(raw_op):
         "fa", "fe", "ah",
         "ts", "tk", "tg", "tx",
         "ep", "fw",
+        "ru",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -2361,6 +2380,15 @@ def parse_op(raw_op):
         if list(raw_op) != ["op", "now"]:
             fail(EXIT_INPUT, "INPUT")
         return ("br", parse_metric_num(raw_op["now"]))
+
+    if name == "ru":
+        # 不可用时长查询：精确键序 op,id,now（键须按此序出现）；id 为非空
+        # UTF-8 串（未知 id 留执行期判 BACKEND），now 为 0..10^9 非 bool
+        # 整数，纳入共用非递减时钟。
+        if list(raw_op) != ["op", "id", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ru", parse_backend_id(raw_op["id"]),
+                parse_metric_num(raw_op["now"]))
 
     if name == "fx":
         if keys != {"op", "cid", "flow", "key", "timeout", "now"}:
@@ -3674,6 +3702,11 @@ def run(raw):
                     "deadline": None,
                     "forced": 0,
                 },
+                # ci/cb 重建默认运行态：ru 的 health/drain/circuit 连续生效
+                # 起点全部清除（fault 只读时间线）。
+                "unavail_since": {
+                    "health": None, "drain": None, "circuit": None,
+                },
                 # 热加载不携带历史写操作形状。
                 "last_op": None,
                 # 后端 IP 端点登记值（v1..v5 已规范化为 None）。
@@ -3784,6 +3817,7 @@ def run(raw):
             "ms", "mx", "rh", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
+            "ru",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -3855,6 +3889,12 @@ def run(raw):
                     "end": None,
                     "deadline": None,
                     "forced": 0,
+                },
+                # ru 不可用连续生效起点：health/drain/circuit 各为 None 或
+                # 整数时刻；fault 只读故障时间线，无需存储。新增即全无；
+                # 起算与清除点见各状态迁移分支与 apply_config。
+                "unavail_since": {
+                    "health": None, "drain": None, "circuit": None,
                 },
                 "last_op": ("add3", weight) if now is None else ("add5", weight, d, now),
                 # 后端 IP 端点：ep 登记的 (host, port)，未配置为 None；
@@ -4123,6 +4163,8 @@ def run(raw):
                         record["successes"] = 0
                         record["failures"] = 0
                         record["current"] = 0
+                        # ru：恢复 healthy，health 连续生效起点清除。
+                        record["unavail_since"]["health"] = None
                         # 恢复：以该 probe 的 now 从 1.00 按登记的 d 重启预热；
                         # d=0 时立即回到目标权重。
                         if record["warm_d"] > 0:
@@ -4145,6 +4187,8 @@ def run(raw):
                         # 不可用原因历史：仅 healthy→unhealthy 的转换记 health；
                         # 同 (id,now,ok) 重报在上方已幂等返回，不会至此。
                         record_reason(backend_id, "health", now)
+                        # ru：probe 转 unhealthy 起算连续生效起点。
+                        record["unavail_since"]["health"] = now
                 record["probe_now"] = now
                 record["probe_ok"] = ok
             results.append({"op": "probe", "ok": True})
@@ -4303,6 +4347,8 @@ def run(raw):
                 "cr_now": None,
                 "cr_ok": None,
             }
+            # ru：cs 重配清除 circuit 连续生效起点。
+            record["unavail_since"]["circuit"] = None
             results.append({"op": "cs", "ok": True})
 
         elif op[0] == "cr":
@@ -4339,6 +4385,9 @@ def run(raw):
                     circuit["used"] = 0
                     # 不可用原因历史：仅 C→O 的熔断打开记 circuit。
                     record_reason(backend_id, "circuit", now)
+                    # ru：自 C 首次转 O 起算；回 C 或 cs 重配已清除，故此刻
+                    # 起点必为 None。
+                    record["unavail_since"]["circuit"] = now
             else:  # H
                 if ok:
                     circuit["used"] += 1
@@ -4347,6 +4396,8 @@ def run(raw):
                         circuit["state"] = "C"
                         circuit["window"].clear()
                         circuit["used"] = 0
+                        # ru：回 C 清除 circuit 连续生效起点。
+                        record["unavail_since"]["circuit"] = None
                 else:
                     # H 中失败立即重开并重算恢复时刻。
                     circuit["state"] = "O"
@@ -4354,6 +4405,7 @@ def run(raw):
                     circuit["used"] = 0
                     # 不可用原因历史：H→O 的重开同样记 circuit。
                     record_reason(backend_id, "circuit", now)
+                    # ru：H 重开 O 不重置起点（沿用首次 C→O 的 now）。
             circuit["cr_now"] = now
             circuit["cr_ok"] = ok
             results.append({"op": "cr", "ok": True})
@@ -4424,6 +4476,9 @@ def run(raw):
                 # 不可用原因历史：A→D/X 的转换记 drain（一次 dr 至多一次）；
                 # D/X 再 dr 幂等返回，不记。
                 record_reason(backend_id, "drain", now)
+                # ru：dr 使 A 转 D/X 起算连续生效起点；D/X 再 dr 无迁移，
+                # 不重置（其后 close/dg/tx 使 D 转 X 同样不触碰起点）。
+                record["unavail_since"]["drain"] = now
             # D/X 再 dr 幂等，不改状态。
             results.append({"op": "dr", "ok": True})
 
@@ -4439,6 +4494,8 @@ def run(raw):
                 # 取消排空记 end=now；已强关的连接不恢复，慢启动不重置。
                 drain["end"] = now
             drain["state"] = "A"
+            # ru：du 清除 drain 连续生效起点（A 态再 du 幂等，本就为 None）。
+            record["unavail_since"]["drain"] = None
             results.append({"op": "du", "ok": True})
 
         elif op[0] == "dg":
@@ -5944,6 +6001,72 @@ def run(raw):
                     }
                 )
             results.append({"op": "br", "now": now, "backends": snapshot})
+
+        elif op[0] == "ru":
+            # 不可用时长查询：除共用时钟按 now 推进（批前通用时钟块）外只读，
+            # 失败批次天然回滚。reasons 按 drain,health,circuit,fault 排序，
+            # 项键序 reason,since,duration，duration=now-since。health/drain/
+            # circuit 取各转换点维护的连续生效起点；fault 只读时间线：D 段
+            # since=a，F 下线相位 since=a+2*v*((now-a)//(2*v))，S 不列入。
+            # 活动段查找 O(log T_b)，整体时间 O(log(T+1))、空间 O(1)。
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            since_map = record["unavail_since"]
+            reasons = []
+            drain_since = since_map["drain"]
+            if drain_since is not None:
+                reasons.append(
+                    {
+                        "reason": "drain",
+                        "since": drain_since,
+                        "duration": now - drain_since,
+                    }
+                )
+            health_since = since_map["health"]
+            if health_since is not None:
+                reasons.append(
+                    {
+                        "reason": "health",
+                        "since": health_since,
+                        "duration": now - health_since,
+                    }
+                )
+            circuit_since = since_map["circuit"]
+            if circuit_since is not None:
+                reasons.append(
+                    {
+                        "reason": "circuit",
+                        "since": circuit_since,
+                        "duration": now - circuit_since,
+                    }
+                )
+            segment = active_fault(record, now)
+            if segment is not None:
+                kind, seg_a, _, seg_v = segment
+                if kind == "D":
+                    # 整个 D 段均不可用。
+                    fault_since = seg_a
+                elif kind == "F" and ((now - seg_a) // seg_v) % 2 == 0:
+                    # F 下线相位：[a+2jv, a+(2j+1)v)，相位起点对齐到偶数 v。
+                    fault_since = seg_a + 2 * seg_v * (
+                        (now - seg_a) // (2 * seg_v)
+                    )
+                else:
+                    # F 上线相位与 S（仅变慢）均不阻断。
+                    fault_since = None
+                if fault_since is not None:
+                    reasons.append(
+                        {
+                            "reason": "fault",
+                            "since": fault_since,
+                            "duration": now - fault_since,
+                        }
+                    )
+            results.append(
+                {"op": "ru", "id": backend_id, "now": now, "reasons": reasons}
+            )
 
         elif op[0] == "hm":
             # H pick 记账只读查询：未知 id 报 BACKEND；不改变任何计数，失败
