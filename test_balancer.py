@@ -3499,9 +3499,11 @@ class FullQueuePolicyTest(unittest.TestCase):
              "evicted": None},
         )
         self.assertEqual(results[6]["evicted"], None)
+        # H 模式 Q 的 backend 同样为路由选中 id（环上唯一后端 a）。
+        self.assertEqual(results[6]["backend"], "a")
         self.assertEqual(
             results[7],
-            {"op": "oa", "cid": "c4", "state": "Q", "backend": None,
+            {"op": "oa", "cid": "c4", "state": "Q", "backend": "a",
              "evicted": "c2"},
         )
         self.assertEqual(results[8], {"op": "og", "queue": ["c3", "c4"]})
@@ -3585,6 +3587,355 @@ class FullQueuePolicyTest(unittest.TestCase):
             {"op": "rg"},
             {"op": "og"},
         ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
+class OqProjectionTest(unittest.TestCase):
+    """oq 等待队列只读投影：FIFO 明细、E/R/C/T/Q 阻塞与只读、时钟契约。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self, ids=("a",), cap=1, q=8, ttl=10, vnodes=1):
+        ops = [{"op": "add", "id": backend_id, "weight": 1}
+               for backend_id in ids]
+        ops.append({"op": "chash", "vnodes": vnodes})
+        ops.append({"op": "os", "cap": cap, "q": q, "ttl": ttl})
+        return ops
+
+    def oa(self, cid, now, key="k", c="c1", s="s1", **costs):
+        op = {"op": "oa", "cid": cid, "flow": self.FLOW,
+              "c": c, "s": s, "key": key, "now": now}
+        op.update(costs)
+        return op
+
+    def ring_first(self, ids, vnodes, key):
+        """复刻 build_ring 自 key 哈希点的首个后端。"""
+        tokens = []
+        for join_index, backend_id in enumerate(ids):
+            encoded = backend_id.encode("utf-8")
+            for i in range(vnodes):
+                digest = hashlib.sha256(
+                    encoded + b"\x00" + str(i).encode("ascii")
+                ).digest()
+                tokens.append(
+                    (int.from_bytes(digest, "big"), join_index, i, backend_id)
+                )
+        tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+        digests = [token[0] for token in tokens]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash) % len(tokens)
+        return tokens[index][3]
+
+    def key_routing_to(self, ids, vnodes, target):
+        for n in range(1000):
+            key = "k%d" % n
+            if self.ring_first(ids, vnodes, key) == target:
+                return key
+        self.fail("no key routing to %s" % target)
+
+    def test_empty_queue_and_exact_outer_key_order(self):
+        results = self.run_ops(self.base_ops() + [{"op": "oq", "now": 0}])
+        self.assertEqual(results[-1], {"op": "oq", "items": []})
+        self.assertEqual(list(results[-1]), ["op", "items"])
+
+    def test_unblocked_item_has_empty_blocked_and_route_backend(self):
+        # cap 充足、无桶无配额：未到期项 backend 为路由目标、blocked 为 []。
+        # 制造 Q（B 配额尽），oq 跨窗投影时配额随窗口恢复。
+        ops = self.base_ops(cap=10, ttl=100)
+        ops.append({"op": "qs", "scope": "B", "id": "a",
+                    "limit": 1, "span": 10, "now": 0})
+        ops.append(self.oa("c1", 0))          # A，used=1
+        ops.append(self.oa("c2", 0))          # Q
+        ops.append({"op": "oq", "now": 10})   # 跨窗投影：配额足、无阻塞
+        results = self.run_ops(ops)
+        item = results[-1]["items"][0]
+        self.assertEqual(
+            item,
+            {"cid": "c2", "backend": "a", "expires": 100,
+             "expired": False, "blocked": []},
+        )
+        self.assertEqual(
+            list(item),
+            ["cid", "backend", "expires", "expired", "blocked"],
+        )
+
+    def test_expired_boundary_and_E_block(self):
+        ops = self.base_ops(ttl=10)
+        ops.append(self.oa("c1", 0))          # A 占满 cap=1
+        ops.append(self.oa("c2", 3))          # Q，expires=13
+        ops.append({"op": "oq", "now": 12})   # 未到期：C
+        ops.append({"op": "oq", "now": 13})   # now==expires：到期 E
+        results = self.run_ops(ops)
+        self.assertEqual(
+            results[5]["items"],
+            [{"cid": "c2", "backend": "a", "expires": 13,
+              "expired": False, "blocked": ["C"]}],
+        )
+        self.assertEqual(
+            results[6]["items"],
+            [{"cid": "c2", "backend": None, "expires": 13,
+              "expired": True, "blocked": ["E"]}],
+        )
+
+    def test_expired_is_E_even_without_eligible_backend(self):
+        # 到期判定先于环：后端失格仍报 E 而非 R。
+        ops = self.base_ops(ttl=10)
+        ops.append(self.oa("c1", 0))
+        ops.append(self.oa("c2", 0))
+        ops.append({"op": "hset", "id": "a", "fail": 1, "success": 1})
+        ops.append({"op": "probe", "id": "a", "ok": False, "now": 10})
+        ops.append({"op": "oq", "now": 10})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["items"][0]["blocked"], ["E"])
+        self.assertIsNone(results[-1]["items"][0]["backend"])
+
+    def test_capacity_C_block_clears_after_close(self):
+        ops = self.base_ops(cap=1)
+        ops.append(self.oa("c1", 0))
+        ops.append(self.oa("c2", 0))           # Q（cap 满）
+        ops.append({"op": "oq", "now": 0})
+        ops.append({"op": "close", "cid": "c1", "now": 1})
+        ops.append({"op": "oq", "now": 1})     # 连接释放：无阻塞
+        results = self.run_ops(ops)
+        self.assertEqual(results[5]["items"][0]["blocked"], ["C"])
+        self.assertEqual(results[7]["items"][0]["blocked"], [])
+        # c2 仍在队列（oq 不建连）。
+        self.assertEqual(results[7]["items"][0]["cid"], "c2")
+
+    def test_token_T_projection_without_consuming_or_refilling(self):
+        # C 桶 b=1：真实 la 耗尽后入队项 T；oq 不补充真实桶（lg 可见 at 不
+        # 变），也不消耗；时钟推进后投影补足则无阻塞。
+        ops = self.base_ops(cap=10)
+        ops.append({"op": "ls", "scope": "C", "id": "cx",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append({"op": "la", "c": "cx", "s": "s1",
+                    "key": "x", "now": 0})       # t 1->0
+        ops.append(self.oa("c2", 0, c="cx"))     # Q：投影 t=0<1
+        ops.append({"op": "oq", "now": 0})
+        ops.append({"op": "lg", "scope": "C", "id": "cx", "now": 0})
+        ops.append({"op": "oq", "now": 1})       # 投影补足为 1：无 T
+        results = self.run_ops(ops)
+        self.assertEqual(results[6]["items"][0]["blocked"], ["T"])
+        # oq 未推进真实桶的补充时刻（lg 前 at 仍为 0；lg 以 now=0 补充）。
+        self.assertEqual(results[7]["at"], 0)
+        self.assertEqual(results[7]["t"], 0)
+        self.assertEqual(results[8]["items"][0]["blocked"], [])
+
+    def test_quota_Q_projection_without_roll_or_consume(self):
+        ops = self.base_ops(cap=10, ttl=100)
+        ops.append({"op": "qs", "scope": "B", "id": "a",
+                    "limit": 1, "span": 10, "now": 0})
+        ops.append(self.oa("c1", 0))             # A，used=1
+        ops.append(self.oa("c2", 0))             # Q
+        ops.append({"op": "oq", "now": 5})       # 同窗：Q
+        ops.append({"op": "qg", "scope": "B", "id": "a", "now": 5})
+        ops.append({"op": "oq", "now": 10})      # 跨窗投影：配额足
+        ops.append({"op": "qg", "scope": "B", "id": "a", "now": 10})
+        results = self.run_ops(ops)
+        self.assertEqual(results[6]["items"][0]["blocked"], ["Q"])
+        # oq 未推进窗口、未消耗：qg now=5 仍是窗 0、used=1。
+        self.assertEqual((results[7]["window"], results[7]["used"]), (0, 1))
+        self.assertEqual(results[8]["items"][0]["blocked"], [])
+        # 第二次 qg 才真正跨窗（now=10），used 归 0。
+        self.assertEqual((results[9]["window"], results[9]["used"]), (1, 0))
+
+    def test_CTQ_ordered_together(self):
+        ops = self.base_ops(cap=1)
+        ops.append({"op": "ls", "scope": "C", "id": "cx",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append({"op": "la", "c": "cx", "s": "s1",
+                    "key": "x", "now": 0})       # C 桶耗尽
+        ops.append({"op": "qs", "scope": "B", "id": "a",
+                    "limit": 1, "span": 1000, "now": 0})
+        ops.append(self.oa("c1", 0))             # A：cap 满、B 配额 used=1
+        ops.append(self.oa("c2", 0, c="cx",
+                           bc=1, cc=1, sc=0))    # Q：C、T、Q
+        ops.append({"op": "oq", "now": 0})
+        results = self.run_ops(ops)
+        item = results[-1]["items"][0]
+        self.assertEqual(item["backend"], "a")
+        self.assertEqual(item["blocked"], ["C", "T", "Q"])
+
+    def test_fifo_order_and_independent_projections(self):
+        # 两项阻塞来源不同但各自独立投影：前项不消耗后项可见的令牌；items
+        # 严格按入队 FIFO。la 一次性耗尽 C 桶 cx 与 S 桶 sx（无 B 配额，
+        # la 不建连），随后两项分别因 C、S 令牌不足入队。
+        ops = self.base_ops(cap=10, ttl=100)
+        ops.append({"op": "ls", "scope": "C", "id": "cx",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append({"op": "ls", "scope": "S", "id": "sx",
+                    "r": 1, "b": 1, "now": 0})
+        ops.append({"op": "la", "c": "cx", "s": "sx",
+                    "key": "x", "now": 0})       # 两桶各 1->0
+        ops.append(self.oa("c2", 0, c="cx", s="sZ",
+                           bc=0, cc=1, sc=0))    # C 不足：T
+        ops.append(self.oa("c3", 0, c="cZ", s="sx",
+                           bc=0, cc=0, sc=1))    # S 不足：T
+        ops.append({"op": "oq", "now": 0})
+        results = self.run_ops(ops)
+        items = results[-1]["items"]
+        self.assertEqual([item["cid"] for item in items], ["c2", "c3"])
+        self.assertEqual(items[0]["blocked"], ["T"])
+        self.assertEqual(items[1]["blocked"], ["T"])
+        self.assertTrue(all(item["backend"] == "a" for item in items))
+        # 真实桶未被 oq 消耗或补充：再查 lg 两桶 t 仍为 0、at 仍为 0。
+        ops.append({"op": "lg", "scope": "C", "id": "cx", "now": 0})
+        ops.append({"op": "lg", "scope": "S", "id": "sx", "now": 0})
+        results = self.run_ops(ops)
+        self.assertEqual((results[-2]["t"], results[-2]["at"]), (0, 0))
+        self.assertEqual((results[-1]["t"], results[-1]["at"]), (0, 0))
+
+    def test_R_when_no_eligible_backend(self):
+        ids = ("a", "b")
+        ops = self.base_ops(ids=ids, cap=10, vnodes=8)
+        ops.append({"op": "qs", "scope": "B", "id": "a",
+                    "limit": 1, "span": 1000, "now": 0})
+        ops.append({"op": "qs", "scope": "B", "id": "b",
+                    "limit": 1, "span": 1000, "now": 0})
+        key_a = self.key_routing_to(ids, 8, "a")
+        key_b = self.key_routing_to(ids, 8, "b")
+        ops.append(self.oa("c1", 0, key=key_a))  # A（used a=1）
+        ops.append(self.oa("c2", 0, key=key_a))  # Q：配额尽
+        ops.append(self.oa("c3", 0, key=key_b))  # A（used b=1）
+        ops.append(self.oa("c4", 0, key=key_b))  # Q
+        ops.append({"op": "hset", "id": "a", "fail": 1, "success": 1})
+        ops.append({"op": "hset", "id": "b", "fail": 1, "success": 1})
+        ops.append({"op": "probe", "id": "a", "ok": False, "now": 1})
+        ops.append({"op": "probe", "id": "b", "ok": False, "now": 1})
+        ops.append({"op": "oq", "now": 1})
+        results = self.run_ops(ops)
+        items = results[-1]["items"]
+        self.assertEqual([item["cid"] for item in items], ["c2", "c4"])
+        for item in items:
+            self.assertEqual(
+                item["blocked"], ["R"],
+            )
+            self.assertIsNone(item["backend"])
+            self.assertFalse(item["expired"])
+
+    def test_remap_onto_ring_when_sticky_target_lost(self):
+        # 入队时粘性指向 a；a 失格、b 合格：oq 只读后投影到 b（不写粘性），
+        # 再次 oq 结果完全一致（证明未改写映射）。
+        ids = ("a", "b")
+        ops = self.base_ops(ids=ids, cap=10, vnodes=8)
+        ops.append({"op": "qs", "scope": "B", "id": "a",
+                    "limit": 1, "span": 1000, "now": 0})
+        key_a = self.key_routing_to(ids, 8, "a")
+        ops.append(self.oa("c1", 0, key=key_a))  # A
+        ops.append(self.oa("c2", 0, key=key_a))  # Q（a 配额尽）
+        ops.append({"op": "hset", "id": "a", "fail": 1, "success": 1})
+        ops.append({"op": "probe", "id": "a", "ok": False, "now": 1})
+        ops.append({"op": "oq", "now": 1})
+        ops.append({"op": "oq", "now": 1})
+        results = self.run_ops(ops)
+        first = results[-2]["items"][0]
+        second = results[-1]["items"][0]
+        self.assertEqual(first["backend"], "b")
+        self.assertEqual(first["blocked"], [])
+        self.assertEqual(second, first)
+
+    def test_read_only_preserves_queue_and_history(self):
+        # oq 不接纳、不入账：队列不变；oh 在 oq 前后结果一致。
+        ops = self.base_ops(cap=1)
+        ops.append(self.oa("c1", 0))
+        ops.append(self.oa("c2", 0))              # Q
+        ops.append({"op": "oq", "now": 5})
+        ops.append({"op": "og"})
+        ops.append({"op": "oh", "from": 0, "to": 0, "now": 5})
+        results = self.run_ops(ops)
+        self.assertEqual(results[5]["items"][0]["blocked"], ["C"])
+        self.assertEqual(results[6], {"op": "og", "queue": ["c2"]})
+        self.assertEqual(
+            results[7]["windows"][0],
+            {"window": 0, "immediate": 1, "queued": 1,
+             "dequeued": 0, "expired": 0, "peak": 1},
+        )
+
+    def test_clock_advances_and_regression_is_input(self):
+        ops = self.base_ops()
+        ops.append({"op": "oq", "now": 5})
+        ops.append({"op": "oq", "now": 5})        # 非递减：合法
+        ops.append({"op": "og"})
+        ops.append({"op": "oq", "now": 4})        # 倒退：INPUT
+        self.assert_failure(ops, 2, "INPUT")
+
+    def test_state_errors(self):
+        # 未 os：STATE（即便环已配）。
+        ops = [{"op": "add", "id": "a", "weight": 1},
+               {"op": "chash", "vnodes": 1},
+               {"op": "oq", "now": 0}]
+        self.assert_failure(ops, 4, "STATE")
+        # 全新状态未 os：STATE。
+        self.assert_failure([{"op": "oq", "now": 0}], 4, "STATE")
+
+    def test_input_errors(self):
+        base = self.base_ops()
+
+        def raw_of(op_obj):
+            return base + [op_obj]
+
+        # 键序反：直接发原始字节（绕过 encode_ops 的键序规范化）。
+        code, stdout, stderr = run_balancer(
+            "run", b'{"ops":[{"now":0,"op":"oq"}]}'
+        )
+        self.assertEqual((code, stdout), (2, b""))
+        self.assertEqual(stderr, b'{"error":"INPUT"}\n')
+        # 多键、缺键。
+        self.assert_failure(base + [{"op": "oq", "now": 0, "x": 1}],
+                            2, "INPUT")
+        self.assert_failure(base + [{"op": "oq"}], 2, "INPUT")
+        # now 类型/范围：bool、负数、超 10^9、字符串、浮点、null。
+        for bad in (True, False, -1, 10 ** 9 + 1, "0", 1.0, None):
+            self.assert_failure(
+                raw_of({"op": "oq", "now": bad}), 2, "INPUT"
+            )
+
+    def test_result_byte_layout(self):
+        raw = encode_ops(
+            self.base_ops(ttl=10)
+            + [self.oa("c1", 0), self.oa("c2", 3),
+               {"op": "oq", "now": 13}]
+        )
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertIn(
+            b'{"op":"oq","items":[{"cid":"c2","backend":null,'
+            b'"expires":13,"expired":true,"blocked":["E"]}]}',
+            out,
+        )
+
+    def test_record_replay_round_trip(self):
+        ops = (
+            self.base_ops(cap=1, ttl=10)
+            + [self.oa("c1", 0), self.oa("c2", 0),
+               {"op": "oq", "now": 0}, {"op": "oq", "now": 10}]
+        )
         raw = encode_ops(ops)
         run_code, run_stdout, run_stderr = run_balancer("run", raw)
         _, rec_stdout, _ = run_balancer("record", raw)
