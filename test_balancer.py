@@ -5355,5 +5355,484 @@ class BrSnapshotTest(unittest.TestCase):
         )
 
 
+class HashDryRunTest(unittest.TestCase):
+    """哈希配置预演 hd：以当前/候选配置的 backends、vnodes 建环（忽略运行态
+    与粘性），按 keys 原序预演 chash 映射，不应用配置。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def backend(self, bid, **overrides):
+        item = {
+            "id": bid, "weight": 1, "d": 0, "fail": 3, "success": 2,
+            "circuit": None, "drain": None, "endpoint": None,
+        }
+        item.update(overrides)
+        return item
+
+    def make_config(self, ids, vnodes, backends=None, **overrides):
+        config = config_v9(1, **overrides)
+        config["backends"] = (
+            list(backends)
+            if backends is not None
+            else [self.backend(bid) for bid in ids]
+        )
+        config["vnodes"] = vnodes
+        return config
+
+    def hd(self, ids, vnodes, keys, now):
+        return {"op": "hd", "config": self.make_config(ids, vnodes),
+                "keys": list(keys), "now": now}
+
+    def load(self, ids, vnodes, now=0):
+        return {"op": "ci", "config": self.make_config(ids, vnodes), "now": now}
+
+    @staticmethod
+    def reference_map(ids, vnodes, key):
+        """与实现同款 chash 规则的独立参考实现。"""
+        tokens = []
+        for join_index, bid in enumerate(ids):
+            encoded = bid.encode("utf-8")
+            for i in range(vnodes):
+                digest = hashlib.sha256(
+                    encoded + b"\x00" + str(i).encode("ascii")
+                ).digest()
+                tokens.append(
+                    (int.from_bytes(digest, "big"), join_index, i, bid)
+                )
+        tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+        digests = [token[0] for token in tokens]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash)
+        if index == len(tokens):
+            index = 0
+        return tokens[index][3]
+
+    def keys_for_each_backend(self, ids, vnodes):
+        """确定性地为每个后端各取一个映射到它的 key（扫描生成串）。"""
+        found = {}
+        n = 0
+        while len(found) < len(ids):
+            key = "probe-key-%d" % n
+            target = self.reference_map(ids, vnodes, key)
+            found.setdefault(target, key)
+            n += 1
+        return found
+
+    def test_result_shape_and_key_order(self):
+        results = self.run_ops([
+            self.load(["a", "b", "c"], 4),
+            self.hd(["a", "b", "c", "d"], 8, ["k1", "k2", "k1"], 5),
+        ])
+        result = results[1]
+        self.assertEqual(
+            list(result), ["op", "base", "target", "cases", "summary"]
+        )
+        self.assertEqual(result["op"], "hd")
+        self.assertRegex(result["base"], r"^[0-9a-f]{64}$")
+        self.assertRegex(result["target"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(result["cases"]), 3)
+        for case in result["cases"]:
+            self.assertEqual(list(case), ["key", "before", "after", "changed"])
+            self.assertIsInstance(case["before"], str)
+            self.assertIsInstance(case["after"], str)
+            self.assertIsInstance(case["changed"], bool)
+            self.assertEqual(case["changed"],
+                             case["before"] != case["after"])
+        self.assertEqual(
+            list(result["summary"]), ["total", "stable", "remapped"]
+        )
+        summary = result["summary"]
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(
+            summary["stable"] + summary["remapped"], summary["total"]
+        )
+        self.assertEqual(summary["remapped"],
+                         sum(1 for c in result["cases"] if c["changed"]))
+        for value in summary.values():
+            self.assertIsInstance(value, int)
+            self.assertNotIsInstance(value, bool)
+            self.assertGreaterEqual(value, 0)
+
+    def test_digests_match_ct_and_candidate(self):
+        results = self.run_ops([
+            {"op": "ct"},
+            self.load(["a", "b"], 4),
+            {"op": "ct"},
+            self.hd(["a", "b", "c"], 8, ["k"], 6),
+        ])
+        result = results[3]
+        # base 为操作前（当前配置）指纹，与同批 ct 一致。
+        self.assertEqual(result["base"], results[2]["digest"])
+        # target 为候选规范化配置的指纹。
+        self.assertEqual(
+            result["target"],
+            digest_of(self.make_config(["a", "b", "c"], 8)),
+        )
+        self.assertNotEqual(result["base"], result["target"])
+        # 首个 ct 是空初始配置，与当前指纹不同。
+        self.assertNotEqual(result["base"], results[0]["digest"])
+
+    def test_mappings_match_independent_reference(self):
+        keys = ["alpha", "beta", "gamma", "x", "y", "z", "k1", "k2",
+                "日本語", "Ω", "repeat", "repeat"]
+        results = self.run_ops([
+            self.load(["a", "b", "c", "e"], 6),
+            self.hd(["a", "b", "c", "d"], 9, keys, 1),
+        ])
+        cases = results[1]["cases"]
+        self.assertEqual([case["key"] for case in cases], keys)
+        for case in cases:
+            self.assertEqual(
+                case["before"],
+                self.reference_map(["a", "b", "c", "e"], 6, case["key"]),
+            )
+            self.assertEqual(
+                case["after"],
+                self.reference_map(["a", "b", "c", "d"], 9, case["key"]),
+            )
+        # 重复键结果逐字相同。
+        self.assertEqual(cases[-1], cases[-2])
+        self.assertEqual(results[1]["summary"]["total"], len(keys))
+
+    def test_identical_rings_are_all_stable(self):
+        results = self.run_ops([
+            self.load(["a", "b", "c"], 7),
+            self.hd(["a", "b", "c"], 7, ["q%d" % i for i in range(20)], 3),
+        ])
+        result = results[1]
+        self.assertEqual(result["base"], result["target"])
+        self.assertTrue(all(not case["changed"] for case in result["cases"]))
+        self.assertEqual(result["summary"],
+                         {"total": 20, "stable": 20, "remapped": 0})
+
+    def test_ignores_health_circuit_and_drain_runtime_state(self):
+        # 当前配置登记值：a 阈值 1/1、b 配熔断、c 登记排空时限；运行态上
+        # a unhealthy、b 熔断 O、c 排空 D。候选配置与登记值逐字相同——hd
+        # 必须忽略这些运行态：三环后端全部上环，前后映射完全一致。
+        candidate = self.make_config(
+            ["a", "b", "c"], 4,
+            backends=[
+                self.backend("a", fail=1, success=1),
+                self.backend("b", circuit={
+                    "n": 1, "m": 1, "r": 1, "w": 1, "q": 1}),
+                self.backend("c", drain=10),
+            ],
+        )
+        picks = self.keys_for_each_backend(["a", "b", "c"], 4)
+        keys = [picks["a"], picks["b"], picks["c"]]
+        results = self.run_ops([
+            self.load(["a", "b", "c"], 4),
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "cs", "id": "b", "n": 1, "m": 1, "r": 1, "w": 1, "q": 1},
+            {"op": "cr", "id": "b", "ok": False, "now": 2},
+            {"op": "ds", "id": "c", "t": 10},
+            {"op": "dr", "id": "c", "now": 3},
+            {"op": "hd", "config": candidate, "keys": keys, "now": 4},
+        ])
+        result = results[-1]
+        self.assertEqual(result["base"], result["target"])
+        # 失格运行态后端在 hd 环上依旧可选，前后均不改变。
+        self.assertEqual(
+            [(case["before"], case["after"], case["changed"]) for case in
+             result["cases"]],
+            [("a", "a", False), ("b", "b", False), ("c", "c", False)],
+        )
+
+    def test_does_not_apply_candidate(self):
+        results = self.run_ops([
+            self.load(["a", "b"], 2),
+            self.hd(["a", "b", "c"], 9, ["k"], 1),
+            {"op": "ce"},
+        ])
+        config = results[2]["config"]
+        self.assertEqual([b["id"] for b in config["backends"]], ["a", "b"])
+        self.assertEqual(config["vnodes"], 2)
+
+    def test_keys_size_boundaries(self):
+        results = self.run_ops([
+            self.load(["a", "b"], 2),
+            self.hd(["a", "b"], 2, ["only"], 0),
+            self.hd(["a", "b"], 2, ["k%d" % i for i in range(256)], 10 ** 9),
+        ])
+        self.assertEqual(results[1]["summary"]["total"], 1)
+        self.assertEqual(results[2]["summary"]["total"], 256)
+
+    def test_now_boundary_values_are_ok(self):
+        results = self.run_ops([
+            self.load(["a", "b"], 2),
+            self.hd(["a", "b"], 2, ["k"], 0),
+            self.hd(["a", "b"], 2, ["k"], 10 ** 9),
+        ])
+        self.assertEqual(len(results), 3)
+
+    def test_state_when_ring_unavailable(self):
+        # 初始空状态：当前 vnodes 为 null（先 ci 置时钟亦可复现，此处直接
+        # 在 now=0 调用）。
+        self.assert_failure(
+            encode_ops([self.hd(["a"], 2, ["k"], 0)]), 4, "STATE"
+        )
+        # 当前 vnodes 为 null（add 但未 chash/ci 配环）。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "a", "weight": 1},
+                self.hd(["a", "b"], 2, ["k"], 0),
+            ]),
+            4, "STATE",
+        )
+        # ci 载入 vnodes=null 的配置。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], None),
+                self.hd(["a"], 2, ["k"], 1),
+            ]),
+            4, "STATE",
+        )
+        # 候选 vnodes 为 null。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hd(["a"], None, ["k"], 1),
+            ]),
+            4, "STATE",
+        )
+        # 候选 backends 为空。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hd([], 2, ["k"], 1),
+            ]),
+            4, "STATE",
+        )
+        # 当前 backends 为空（ci 允许空 backends 配 vnodes）。
+        self.assert_failure(
+            encode_ops([
+                self.load([], 2),
+                self.hd(["a"], 2, ["k"], 1),
+            ]),
+            4, "STATE",
+        )
+
+    def test_unknown_backend_references_are_backend(self):
+        base = [self.load(["a"], 2)]
+        bad_limit = self.make_config(
+            ["a"], 2,
+            limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}])
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "hd", "config": bad_limit, "keys": ["k"], "now": 1}]),
+            3, "BACKEND",
+        )
+        bad_quota = self.make_config(
+            ["a"], 2,
+            quotas=[{"scope": "B", "id": "ghost", "limit": 1, "span": 1}])
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "hd", "config": bad_quota, "keys": ["k"], "now": 1}]),
+            3, "BACKEND",
+        )
+        bad_fault = self.make_config(
+            ["a"], 2,
+            faults=[{"id": "ghost", "k": "D", "a": 0, "z": 5, "v": 0}])
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "hd", "config": bad_fault, "keys": ["k"], "now": 1}]),
+            3, "BACKEND",
+        )
+
+    def test_backend_takes_priority_over_state(self):
+        # 同一候选既引用未知 B 限流、vnodes 又为 null：BACKEND 先于 STATE。
+        bad = self.make_config(
+            ["a"], None,
+            limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}])
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                {"op": "hd", "config": bad, "keys": ["k"], "now": 1},
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_exact_key_order(self):
+        config = self.make_config(["a"], 2)
+
+        def raw(segment):
+            return ('{"ops":[' + segment + ']}').encode("utf-8")
+
+        canonical = '{"op":"hd","config":%s,"keys":["k"],"now":0}' % (
+            json.dumps(config, separators=(",", ":")))
+        # 键序乱序（now 提前、config/keys 交换）均 INPUT。
+        self.assert_failure(
+            raw('{"op":"hd","now":0,"config":%s,"keys":["k"]}'
+                % json.dumps(config, separators=(",", ":"))),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            raw('{"op":"hd","config":%s,"now":0,"keys":["k"]}'
+                % json.dumps(config, separators=(",", ":"))),
+            2, "INPUT",
+        )
+        # 多余键、缺键。
+        self.assert_failure(
+            raw(canonical[:-1] + ',"x":1}'), 2, "INPUT"
+        )
+        self.assert_failure(
+            raw('{"op":"hd","config":%s,"now":0}'
+                % json.dumps(config, separators=(",", ":"))),
+            2, "INPUT",
+        )
+
+    def test_invalid_keys_are_input(self):
+        config = self.make_config(["a"], 2)
+
+        def raw(keys_segment):
+            return encode_ops([{
+                "op": "hd", "config": config, "keys": json.loads(keys_segment),
+                "now": 0,
+            }])
+
+        self.assert_failure(raw("[]"), 2, "INPUT")
+        self.assert_failure(raw(json.dumps(["k"] * 257)), 2, "INPUT")
+        self.assert_failure(raw('[""]'), 2, "INPUT")
+        self.assert_failure(raw("[1]"), 2, "INPUT")
+        self.assert_failure(raw("[true]"), 2, "INPUT")
+        self.assert_failure(raw('[["k"]]'), 2, "INPUT")
+        self.assert_failure(raw("null"), 2, "INPUT")
+        self.assert_failure(raw('"k"'), 2, "INPUT")
+        # 孤立代理项不可直接 UTF-8 编码：INPUT。
+        config_json = json.dumps(config, separators=(",", ":"))
+        self.assert_failure(
+            ('{"ops":[{"op":"hd","config":%s,"keys":["\\ud800"],"now":0}]}'
+             % config_json).encode("utf-8"),
+            2, "INPUT",
+        )
+
+    def test_invalid_now_is_input(self):
+        for bad_now in (True, -1, 10 ** 9 + 1, "0", 1.5, None):
+            self.assert_failure(
+                encode_ops([{
+                    "op": "hd", "config": self.make_config(["a"], 2),
+                    "keys": ["k"], "now": bad_now,
+                }]),
+                2, "INPUT",
+            )
+
+    def test_invalid_config_is_input(self):
+        # 重复后端 id：config 校验同 cv/cd。
+        config = self.make_config(["a", "a"], 2)
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                {"op": "hd", "config": config, "keys": ["k"], "now": 1},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_clock_regression_input_and_advances_clock(self):
+        # 时钟倒退 INPUT；相等 now 合法。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hd(["a"], 2, ["k"], 10),
+                self.hd(["a"], 2, ["k"], 9),
+            ]),
+            2, "INPUT",
+        )
+        results = self.run_ops([
+            self.load(["a"], 2),
+            self.hd(["a"], 2, ["k"], 10),
+            self.hd(["a"], 2, ["k"], 10),
+        ])
+        self.assertEqual(len(results), 3)
+        # 成功 hd 推进共用时钟：其后旧时刻 br 报倒退。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hd(["a"], 2, ["k"], 10),
+                {"op": "br", "now": 9},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_failure_rolls_back_batch(self):
+        # 靠后的 hd 非法：整批无 stdout，前面成功的 ci 也不落任何状态。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hd(["a"], 2, ["k"], 1),
+                self.hd(["a"], 2, ["k"], "x"),
+            ]),
+            2, "INPUT",
+        )
+        # 靠后的 hd 因 STATE 失败同样整批回滚。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hd(["a"], 2, ["k"], 1),
+                self.hd(["a"], None, ["k"], 2),
+            ]),
+            4, "STATE",
+        )
+
+    def test_non_ascii_keys_compact_single_newline(self):
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([
+                self.load(["a", "b"], 2),
+                self.hd(["a", "b"], 2, ["日本語", "Ω", "emoji😀"], 1),
+            ]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertEqual(out.count(b"\n"), 1)
+        # 非 ASCII 不转义、无多余空白。
+        self.assertIn("日本語".encode("utf-8"), out)
+        self.assertIn("😀".encode("utf-8"), out)
+        self.assertNotIn(b"\\u", out)
+        self.assertNotIn(b" ", out)
+
+    def test_record_replay_covers_hd(self):
+        ops = [
+            self.load(["a", "b"], 2),
+            self.hd(["a", "b", "c"], 9, ["k1", "k2", "k2"], 1),
+            {"op": "ct"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+        self.assertEqual(rep_stderr, run_stderr)
+        # 失败 hd（STATE）同样逐字节覆盖。
+        failing = encode_ops([self.hd(["a"], 2, ["k"], 0)])
+        _, rec_fail, _ = run_balancer("record", failing)
+        record = json.loads(rec_fail.decode("utf-8"))
+        rep_code, _, rep_stderr = run_balancer("replay", rec_fail)
+        self.assertEqual((rep_code, record["exit"]), (4, 4))
+        self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
+
+
 if __name__ == "__main__":
     unittest.main()

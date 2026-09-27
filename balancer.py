@@ -361,7 +361,27 @@ op,base,target,added,removed,changed,order：base/target 为 ct 摘要
 changed 为对象数组，按候选序含共有且变化者，项键序 id,fields，
 fields 为字符串数组，按 weight,d,fail,success,circuit,drain,endpoint
 顺序列差异；order 为两侧完整 id 序列是否不同的 bool。cv/cd 成功仅
-推进时钟，失败批回滚，时空 O(N)。ci 结果 op,ok=true；now 为非负非
+推进时钟，失败批回滚，时空 O(N)。
+hd 哈希配置预演，精确键序 op,config,keys,now（键须按此序出现）：
+config 校验与规范化同 cv/cd/pd，now ∈ [0,10^9] 非 bool 整数并进入
+共用非递减时钟；keys 为 1..256 项非空、可直接 UTF-8 编码的字符串数组
+（沿用 route 的 key 校验），可重复。不应用候选配置：以当前与候选配置
+各自的 backends、vnodes 分别建环，忽略运行态（健康、熔断、排空、连接）
+与粘性，全部后端按配置加入序上环，哈希规则沿用 chash
+（SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，按摘要、加入序、i 排序；
+key 哈希取首个不小于它的令牌、越界回绕），按 keys 原序各自独立映射。
+结果键序 op,base,target,cases,summary：base/target 为当前/候选规范化
+version=9 配置的 ct 摘要字符串；cases 按 keys 原序，项键序
+key,before,after,changed，before/after 为当前/候选环选中的后端 id
+字符串，changed 为 bool；summary 键序 total,stable,remapped，均为非负
+整数，total 等于 keys 长度，stable 为前后相同的项数、remapped 为变化
+项数。键序、keys（容器、项数、元素非空或编码）、now 非法或时钟倒退报
+INPUT/2；候选 B 限流/B 配额/faults 引用未知后端报 BACKEND/3（优先级同
+cv/cd/pd）；当前或候选任一 vnodes 为 null 或 backends 为空报 STATE/4。
+hd 成功仅推进时钟且不改任何状态，失败批回滚。N 为两环令牌总数、K 为
+keys 长度，时间 O(N log N + K log N)，空间 O(N+K)，仅用标准库；紧凑
+UTF-8 固定键序 JSON、单换行及 record/replay 逐字节行为照常，其他子命令
+不变。ci 结果 op,ok=true；now 为非负非
 bool 整数并纳入共用非递减
 时钟（乐观并发形式的 now 仅收 0..10^9 非 bool 整数，否则 INPUT/2 且
 整批回滚），亦接受 version=1 原结构（仅前五键）与 version=2 结构（追加三键），
@@ -1088,6 +1108,36 @@ def build_ring(backends, vnodes):
     return tokens
 
 
+def build_static_ring(backend_ids, vnodes):
+    """与 build_ring 同款 chash 规则，但忽略全部运行态：后端按给定加入序
+    全部上环，vnodes 个令牌为 SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，
+    摘要按 256 位大端无符号数排序（并列按加入顺序、i 升序）。供 hd 这类
+    纯配置预演以配置 backends/vnodes 建环。时间 O(N log N)（N 为令牌总数），
+    额外空间 O(N)。"""
+    tokens = []
+    for join_index, backend_id in enumerate(backend_ids):
+        encoded = encode_backend_id(backend_id)
+        for i in range(vnodes):
+            digest = hashlib.sha256(
+                encoded + b"\x00" + str(i).encode("ascii")
+            ).digest()
+            tokens.append((int.from_bytes(digest, "big"), join_index, i, backend_id))
+    tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+    return tokens
+
+
+def lookup_ring(tokens, digests, key):
+    """chash 路由：哈希 UTF8(key) 取首个不小于它的令牌，越界回绕到环首。
+    tokens/digests 非空（空环由调用方先报 STATE）。O(log N)，N 为令牌数。"""
+    key_hash = int.from_bytes(
+        hashlib.sha256(key.encode("utf-8")).digest(), "big"
+    )
+    index = bisect.bisect_left(digests, key_hash)
+    if index == len(tokens):
+        index = 0  # 越界回绕到环首
+    return tokens[index][3]
+
+
 def parse_flow(value):
     """校验 [源IP,源端口,目的IP,目的端口,协议]，返回规范化五元组。"""
     if not isinstance(value, list) or len(value) != 5:
@@ -1625,7 +1675,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
-        "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd",
+        "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "br",
@@ -2404,6 +2454,24 @@ def parse_op(raw_op):
         parse_warm_now(raw_op["now"])
         config = parse_config(raw_op["config"])
         return ("pd", config, raw_op["now"])
+
+    if name == "hd":
+        # 哈希配置预演：精确键序 op,config,keys,now（键须按此序出现，乱序报
+        # INPUT）；config 校验与规范化同 cv/cd（B 限流/配额与 faults 引用未知
+        # 后端留执行期判 BACKEND）；keys 为 1..256 项非空、可直接 UTF-8 编码
+        # 的字符串数组（沿用 route 的 key 校验），可重复；now ∈ [0,10^9] 非
+        # bool 整数并纳入共用非递减时钟（倒退在执行期与其余操作同序判
+        # INPUT）。不应用候选配置；任一 vnodes 为 null 或 backends 为空的
+        # STATE 留执行期判。
+        if list(raw_op) != ["op", "config", "keys", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        raw_keys = raw_op["keys"]
+        if not isinstance(raw_keys, list) or not 1 <= len(raw_keys) <= 256:
+            fail(EXIT_INPUT, "INPUT")
+        keys = [parse_key(raw_key) for raw_key in raw_keys]
+        parse_warm_now(raw_op["now"])
+        config = parse_config(raw_op["config"])
+        return ("hd", config, keys, raw_op["now"])
 
     if name == "ct":
         # 配置指纹查询：精确键序仅 op，只读且不推进时钟。
@@ -3558,7 +3626,7 @@ def run(raw):
             "oq",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
-            "ci", "cb", "cv", "cd", "pd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
         ):
             now = op[-1]
@@ -5355,6 +5423,72 @@ def run(raw):
                     "base": config_digest(current_export),
                     "target": config_digest(candidate_export),
                     "changes": changes,
+                }
+            )
+
+        elif op[0] == "hd":
+            # 哈希配置预演（不应用配置）：以当前与候选配置各自的 backends、
+            # vnodes 分别建环——忽略运行态（健康、熔断、排空）与粘性，全部后端
+            # 按加入序上环，哈希规则沿用 chash，按 keys 原序独立映射。B 限流/
+            # 配额与 faults 引用未知后端报 BACKEND（优先级同 cv/cd/pd，先于
+            # STATE）；任一 vnodes 为 null 或任一侧 backends 为空报 STATE。
+            # 成功仅推进时钟（已在共用时钟块完成），不改任何状态；失败批次
+            # 天然回滚。N 为两环令牌总数、K 为 keys 长度：两环各排序一次共
+            # O(N log N)，每键两次二分共 O(K log N)，额外空间 O(N+K)。
+            _, config, keys, now = op
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            candidate_export = export_normalized_config(config)
+            candidate_ids = [item["id"] for item in candidate_export["backends"]]
+            if config["vnodes"] is None or not candidate_ids:
+                # 候选未配环或候选后端为空：无法为候选建环。
+                fail(EXIT_STATE, "STATE")
+            current_export = export_config()
+            current_ids = [item["id"] for item in current_export["backends"]]
+            if ring_vnodes is None or not current_ids:
+                # 当前未 chash 或当前后端为空：无法为当前建环（初始空配置即
+                # 如此）。
+                fail(EXIT_STATE, "STATE")
+            target_tokens = build_static_ring(candidate_ids, config["vnodes"])
+            base_tokens = build_static_ring(current_ids, ring_vnodes)
+            target_digests = [token[0] for token in target_tokens]
+            base_digests = [token[0] for token in base_tokens]
+            cases = []
+            stable = 0
+            for key in keys:
+                before = lookup_ring(base_tokens, base_digests, key)
+                after = lookup_ring(target_tokens, target_digests, key)
+                changed = before != after
+                if not changed:
+                    stable += 1
+                cases.append(
+                    {
+                        "key": key,
+                        "before": before,
+                        "after": after,
+                        "changed": changed,
+                    }
+                )
+            total = len(keys)
+            results.append(
+                {
+                    "op": "hd",
+                    "base": config_digest(current_export),
+                    "target": config_digest(candidate_export),
+                    "cases": cases,
+                    "summary": {
+                        "total": total,
+                        "stable": stable,
+                        "remapped": total - stable,
+                    },
                 }
             )
 
