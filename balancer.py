@@ -1468,6 +1468,87 @@ def parse_config(value):
     }
 
 
+def export_normalized_config(config):
+    """把 parse_config 的规范化结构导出为 version=9 配置对象：逐层键序、
+    值格式与数组排序同 ce.config（backends 按配置出现序，项 id,weight,d,
+    fail,success,circuit,drain,endpoint；limits/quotas 已由 parse_config
+    强制按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；faults 按后端出现序、
+    段 a 升序，项键序 id,k,a,z,v；queue 末置，键序 dequeue,full）。纯
+    登记值、不含任何运行态；返回全新结构。O(N)，N 为 config 元素数。"""
+    exported_backends = []
+    for (backend_id, weight, d, fail_threshold, success_threshold,
+         circuit_params, drain_t, endpoint) in config["backends"]:
+        exported_backends.append(
+            {
+                "id": backend_id,
+                "weight": weight,
+                "d": d,
+                "fail": fail_threshold,
+                "success": success_threshold,
+                "circuit": (
+                    None
+                    if circuit_params is None
+                    else {
+                        "n": circuit_params[0],
+                        "m": circuit_params[1],
+                        "r": circuit_params[2],
+                        "w": circuit_params[3],
+                        "q": circuit_params[4],
+                    }
+                ),
+                "drain": drain_t,
+                # 既有七键后追加 endpoint：null 或键序 host,port。
+                "endpoint": (
+                    None
+                    if endpoint is None
+                    else {"host": endpoint[0], "port": endpoint[1]}
+                ),
+            }
+        )
+    exported_limits = [
+        {"scope": scope, "id": bucket_id, "r": r, "b": b}
+        for scope, bucket_id, r, b in config["limits"]
+    ]
+    overload = config["overload"]
+    # faults 按后端出现序、同后端段 a 升序（plan 段已为该序）；空计划为 []。
+    faults_plan = config["faults"]
+    exported_faults = []
+    for entry in config["backends"]:
+        for k, a, z, v in faults_plan.get(entry[0], ()):
+            exported_faults.append(
+                {"id": entry[0], "k": k, "a": a, "z": z, "v": v}
+            )
+    exported_quotas = [
+        {"scope": scope, "id": quota_id, "limit": limit, "span": span}
+        for scope, quota_id, limit, span in config["quotas"]
+    ]
+    sticky_ttl = config["sticky"]
+    idle_ttl = config["idle"]
+    backpressure = config["backpressure"]
+    return {
+        "version": 9,
+        "backends": exported_backends,
+        "vnodes": config["vnodes"],
+        "limits": exported_limits,
+        "overload": (
+            None
+            if overload is None
+            else {"cap": overload[0], "q": overload[1], "ttl": overload[2]}
+        ),
+        "sticky": None if sticky_ttl is None else {"ttl": sticky_ttl},
+        "idle": None if idle_ttl is None else {"ttl": idle_ttl},
+        "backpressure": (
+            None
+            if backpressure is None
+            else {"low": backpressure[0], "high": backpressure[1]}
+        ),
+        "scheduler": {"pick": config["scheduler"]},
+        "faults": exported_faults,
+        "quotas": exported_quotas,
+        "queue": {"dequeue": config["queue"][0], "full": config["queue"][1]},
+    }
+
+
 def parse_op(raw_op):
     """校验单个操作的形状，返回规范化元组；不合格式直接 INPUT 退出。"""
     if not isinstance(raw_op, dict):
@@ -1483,7 +1564,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
-        "ce", "ci", "cl", "cb",
+        "ce", "ci", "cl", "cb", "cv",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
@@ -2205,6 +2286,17 @@ def parse_op(raw_op):
         parse_now(raw_op["now"])
         config = parse_config(raw_op["config"])
         return ("ci", config, raw_op["now"])
+
+    if name == "cv":
+        # 配置预检：精确键集 op,config,now；config 校验与规范化同 ci，
+        # now ∈ [0,10^9] 非 bool 整数，进入共用非递减时钟（倒退在执行期
+        # 与其余操作同序判 INPUT）。B 限流/配额与 faults 引用未知后端留
+        # 执行期判 BACKEND；不应用配置。
+        if keys != {"op", "config", "now"}:
+            fail(EXIT_INPUT, "INPUT")
+        parse_warm_now(raw_op["now"])
+        config = parse_config(raw_op["config"])
+        return ("cv", config, raw_op["now"])
 
     if name == "cl":
         # 配置提交历史查询：精确键集仅 op，只读。
@@ -3353,7 +3445,7 @@ def run(raw):
             "oq",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
-            "ci", "cb", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cv", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh",
         ):
             now = op[-1]
@@ -5009,6 +5101,33 @@ def run(raw):
             if len(commit_history) > 16:
                 commit_history.pop(0)
             results.append({"op": "ci", "ok": True})
+
+        elif op[0] == "cv":
+            _, config, now = op
+            # B 限流、B 配额与 faults 引用未知后端：BACKEND，先于活动状态
+            # 判定（同 ci 的错误优先级）。
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 预检不应用配置：活动连接或排队项仅令 applicable=false，不报
+            # STATE；成功仅推进时钟（已在共用时钟块完成），配置、连接、
+            # 队列、粘性、桶、配额、指标、告警、rev 与提交历史均不变。
+            results.append(
+                {
+                    "op": "cv",
+                    "applicable": not connections and not wait_queue,
+                    "connections": len(connections),
+                    "queued": len(wait_queue),
+                    "config": export_normalized_config(config),
+                }
+            )
 
         elif op[0] == "cl":
             # 配置提交历史（只读）：current 为最新 rev 或 null，commits 按

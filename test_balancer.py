@@ -392,6 +392,245 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
 
 
+class ConfigPrecheckTest(unittest.TestCase):
+    """配置预检 cv：只校验并回显规范化配置，不应用、不提交。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        return code, out
+
+    def test_cv_empty_state_applicable(self):
+        code, out = self.run_ops(
+            [{"op": "cv", "config": config_v9(2), "now": 5}]
+        )
+        self.assertEqual(code, 0)
+        result = json.loads(out)["results"][0]
+        # 结果键序 op,applicable,connections,queued,config。
+        self.assertEqual(
+            list(result), ["op", "applicable", "connections", "queued", "config"]
+        )
+        self.assertEqual(result["applicable"], True)
+        self.assertEqual(result["connections"], 0)
+        self.assertEqual(result["queued"], 0)
+        self.assertEqual(result["config"], config_v9(2))
+
+    def test_cv_normalizes_v1_to_v9(self):
+        # version=1 旧结构回显为规范化 version=9（同 ci 提交格式）。
+        config_v1 = {
+            "version": 1,
+            "backends": [
+                {
+                    "id": "a",
+                    "weight": 2,
+                    "d": 0,
+                    "fail": 3,
+                    "success": 2,
+                    "circuit": None,
+                    "drain": None,
+                }
+            ],
+            "vnodes": None,
+            "limits": [],
+            "overload": None,
+        }
+        code, out = self.run_ops(
+            [{"op": "cv", "config": config_v1, "now": 0}]
+        )
+        self.assertEqual(code, 0)
+        result = json.loads(out)["results"][0]
+        self.assertEqual(result["config"], config_v9(2))
+
+    def test_cv_config_matches_ci_export(self):
+        # 富 v9 配置：cv 回显与 ci 成功后 ce 导出逐字节同构。
+        config = config_v9(
+            2,
+            faults=[
+                {"id": "a", "k": "S", "a": 0, "z": 3, "v": 1},
+                {"id": "a", "k": "D", "a": 3, "z": 4, "v": 0},
+            ],
+            quotas=[{"scope": "B", "id": "a", "limit": 100, "span": 60}],
+            dequeue="S",
+            full="H",
+            vnodes=64,
+            limits=[{"scope": "B", "id": "a", "r": 10, "b": 5}],
+            overload={"cap": 3, "q": 4, "ttl": 10},
+            sticky={"ttl": 100},
+            idle={"ttl": 50},
+            backpressure={"low": 1, "high": 4},
+            scheduler={"pick": "H"},
+        )
+        code, out = self.run_ops([{"op": "cv", "config": config, "now": 7}])
+        self.assertEqual(code, 0)
+        cv_config = json.loads(out)["results"][0]["config"]
+        code, out = self.run_ops(
+            [{"op": "ci", "config": config, "now": 7}, {"op": "ce"}]
+        )
+        self.assertEqual(code, 0)
+        ce_config = json.loads(out)["results"][1]["config"]
+        self.assertEqual(cv_config, ce_config)
+
+    def test_cv_does_not_apply_or_commit(self):
+        # cv 后 ce 仍为空配置、cl 无提交、backends 为空；随后 ci 仍得 rev 1。
+        ops = [
+            {"op": "cv", "config": config_v9(2), "now": 0},
+            {"op": "ce"},
+            {"op": "cl"},
+            {"op": "ci", "config": config_v6(1), "now": 1},
+            {"op": "cl"},
+        ]
+        code, out = self.run_ops(ops)
+        self.assertEqual(code, 0)
+        output = json.loads(out)
+        # cv 后的 ce 仍为空配置：cv 未应用任何后端。
+        ce_result = output["results"][1]
+        self.assertEqual(ce_result["config"]["backends"], [])
+        cl_result = output["results"][2]
+        self.assertEqual(
+            cl_result, {"op": "cl", "current": None, "commits": []}
+        )
+        final_cl = output["results"][4]
+        self.assertEqual(final_cl["current"], 1)
+        self.assertEqual(len(final_cl["commits"]), 1)
+
+    def test_cv_with_active_connection_not_applicable(self):
+        # 活动连接仅令 applicable=false，不报 STATE。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "cv", "config": config_v9(2), "now": 1},
+        ]
+        code, out = self.run_ops(ops)
+        self.assertEqual(code, 0)
+        result = json.loads(out)["results"][-1]
+        self.assertEqual(result["applicable"], False)
+        self.assertEqual(result["connections"], 1)
+        self.assertEqual(result["queued"], 0)
+
+    def test_cv_with_queued_item_not_applicable(self):
+        ops = [
+            {"op": "add", "id": "o", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+            {"op": "open", "cid": "y", "flow": FLOW, "now": 0},
+            {
+                "op": "oa",
+                "cid": "z",
+                "flow": FLOW,
+                "c": "k",
+                "s": "k",
+                "key": "k",
+                "now": 0,
+            },
+            {"op": "cv", "config": config_v9(2), "now": 1},
+        ]
+        code, out = self.run_ops(ops)
+        self.assertEqual(code, 0)
+        result = json.loads(out)["results"][-1]
+        self.assertEqual(result["applicable"], False)
+        self.assertEqual(result["connections"], 1)
+        self.assertEqual(result["queued"], 1)
+
+    def test_cv_unknown_backend_references_are_backend(self):
+        # B 限流、B 配额、faults 引用未知后端均 BACKEND；有活动连接时
+        # 仍优先报 BACKEND 而非受连接影响。
+        bad_limit = config_v9(
+            1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}]
+        )
+        bad_quota = config_v9(
+            1, quotas=[{"scope": "B", "id": "ghost", "limit": 1, "span": 1}]
+        )
+        bad_fault = config_v9(
+            1, faults=[{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}]
+        )
+        for bad in (bad_limit, bad_quota, bad_fault):
+            code, out, err = run_balancer(
+                "run", encode_ops([{"op": "cv", "config": bad, "now": 0}])
+            )
+            self.assertEqual((code, out, err), (3, b"", b'{"error":"BACKEND"}\n'))
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "cv", "config": bad_limit, "now": 1},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (3, b"", b'{"error":"BACKEND"}\n'))
+
+    def test_cv_invalid_config_is_input(self):
+        bad_version = config_v9(1)
+        bad_version["version"] = 8
+        missing = config_v9(1)
+        del missing["scheduler"]
+        for bad in (bad_version, missing, {"version": 9}, []):
+            code, out, err = run_balancer(
+                "run", encode_ops([{"op": "cv", "config": bad, "now": 0}])
+            )
+            self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_cv_bad_now_is_input(self):
+        for now in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
+            code, out, err = run_balancer(
+                "run",
+                encode_ops([{"op": "cv", "config": config_v9(1), "now": now}]),
+            )
+            self.assertEqual(
+                (code, out, err), (2, b"", b'{"error":"INPUT"}\n'), now
+            )
+
+    def test_cv_exact_key_set(self):
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(
+                [{"op": "cv", "config": config_v9(1), "now": 0, "x": 1}]
+            ),
+        )
+        self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "cv", "config": config_v9(1)}])
+        )
+        self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_cv_clock_regression_is_input(self):
+        ops = [
+            {"op": "cv", "config": config_v9(1), "now": 10},
+            {"op": "cv", "config": config_v9(2), "now": 5},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
+        # 同刻不重拨：相等 now 合法。
+        ops = [
+            {"op": "cv", "config": config_v9(1), "now": 10},
+            {"op": "cv", "config": config_v9(2), "now": 10},
+        ]
+        code, out = self.run_ops(ops)
+        self.assertEqual(code, 0)
+
+    def test_cv_failure_rolls_back_batch(self):
+        # 批内靠后的 cv 失败：整批无 stdout，前面成功的 cv 也不落任何状态。
+        ops = [
+            {"op": "cv", "config": config_v9(1), "now": 0},
+            {"op": "cv", "config": config_v9(2), "now": 5},
+            {"op": "cv", "config": config_v9(3), "now": 1},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_record_replay_covers_cv(self):
+        ops = [
+            {"op": "cv", "config": config_v9(2), "now": 0},
+            {"op": "ci", "config": config_v6(1), "now": 1},
+            {"op": "cv", "config": config_v9(3), "now": 2},
+        ]
+        raw = encode_ops(ops)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+
+
 class FaultHotReloadTest(unittest.TestCase):
     """version=7 faults 时间线纳入 ce/ci/cl/cb 热加载。"""
 
