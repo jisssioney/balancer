@@ -212,8 +212,19 @@ def config_v8(weight, faults=(), quotas=(), **overrides):
     return config
 
 
-def config_v9(weight, faults=(), quotas=(), dequeue="F", full="T", **overrides):
-    """最小 version=9 配置：十一键同 v8 且末置 queue（dequeue,full）。"""
+def config_v10(weight, faults=(), quotas=(), dequeue="F", full="T",
+               capacities=(), **overrides):
+    """最小 version=10 配置：十二键同 v9 且末置 capacities（id,cap 数组）。"""
+    config = config_v8(weight, faults, quotas, **overrides)
+    config["version"] = 10
+    config["queue"] = {"dequeue": dequeue, "full": full}
+    config["capacities"] = list(capacities)
+    return config
+
+
+def config_v9_input(weight, faults=(), quotas=(), dequeue="F", full="T",
+                    **overrides):
+    """最小 version=9 输入：十一键同 v8 且末置 queue（dequeue,full）。"""
     config = config_v8(weight, faults, quotas, **overrides)
     config["version"] = 9
     config["queue"] = {"dequeue": dequeue, "full": full}
@@ -235,9 +246,9 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(list(result), ["op", "current", "commits"])
         self.assertEqual(result, {"op": "cl", "current": None, "commits": []})
 
-    def test_ci_commits_normalized_v9(self):
-        # version=1 旧结构成功加载后，提交为规范化 version=9 配置
-        # （faults 空计划、quotas 空数组、queue 默认 F/T）。
+    def test_ci_commits_normalized_v10(self):
+        # version=1 旧结构成功加载后，提交为规范化 version=10 配置
+        # （faults 空计划、quotas 空数组、queue 默认 F/T、capacities 空）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -267,7 +278,7 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(commit["rev"], 1)
         self.assertEqual(
             commit["config"],
-            config_v9(2),
+            config_v10(2),
         )
 
     def test_failed_ci_does_not_commit(self):
@@ -314,9 +325,9 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(
             results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
         )
-        # 回滚后当前配置即 rev=1 的规范化 v9 快照（faults、quotas 均空，
-        # queue 默认 F/T）。
-        self.assertEqual(results[3]["config"], config_v9(1))
+        # 回滚后当前配置即 rev=1 的规范化 v10 快照（faults、quotas 均空，
+        # queue 默认 F/T、capacities 空）。
+        self.assertEqual(results[3]["config"], config_v10(1))
 
     def test_cb_restores_runtime_state(self):
         # 回滚按目标快照重建默认运行态：调度策略、限流桶、预热自 cb.now 起算。
@@ -402,7 +413,7 @@ class ConfigPrecheckTest(unittest.TestCase):
 
     def test_cv_empty_state_applicable(self):
         code, out = self.run_ops(
-            [{"op": "cv", "config": config_v9(2), "now": 5}]
+            [{"op": "cv", "config": config_v10(2), "now": 5}]
         )
         self.assertEqual(code, 0)
         result = json.loads(out)["results"][0]
@@ -413,10 +424,10 @@ class ConfigPrecheckTest(unittest.TestCase):
         self.assertEqual(result["applicable"], True)
         self.assertEqual(result["connections"], 0)
         self.assertEqual(result["queued"], 0)
-        self.assertEqual(result["config"], config_v9(2))
+        self.assertEqual(result["config"], config_v10(2))
 
     def test_cv_normalizes_v1_to_v9(self):
-        # version=1 旧结构回显为规范化 version=9（同 ci 提交格式）。
+        # version=1 旧结构回显为规范化 version=10（同 ci 提交格式）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -439,11 +450,11 @@ class ConfigPrecheckTest(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         result = json.loads(out)["results"][0]
-        self.assertEqual(result["config"], config_v9(2))
+        self.assertEqual(result["config"], config_v10(2))
 
     def test_cv_config_matches_ci_export(self):
-        # 富 v9 配置：cv 回显与 ci 成功后 ce 导出逐字节同构。
-        config = config_v9(
+        # 富 v10 配置：cv 回显与 ci 成功后 ce 导出逐字节同构。
+        config = config_v10(
             2,
             faults=[
                 {"id": "a", "k": "S", "a": 0, "z": 3, "v": 1},
@@ -473,7 +484,7 @@ class ConfigPrecheckTest(unittest.TestCase):
     def test_cv_does_not_apply_or_commit(self):
         # cv 后 ce 仍为空配置、cl 无提交、backends 为空；随后 ci 仍得 rev 1。
         ops = [
-            {"op": "cv", "config": config_v9(2), "now": 0},
+            {"op": "cv", "config": config_v10(2), "now": 0},
             {"op": "ce"},
             {"op": "cl"},
             {"op": "ci", "config": config_v6(1), "now": 1},
@@ -498,7 +509,7 @@ class ConfigPrecheckTest(unittest.TestCase):
         ops = [
             {"op": "add", "id": "a", "weight": 1},
             {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
-            {"op": "cv", "config": config_v9(2), "now": 1},
+            {"op": "cv", "config": config_v10(2), "now": 1},
         ]
         code, out = self.run_ops(ops)
         self.assertEqual(code, 0)
@@ -522,7 +533,7 @@ class ConfigPrecheckTest(unittest.TestCase):
                 "key": "k",
                 "now": 0,
             },
-            {"op": "cv", "config": config_v9(2), "now": 1},
+            {"op": "cv", "config": config_v10(2), "now": 1},
         ]
         code, out = self.run_ops(ops)
         self.assertEqual(code, 0)
@@ -534,13 +545,13 @@ class ConfigPrecheckTest(unittest.TestCase):
     def test_cv_unknown_backend_references_are_backend(self):
         # B 限流、B 配额、faults 引用未知后端均 BACKEND；有活动连接时
         # 仍优先报 BACKEND 而非受连接影响。
-        bad_limit = config_v9(
+        bad_limit = config_v10(
             1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}]
         )
-        bad_quota = config_v9(
+        bad_quota = config_v10(
             1, quotas=[{"scope": "B", "id": "ghost", "limit": 1, "span": 1}]
         )
-        bad_fault = config_v9(
+        bad_fault = config_v10(
             1, faults=[{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}]
         )
         for bad in (bad_limit, bad_quota, bad_fault):
@@ -557,9 +568,9 @@ class ConfigPrecheckTest(unittest.TestCase):
         self.assertEqual((code, out, err), (3, b"", b'{"error":"BACKEND"}\n'))
 
     def test_cv_invalid_config_is_input(self):
-        bad_version = config_v9(1)
+        bad_version = config_v10(1)
         bad_version["version"] = 8
-        missing = config_v9(1)
+        missing = config_v10(1)
         del missing["scheduler"]
         for bad in (bad_version, missing, {"version": 9}, []):
             code, out, err = run_balancer(
@@ -571,7 +582,7 @@ class ConfigPrecheckTest(unittest.TestCase):
         for now in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
             code, out, err = run_balancer(
                 "run",
-                encode_ops([{"op": "cv", "config": config_v9(1), "now": now}]),
+                encode_ops([{"op": "cv", "config": config_v10(1), "now": now}]),
             )
             self.assertEqual(
                 (code, out, err), (2, b"", b'{"error":"INPUT"}\n'), now
@@ -581,26 +592,26 @@ class ConfigPrecheckTest(unittest.TestCase):
         code, out, err = run_balancer(
             "run",
             encode_ops(
-                [{"op": "cv", "config": config_v9(1), "now": 0, "x": 1}]
+                [{"op": "cv", "config": config_v10(1), "now": 0, "x": 1}]
             ),
         )
         self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
         code, out, err = run_balancer(
-            "run", encode_ops([{"op": "cv", "config": config_v9(1)}])
+            "run", encode_ops([{"op": "cv", "config": config_v10(1)}])
         )
         self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
 
     def test_cv_clock_regression_is_input(self):
         ops = [
-            {"op": "cv", "config": config_v9(1), "now": 10},
-            {"op": "cv", "config": config_v9(2), "now": 5},
+            {"op": "cv", "config": config_v10(1), "now": 10},
+            {"op": "cv", "config": config_v10(2), "now": 5},
         ]
         code, out, err = run_balancer("run", encode_ops(ops))
         self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
         # 同刻不重拨：相等 now 合法。
         ops = [
-            {"op": "cv", "config": config_v9(1), "now": 10},
-            {"op": "cv", "config": config_v9(2), "now": 10},
+            {"op": "cv", "config": config_v10(1), "now": 10},
+            {"op": "cv", "config": config_v10(2), "now": 10},
         ]
         code, out = self.run_ops(ops)
         self.assertEqual(code, 0)
@@ -608,18 +619,18 @@ class ConfigPrecheckTest(unittest.TestCase):
     def test_cv_failure_rolls_back_batch(self):
         # 批内靠后的 cv 失败：整批无 stdout，前面成功的 cv 也不落任何状态。
         ops = [
-            {"op": "cv", "config": config_v9(1), "now": 0},
-            {"op": "cv", "config": config_v9(2), "now": 5},
-            {"op": "cv", "config": config_v9(3), "now": 1},
+            {"op": "cv", "config": config_v10(1), "now": 0},
+            {"op": "cv", "config": config_v10(2), "now": 5},
+            {"op": "cv", "config": config_v10(3), "now": 1},
         ]
         code, out, err = run_balancer("run", encode_ops(ops))
         self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
 
     def test_record_replay_covers_cv(self):
         ops = [
-            {"op": "cv", "config": config_v9(2), "now": 0},
+            {"op": "cv", "config": config_v10(2), "now": 0},
             {"op": "ci", "config": config_v6(1), "now": 1},
-            {"op": "cv", "config": config_v9(3), "now": 2},
+            {"op": "cv", "config": config_v10(3), "now": 2},
         ]
         raw = encode_ops(ops)
         rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
@@ -664,12 +675,12 @@ class ConfigDigestTest(unittest.TestCase):
         result = results[0]
         # 结果精确键序 op,digest。
         self.assertEqual(list(result), ["op", "digest"])
-        empty_config = config_v9(1)
+        empty_config = config_v10(1)
         empty_config["backends"] = []
         self.assertEqual(result["digest"], digest_of(empty_config))
 
     def test_ct_matches_ce_config(self):
-        # ct 指纹即同一批内 ce.config 规范化 version=9 对象的摘要。
+        # ct 指纹即同一批内 ce.config 规范化 version=10 对象的摘要。
         ops = [
             {"op": "add", "id": "a", "weight": 2},
             {"op": "chash", "vnodes": 8},
@@ -705,13 +716,13 @@ class ConfigDigestTest(unittest.TestCase):
         # cv 只接受按 op,config,now 出现的对象，乱序报 INPUT/2。
         self.assert_failure(
             encode_ops(
-                [{"op": "cv", "now": 0, "config": config_v9(1)}]
+                [{"op": "cv", "now": 0, "config": config_v10(1)}]
             ),
             2, "INPUT",
         )
         self.assert_failure(
             encode_ops(
-                [{"config": config_v9(1), "op": "cv", "now": 0}]
+                [{"config": config_v10(1), "op": "cv", "now": 0}]
             ),
             2, "INPUT",
         )
@@ -721,7 +732,7 @@ class ConfigDigestTest(unittest.TestCase):
         results = self.run_ops([{"op": "ct"}])
         digest = results[0]["digest"]
         results = self.run_ops([
-            {"op": "ci", "config": config_v9(2), "base": digest, "now": 0},
+            {"op": "ci", "config": config_v10(2), "base": digest, "now": 0},
             {"op": "cl"},
         ])
         self.assertEqual(results[0], {"op": "ci", "ok": True})
@@ -730,20 +741,20 @@ class ConfigDigestTest(unittest.TestCase):
     def test_ci_base_stale_is_state(self):
         # 配置变更后旧指纹即过期：同一批内第二次携带旧 base 报 STATE/4。
         results = self.run_ops(
-            [{"op": "ci", "config": config_v9(1), "now": 0}, {"op": "ct"}]
+            [{"op": "ci", "config": config_v10(1), "now": 0}, {"op": "ct"}]
         )
         digest = results[1]["digest"]
         ops = [
-            {"op": "ci", "config": config_v9(1), "now": 0},
-            {"op": "ci", "config": config_v9(2), "base": digest, "now": 1},
-            {"op": "ci", "config": config_v9(3), "base": digest, "now": 2},
+            {"op": "ci", "config": config_v10(1), "now": 0},
+            {"op": "ci", "config": config_v10(2), "base": digest, "now": 1},
+            {"op": "ci", "config": config_v10(3), "base": digest, "now": 2},
         ]
         self.assert_failure(encode_ops(ops), 4, "STATE")
 
     def test_ci_base_mismatch_is_state(self):
         self.assert_failure(
             encode_ops([
-                {"op": "ci", "config": config_v9(1), "base": "0" * 64,
+                {"op": "ci", "config": config_v10(1), "base": "0" * 64,
                  "now": 0},
             ]),
             4, "STATE",
@@ -754,7 +765,7 @@ class ConfigDigestTest(unittest.TestCase):
         ops = [
             {"op": "add", "id": "a", "weight": 1},
             {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
-            {"op": "ci", "config": config_v9(1), "base": "0" * 64, "now": 1},
+            {"op": "ci", "config": config_v10(1), "base": "0" * 64, "now": 1},
         ]
         self.assert_failure(encode_ops(ops), 4, "STATE")
         results = self.run_ops([
@@ -766,14 +777,14 @@ class ConfigDigestTest(unittest.TestCase):
         ops = [
             {"op": "add", "id": "a", "weight": 1},
             {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
-            {"op": "ci", "config": config_v9(1), "base": live_digest,
+            {"op": "ci", "config": config_v10(1), "base": live_digest,
              "now": 1},
         ]
         self.assert_failure(encode_ops(ops), 4, "STATE")
 
     def test_ci_base_backend_precedes_state(self):
         # 未知 B 限流引用仍报 BACKEND/3，先于 base 比较。
-        bad = config_v9(
+        bad = config_v10(
             1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}]
         )
         self.assert_failure(
@@ -789,7 +800,7 @@ class ConfigDigestTest(unittest.TestCase):
         for bad in ("A" * 64, "0" * 63, "0" * 65, "g" * 64, 0, None, True):
             self.assert_failure(
                 encode_ops([
-                    {"op": "ci", "config": config_v9(1), "base": bad,
+                    {"op": "ci", "config": config_v10(1), "base": bad,
                      "now": 0},
                 ]),
                 2, "INPUT",
@@ -799,14 +810,14 @@ class ConfigDigestTest(unittest.TestCase):
         # 四键形式须精确按 op,config,base,now 出现，乱序报 INPUT/2。
         self.assert_failure(
             encode_ops([
-                {"op": "ci", "base": "0" * 64, "config": config_v9(1),
+                {"op": "ci", "base": "0" * 64, "config": config_v10(1),
                  "now": 0},
             ]),
             2, "INPUT",
         )
         self.assert_failure(
             encode_ops([
-                {"op": "ci", "config": config_v9(1), "now": 0,
+                {"op": "ci", "config": config_v10(1), "now": 0,
                  "base": "0" * 64},
             ]),
             2, "INPUT",
@@ -815,23 +826,23 @@ class ConfigDigestTest(unittest.TestCase):
     def test_ci_three_key_form_any_order(self):
         # 原三键形式保留：仅键集匹配，键序不限。
         results = self.run_ops(
-            [{"now": 0, "op": "ci", "config": config_v9(1)}]
+            [{"now": 0, "op": "ci", "config": config_v10(1)}]
         )
         self.assertEqual(results[0], {"op": "ci", "ok": True})
 
     def test_ci_base_clock_regression_is_input(self):
         # base 形式的 now 沿用共用非递减时钟。
         ops = [
-            {"op": "ci", "config": config_v9(1), "now": 5},
-            {"op": "ci", "config": config_v9(2), "base": "0" * 64, "now": 3},
+            {"op": "ci", "config": config_v10(1), "now": 5},
+            {"op": "ci", "config": config_v10(2), "base": "0" * 64, "now": 3},
         ]
         self.assert_failure(encode_ops(ops), 2, "INPUT")
 
     def test_ci_base_failure_rolls_back_batch(self):
         # base 不等的 ci 失败：整批无 stdout，前面成功的 ci 也不落任何状态。
         ops = [
-            {"op": "ci", "config": config_v9(1), "now": 0},
-            {"op": "ci", "config": config_v9(2), "base": "0" * 64, "now": 1},
+            {"op": "ci", "config": config_v10(1), "now": 0},
+            {"op": "ci", "config": config_v10(2), "base": "0" * 64, "now": 1},
         ]
         self.assert_failure(encode_ops(ops), 4, "STATE")
 
@@ -840,7 +851,7 @@ class ConfigDigestTest(unittest.TestCase):
         digest = results[0]["digest"]
         ops = [
             {"op": "ct"},
-            {"op": "ci", "config": config_v9(1), "base": digest, "now": 0},
+            {"op": "ci", "config": config_v10(1), "base": digest, "now": 0},
             {"op": "ct"},
         ]
         raw = encode_ops(ops)
@@ -860,14 +871,14 @@ class ConfigDigestTest(unittest.TestCase):
         for bad in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
             self.assert_failure(
                 encode_ops([
-                    {"op": "ci", "config": config_v9(1), "base": digest,
+                    {"op": "ci", "config": config_v10(1), "base": digest,
                      "now": bad},
                 ]),
                 2, "INPUT",
             )
         # 上界 10^9 本身合法。
         results = self.run_ops([
-            {"op": "ci", "config": config_v9(1), "base": digest,
+            {"op": "ci", "config": config_v10(1), "base": digest,
              "now": 10 ** 9},
         ])
         self.assertEqual(results[0], {"op": "ci", "ok": True})
@@ -875,8 +886,8 @@ class ConfigDigestTest(unittest.TestCase):
     def test_ci_base_bad_now_rolls_back_batch(self):
         # base 形式 now 非法：整批无 stdout，前面成功的 ci 也不落状态。
         ops = [
-            {"op": "ci", "config": config_v9(1), "now": 0},
-            {"op": "ci", "config": config_v9(2), "base": "0" * 64,
+            {"op": "ci", "config": config_v10(1), "now": 0},
+            {"op": "ci", "config": config_v10(2), "base": "0" * 64,
              "now": 10 ** 9 + 1},
         ]
         self.assert_failure(encode_ops(ops), 2, "INPUT")
@@ -884,7 +895,7 @@ class ConfigDigestTest(unittest.TestCase):
     def test_ci_three_key_now_still_unbounded(self):
         # 原三键形式的 now 无上界（仅非负非 bool 整数），行为不变。
         results = self.run_ops(
-            [{"op": "ci", "config": config_v9(1), "now": 10 ** 9 + 5}]
+            [{"op": "ci", "config": config_v10(1), "now": 10 ** 9 + 5}]
         )
         self.assertEqual(results[0], {"op": "ci", "ok": True})
 
@@ -922,8 +933,8 @@ class ConfigDiffTest(unittest.TestCase):
         }
 
     def make_config(self, backends, **overrides):
-        # 以最小 v9 配置为底，整体替换 backends。
-        config = config_v9(1, **overrides)
+        # 以最小 v10 配置为底，整体替换 backends。
+        config = config_v10(1, **overrides)
         config["backends"] = list(backends)
         return config
 
@@ -942,7 +953,7 @@ class ConfigDiffTest(unittest.TestCase):
         self.assertEqual(result["op"], "cd")
         # base 即同批 ct 对空配置的指纹；target 为候选规范化配置的指纹。
         self.assertEqual(result["base"], results[0]["digest"])
-        empty = config_v9(1)
+        empty = config_v10(1)
         empty["backends"] = []
         self.assertEqual(result["base"], digest_of(empty))
         self.assertEqual(result["target"], digest_of(self.make_config(
@@ -1122,8 +1133,8 @@ class ConfigDiffTest(unittest.TestCase):
         }
         results = self.run_ops([{"op": "cd", "config": config_v1, "now": 0}])
         result = results[0]
-        # target 为规范化 v9 配置（endpoint=null、queue 默认 F/T）的指纹。
-        normalized = config_v9(2)
+        # target 为规范化 v10 配置（endpoint=null、queue 默认 F/T）的指纹。
+        normalized = config_v10(2)
         self.assertEqual(result["target"], digest_of(normalized))
         self.assertEqual(result["added"], ["a"])
 
@@ -1148,9 +1159,9 @@ class ConfigDiffTest(unittest.TestCase):
             )
 
     def test_cd_invalid_config_is_input(self):
-        bad_version = config_v9(1)
+        bad_version = config_v10(1)
         bad_version["version"] = 8
-        missing = config_v9(1)
+        missing = config_v10(1)
         del missing["scheduler"]
         for bad in (bad_version, missing, {"version": 9}, []):
             self.assert_failure(
@@ -1161,14 +1172,14 @@ class ConfigDiffTest(unittest.TestCase):
     def test_cd_bad_now_is_input(self):
         for bad in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
             self.assert_failure(
-                encode_ops([{"op": "cd", "config": config_v9(1), "now": bad}]),
+                encode_ops([{"op": "cd", "config": config_v10(1), "now": bad}]),
                 2, "INPUT",
             )
 
     def test_cd_now_boundary_values_are_ok(self):
         results = self.run_ops([
-            {"op": "cd", "config": config_v9(1), "now": 0},
-            {"op": "cd", "config": config_v9(2), "now": 10 ** 9},
+            {"op": "cd", "config": config_v10(1), "now": 0},
+            {"op": "cd", "config": config_v10(2), "now": 10 ** 9},
         ])
         self.assertEqual(len(results), 2)
 
@@ -1176,24 +1187,24 @@ class ConfigDiffTest(unittest.TestCase):
         # 精确键序 op,config,now：乱序、多键、缺键均 INPUT。
         self.assert_failure(
             encode_ops(
-                [{"op": "cd", "now": 0, "config": config_v9(1)}]
+                [{"op": "cd", "now": 0, "config": config_v10(1)}]
             ),
             2, "INPUT",
         )
         self.assert_failure(
             encode_ops(
-                [{"config": config_v9(1), "op": "cd", "now": 0}]
+                [{"config": config_v10(1), "op": "cd", "now": 0}]
             ),
             2, "INPUT",
         )
         self.assert_failure(
             encode_ops(
-                [{"op": "cd", "config": config_v9(1), "now": 0, "x": 1}]
+                [{"op": "cd", "config": config_v10(1), "now": 0, "x": 1}]
             ),
             2, "INPUT",
         )
         self.assert_failure(
-            encode_ops([{"op": "cd", "config": config_v9(1)}]),
+            encode_ops([{"op": "cd", "config": config_v10(1)}]),
             2, "INPUT",
         )
 
@@ -1201,21 +1212,21 @@ class ConfigDiffTest(unittest.TestCase):
         # 时钟倒退 INPUT/2；相等 now 合法。
         self.assert_failure(
             encode_ops([
-                {"op": "cd", "config": config_v9(1), "now": 10},
-                {"op": "cd", "config": config_v9(2), "now": 5},
+                {"op": "cd", "config": config_v10(1), "now": 10},
+                {"op": "cd", "config": config_v10(2), "now": 5},
             ]),
             2, "INPUT",
         )
         results = self.run_ops([
-            {"op": "cd", "config": config_v9(1), "now": 10},
-            {"op": "cd", "config": config_v9(2), "now": 10},
+            {"op": "cd", "config": config_v10(1), "now": 10},
+            {"op": "cd", "config": config_v10(2), "now": 10},
         ])
         self.assertEqual(len(results), 2)
         # cd 成功推进共用时钟：其后旧时刻的其他操作报倒退。
         self.assert_failure(
             encode_ops([
-                {"op": "cd", "config": config_v9(1), "now": 10},
-                {"op": "cv", "config": config_v9(2), "now": 9},
+                {"op": "cd", "config": config_v10(1), "now": 10},
+                {"op": "cv", "config": config_v10(2), "now": 9},
             ]),
             2, "INPUT",
         )
@@ -1223,9 +1234,9 @@ class ConfigDiffTest(unittest.TestCase):
     def test_cd_failure_rolls_back_batch(self):
         # 批内靠后的 cd 失败：整批无 stdout，前面成功的 ci 也不落任何状态。
         ops = [
-            {"op": "ci", "config": config_v9(1), "now": 0},
-            {"op": "cd", "config": config_v9(2), "now": 1},
-            {"op": "cd", "config": config_v9(3), "now": "x"},
+            {"op": "ci", "config": config_v10(1), "now": 0},
+            {"op": "cd", "config": config_v10(2), "now": 1},
+            {"op": "cd", "config": config_v10(3), "now": "x"},
         ]
         self.assert_failure(encode_ops(ops), 2, "INPUT")
 
@@ -1269,26 +1280,26 @@ class PolicyDiffTest(unittest.TestCase):
         return {"op": "pd", "config": config, "now": now}
 
     def test_pd_result_shape_and_digests(self):
-        results = self.run_ops([{"op": "ct"}, self.pd(config_v9(1))])
+        results = self.run_ops([{"op": "ct"}, self.pd(config_v10(1))])
         result = results[1]
         # 精确结果键序 op,base,target,changes。
         self.assertEqual(list(result), ["op", "base", "target", "changes"])
         self.assertEqual(result["op"], "pd")
         # base 即同批 ct 对当前（空）配置的指纹；target 为候选规范化指纹。
         self.assertEqual(result["base"], results[0]["digest"])
-        empty = config_v9(1)
+        empty = config_v10(1)
         empty["backends"] = []
         self.assertEqual(result["base"], digest_of(empty))
-        self.assertEqual(result["target"], digest_of(config_v9(1)))
+        self.assertEqual(result["target"], digest_of(config_v10(1)))
         self.assertRegex(result["target"], r"^[0-9a-f]{64}$")
         # 仅 backends 不同：changes 为空。
         self.assertEqual(result["changes"], [])
 
     def test_pd_identical_config_is_empty_diff(self):
         results = self.run_ops([
-            {"op": "ci", "config": config_v9(2), "now": 0},
+            {"op": "ci", "config": config_v10(2), "now": 0},
             {"op": "ct"},
-            self.pd(config_v9(2), now=1),
+            self.pd(config_v10(2), now=1),
         ])
         result = results[2]
         self.assertEqual(result["base"], result["target"])
@@ -1299,7 +1310,7 @@ class PolicyDiffTest(unittest.TestCase):
         # 候选同时改 vnodes/limits/overload/sticky/idle/backpressure/
         # scheduler/faults/quotas/queue：changes 按固定节序列出，与配置
         # 内登记先后无关；项键序 section,before,after。
-        candidate = config_v9(
+        candidate = config_v10(
             1,
             faults=[{"id": "a", "k": "D", "a": 0, "z": 10, "v": 0}],
             quotas=[{"scope": "C", "id": "c", "limit": 5, "span": 60}],
@@ -1363,9 +1374,9 @@ class PolicyDiffTest(unittest.TestCase):
     def test_pd_before_reflects_current_config(self):
         # before 取自当前 ce 配置（含运行期 qp/rp 修改后的登记值）。
         ops = [
-            {"op": "ci", "config": config_v9(1, vnodes=32), "now": 0},
+            {"op": "ci", "config": config_v10(1, vnodes=32), "now": 0},
             {"op": "qp", "mode": "S"},
-            self.pd(config_v9(1, vnodes=32), now=1),
+            self.pd(config_v10(1, vnodes=32), now=1),
         ]
         results = self.run_ops(ops)
         changes = results[-1]["changes"]
@@ -1381,8 +1392,8 @@ class PolicyDiffTest(unittest.TestCase):
     def test_pd_backends_only_change_is_empty_changes(self):
         # 仅 backends 变化（含增删与字段变更）：changes 为空，base/target
         # 仍为两份完整配置的指纹。
-        current = config_v9(1)
-        candidate = config_v9(9)
+        current = config_v10(1)
+        candidate = config_v10(9)
         candidate["backends"].append(
             {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
              "circuit": None, "drain": None, "endpoint": None}
@@ -1399,11 +1410,11 @@ class PolicyDiffTest(unittest.TestCase):
     def test_pd_does_not_apply_or_commit(self):
         # pd 后 ce 仍为原配置、cl 无提交；再次 pd 看到的仍是旧现状。
         ops = [
-            {"op": "ci", "config": config_v9(1), "now": 0},
-            self.pd(config_v9(1, vnodes=64), now=1),
+            {"op": "ci", "config": config_v10(1), "now": 0},
+            self.pd(config_v10(1, vnodes=64), now=1),
             {"op": "ce"},
             {"op": "cl"},
-            self.pd(config_v9(1, vnodes=64), now=2),
+            self.pd(config_v10(1, vnodes=64), now=2),
         ]
         results = self.run_ops(ops)
         self.assertIsNone(results[2]["config"]["vnodes"])
@@ -1420,7 +1431,7 @@ class PolicyDiffTest(unittest.TestCase):
         ops = [
             {"op": "add", "id": "a", "weight": 1},
             {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
-            self.pd(config_v9(1, vnodes=8), now=1),
+            self.pd(config_v10(1, vnodes=8), now=1),
         ]
         results = self.run_ops(ops)
         self.assertEqual(
@@ -1437,7 +1448,7 @@ class PolicyDiffTest(unittest.TestCase):
                 "op": "oa", "cid": "z", "flow": self.FLOW, "c": "k",
                 "s": "k", "key": "k", "now": 0,
             },
-            self.pd(config_v9(1, idle={"ttl": 5}), now=1),
+            self.pd(config_v10(1, idle={"ttl": 5}), now=1),
         ]
         results = self.run_ops(ops)
         # chash/os 的登记值随 ce 导出，与候选差异一并按节序列出。
@@ -1465,18 +1476,18 @@ class PolicyDiffTest(unittest.TestCase):
         }
         results = self.run_ops([self.pd(config_v1)])
         result = results[0]
-        self.assertEqual(result["target"], digest_of(config_v9(2)))
+        self.assertEqual(result["target"], digest_of(config_v10(2)))
         self.assertEqual(result["changes"], [])
 
     def test_pd_unknown_backend_references_are_backend(self):
         # 错误类型与优先级同 cv：B 限流、B 配额、faults 引用未知候选后端。
-        bad_limit = config_v9(
+        bad_limit = config_v10(
             1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}]
         )
-        bad_quota = config_v9(
+        bad_quota = config_v10(
             1, quotas=[{"scope": "B", "id": "ghost", "limit": 1, "span": 1}]
         )
-        bad_fault = config_v9(
+        bad_fault = config_v10(
             1, faults=[{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}]
         )
         for bad in (bad_limit, bad_quota, bad_fault):
@@ -1486,9 +1497,9 @@ class PolicyDiffTest(unittest.TestCase):
             )
 
     def test_pd_invalid_config_is_input(self):
-        bad_version = config_v9(1)
+        bad_version = config_v10(1)
         bad_version["version"] = 8
-        missing = config_v9(1)
+        missing = config_v10(1)
         del missing["scheduler"]
         for bad in (bad_version, missing, {"version": 9}, []):
             self.assert_failure(
@@ -1499,33 +1510,33 @@ class PolicyDiffTest(unittest.TestCase):
     def test_pd_bad_now_is_input(self):
         for bad in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
             self.assert_failure(
-                encode_ops([self.pd(config_v9(1), now=bad)]),
+                encode_ops([self.pd(config_v10(1), now=bad)]),
                 2, "INPUT",
             )
 
     def test_pd_now_boundary_values_are_ok(self):
         results = self.run_ops([
-            self.pd(config_v9(1), now=0),
-            self.pd(config_v9(2), now=10 ** 9),
+            self.pd(config_v10(1), now=0),
+            self.pd(config_v10(2), now=10 ** 9),
         ])
         self.assertEqual(len(results), 2)
 
     def test_pd_exact_key_order(self):
         # 精确键序 op,config,now：乱序、多键、缺键均 INPUT。
         self.assert_failure(
-            encode_ops([{"op": "pd", "now": 0, "config": config_v9(1)}]),
+            encode_ops([{"op": "pd", "now": 0, "config": config_v10(1)}]),
             2, "INPUT",
         )
         self.assert_failure(
-            encode_ops([{"config": config_v9(1), "op": "pd", "now": 0}]),
+            encode_ops([{"config": config_v10(1), "op": "pd", "now": 0}]),
             2, "INPUT",
         )
         self.assert_failure(
-            encode_ops([{"op": "pd", "config": config_v9(1), "now": 0, "x": 1}]),
+            encode_ops([{"op": "pd", "config": config_v10(1), "now": 0, "x": 1}]),
             2, "INPUT",
         )
         self.assert_failure(
-            encode_ops([{"op": "pd", "config": config_v9(1)}]),
+            encode_ops([{"op": "pd", "config": config_v10(1)}]),
             2, "INPUT",
         )
 
@@ -1533,21 +1544,21 @@ class PolicyDiffTest(unittest.TestCase):
         # 时钟倒退 INPUT/2；相等 now 合法。
         self.assert_failure(
             encode_ops([
-                self.pd(config_v9(1), now=10),
-                self.pd(config_v9(2), now=5),
+                self.pd(config_v10(1), now=10),
+                self.pd(config_v10(2), now=5),
             ]),
             2, "INPUT",
         )
         results = self.run_ops([
-            self.pd(config_v9(1), now=10),
-            self.pd(config_v9(2), now=10),
+            self.pd(config_v10(1), now=10),
+            self.pd(config_v10(2), now=10),
         ])
         self.assertEqual(len(results), 2)
         # pd 成功推进共用时钟：其后旧时刻的其他操作报倒退。
         self.assert_failure(
             encode_ops([
-                self.pd(config_v9(1), now=10),
-                {"op": "cv", "config": config_v9(2), "now": 9},
+                self.pd(config_v10(1), now=10),
+                {"op": "cv", "config": config_v10(2), "now": 9},
             ]),
             2, "INPUT",
         )
@@ -1555,16 +1566,16 @@ class PolicyDiffTest(unittest.TestCase):
     def test_pd_failure_rolls_back_batch(self):
         # 批内靠后的 pd 失败：整批无 stdout，前面成功的 ci 也不落任何状态。
         ops = [
-            {"op": "ci", "config": config_v9(1), "now": 0},
-            self.pd(config_v9(2), now=1),
-            self.pd(config_v9(3), now="x"),
+            {"op": "ci", "config": config_v10(1), "now": 0},
+            self.pd(config_v10(2), now=1),
+            self.pd(config_v10(3), now="x"),
         ]
         self.assert_failure(encode_ops(ops), 2, "INPUT")
 
     def test_record_replay_covers_pd(self):
         ops = [
-            {"op": "ci", "config": config_v9(1), "now": 0},
-            self.pd(config_v9(1, vnodes=16, scheduler={"pick": "R"}), now=1),
+            {"op": "ci", "config": config_v10(1), "now": 0},
+            self.pd(config_v10(1, vnodes=16, scheduler={"pick": "R"}), now=1),
             {"op": "ct"},
         ]
         raw = encode_ops(ops)
@@ -1596,7 +1607,7 @@ class PolicyDiffTest(unittest.TestCase):
     def seg(self, backend="a", k="D", a=0, z=10, v=0):
         return {"id": backend, "k": k, "a": a, "z": z, "v": v}
 
-    def test_ce_exports_v9_with_faults_quotas_and_queue_last(self):
+    def test_ce_exports_v10_with_faults_quotas_queue_and_capacities_last(self):
         results = self.run_ops([{"op": "add", "id": "a", "weight": 1},
                                 {"op": "ce"}])
         config = results[-1]["config"]
@@ -1604,14 +1615,17 @@ class PolicyDiffTest(unittest.TestCase):
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue"],
+             "queue", "capacities"],
         )
-        self.assertEqual(config["version"], 9)
+        self.assertEqual(config["version"], 10)
         self.assertEqual(config["faults"], [])
         self.assertEqual(config["quotas"], [])
         # queue 精确键序 dequeue,full，默认 F/T；不含 evicted、last。
         self.assertEqual(list(config["queue"]), ["dequeue", "full"])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
+        # capacities 末置、默认为空 []（无 pc 覆盖）。
+        self.assertEqual(list(config)[-1], "capacities")
+        self.assertEqual(config["capacities"], [])
 
     def test_ci_loads_faults_observed_by_fq(self):
         # 乱序提交（段与后端），ce/fq 按后端加入序、段 a 升序规范化。
@@ -1865,7 +1879,7 @@ class PolicyDiffTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
         # ce 输出逐字节固定键序、紧凑、单换行。
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":9', run_stdout)
+        self.assertIn(b'"version":10', run_stdout)
 
 
 class FaultTimelineTest(unittest.TestCase):
@@ -2597,19 +2611,20 @@ class QuotaWindowTest(unittest.TestCase):
             {"op": "ce"},
         ]
         results = self.run_ops(ops)
-        # ce 导出 version=9：精确十二键，queue 末置；v1..v7 热加载视
-        # quotas=[]、queue 为默认 F/T，故 quotas 为空。
+        # ce 导出 version=10：精确十三键，capacities 末置；v1..v7 热加载视
+        # quotas=[]、queue 为默认 F/T、capacities 为空，故 quotas 为空。
         self.assertEqual(
             list(results[4]["config"]),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue"],
+             "queue", "capacities"],
         )
-        self.assertEqual(results[4]["config"]["version"], 9)
+        self.assertEqual(results[4]["config"]["version"], 10)
         self.assertEqual(results[4]["config"]["quotas"], [])
         self.assertEqual(
             results[4]["config"]["queue"], {"dequeue": "F", "full": "T"}
         )
+        self.assertEqual(results[4]["config"]["capacities"], [])
         # ci（v7）成功后配额已清空。
         self.assert_failure(
             self.base_ops() + [
@@ -2688,13 +2703,15 @@ class QuotaHotReloadTest(unittest.TestCase):
             {"op": "ce"},
         ])
         config = results[-1]["config"]
-        self.assertEqual(config["version"], 9)
-        # queue 末置、键序 dequeue,full，默认 F/T。
+        self.assertEqual(config["version"], 10)
+        # capacities 末置、键序 id,cap，默认空 []。
         self.assertEqual(list(config), [
             "version", "backends", "vnodes", "limits", "overload", "sticky",
             "idle", "backpressure", "scheduler", "faults", "quotas", "queue",
+            "capacities",
         ])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
+        self.assertEqual(config["capacities"], [])
         # 按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；项键序
         # scope,id,limit,span，不含 window、used。
         self.assertEqual(
@@ -2870,10 +2887,10 @@ class QuotaHotReloadTest(unittest.TestCase):
         self.assertEqual(
             commits[2]["config"]["quotas"], [self.quota("C", "c", 5, 10)]
         )
-        self.assertEqual(commits[2]["config"]["version"], 9)
-        # cl/cb 快照一律规范化为 version=9，queue 默认 F/T。
+        self.assertEqual(commits[2]["config"]["version"], 10)
+        # cl/cb 快照一律规范化为 version=10，queue 默认 F/T、capacities 空。
         for commit in commits:
-            self.assertEqual(commit["config"]["version"], 9)
+            self.assertEqual(commit["config"]["version"], 10)
             self.assertEqual(
                 commit["config"]["queue"], {"dequeue": "F", "full": "T"}
             )
@@ -2898,7 +2915,7 @@ class QuotaHotReloadTest(unittest.TestCase):
             (run_code, run_stdout, run_stderr),
         )
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":9', run_stdout)
+        self.assertIn(b'"version":10', run_stdout)
         self.assertIn(b'"quotas":[{', run_stdout)
 
     @staticmethod
@@ -2945,7 +2962,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
 
     def config(self, dequeue="F", full="T", cap=10, q=4, ttl=1000,
                limits=(), vnodes=1):
-        return config_v9(
+        return config_v10(
             1,
             quotas=(),
             dequeue=dequeue,
@@ -2957,7 +2974,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
 
     # ---- 导出与默认 ----
 
-    def test_ce_twelve_keys_queue_last_with_default_ft(self):
+    def test_ce_thirteen_keys_capacities_last_with_default_ft(self):
         results = self.run_ops([
             {"op": "ci", "config": config_v8(1), "now": 0},
             {"op": "ce"},
@@ -2967,11 +2984,12 @@ class V9QueueHotReloadTest(unittest.TestCase):
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue"],
+             "queue", "capacities"],
         )
-        self.assertEqual(config["version"], 9)
+        self.assertEqual(config["version"], 10)
         self.assertEqual(list(config["queue"]), ["dequeue", "full"])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
+        self.assertEqual(config["capacities"], [])
 
     def test_v1_through_v8_default_to_ft(self):
         be7 = [{
@@ -3011,7 +3029,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
                 {"dequeue": "F", "full": "T"},
                 version,
             )
-            self.assertEqual(results[1]["config"]["version"], 9)
+            self.assertEqual(results[1]["config"]["version"], 10)
 
     def test_v9_loads_and_exports_sh(self):
         cfg = self.config(dequeue="S", full="H")
@@ -3042,7 +3060,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
             None, [], "S", 3,
         ]
         for bad in bad_queues:
-            cfg = config_v9(1)
+            cfg = config_v10(1)
             cfg["queue"] = bad
             self.assert_failure(
                 encode_ops([{"op": "ci", "config": cfg, "now": 0}]),
@@ -3057,16 +3075,16 @@ class V9QueueHotReloadTest(unittest.TestCase):
             encode_ops([{"op": "ci", "config": missing, "now": 0}]),
             2, "INPUT",
         )
-        # version=8 含 queue（十二键）。
-        extra = config_v9(1)
+        # version=8 含 queue、capacities（十三键）。
+        extra = config_v10(1)
         extra["version"] = 8
         self.assert_failure(
             encode_ops([{"op": "ci", "config": extra, "now": 0}]),
             2, "INPUT",
         )
-        # version 字段非法（字符串、越界、bool）。
-        for bad_version in ("9", 0, 10, True):
-            cfg = config_v9(1)
+        # version 字段非法（字符串、越界、bool）；10 现为合法版本号。
+        for bad_version in ("10", 0, 11, True):
+            cfg = config_v10(1)
             cfg["version"] = bad_version
             self.assert_failure(
                 encode_ops([{"op": "ci", "config": cfg, "now": 0}]),
@@ -3189,7 +3207,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
             {"op": "ci", "config": cfg, "now": 0}, {"op": "cl"},
         ])
         commit = results[1]["commits"][0]["config"]
-        self.assertEqual(commit["version"], 9)
+        self.assertEqual(commit["version"], 10)
         self.assertEqual(commit["queue"], {"dequeue": "S", "full": "H"})
 
     def test_post_commit_qp_rp_change_does_not_mutate_commit(self):
@@ -3254,7 +3272,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
         # 两个快照均规范化为 v9 且均携带恢复后的 S/H。
         self.assertEqual(len(commits), 2)
         for commit in commits:
-            self.assertEqual(commit["config"]["version"], 9)
+            self.assertEqual(commit["config"]["version"], 10)
             self.assertEqual(
                 commit["config"]["queue"], {"dequeue": "S", "full": "H"}
             )
@@ -3262,7 +3280,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
     # ---- STATE/4 ----
 
     def test_active_connection_blocks_ci_and_cb(self):
-        cfg = config_v9(1)
+        cfg = config_v10(1)
         for terminal in ("ci", "cb"):
             ops = [
                 {"op": "ci", "config": cfg, "now": 0},
@@ -3293,7 +3311,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
         # 整批无 stdout、错误 STATE，中间 rev 与策略变更均不落盘（进程级
         # 原子回滚，与既有 ci 失败语义一致）。
         cfg = self.config(dequeue="S", full="H")
-        same = config_v9(1)
+        same = config_v10(1)
         code, out, err = run_balancer(
             "run",
             encode_ops([
@@ -3329,8 +3347,563 @@ class V9QueueHotReloadTest(unittest.TestCase):
         )
         # 单换行、紧凑、固定键序。
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":9', run_stdout)
+        self.assertIn(b'"version":10', run_stdout)
         self.assertIn(b'"queue":{"dequeue":"S","full":"H"}', run_stdout)
+
+
+def v10_backend(bid, weight=1):
+    return {
+        "id": bid, "weight": weight, "d": 0, "fail": 3, "success": 2,
+        "circuit": None, "drain": None, "endpoint": None,
+    }
+
+
+class V10CapacitiesHotReloadTest(unittest.TestCase):
+    """version=10 capacities：每后端接纳容量覆盖纳入配置与热加载/回滚。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def two_backend_config(self, capacities=(), **overrides):
+        return config_v10(
+            1,
+            capacities=list(capacities),
+            **dict(overrides, backends=[v10_backend("a"), v10_backend("b")])
+        )
+
+    # ---- 导出与规范化 ----
+
+    def test_ce_exports_capacities_last_empty_by_default(self):
+        # 初始空配置：capacities 末置为空 []。
+        results = self.run_ops([{"op": "ce"}])
+        config = results[0]["config"]
+        self.assertEqual(config["version"], 10)
+        self.assertEqual(list(config)[-1], "capacities")
+        self.assertEqual(config["capacities"], [])
+
+    def test_ci_loads_and_ce_exports_capacities_in_backend_order(self):
+        # 输入顺序不限：乱序提交按后端加入序（a 在 b 前）输出，仅列显式项。
+        cfg = self.two_backend_config(
+            capacities=[{"id": "b", "cap": 5}, {"id": "a", "cap": 2}]
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0}, {"op": "ce"},
+        ])
+        config = results[1]["config"]
+        self.assertEqual(
+            list(config),
+            ["version", "backends", "vnodes", "limits", "overload", "sticky",
+             "idle", "backpressure", "scheduler", "faults", "quotas",
+             "queue", "capacities"],
+        )
+        self.assertEqual(
+            config["capacities"],
+            [{"id": "a", "cap": 2}, {"id": "b", "cap": 5}],
+        )
+        for item in config["capacities"]:
+            self.assertEqual(list(item), ["id", "cap"])
+
+    def test_capacity_boundary_values_ok(self):
+        cfg = self.two_backend_config(
+            capacities=[{"id": "a", "cap": 1}, {"id": "b", "cap": 10 ** 6}]
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0}, {"op": "ce"},
+        ])
+        self.assertEqual(
+            results[1]["config"]["capacities"],
+            [{"id": "a", "cap": 1}, {"id": "b", "cap": 10 ** 6}],
+        )
+
+    def test_only_explicit_overrides_listed(self):
+        # 未列入 capacities 的后端不输出覆盖，pg 判 STATE。
+        cfg = self.two_backend_config(capacities=[{"id": "b", "cap": 5}])
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "pg", "id": "b"},
+        ])
+        self.assertEqual(
+            results[1],
+            {"op": "pg", "id": "b", "cap": 5, "connections": 0, "available": 5},
+        )
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": cfg, "now": 0},
+                {"op": "pg", "id": "a"},
+            ]),
+            4, "STATE",
+        )
+
+    def test_cv_normalizes_to_v10_without_applying(self):
+        cfg = self.two_backend_config(
+            capacities=[{"id": "b", "cap": 9}, {"id": "a", "cap": 3}]
+        )
+        results = self.run_ops([{"op": "cv", "config": cfg, "now": 0}])
+        result = results[0]
+        self.assertEqual(result["applicable"], True)
+        self.assertEqual(
+            result["config"]["capacities"],
+            [{"id": "a", "cap": 3}, {"id": "b", "cap": 9}],
+        )
+        self.assertEqual(result["config"]["version"], 10)
+        # cv 不应用：ce 仍为空。
+        results = self.run_ops([{"op": "cv", "config": cfg, "now": 0},
+                                {"op": "ce"}])
+        self.assertEqual(results[1]["config"]["capacities"], [])
+
+    def test_utf8_ids_sorted_by_backend_order(self):
+        cfg = config_v10(
+            1,
+            capacities=[{"id": "Ω", "cap": 2}, {"id": "a", "cap": 1}],
+            backends=[v10_backend("a"), v10_backend("Ω")],
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0}, {"op": "ce"},
+        ])
+        self.assertEqual(
+            results[1]["config"]["capacities"],
+            [{"id": "a", "cap": 1}, {"id": "Ω", "cap": 2}],
+        )
+
+    # ---- 覆盖实际生效 ----
+
+    def test_loaded_capacity_drives_admission(self):
+        # overload.cap=4，但 capacities 把唯一后端覆盖为 1：第 2 个连接到达
+        # 容量即排队（vnodes=1 使 ci 后即可经一致性环路由）。
+        cfg = config_v10(
+            1,
+            vnodes=1,
+            capacities=[{"id": "a", "cap": 1}],
+            overload={"cap": 4, "q": 4, "ttl": 100},
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "open", "cid": "c1", "flow": self.FLOW, "now": 0},
+            {"op": "oa", "cid": "c2", "flow": self.FLOW, "c": "k",
+             "s": "k", "key": "k", "now": 0},
+        ])
+        self.assertEqual(results[2]["state"], "Q")
+
+    # ---- 非法结构 INPUT/2 ----
+
+    def test_capacities_container_and_items_are_input(self):
+        item_cases = [
+            [{"id": "a", "cap": "1"}],  # cap 类型
+            [{"id": "a", "cap": 1.0}],
+            [{"id": "a", "cap": 0}],    # 下界
+            [{"id": "a", "cap": 10 ** 6 + 1}],  # 上界
+            [{"id": "a", "cap": True}],          # bool
+            [{"id": "a", "cap": None}],
+            [{"id": 1, "cap": 1}],      # id 类型
+            [{"id": "", "cap": 1}],     # id 空串
+            [{"cap": 1, "id": "a"}],    # 项键序反
+            [{"id": "a"}],              # 缺 cap
+            [{"cap": 1}],               # 缺 id
+            [{"id": "a", "cap": 1, "x": 0}],  # 多项
+            [{"id": "a", "cap": 1}, {"id": "a", "cap": 2}],  # 重复 id
+        ]
+        for bad in item_cases:
+            self.assert_failure(
+                encode_ops([
+                    {"op": "ci", "config": config_v10(1, capacities=bad),
+                     "now": 0},
+                ]),
+                2, "INPUT",
+            )
+        # 非数组容器：dict/None/字符串/整数，整体替换 capacities 字段。
+        for bad in ({}, None, "x", 1):
+            cfg = config_v10(1)
+            cfg["capacities"] = bad
+            self.assert_failure(
+                encode_ops([{"op": "ci", "config": cfg, "now": 0}]),
+                2, "INPUT",
+            )
+
+    def test_capacities_id_not_utf8_encodable_is_input(self):
+        # 孤立代理无法 UTF-8 编码：INPUT。
+        raw = (
+            b'{"ops":[{"op":"ci","now":0,"config":{'
+            b'"version":10,'
+            b'"backends":[{"id":"a","weight":1,"d":0,"fail":3,"success":2,'
+            b'"circuit":null,"drain":null,"endpoint":null}],'
+            b'"vnodes":null,"limits":[],"overload":null,'
+            b'"sticky":null,"idle":null,"backpressure":null,'
+            b'"scheduler":{"pick":"W"},"faults":[],"quotas":[],'
+            b'"queue":{"dequeue":"F","full":"T"},'
+            b'"capacities":[{"id":"\\ud800","cap":1}]'
+            b'}}]}'
+        )
+        self.assert_failure(raw, 2, "INPUT")
+
+    def test_top_level_capacities_order_and_keyset_are_input(self):
+        # v10 缺 capacities（十二键）。
+        missing = config_v9_input(1)
+        missing["version"] = 10
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": missing, "now": 0}]),
+            2, "INPUT",
+        )
+        # v9 含 capacities（十三键）。
+        extra = config_v10(1)
+        extra["version"] = 9
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": extra, "now": 0}]),
+            2, "INPUT",
+        )
+        # version 字段非法：字符串、越界 11、bool。
+        for bad in ("10", 11, False):
+            cfg = config_v10(1)
+            cfg["version"] = bad
+            self.assert_failure(
+                encode_ops([{"op": "ci", "config": cfg, "now": 0}]),
+                2, "INPUT",
+            )
+
+    def test_capacities_before_queue_is_input(self):
+        raw = (
+            b'{"ops":[{"op":"ci","now":0,"config":{'
+            b'"version":10,'
+            b'"backends":[{"id":"a","weight":1,"d":0,"fail":3,"success":2,'
+            b'"circuit":null,"drain":null,"endpoint":null}],'
+            b'"vnodes":null,"limits":[],"overload":null,'
+            b'"sticky":null,"idle":null,"backpressure":null,'
+            b'"scheduler":{"pick":"W"},"faults":[],"quotas":[],'
+            b'"capacities":[],"queue":{"dequeue":"F","full":"T"}'
+            b'}}]}'
+        )
+        self.assert_failure(raw, 2, "INPUT")
+
+    def test_inner_capacity_key_swap_is_input(self):
+        raw = (
+            b'{"ops":[{"op":"ci","now":0,"config":{'
+            b'"version":10,'
+            b'"backends":[{"id":"a","weight":1,"d":0,"fail":3,"success":2,'
+            b'"circuit":null,"drain":null,"endpoint":null}],'
+            b'"vnodes":null,"limits":[],"overload":null,'
+            b'"sticky":null,"idle":null,"backpressure":null,'
+            b'"scheduler":{"pick":"W"},"faults":[],"quotas":[],'
+            b'"queue":{"dequeue":"F","full":"T"},'
+            b'"capacities":[{"cap":1,"id":"a"}]'
+            b'}}]}'
+        )
+        self.assert_failure(raw, 2, "INPUT")
+
+    # ---- 未知 id：BACKEND/3 ----
+
+    def test_unknown_capacity_id_is_backend_for_all_preview_ops(self):
+        cfg = config_v10(1, capacities=[{"id": "ghost", "cap": 1}])
+        for opname in ("ci", "cv", "cd", "pd"):
+            self.assert_failure(
+                encode_ops([{"op": opname, "config": cfg, "now": 0}]),
+                3, "BACKEND",
+            )
+        cfg_hd = config_v10(
+            1, capacities=[{"id": "ghost", "cap": 1}], vnodes=4
+        )
+        self.assert_failure(
+            encode_ops([{"op": "hd", "config": cfg_hd, "keys": ["k"],
+                         "now": 0}]),
+            3, "BACKEND",
+        )
+
+    def test_input_precedes_backend(self):
+        # 未知 id 但 cap 非法：仍判 INPUT。
+        cfg = config_v10(1, capacities=[{"id": "ghost", "cap": 0}])
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": cfg, "now": 0}]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "pd", "config": cfg, "now": 0}]),
+            2, "INPUT",
+        )
+
+    def test_backend_precedes_state(self):
+        # 活动连接存在时未知 id 仍报 BACKEND（先于活动连接 STATE）。
+        cfg_bad = config_v10(1, capacities=[{"id": "ghost", "cap": 1}])
+        ops = [
+            {"op": "ci", "config": config_v10(1), "now": 0},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+            {"op": "ci", "config": cfg_bad, "now": 2},
+        ]
+        self.assert_failure(encode_ops(ops), 3, "BACKEND")
+
+    # ---- 活动连接/排队：STATE/4 ----
+
+    def test_active_connection_or_queue_blocks_ci(self):
+        cfg = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        ops = [
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+            {"op": "ci", "config": cfg, "now": 2},
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+        queued = config_v10(
+            1, capacities=[{"id": "a", "cap": 1}],
+            overload={"cap": 1, "q": 2, "ttl": 10},
+        )
+        ops = [
+            {"op": "ci", "config": queued, "now": 0},
+            {"op": "open", "cid": "c1", "flow": self.FLOW, "now": 0},
+            {"op": "oa", "cid": "c2", "flow": self.FLOW, "c": "k",
+             "s": "k", "key": "k", "now": 0},
+            {"op": "ci", "config": queued, "now": 1},
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    # ---- 原子替换、旧版清空、cb 恢复、pc 隔离 ----
+
+    def test_atomic_replace_drops_unlisted_overrides(self):
+        first = self.two_backend_config(
+            capacities=[{"id": "a", "cap": 2}, {"id": "b", "cap": 7}]
+        )
+        # 第二次仅覆盖 a：b 的旧覆盖必须消失。
+        second = self.two_backend_config(capacities=[{"id": "a", "cap": 3}])
+        results = self.run_ops([
+            {"op": "ci", "config": first, "now": 0},
+            {"op": "ci", "config": second, "now": 1},
+            {"op": "pg", "id": "a"},
+        ])
+        self.assertEqual(results[2]["cap"], 3)
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": first, "now": 0},
+                {"op": "ci", "config": second, "now": 1},
+                {"op": "pg", "id": "b"},
+            ]),
+            4, "STATE",
+        )
+
+    def test_legacy_versions_clear_overrides(self):
+        with_override = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        v1_config = {
+            "version": 1,
+            "backends": [{
+                "id": "a", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                "circuit": None, "drain": None,
+            }],
+            "vnodes": None, "limits": [], "overload": None,
+        }
+        legacy_configs = [
+            v1_config,
+            config_v6(1), config_v7(1), config_v8(1), config_v9_input(1),
+        ]
+        for cfg in legacy_configs:
+            with self.subTest(version=cfg["version"]):
+                ops = [
+                    {"op": "ci", "config": with_override, "now": 0},
+                    {"op": "ci", "config": cfg, "now": 1},
+                    {"op": "pg", "id": "a"},
+                ]
+                self.assert_failure(encode_ops(ops), 4, "STATE")
+        # 显式空 capacities 同样清空。
+        ops = [
+            {"op": "ci", "config": with_override, "now": 0},
+            {"op": "ci", "config": config_v10(1, capacities=[]), "now": 1},
+            {"op": "pg", "id": "a"},
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_cb_restores_overrides_and_new_snapshot_is_v10(self):
+        first = self.two_backend_config(
+            capacities=[{"id": "a", "cap": 2}, {"id": "b", "cap": 7}]
+        )
+        empty = self.two_backend_config(capacities=[])
+        results = self.run_ops([
+            {"op": "ci", "config": first, "now": 0},   # rev 1
+            {"op": "ci", "config": empty, "now": 1},   # rev 2 清空
+            {"op": "cb", "rev": 1, "now": 2},          # rev 3 恢复
+            {"op": "pg", "id": "a"},
+            {"op": "pg", "id": "b"},
+            {"op": "cl"},
+            {"op": "ce"},
+        ])
+        self.assertEqual(
+            results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
+        )
+        self.assertEqual(results[3]["cap"], 2)
+        self.assertEqual(results[4]["cap"], 7)
+        commits = results[5]["commits"]
+        self.assertEqual(commits[0]["config"]["capacities"],
+                         [{"id": "a", "cap": 2}, {"id": "b", "cap": 7}])
+        self.assertEqual(commits[1]["config"]["capacities"], [])
+        self.assertEqual(commits[2]["config"]["capacities"],
+                         [{"id": "a", "cap": 2}, {"id": "b", "cap": 7}])
+        for commit in commits:
+            self.assertEqual(commit["config"]["version"], 10)
+        self.assertEqual(
+            results[6]["config"]["capacities"],
+            [{"id": "a", "cap": 2}, {"id": "b", "cap": 7}],
+        )
+
+    def test_cb_to_empty_snapshot_clears_overrides(self):
+        with_override = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        empty = config_v10(1, capacities=[])
+        ops = [
+            {"op": "ci", "config": with_override, "now": 0},
+            {"op": "ci", "config": empty, "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},  # 回滚到有覆盖快照后……
+            {"op": "cb", "rev": 2, "now": 3},  # ……再回到空快照。
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[3]["rev"], 4)
+        # 第二次 cb 已清空覆盖：再 pg 判 STATE。
+        self.assert_failure(
+            encode_ops(ops + [{"op": "pg", "id": "a"}]),
+            4, "STATE",
+        )
+
+    def test_pc_after_ci_changes_only_current_ce(self):
+        cfg = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "pc", "id": "a", "cap": 99},
+            {"op": "cl"},
+            {"op": "ce"},
+            {"op": "pg", "id": "a"},
+        ])
+        # 提交快照仍为 cap=2，当前 ce 与 pg 为 cap=99。
+        self.assertEqual(
+            results[2]["commits"][0]["config"]["capacities"],
+            [{"id": "a", "cap": 2}],
+        )
+        self.assertEqual(
+            results[3]["config"]["capacities"], [{"id": "a", "cap": 99}]
+        )
+        self.assertEqual(results[4]["cap"], 99)
+
+    # ---- ct 摘要与 pd differences ----
+
+    def test_ct_digest_changes_with_capacities(self):
+        one = config_v10(1, capacities=[{"id": "a", "cap": 1}])
+        two = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        results = self.run_ops([
+            {"op": "ci", "config": one, "now": 0},
+            {"op": "ct"},
+            {"op": "pd", "config": two, "now": 1},
+        ])
+        self.assertNotEqual(results[1]["digest"], results[2]["target"])
+        self.assertEqual(results[1]["digest"], results[2]["base"])
+
+    def test_pd_capacities_section_after_queue(self):
+        current = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        candidate = config_v10(
+            1, dequeue="S", capacities=[{"id": "a", "cap": 5}]
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": current, "now": 0},
+            {"op": "pd", "config": candidate, "now": 1},
+        ])
+        sections = [item["section"] for item in results[1]["changes"]]
+        self.assertEqual(sections, ["queue", "capacities"])
+        capacities_change = results[1]["changes"][1]
+        self.assertEqual(
+            list(capacities_change), ["section", "before", "after"]
+        )
+        self.assertEqual(capacities_change["before"],
+                         [{"id": "a", "cap": 2}])
+        self.assertEqual(capacities_change["after"],
+                         [{"id": "a", "cap": 5}])
+
+    def test_pd_before_reflects_runtime_pc_overrides(self):
+        cfg = config_v10(1, capacities=[])
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "pc", "id": "a", "cap": 8},
+            {"op": "pd", "config": cfg, "now": 1},
+        ])
+        self.assertEqual(
+            results[2]["changes"],
+            [{
+                "section": "capacities",
+                "before": [{"id": "a", "cap": 8}],
+                "after": [],
+            }],
+        )
+
+    def test_pd_legacy_candidate_normalizes_capacities_empty(self):
+        # v9 候选规范化为 capacities=[]：与当前显式覆盖产生一节差异。
+        current = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        results = self.run_ops([
+            {"op": "ci", "config": current, "now": 0},
+            {"op": "pd", "config": config_v9_input(1), "now": 1},
+        ])
+        self.assertEqual(
+            results[1]["changes"],
+            [{
+                "section": "capacities",
+                "before": [{"id": "a", "cap": 2}],
+                "after": [],
+            }],
+        )
+
+    def test_pd_identical_capacities_is_empty_diff(self):
+        cfg = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "pd", "config": cfg, "now": 1},
+        ])
+        self.assertEqual(results[1]["changes"], [])
+        self.assertEqual(results[1]["base"], results[1]["target"])
+
+    # ---- 失败回滚与 record/replay ----
+
+    def test_failed_ci_rolls_back_everything(self):
+        # 先成功载入覆盖并 rev=1，随后未知 id 失败：整批无 stdout。
+        good = config_v10(1, capacities=[{"id": "a", "cap": 2}])
+        bad = config_v10(1, capacities=[{"id": "ghost", "cap": 1}])
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": good, "now": 5},
+                {"op": "ci", "config": bad, "now": 6},
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_record_replay_byte_identical(self):
+        cfg = self.two_backend_config(
+            capacities=[{"id": "b", "cap": 5}, {"id": "a", "cap": 2}]
+        )
+        empty = self.two_backend_config(capacities=[])
+        ops = [
+            {"op": "ci", "config": cfg, "now": 7},
+            {"op": "pg", "id": "b"},
+            {"op": "pc", "id": "a", "cap": 9},
+            {"op": "ce"},
+            {"op": "cl"},
+            {"op": "cb", "rev": 1, "now": 9},
+            {"op": "ci", "config": empty, "now": 10},
+            {"op": "pd", "config": cfg, "now": 11},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+        # 单换行、紧凑、固定键序：capacities 数组逐项键序 id,cap。
+        self.assertEqual(run_stdout.count(b"\n"), 1)
+        self.assertIn(
+            b'"capacities":[{"id":"a","cap":2},{"id":"b","cap":5}]',
+            run_stdout,
+        )
 
 
 class V7FaultNormalizationTest(unittest.TestCase):
@@ -5382,7 +5955,7 @@ class HashDryRunTest(unittest.TestCase):
         return item
 
     def make_config(self, ids, vnodes, backends=None, **overrides):
-        config = config_v9(1, **overrides)
+        config = config_v10(1, **overrides)
         config["backends"] = (
             list(backends)
             if backends is not None
@@ -6070,6 +6643,7 @@ class PerBackendCapOverrideTest(unittest.TestCase):
         self.assertEqual(stderr, b'{"error":"BACKEND"}\n')
 
     def ci_config(self):
+        # 旧版 version=9 输入（无 capacities）：成功即清空全部覆盖。
         return {
             "version": 9,
             "backends": [{
@@ -6082,7 +6656,7 @@ class PerBackendCapOverrideTest(unittest.TestCase):
             "queue": {"dequeue": "F", "full": "T"},
         }
 
-    def test_ci_clears_override_and_ce_does_not_export_it(self):
+    def test_ci_clears_override_and_ce_exports_it_via_capacities(self):
         ops = [
             {"op": "add", "id": "b", "weight": 1},
             {"op": "pc", "id": "b", "cap": 4},
@@ -6090,9 +6664,12 @@ class PerBackendCapOverrideTest(unittest.TestCase):
         ]
         _, out, _ = self.run_ops(ops)
         config = json.loads(out.decode("utf-8"))["results"][-1]["config"]
-        # 覆盖为纯运行态，不出现在 ce 导出。
+        # 覆盖经 capacities 末置导出（键序 id,cap），不含运行态名。
         self.assertNotIn("cap_overrides", config)
-        self.assertNotIn("pc", json.dumps(config))
+        self.assertEqual(
+            config["capacities"], [{"id": "b", "cap": 4}]
+        )
+        # 旧版（无 capacities）热加载成功：覆盖清空。
         self.assert_failure(ops + [
             {"op": "ci", "config": self.ci_config(), "now": 0},
             {"op": "pg", "id": "b"},
