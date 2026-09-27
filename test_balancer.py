@@ -5355,5 +5355,383 @@ class BrSnapshotTest(unittest.TestCase):
         )
 
 
+class HashConfigDryRunTest(unittest.TestCase):
+    """哈希配置预演 hd：当前/候选配置各建一环，忽略运行态，按 keys 原序
+    映射比较；只读、仅推进时钟。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def backend(self, bid, weight=1):
+        return {
+            "id": bid,
+            "weight": weight,
+            "d": 0,
+            "fail": 3,
+            "success": 2,
+            "circuit": None,
+            "drain": None,
+            "endpoint": None,
+        }
+
+    def make_config(self, ids, vnodes, pick="H", **overrides):
+        config = config_v9(1, **overrides)
+        config["backends"] = [self.backend(bid) for bid in ids]
+        config["vnodes"] = vnodes
+        config["scheduler"] = {"pick": pick}
+        return config
+
+    def hd(self, config, keys, now=0):
+        return {"op": "hd", "config": config, "keys": keys, "now": now}
+
+    def chash_ring(self, ids, vnodes):
+        """与实现同款的独立 chash 环（忽略运行态），返回按摘要升序的
+        (digest, backend) 列表。"""
+        tokens = []
+        for join_index, bid in enumerate(ids):
+            encoded = bid.encode("utf-8")
+            for i in range(vnodes):
+                digest = hashlib.sha256(
+                    encoded + b"\x00" + str(i).encode("ascii")
+                ).digest()
+                tokens.append(
+                    (int.from_bytes(digest, "big"), join_index, i, bid)
+                )
+        tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+        return tokens
+
+    def chash_pick(self, tokens, key):
+        digests = [token[0] for token in tokens]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash)
+        if index == len(tokens):
+            index = 0
+        return tokens[index][3]
+
+    def test_result_shape_and_digest_anchors(self):
+        current = self.make_config(["a", "b", "c"], 16)
+        candidate = self.make_config(["a", "b", "d"], 32)
+        results = self.run_ops([
+            {"op": "ci", "config": current, "now": 0},
+            {"op": "ct"},
+            self.hd(candidate, ["k1", "k2"]),
+        ])
+        result = results[2]
+        # 精确结果键序 op,base,target,cases,summary。
+        self.assertEqual(
+            list(result), ["op", "base", "target", "cases", "summary"]
+        )
+        self.assertEqual(result["op"], "hd")
+        # base 锚定同批 ct 的当前指纹，target 为候选规范化指纹。
+        self.assertEqual(result["base"], results[1]["digest"])
+        self.assertEqual(result["base"], digest_of(current))
+        self.assertEqual(result["target"], digest_of(candidate))
+        self.assertRegex(result["base"], r"^[0-9a-f]{64}$")
+        # cases 与 summary 键序固定。
+        self.assertEqual(
+            [list(case) for case in result["cases"]],
+            [["key", "before", "after", "changed"]] * 2,
+        )
+        self.assertEqual(
+            list(result["summary"]), ["total", "stable", "remapped"]
+        )
+        self.assertEqual(result["summary"]["total"], 2)
+
+    def test_mapping_follows_chash_and_key_order(self):
+        current = self.make_config(["a", "b", "c", "d"], 40)
+        candidate = self.make_config(["a", "b", "c", "e"], 80)
+        keys = ["key-%d" % i for i in range(64)] + ["key-0"]  # 末项重复
+        results = self.run_ops([
+            {"op": "ci", "config": current, "now": 0},
+            self.hd(candidate, keys, now=1),
+        ])
+        result = results[1]
+        base_ring = self.chash_ring(["a", "b", "c", "d"], 40)
+        target_ring = self.chash_ring(["a", "b", "c", "e"], 80)
+        # cases 按 keys 原序（含重复），前后落点与独立 chash 环逐一一致。
+        self.assertEqual([case["key"] for case in result["cases"]], keys)
+        stable = 0
+        for case in result["cases"]:
+            before = self.chash_pick(base_ring, case["key"])
+            after = self.chash_pick(target_ring, case["key"])
+            self.assertEqual(case["before"], before)
+            self.assertEqual(case["after"], after)
+            self.assertIsInstance(case["changed"], bool)
+            self.assertEqual(case["changed"], before != after)
+            if before == after:
+                stable += 1
+        self.assertEqual(
+            result["summary"],
+            {"total": 65, "stable": stable, "remapped": 65 - stable},
+        )
+
+    def test_identical_config_is_all_stable(self):
+        config = self.make_config(["a", "b", "c"], 64)
+        keys = ["x", "y", "z"]
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            self.hd(config, keys),
+        ])
+        result = results[1]
+        self.assertEqual(result["base"], result["target"])
+        self.assertTrue(all(not case["changed"] for case in result["cases"]))
+        self.assertEqual(
+            result["summary"], {"total": 3, "stable": 3, "remapped": 0}
+        )
+
+    def test_runtime_state_is_ignored(self):
+        # 健康（b 转 unhealthy）、熔断（a 转 O）、排空（a 经 dg 转 X）与
+        # 活动连接均不影响 hd：环仍含全部候选后端，结果与独立环一致。
+        config = self.make_config(["a", "b"], 64)
+        keys = ["k%d" % i for i in range(80)]
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 0},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 1, "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 0},
+            {"op": "ds", "id": "a", "t": 10},
+            {"op": "dr", "id": "a", "now": 0},
+            {"op": "dg", "id": "a", "now": 100},
+            self.hd(config, keys, now=101),
+        ])
+        result = results[-1]
+        ring = self.chash_ring(["a", "b"], 64)
+        targets = set()
+        for case in result["cases"]:
+            expected = self.chash_pick(ring, case["key"])
+            self.assertEqual(case["before"], expected)
+            self.assertEqual(case["after"], expected)
+            targets.add(expected)
+        # 即使 a 为熔断 O+排空 X、b 为 unhealthy，二者仍均能被哈希命中。
+        self.assertEqual(targets, {"a", "b"})
+
+    def test_sticky_mappings_are_not_read_or_written(self):
+        # hd 不读写粘性映射：先经 route 建立粘性，再以删除其目标的候选
+        # hd（仍按纯环投影），随后 route 依旧命中旧粘性。
+        config = self.make_config(["a", "b"], 64)
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "route", "key": "s"},
+            self.hd(self.make_config(["b"], 64), ["s"], now=1),
+            {"op": "route", "key": "s"},
+        ])
+        first = results[1]["backend"]
+        # hd 的候选环只有 b，after 必为 b；before 为当前环落点。
+        self.assertEqual(results[2]["cases"][0]["after"], "b")
+        # 粘性未被 hd 改动：后续 route 沿用首见目标（sticky=true、不 remap）。
+        self.assertEqual(results[3]["backend"], first)
+        self.assertTrue(results[3]["sticky"])
+        self.assertFalse(results[3]["remapped"])
+
+    def test_candidate_is_not_applied(self):
+        current = self.make_config(["a"], 16)
+        candidate = self.make_config(["a", "b"], 32)
+        results = self.run_ops([
+            {"op": "ci", "config": current, "now": 0},
+            self.hd(candidate, ["x"], now=1),
+            {"op": "ce"},
+            {"op": "ct"},
+        ])
+        # 预演后 ce/ct 仍是当前配置，候选未落盘。
+        self.assertEqual(
+            [b["id"] for b in results[2]["config"]["backends"]], ["a"]
+        )
+        self.assertEqual(results[2]["config"]["vnodes"], 16)
+        self.assertEqual(results[3]["digest"], digest_of(current))
+
+    def test_state_when_either_vnodes_null_or_backends_empty(self):
+        current_h = self.make_config(["a"], 4)
+        current_w = self.make_config(["a"], None, pick="W")
+        candidate_w = self.make_config(["a"], None, pick="W")
+        # 当前 vnodes 为 null。
+        self.assert_failure(
+            [
+                {"op": "ci", "config": current_w, "now": 0},
+                self.hd(current_h, ["x"]),
+            ],
+            4, "STATE",
+        )
+        # 候选 vnodes 为 null（W 配置本身合法）。
+        self.assert_failure(
+            [
+                {"op": "ci", "config": current_h, "now": 0},
+                self.hd(candidate_w, ["x"]),
+            ],
+            4, "STATE",
+        )
+        # 候选 backends 为空。
+        self.assert_failure(
+            [
+                {"op": "ci", "config": current_h, "now": 0},
+                self.hd(self.make_config([], 4), ["x"]),
+            ],
+            4, "STATE",
+        )
+        # 全新状态：当前 backends 为空（且 vnodes null）。
+        self.assert_failure([self.hd(current_h, ["x"])], 4, "STATE")
+
+    def test_unknown_backend_references_are_backend(self):
+        current = self.make_config(["a"], 4)
+        bad_limit = self.make_config(
+            ["a"], 4,
+            limits=[{"scope": "B", "id": "zzz", "r": 1, "b": 1}],
+        )
+        bad_quota = self.make_config(
+            ["a"], 4,
+            quotas=[{"scope": "B", "id": "zzz", "limit": 1, "span": 1}],
+        )
+        bad_fault = self.make_config(
+            ["a"], 4,
+            faults=[{"id": "qq", "k": "D", "a": 0, "z": 1, "v": 0}],
+        )
+        for bad in (bad_limit, bad_quota, bad_fault):
+            self.assert_failure(
+                [
+                    {"op": "ci", "config": current, "now": 0},
+                    self.hd(bad, ["x"]),
+                ],
+                3, "BACKEND",
+            )
+
+    def test_exact_key_order_and_input_shapes(self):
+        config = self.make_config(["a"], 4)
+        prelude = [{"op": "ci", "config": config, "now": 0}]
+        good = {"op": "hd", "config": config, "keys": ["x"], "now": 0}
+        # 乱序、缺键、多键均 INPUT。
+        for shape in (
+            {"op": "hd", "now": 0, "config": config, "keys": ["x"]},
+            {"op": "hd", "config": config, "keys": ["x"]},
+            {"op": "hd", "config": config, "now": 0},
+            {**good, "x": 1},
+        ):
+            self.assert_failure(prelude + [shape], 2, "INPUT")
+        # keys 容器与项数/元素约束。
+        for bad_keys in ([], ["k"] * 257, "", [""] , [1], [None], [True]):
+            self.assert_failure(
+                prelude + [{"op": "hd", "config": config,
+                            "keys": bad_keys, "now": 0}],
+                2, "INPUT",
+            )
+        # now 类型/范围。
+        for bad_now in (True, False, -1, 10 ** 9 + 1, "0", 1.0, None):
+            self.assert_failure(
+                prelude + [{"op": "hd", "config": config,
+                            "keys": ["x"], "now": bad_now}],
+                2, "INPUT",
+            )
+        # 非法 config（重复后端）即使不应用也 INPUT。
+        dup = self.make_config(["a"], 4)
+        dup["backends"] = dup["backends"] * 2
+        self.assert_failure(prelude + [self.hd(dup, ["x"], 1)], 2, "INPUT")
+
+    def test_now_boundaries_and_utf8_keys(self):
+        config = self.make_config(["a"], 4)
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            self.hd(config, ["héllo", "日本語", "🔑"], 0),
+            self.hd(config, ["x"], 10 ** 9),
+        ])
+        self.assertEqual(results[1]["summary"]["total"], 3)
+        self.assertEqual(
+            [case["key"] for case in results[1]["cases"]],
+            ["héllo", "日本語", "🔑"],
+        )
+
+    def test_clock_advances_only_on_success(self):
+        config = self.make_config(["a"], 4)
+        # 成功推进时钟：20 后再来 19 报 INPUT。
+        self.assert_failure(
+            [
+                {"op": "ci", "config": config, "now": 10},
+                self.hd(config, ["x"], 20),
+                self.hd(config, ["x"], 19),
+            ],
+            2, "INPUT",
+        )
+        # 同一 now 重报合法（非递减），结果不变。
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 10},
+            self.hd(config, ["x"], 20),
+            self.hd(config, ["x"], 20),
+        ])
+        self.assertEqual(results[1], results[2])
+
+    def test_failure_rolls_back_batch(self):
+        config = self.make_config(["a"], 4)
+        # 整批失败无 stdout，成功 hd 推进的时钟随批回滚：新批次从 0 起重放。
+        ops = [
+            {"op": "ci", "config": config, "now": 0},
+            self.hd(config, ["x"], 5),
+            self.hd(config, ["x"], 4),  # 时钟倒退
+        ]
+        self.assert_failure(ops, 2, "INPUT")
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            self.hd(config, ["x"], 1),
+        ])
+        self.assertEqual(results[1]["summary"]["total"], 1)
+
+    def test_result_byte_layout(self):
+        config = self.make_config(["solo"], 1)
+        raw = encode_ops([
+            {"op": "ci", "config": config, "now": 0},
+            self.hd(config, ["a", "b"]),
+        ])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        output = json.loads(out.decode("utf-8"))
+        result = output["results"][1]
+        self.assertEqual(
+            result,
+            {
+                "op": "hd",
+                "base": digest_of(config),
+                "target": digest_of(config),
+                "cases": [
+                    {"key": "a", "before": "solo",
+                     "after": "solo", "changed": False},
+                    {"key": "b", "before": "solo",
+                     "after": "solo", "changed": False},
+                ],
+                "summary": {"total": 2, "stable": 2, "remapped": 0},
+            },
+        )
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertNotIn(b"\n", out[:-1])
+
+    def test_record_replay_round_trip(self):
+        current = self.make_config(["a", "b"], 32)
+        candidate = self.make_config(["a", "c"], 64)
+        ops = [
+            {"op": "ci", "config": current, "now": 0},
+            self.hd(candidate, ["r1", "r2", "r1"], 5),
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
