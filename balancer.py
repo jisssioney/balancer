@@ -340,7 +340,15 @@ id 的 UTF-8 字节升序输出，只含登记值，不含 window、used；queue
 精确键序 {dequeue,full}：dequeue 为 "F"/"S"（ot 遇阻即停/跳过阻塞），
 full 为 "T"/"H"（队满尾拒绝/头淘汰），只含登记策略，不含等待项、
 evicted 或 last。ci 精确键集
-op,config,now，结果 op,ok=true；now 为非负非 bool 整数并纳入共用非递减
+op,config,now（原形式，键序不限），另接受精确键序 op,config,base,now
+的乐观并发形式：base 为小写 64 位十六进制串（ct 输出的配置指纹），
+格式非法判 INPUT/2；候选完成既有校验后比较 base 与操作前指纹，不等
+判 STATE/4 且先于活动连接或排队检查，相等则沿用 ci 全部成功语义。
+ct 精确键序仅 op，返回键序 op,digest：digest 为 ce.config 规范化
+version=9 对象按逐层键序序列化为 UTF-8 紧凑 JSON（非 ASCII 不转义、
+无末尾换行）后的 SHA-256 小写 64 位十六进制；ct 只读且不推进时钟，
+时空 O(N)（N 为规范化配置大小）。ci 结果 op,ok=true；now 为非负非
+bool 整数并纳入共用非递减
 时钟，亦接受 version=1 原结构（仅前五键）与 version=2 结构（追加三键），
 两者 scheduler 缺省等价于 W；version=3 同为九键但 scheduler 仅收 W/R，
 version=4 须含 scheduler 并收 W/R/L，version=5 收 W/R/L/H 且选 H 时
@@ -360,7 +368,8 @@ v5..v9 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
 重复后端/限流项/故障段/
 配额项、编码、
 交叉约束（含同 id 段重叠）或时钟倒退判
-INPUT/2，B 限流、B 配额或 faults 引用未知后端判 BACKEND/3，有活动连接或
+INPUT/2，B 限流、B 配额或 faults 引用未知后端判 BACKEND/3，base 与操作前
+指纹不等判 STATE/4，有活动连接或
 排队项
 判 STATE/4，依次判错。成功时原子替换配置并以 now 重建默认运行态（全部
 healthy、d>0
@@ -1549,6 +1558,29 @@ def export_normalized_config(config):
     }
 
 
+def config_digest(exported):
+    """ce.config 规范化 version=9 对象的指纹：按逐层键序序列化为 UTF-8
+    紧凑 JSON（非 ASCII 不转义、无末尾换行）后取 SHA-256，返回小写 64 位
+    十六进制。exported 为 export_config 产出的结构。O(N)，N 为规范化
+    配置大小。"""
+    canonical = json.dumps(
+        exported, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def parse_base(value):
+    # ci 乐观并发的 base：小写 64 位十六进制串（ct 输出的配置指纹）；
+    # 类型、长度或字符集不符判 INPUT。
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_op(raw_op):
     """校验单个操作的形状，返回规范化元组；不合格式直接 INPUT 退出。"""
     if not isinstance(raw_op, dict):
@@ -1564,7 +1596,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
-        "ce", "ci", "cl", "cb", "cv",
+        "ce", "ci", "cl", "cb", "cv", "ct",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
@@ -2280,23 +2312,36 @@ def parse_op(raw_op):
             if keys != {"op"}:
                 fail(EXIT_INPUT, "INPUT")
             return ("ce",)
-        if keys != {"op", "config", "now"}:
+        if keys == {"op", "config", "now"}:
+            # 原三键形式：仅键集匹配（键序不限），不带 base。
+            base = None
+        elif list(raw_op) == ["op", "config", "base", "now"]:
+            # 乐观并发形式：精确键序 op,config,base,now；base 须为小写
+            # 64 位十六进制串（ct 输出的配置指纹），格式非法报 INPUT。
+            base = parse_base(raw_op["base"])
+        else:
             fail(EXIT_INPUT, "INPUT")
         # now 为非负非 bool 整数，时钟倒退在执行期与其余操作同序判定。
         parse_now(raw_op["now"])
         config = parse_config(raw_op["config"])
-        return ("ci", config, raw_op["now"])
+        return ("ci", config, base, raw_op["now"])
 
     if name == "cv":
-        # 配置预检：精确键集 op,config,now；config 校验与规范化同 ci，
-        # now ∈ [0,10^9] 非 bool 整数，进入共用非递减时钟（倒退在执行期
-        # 与其余操作同序判 INPUT）。B 限流/配额与 faults 引用未知后端留
-        # 执行期判 BACKEND；不应用配置。
-        if keys != {"op", "config", "now"}:
+        # 配置预检：精确键序 op,config,now（键须按此序出现，乱序报
+        # INPUT）；config 校验与规范化同 ci，now ∈ [0,10^9] 非 bool 整数，
+        # 进入共用非递减时钟（倒退在执行期与其余操作同序判 INPUT）。B 限流/
+        # 配额与 faults 引用未知后端留执行期判 BACKEND；不应用配置。
+        if list(raw_op) != ["op", "config", "now"]:
             fail(EXIT_INPUT, "INPUT")
         parse_warm_now(raw_op["now"])
         config = parse_config(raw_op["config"])
         return ("cv", config, raw_op["now"])
+
+    if name == "ct":
+        # 配置指纹查询：精确键序仅 op，只读且不推进时钟。
+        if list(raw_op) != ["op"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ct",)
 
     if name == "cl":
         # 配置提交历史查询：精确键集仅 op，只读。
@@ -5069,8 +5114,15 @@ def run(raw):
             # 导出纯配置（登记值），不含任何运行态。
             results.append({"op": "ce", "config": export_config()})
 
+        elif op[0] == "ct":
+            # 配置指纹（只读，不推进时钟）：当前 ce.config 规范化
+            # version=9 对象的 SHA-256，键序 op,digest。
+            results.append(
+                {"op": "ct", "digest": config_digest(export_config())}
+            )
+
         elif op[0] == "ci":
-            _, config, now = op
+            _, config, base, now = op
             # B 限流、B 配额与 faults 引用未知后端：BACKEND，先于活动状态
             # 判定。
             config_backend_ids = {entry[0] for entry in config["backends"]}
@@ -5083,6 +5135,10 @@ def run(raw):
             for fault_id in config["faults"]:
                 if fault_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
+            if base is not None and base != config_digest(export_config()):
+                # 乐观并发保护：base 与操作前指纹不等即拒绝热加载，
+                # 先于活动连接或排队检查。
+                fail(EXIT_STATE, "STATE")
             # 有活动连接或排队项时拒绝热加载：STATE。
             if connections or wait_queue:
                 fail(EXIT_STATE, "STATE")

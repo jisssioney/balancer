@@ -631,6 +631,228 @@ class ConfigPrecheckTest(unittest.TestCase):
         self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
 
 
+def digest_of(config):
+    """与实现同款：逐层键序紧凑 UTF-8 JSON（非 ASCII 不转义、无末尾
+    换行）的 SHA-256 小写十六进制。"""
+    canonical = json.dumps(
+        config, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+class ConfigDigestTest(unittest.TestCase):
+    """配置指纹 ct 与 ci 乐观并发（base）、cv 键序。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def test_ct_empty_state_digest(self):
+        results = self.run_ops([{"op": "ct"}])
+        result = results[0]
+        # 结果精确键序 op,digest。
+        self.assertEqual(list(result), ["op", "digest"])
+        empty_config = config_v9(1)
+        empty_config["backends"] = []
+        self.assertEqual(result["digest"], digest_of(empty_config))
+
+    def test_ct_matches_ce_config(self):
+        # ct 指纹即同一批内 ce.config 规范化 version=9 对象的摘要。
+        ops = [
+            {"op": "add", "id": "a", "weight": 2},
+            {"op": "chash", "vnodes": 8},
+            {"op": "ss", "ttl": 100},
+            {"op": "ce"},
+            {"op": "ct"},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[4]["digest"], digest_of(results[3]["config"]))
+
+    def test_ct_read_only_and_no_clock(self):
+        # ct 不推进时钟：夹在两个 now=5 的写操作之间不引入时钟倒退；
+        # 不改变配置与提交历史。
+        results = self.run_ops([
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 5},
+            {"op": "ct"},
+            {"op": "close", "cid": "x", "now": 5},
+            {"op": "ce"},
+            {"op": "cl"},
+        ])
+        self.assertEqual(len(results[4]["config"]["backends"]), 1)
+        self.assertEqual(
+            results[5], {"op": "cl", "current": None, "commits": []}
+        )
+
+    def test_ct_exact_key_set(self):
+        self.assert_failure(
+            encode_ops([{"op": "ct", "x": 1}]), 2, "INPUT"
+        )
+
+    def test_cv_out_of_order_keys_is_input(self):
+        # cv 只接受按 op,config,now 出现的对象，乱序报 INPUT/2。
+        self.assert_failure(
+            encode_ops(
+                [{"op": "cv", "now": 0, "config": config_v9(1)}]
+            ),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops(
+                [{"config": config_v9(1), "op": "cv", "now": 0}]
+            ),
+            2, "INPUT",
+        )
+
+    def test_ci_base_success_and_output(self):
+        # ct 取指纹后 ci 携带匹配 base：沿用全部成功语义与 op,ok=true 输出。
+        results = self.run_ops([{"op": "ct"}])
+        digest = results[0]["digest"]
+        results = self.run_ops([
+            {"op": "ci", "config": config_v9(2), "base": digest, "now": 0},
+            {"op": "cl"},
+        ])
+        self.assertEqual(results[0], {"op": "ci", "ok": True})
+        self.assertEqual(results[1]["current"], 1)
+
+    def test_ci_base_stale_is_state(self):
+        # 配置变更后旧指纹即过期：同一批内第二次携带旧 base 报 STATE/4。
+        results = self.run_ops(
+            [{"op": "ci", "config": config_v9(1), "now": 0}, {"op": "ct"}]
+        )
+        digest = results[1]["digest"]
+        ops = [
+            {"op": "ci", "config": config_v9(1), "now": 0},
+            {"op": "ci", "config": config_v9(2), "base": digest, "now": 1},
+            {"op": "ci", "config": config_v9(3), "base": digest, "now": 2},
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_ci_base_mismatch_is_state(self):
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": config_v9(1), "base": "0" * 64,
+                 "now": 0},
+            ]),
+            4, "STATE",
+        )
+
+    def test_ci_base_precedes_connection_check(self):
+        # base 不等先于活动连接检查报 STATE；base 相等时活动连接仍报 STATE。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+            {"op": "ci", "config": config_v9(1), "base": "0" * 64, "now": 1},
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+        results = self.run_ops([
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+            {"op": "ct"},
+        ])
+        live_digest = results[-1]["digest"]
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+            {"op": "ci", "config": config_v9(1), "base": live_digest,
+             "now": 1},
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_ci_base_backend_precedes_state(self):
+        # 未知 B 限流引用仍报 BACKEND/3，先于 base 比较。
+        bad = config_v9(
+            1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}]
+        )
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": bad, "base": "0" * 64, "now": 0},
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_ci_base_format_is_input(self):
+        # base 须为小写 64 位十六进制串：大写、长度、字符集、类型非法均
+        # INPUT/2。
+        for bad in ("A" * 64, "0" * 63, "0" * 65, "g" * 64, 0, None, True):
+            self.assert_failure(
+                encode_ops([
+                    {"op": "ci", "config": config_v9(1), "base": bad,
+                     "now": 0},
+                ]),
+                2, "INPUT",
+            )
+
+    def test_ci_base_exact_key_order(self):
+        # 四键形式须精确按 op,config,base,now 出现，乱序报 INPUT/2。
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "base": "0" * 64, "config": config_v9(1),
+                 "now": 0},
+            ]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([
+                {"op": "ci", "config": config_v9(1), "now": 0,
+                 "base": "0" * 64},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_ci_three_key_form_any_order(self):
+        # 原三键形式保留：仅键集匹配，键序不限。
+        results = self.run_ops(
+            [{"now": 0, "op": "ci", "config": config_v9(1)}]
+        )
+        self.assertEqual(results[0], {"op": "ci", "ok": True})
+
+    def test_ci_base_clock_regression_is_input(self):
+        # base 形式的 now 沿用共用非递减时钟。
+        ops = [
+            {"op": "ci", "config": config_v9(1), "now": 5},
+            {"op": "ci", "config": config_v9(2), "base": "0" * 64, "now": 3},
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_ci_base_failure_rolls_back_batch(self):
+        # base 不等的 ci 失败：整批无 stdout，前面成功的 ci 也不落任何状态。
+        ops = [
+            {"op": "ci", "config": config_v9(1), "now": 0},
+            {"op": "ci", "config": config_v9(2), "base": "0" * 64, "now": 1},
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_record_replay_covers_ct_and_base(self):
+        results = self.run_ops([{"op": "ct"}])
+        digest = results[0]["digest"]
+        ops = [
+            {"op": "ct"},
+            {"op": "ci", "config": config_v9(1), "base": digest, "now": 0},
+            {"op": "ct"},
+        ]
+        raw = encode_ops(ops)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+
+
 class FaultHotReloadTest(unittest.TestCase):
     """version=7 faults 时间线纳入 ce/ci/cl/cb 热加载。"""
 
