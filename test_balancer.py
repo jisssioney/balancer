@@ -7335,5 +7335,356 @@ class LatencyPercentileTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class EaErrorRateAlertTest(unittest.TestCase):
+    """ea 后端错误率阈值告警：v/rate、N/A 状态机、缓存与各类拒绝。"""
+
+    def ea(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        results = json.loads(out.decode("utf-8"))["results"]
+        return [r for r in results if r["op"] == "ea"], out
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def mr(backend_id, ok, now):
+        return {"op": "mr", "id": backend_id, "ok": ok, "ms": 1,
+                "retries": 0, "remaps": 0, "now": now}
+
+    def test_v_floor_and_rate_fixed_point(self):
+        # 无请求 v=0/0.00；1/3 下截为 33.33；全错为 100.00。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ea", "id": "b", "w": 0, "hi": 10000, "lo": 0,
+             "n": 1, "now": 60},
+        ]
+        ea_results, _ = self.ea(ops)
+        self.assertEqual(ea_results[0]["requests"], 0)
+        self.assertEqual(ea_results[0]["errors"], 0)
+        self.assertEqual(ea_results[0]["rate"], "0.00")
+        self.assertEqual(ea_results[0]["state"], "N")
+        ops = [{"op": "add", "id": "b", "weight": 1}]
+        ops += [self.mr("b", True, 0), self.mr("b", True, 1),
+                self.mr("b", False, 2)]
+        ops.append({"op": "ea", "id": "b", "w": 0, "hi": 10000,
+                    "lo": 0, "n": 1, "now": 60})
+        ea_results, _ = self.ea(ops)
+        self.assertEqual(
+            (ea_results[0]["requests"], ea_results[0]["errors"],
+             ea_results[0]["rate"]),
+            (3, 1, "33.33"),
+        )
+        ops = [{"op": "add", "id": "b", "weight": 1}, self.mr("b", False, 0)]
+        ops.append({"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+                    "n": 1, "now": 60})
+        ea_results, _ = self.ea(ops)
+        self.assertEqual(ea_results[0]["rate"], "100.00")
+
+    def test_n_streak_n_to_a(self):
+        # n=3：连续三窗 v>=hi 才转 A，转换窗 run=0、changed=true。
+        ops = [{"op": "add", "id": "b", "weight": 1}]
+        for w in range(3):
+            ops.append(self.mr("b", False, w * 60))
+        for w in range(3):
+            ops.append({"op": "ea", "id": "b", "w": w, "hi": 10000,
+                        "lo": 0, "n": 3, "now": 180})
+        ea_results, _ = self.ea(ops)
+        self.assertEqual([(r["state"], r["run"], r["changed"]) for r in ea_results],
+                         [("N", 1, False), ("N", 2, False), ("A", 0, True)])
+
+    def test_direction_mismatch_resets_run(self):
+        # N 态：v>=hi 计 1，随后方向不符（v<hi）清零。
+        ops = [{"op": "add", "id": "b", "weight": 1}]
+        ops.append(self.mr("b", False, 0))          # w0 v=10000
+        ops.append(self.mr("b", True, 60))          # w1 v=0
+        ops.append(self.mr("b", False, 120))        # w2 v=10000
+        ops += [
+            {"op": "ea", "id": "b", "w": 0, "hi": 10000, "lo": 0,
+             "n": 3, "now": 180},
+            {"op": "ea", "id": "b", "w": 1, "hi": 10000, "lo": 0,
+             "n": 3, "now": 180},
+            {"op": "ea", "id": "b", "w": 2, "hi": 10000, "lo": 0,
+             "n": 3, "now": 180},
+        ]
+        ea_results, _ = self.ea(ops)
+        self.assertEqual([r["run"] for r in ea_results], [1, 0, 1])
+        self.assertTrue(all(r["state"] == "N" for r in ea_results))
+
+    def test_a_to_n_transition(self):
+        # n=1：w0 全错转 A；w1 无请求 v=0<=lo 转 N。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", False, 0),
+            {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 60},
+            {"op": "ea", "id": "b", "w": 1, "hi": 1, "lo": 0,
+             "n": 1, "now": 120},
+        ]
+        ea_results, _ = self.ea(ops)
+        self.assertEqual(
+            [(r["state"], r["run"], r["changed"]) for r in ea_results],
+            [("A", 0, True), ("N", 0, True)],
+        )
+        self.assertEqual(ea_results[1]["requests"], 0)
+
+    def test_same_window_cache_does_not_advance(self):
+        # 同窗同阈值原样返回缓存结果；之后 +1 窗按缓存时的状态（A）继续，
+        # v>lo 保持 A、run=0，证明缓存不推进状态机。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", False, 0),
+            self.mr("b", False, 60),
+            {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 120},
+            {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 120},
+            {"op": "ea", "id": "b", "w": 1, "hi": 1, "lo": 0,
+             "n": 1, "now": 120},
+        ]
+        ea_results, _ = self.ea(ops)
+        self.assertEqual(ea_results[0], ea_results[1])
+        self.assertEqual(
+            (ea_results[2]["state"], ea_results[2]["run"],
+             ea_results[2]["changed"]),
+            ("A", 0, False),
+        )
+
+    def test_result_key_order_and_trailing_newline(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 60},
+        ])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertTrue(out.endswith(b"\n") and out.count(b"\n") == 1)
+        # 结果对象键序固定为 op,id,w,state,requests,errors,rate,run,changed。
+        self.assertIn(
+            b'{"op":"ea","id":"b","w":0,"state":"N","requests":0,'
+            b'"errors":0,"rate":"0.00","run":0,"changed":false}',
+            out,
+        )
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            encode_ops([{"op": "ea", "id": "x", "w": 0, "hi": 1,
+                         "lo": 0, "n": 1, "now": 60}]),
+            3, "BACKEND",
+        )
+
+    def test_window_bounds_are_state(self):
+        # w==now//60：窗未结束。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+                 "n": 1, "now": 59},
+            ]),
+            4, "STATE",
+        )
+        # w 早于 max(0,now//60-59)。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+                 "n": 1, "now": 3600},
+            ]),
+            4, "STATE",
+        )
+
+    def test_skip_and_backtrack_window_are_state(self):
+        base = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 60},
+        ]
+        # 跳窗：上次评 w0，本次 w2。
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "ea", "id": "b", "w": 2, "hi": 1, "lo": 0,
+                 "n": 1, "now": 180},
+            ]),
+            4, "STATE",
+        )
+        # 回退窗：首评 w2（首评接受保留窗内任意窗），再评 w1 即 STATE；
+        # now 保持非递减，故不是时钟 INPUT。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "ea", "id": "b", "w": 2, "hi": 1, "lo": 0,
+                 "n": 1, "now": 180},
+                {"op": "ea", "id": "b", "w": 1, "hi": 1, "lo": 0,
+                 "n": 1, "now": 190},
+            ]),
+            4, "STATE",
+        )
+        # 同窗缓存不推进时钟；缓存后 now 倒退仍报 INPUT。
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+                 "n": 1, "now": 120},
+                {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+                 "n": 1, "now": 119},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_threshold_change_is_state(self):
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+                 "n": 1, "now": 60},
+                {"op": "ea", "id": "b", "w": 1, "hi": 2, "lo": 0,
+                 "n": 1, "now": 120},
+            ]),
+            4, "STATE",
+        )
+
+    def test_key_order_type_and_range_inputs(self):
+        # 键序错乱。
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"ea","id":"b","w":0,"n":1,"hi":1,"lo":0,"now":60}]}',
+            2, "INPUT",
+        )
+        # 多键/缺键。
+        self.assert_failure(
+            encode_ops([{"op": "ea", "id": "b", "w": 0, "hi": 1,
+                         "lo": 0, "n": 1, "now": 60, "x": 1}]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "ea", "id": "b", "w": 0, "hi": 1,
+                         "lo": 0, "n": 1}]),
+            2, "INPUT",
+        )
+        for bad in (
+            {"w": True}, {"hi": True}, {"lo": False}, {"n": True},
+            {"now": True},
+            {"w": -1}, {"w": 10 ** 9 + 1},
+            {"hi": 0}, {"hi": 10001},
+            {"lo": -1}, {"lo": 10000},
+            {"n": 0}, {"n": 61},
+            {"now": -1}, {"now": 10 ** 9 + 1},
+        ):
+            fields = {"op": "ea", "id": "b", "w": 0, "hi": 1,
+                      "lo": 0, "n": 1, "now": 60}
+            fields.update(bad)
+            self.assert_failure(
+                encode_ops([fields]), 2, "INPUT",
+            )
+        # lo==hi 非法（lo<hi）。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "ea", "id": "b", "w": 0, "hi": 5, "lo": 5,
+                 "n": 1, "now": 60},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_clock_regression_is_input(self):
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "mg", "id": "b", "now": 120},
+                {"op": "ea", "id": "b", "w": 1, "hi": 1, "lo": 0,
+                 "n": 1, "now": 119},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_remove_and_readd_clears_alert(self):
+        # w0 转 A；remove 后同 id 重加，w1 首评重新固化并自 N 起评。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", False, 0),
+            {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 60},
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", False, 60),
+            {"op": "ea", "id": "b", "w": 1, "hi": 5000, "lo": 0,
+             "n": 2, "now": 120},
+        ]
+        ea_results, _ = self.ea(ops)
+        self.assertEqual(
+            (ea_results[0]["state"], ea_results[0]["changed"]),
+            ("A", True),
+        )
+        # 重加后按全新首评处理：阈值可重新固化（5000），自 N 起评。
+        self.assertEqual(
+            (ea_results[1]["state"], ea_results[1]["run"],
+             ea_results[1]["changed"]),
+            ("N", 1, False),
+        )
+
+    def test_ci_clears_alert(self):
+        config = config_v6(1)
+        config["backends"][0]["id"] = "b"
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", False, 0),
+            {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 60},
+            {"op": "ci", "config": config, "now": 120},
+            # ci 后告警已清：w1 重新首评，空窗 v=0 自 N 起评。
+            {"op": "ea", "id": "b", "w": 1, "hi": 1, "lo": 0,
+             "n": 1, "now": 180},
+        ]
+        ea_results, _ = self.ea(ops)
+        self.assertEqual(ea_results[0]["state"], "A")
+        self.assertEqual(
+            (ea_results[1]["state"], ea_results[1]["run"],
+             ea_results[1]["changed"], ea_results[1]["requests"]),
+            ("N", 0, False, 0),
+        )
+
+    def test_per_backend_state_is_independent(self):
+        # 两后端独立状态机：b 在 w0 转 A，c 同窗空请求仍为 N。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            self.mr("b", False, 0),
+            {"op": "ea", "id": "b", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 60},
+            {"op": "ea", "id": "c", "w": 0, "hi": 1, "lo": 0,
+             "n": 1, "now": 60},
+        ]
+        ea_results, _ = self.ea(ops)
+        self.assertEqual(
+            [(r["id"], r["state"], r["changed"]) for r in ea_results],
+            [("b", "A", True), ("c", "N", False)],
+        )
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 0),
+            self.mr("b", False, 59),
+            {"op": "ea", "id": "b", "w": 0, "hi": 5000, "lo": 1000,
+             "n": 1, "now": 120},
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+
 if __name__ == "__main__":
     unittest.main()

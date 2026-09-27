@@ -674,6 +674,20 @@ INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4。ci 成功清空告警现
 态与历史，失败回滚；remove 及同 id 重加不清历史，仅影响后续 fe 的
 v；批内失败回滚事件。fe 记账 O(1)，ah 时间 O(60)、空间 O(60)。
 
+后端错误率阈值告警：ea 精确键序 op,id,w,hi,lo,n,now（键须按此序出现），
+id 沿用后端标识，w/now 为 [0,10^9] 非 bool 整数，hi ∈ [1,10000]、
+0≤lo≤9999 且 lo<hi、n ∈ [1,60] 均非 bool 整数；now 纳入共用非递减
+时钟，并须 max(0,now//60-59)≤w<now//60。取 w 窗 mh 同款 requests、
+errors；无请求则 v=0，否则 v=floor(10000*errors/requests)，rate 为
+v/100 的两位定点串。初始 N：连续 n 窗 v≥hi 转 A，A 连续 n 窗 v≤lo
+转 N；run 记连续数，方向不符及转换后清 0。首评固化 hi/lo/n；以后 w
+只准原值或 +1，同窗同阈值返缓存且不推进。结果键序
+op,id,w,state,requests,errors,rate,run,changed；changed 仅转换时
+true，否则 false。非法键序/类型/范围/关系或时钟倒退→INPUT/2；未知
+id→BACKEND/3；窗口越界、跳窗或变阈值→STATE/4。重加、ci/cb 成功清
+告警；失败批回滚，record/replay 逐字节覆盖。ea 时间 O(1)、额外空间
+O(B)，仅标准库。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -1777,6 +1791,7 @@ def parse_op(raw_op):
         "br",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
+        "ea",
         "ts", "tk", "tg", "tx",
         "ep", "fw",
         "ru",
@@ -2486,6 +2501,42 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("ah", start, end, now)
 
+    if name == "ea":
+        # 后端错误率阈值告警：精确键序 op,id,w,hi,lo,n,now（键须按此序
+        # 出现）；id 沿用后端标识；w/now ∈ [0,10^9]，hi ∈ [1,10000]，
+        # lo ∈ [0,9999] 且 lo<hi，n ∈ [1,60]，均非 bool 整数；now 纳入
+        # 共用非递减时钟；窗未结束/越界、跳窗或变阈值的 STATE 留执行期判
+        # （未知 id 先 BACKEND）。
+        if list(raw_op) != ["op", "id", "w", "hi", "lo", "n", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        backend_id = parse_backend_id(raw_op["id"])
+        w = parse_metric_num(raw_op["w"])
+        hi = raw_op["hi"]
+        # bool 是 int 的子类，必须显式排除。
+        if (
+            not isinstance(hi, int)
+            or isinstance(hi, bool)
+            or not 1 <= hi <= 10000
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        lo = raw_op["lo"]
+        if (
+            not isinstance(lo, int)
+            or isinstance(lo, bool)
+            or not 0 <= lo <= 9999
+            or not lo < hi
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        n = raw_op["n"]
+        if (
+            not isinstance(n, int)
+            or isinstance(n, bool)
+            or not 1 <= n <= 60
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("ea", backend_id, w, hi, lo, n,
+                parse_metric_num(raw_op["now"]))
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -2840,6 +2891,12 @@ def run(raw):
     # 同窗重报不推进状态机，自然不重复追加；remove 及同 id 重加不影响
     # （仅改变后续 fe 的 v），ci 成功清空。
     alert_events = deque()
+    # 后端错误率阈值告警（ea）：以后端 id 为键，仅现存后端持有（remove 即
+    # 删、重加从零，ci/cb 成功清空）。值为 {"hi","lo","n","state","run",
+    # "w","result"}——(hi,lo,n) 为首评固化的阈值，state ∈ N/A，run 为当前
+    # 连续计数，w 为最近已评窗，result 为该窗结果（同窗重报原样返回，不
+    # 推进状态机与时钟）。ea 只读 mr 的 metrics 分钟历史。
+    err_alerts = {}
     # 配置提交历史（cl/cb）：(rev, 规范化 version=10 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
@@ -3653,6 +3710,7 @@ def run(raw):
         nonlocal sticky_map, alert, alert_events, overload_hist
         nonlocal mo_seq, mo_cache, queue_mode
         nonlocal full_mode, evict_count, evict_last, cap_overrides
+        nonlocal err_alerts
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -3801,6 +3859,8 @@ def run(raw):
         # ci 成功清除全池故障告警状态（fe 回到未首评）与转换历史。
         alert = None
         alert_events = deque()
+        # ci/cb 成功清除各后端错误率告警（ea 全部回到未首评）。
+        err_alerts = {}
         # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
@@ -3817,6 +3877,7 @@ def run(raw):
             "ms", "mx", "rh", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
+            "ea",
             "ru",
         ):
             now = op[-1]
@@ -3961,6 +4022,8 @@ def run(raw):
             del backends[backend_id]
             buckets.pop(("B", backend_id), None)
             quotas.pop(("B", backend_id), None)
+            # remove 删除该后端错误率告警；同 id 重加不继承，首评重新固化。
+            err_alerts.pop(backend_id, None)
             # remove 删除接纳容量覆盖；同 id 重加不继承（cap_overrides 以现存
             # 后端为键，新记录无覆盖）。
             cap_overrides.pop(backend_id, None)
@@ -6303,6 +6366,99 @@ def run(raw):
                 if start <= event["window"] <= end
             ]
             results.append({"op": "ah", "events": events})
+
+        elif op[0] == "ea":
+            # 后端错误率阈值告警：首评固化 (hi,lo,n) 并自 N 态起评；此后
+            # 阈值须相同且 w 仅同前（同窗原样返回首评结果，不推进状态机）
+            # 或 +1，变阈值或跳窗（含回退）报 STATE。w 窗须已结束且在度量
+            # 保留窗内；未知 id 先判 BACKEND。取该后端 w 窗 mr 记账的
+            # requests/errors：无请求 v=0，否则 v=floor(10000*errors/
+            # requests)，rate 为 v/100 的两位定点串。N 态连续 n 窗 v>=hi
+            # 转 A，A 态连续 n 窗 v<=lo 转 N，方向不符连续数归零；转换时
+            # changed=true 且 run 归零。返回键序
+            # op,id,w,state,requests,errors,rate,run,changed。
+            _, backend_id, w, hi, lo, n, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if w >= current or w < max(0, current - 59):
+                # 窗未结束（含未来窗），或已超出最近 60 窗的保留下界。
+                fail(EXIT_STATE, "STATE")
+            ea_state = err_alerts.get(backend_id)
+            if ea_state is not None:
+                if (hi, lo, n) != (
+                    ea_state["hi"], ea_state["lo"], ea_state["n"]
+                ):
+                    # 变阈值。
+                    fail(EXIT_STATE, "STATE")
+                if w == ea_state["w"]:
+                    # 同窗重报：原样返回首评结果，不推进状态机。
+                    results.append(dict(ea_state["result"]))
+                    continue
+                if w != ea_state["w"] + 1:
+                    # 跳窗（含回退）。
+                    fail(EXIT_STATE, "STATE")
+            metrics = record["metrics"].get(w)
+            if metrics is None:
+                # 空窗（从未 mr）：requests/errors 均为 0，v=0、rate 0.00。
+                requests = errors = 0
+            else:
+                requests = metrics[0]
+                errors = metrics[1]
+            if requests == 0:
+                v = 0
+            else:
+                v = errors * 10000 // requests
+            # v/100 两位定点串：v<=10000，形如 0.00..100.00。
+            rate = "%d.%02d" % divmod(v, 100)
+            if ea_state is None:
+                state = "N"
+                run_count = 0
+            else:
+                state = ea_state["state"]
+                run_count = ea_state["run"]
+            changed = False
+            if state == "N":
+                if v >= hi:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "A"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符：连续数清 0。
+                    run_count = 0
+            else:
+                if v <= lo:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "N"
+                        run_count = 0
+                        changed = True
+                else:
+                    run_count = 0
+            result = {
+                "op": "ea",
+                "id": backend_id,
+                "w": w,
+                "state": state,
+                "requests": requests,
+                "errors": errors,
+                "rate": rate,
+                "run": run_count,
+                "changed": changed,
+            }
+            err_alerts[backend_id] = {
+                "hi": hi,
+                "lo": lo,
+                "n": n,
+                "state": state,
+                "run": run_count,
+                "w": w,
+                "result": dict(result),
+            }
+            results.append(result)
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
