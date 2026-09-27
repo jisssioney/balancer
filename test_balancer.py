@@ -6708,5 +6708,232 @@ class PerBackendCapOverrideTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class LatencyPercentileTest(unittest.TestCase):
+    """lp 后端延迟分位查询：分桶汇总、rank 定位与各类拒绝。"""
+
+    def lp(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        results = json.loads(out.decode("utf-8"))["results"]
+        return results, out
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def test_bucket_boundaries_and_percentiles(self):
+        # 边界 ms：1 落桶 0、10 落桶 1、100 落桶 2、1000 落桶 3、1001 桶 4。
+        ops = [{"op": "add", "id": "b", "weight": 1}]
+        for ms in (0, 1, 10, 100, 1000, 1001):
+            ops.append(
+                {"op": "mr", "id": "b", "ok": True, "ms": ms,
+                 "retries": 0, "remaps": 0, "now": 0}
+            )
+        for p, bucket, upper in (
+            (1, 0, 1), (34, 1, 10), (51, 2, 100), (67, 3, 1000),
+            (84, 4, None), (100, 4, None),
+        ):
+            ops.append(
+                {"op": "lp", "id": "b", "from": 0, "to": 0, "p": p, "now": 0}
+            )
+        results, _ = self.lp(ops)
+        lp_results = [r for r in results if r["op"] == "lp"]
+        self.assertEqual(
+            [r["buckets"] for r in lp_results],
+            [[2, 1, 1, 1, 1]] * 6,
+        )
+        for result, bucket, upper in zip(lp_results, (0, 1, 2, 3, 4, 4),
+                                         (1, 10, 100, 1000, None, None)):
+            self.assertEqual(result["samples"], 6)
+            self.assertEqual(result["bucket"], bucket)
+            self.assertEqual(result["upper"], upper)
+            self.assertEqual(
+                result["rank"],
+                -(-result["p"] * 6 // 100),  # ceil(p*6/100)
+            )
+
+    def test_empty_window_is_nulls(self):
+        results, _ = self.lp([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "lp", "id": "b", "from": 0, "to": 0, "p": 1, "now": 0},
+        ])
+        self.assertEqual(
+            results[-1],
+            {
+                "op": "lp", "id": "b", "from": 0, "to": 0, "p": 1,
+                "samples": 0, "buckets": [0, 0, 0, 0, 0], "rank": 0,
+                "bucket": None, "upper": None,
+            },
+        )
+
+    def test_multi_window_aggregation(self):
+        # w0：桶 0 两个；w1：桶 4 三个；跨窗汇总后 p=50 落桶 4。
+        ops = [{"op": "add", "id": "b", "weight": 1}]
+        for ms, now in ((0, 0), (1, 59), (1001, 60), (2000, 90), (99999, 119)):
+            ops.append(
+                {"op": "mr", "id": "b", "ok": True, "ms": ms,
+                 "retries": 0, "remaps": 0, "now": now}
+            )
+        ops.append(
+            {"op": "lp", "id": "b", "from": 0, "to": 1, "p": 50, "now": 119}
+        )
+        results, _ = self.lp(ops)
+        self.assertEqual(
+            results[-1],
+            {
+                "op": "lp", "id": "b", "from": 0, "to": 1, "p": 50,
+                "samples": 5, "buckets": [2, 0, 0, 0, 3], "rank": 3,
+                "bucket": 4, "upper": None,
+            },
+        )
+
+    def test_read_only_does_not_change_metrics(self):
+        # lp 前后的 mh 必须逐字一致。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "mr", "id": "b", "ok": True, "ms": 5,
+             "retries": 0, "remaps": 0, "now": 0},
+            {"op": "mh", "id": "b", "from": 0, "to": 0, "now": 0},
+            {"op": "lp", "id": "b", "from": 0, "to": 0, "p": 99, "now": 0},
+            {"op": "mh", "id": "b", "from": 0, "to": 0, "now": 0},
+        ]
+        results, _ = self.lp(ops)
+        mh_results = [r for r in results if r["op"] == "mh"]
+        self.assertEqual(mh_results[0], mh_results[1])
+
+    def test_compact_key_order_and_single_newline(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "mr", "id": "b", "ok": True, "ms": 5,
+             "retries": 0, "remaps": 0, "now": 0},
+            {"op": "lp", "id": "b", "from": 0, "to": 0, "p": 50, "now": 0},
+        ])
+        _, out, _ = run_balancer("run", raw)
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+        result = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(
+            list(result),
+            ["op", "id", "from", "to", "p", "samples", "buckets",
+             "rank", "bucket", "upper"],
+        )
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "lp", "id": "z", "from": 0, "to": 0,
+                 "p": 1, "now": 0},
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_unknown_id_precedes_state(self):
+        self.assert_failure(
+            encode_ops([
+                {"op": "lp", "id": "z", "from": 0, "to": 59,
+                 "p": 1, "now": 3600},
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_premature_from_is_state(self):
+        # now=3600 时当前窗为 60、下界为 1；from=0 过早。
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"lp","id":"b","from":0,"to":59,'
+            b'"p":1,"now":3600}]}',
+            4, "STATE",
+        )
+
+    def test_from_boundary_accepted(self):
+        results, _ = self.lp([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "lp", "id": "b", "from": 1, "to": 60, "p": 1, "now": 3600},
+        ])
+        self.assertEqual(results[-1]["samples"], 0)
+
+    def test_key_order_and_shape_rejections(self):
+        # 键序须为 op,id,from,to,p,now：p/now 倒置非法。
+        self.assert_failure(
+            b'{"ops":[{"op":"lp","id":"b","from":0,"to":0,'
+            b'"now":0,"p":1}]}',
+            2, "INPUT",
+        )
+        # 缺键 / 多键。
+        self.assert_failure(
+            b'{"ops":[{"op":"lp","id":"b","from":0,"to":0,"now":0}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"lp","id":"b","from":0,"to":0,"p":1,'
+            b'"now":0,"x":1}]}',
+            2, "INPUT",
+        )
+
+    def test_p_range_and_type(self):
+        for bad_p in (b"0", b"101", b"true", b"1.5", b'"1"', b"-1"):
+            self.assert_failure(
+                b'{"ops":[{"op":"add","id":"b","weight":1},'
+                b'{"op":"lp","id":"b","from":0,"to":0,"p":'
+                + bad_p + b',"now":0}]}',
+                2, "INPUT",
+            )
+
+    def test_window_relations(self):
+        # from>to、to>now//60、to-from>=60 均为 INPUT。
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"lp","id":"b","from":1,"to":0,"p":1,"now":60}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"lp","id":"b","from":0,"to":1,"p":1,"now":59}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"lp","id":"b","from":0,"to":60,"p":1,"now":3600}]}',
+            2, "INPUT",
+        )
+
+    def test_clock_regression_is_input(self):
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "mg", "id": "b", "now": 100},
+                {"op": "lp", "id": "b", "from": 1, "to": 1,
+                 "p": 1, "now": 60},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "mr", "id": "b", "ok": True, "ms": 1,
+             "retries": 0, "remaps": 0, "now": 0},
+            {"op": "mr", "id": "b", "ok": False, "ms": 5000,
+             "retries": 2, "remaps": 1, "now": 30},
+            {"op": "lp", "id": "b", "from": 0, "to": 0, "p": 90, "now": 59},
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+
 if __name__ == "__main__":
     unittest.main()
