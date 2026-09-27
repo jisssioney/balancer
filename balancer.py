@@ -152,6 +152,19 @@ admitted 按原 FIFO 顺序，各项使用同一 ot.now，前项扣减对后项�
 修改仅影响当前 ce，不改已存提交快照；record/replay 逐字节覆盖。
 S 模式 ot 时间 O(qBV log(BV))、额外空间 O(q)。
 
+每后端接纳容量覆盖：pc 精确键序 op,id,cap（键须按此序出现），id 须现存，
+cap 为 1..10^6 非 bool 整数；同值幂等、异值覆盖，返回键序 op,ok（ok=true）。
+调低上限不关闭既有连接、不改 FIFO 项，连接释放后自然恢复。pg 精确键序
+op,id（键须按此序出现），id 须现存且已配置覆盖；返回键序
+op,id,cap,connections,available：connections 为活动连接数，
+available=max(cap-connections,0)，均为整数。pc/pg 不携带 now、不要求已
+os。oa/ot 接纳与 oi/od/oq 投影判 capacity 时，已配 pc 的后端取其 cap，
+否则取 os.cap；达到上限按各操作既有阻塞、排队、跳过与输出语义处理。
+remove 删除覆盖，同 id 重加不继承；ci/cb 成功清空覆盖；覆盖为运行态，
+不随 ce/ci 导出。pc/pg 键序、类型或范围非法报 INPUT/2，未知 id 报
+BACKEND/3，pg 未配置报 STATE/4，按此顺序判定；失败批回滚全部状态。
+pc/pg 及新增容量判定均 O(1)，额外空间 O(B)。
+
 FIFO 满载策略：rp 精确键序 op,mode（键须按此序出现），mode 仅 T/H：T 为
 队满尾拒绝（默认，即既有 OVERLOAD/7 行为），H 为队满头淘汰；同值幂等，
 返回键序 op,ok（ok=true）。rg 键序仅 op，只读，返回键序
@@ -179,7 +192,8 @@ expires=入队 now+os.ttl，expired 为 bool，blocked 为字符串数组。到�
 入队三项成本对当前环、粘性、桶和配额作只读投影（各项独立从当前真实桶/
 配额投影，前项不影响后项，不读写粘性映射）：环内无合格后端取 null、
 false、["R"]，否则 backend 为投影目标，blocked 按 C、T、Q 序列出连接达
-os.cap、按 now 只读补充后任一令牌桶令牌不足、推进固定窗后任一配额
+该后端生效容量（pc 覆盖或 os.cap）、按 now 只读补充后任一令牌桶令牌不足、
+推进固定窗后任一配额
 used+成本>limit，无阻塞为 []。oq 除推进时钟外不改任何状态，失败批回滚；
 环为全项共用的当前快照仅构建一次，时间 O(qBVlog(BV))、额外空间
 O(q+BV)，仅用标准库；JSON、record/replay 逐字节契约与旧操作行为不变。
@@ -260,8 +274,8 @@ fault,none 的非负整数计数对象，removed=null 的样本计入 none。mx 
 不可用原因分钟历史：按 window=now//60 记账，各后端只保留最近 60 窗，
 空窗不预建。probe 使 healthy 转 unhealthy 时该后端 health 加 1；dr 使 A
 转 D/X 时 drain 加 1；cr 使 C/H 转 O 时 circuit 加 1；oa 返回 Q 且所选
-后端 conns≥os.cap 时该后端 overload 加 1（同次过载与其它原因重叠只记
-overload 一次）。重报（probe/cr 幂等重报、D/X 再 dr）与无状态转换一律
+后端 conns 达到其生效容量（pc 覆盖或 os.cap）时该后端 overload 加 1
+（同次过载与其它原因重叠只记 overload 一次）。重报（probe/cr 幂等重报、D/X 再 dr）与无状态转换一律
 不记；oa 报 OVERLOAD/7（P 态背压或队满尾拒绝）回滚整批且不记。各计数
 封顶 10^18。rh 精确键序 op,id,from,to,now；from/to/now 为 0..10^9 非
 bool 整数，now 进入共用非递减时钟，须 from≤to≤now//60 且 to-from<60。
@@ -559,10 +573,10 @@ UTF-8 固定键序 JSON、单换行及 record/replay 逐字节行为照常，仅
 时钟），环内无合格候选同样报 STATE/4。自 key 哈希点按 fr 顺序遍历环上
 不同后端至多 max 个（环同 route，仅健康、熔断 C、排空 A），每个候选即
 一次尝试，按 fault、slow、capacity、quota 优先判失败：窗口内 D 或故障
-相位 F 失败、耗时 0，S 且 v>timeout 失败、耗时 timeout，conns≥os.cap
-失败、耗时 0，以 now 只读补充令牌并推进固定窗后任一 B/C/S 桶或配额不
-足失败、耗时 v（S）或 0；首个全部通过的后端即 A 并停止，耗尽全部尝试
-为 R。桶补充与固定窗推进仅在只读投影上计算：每次尝试自当前真实桶/配额
+相位 F 失败、耗时 0，S 且 v>timeout 失败、耗时 timeout，conns 达到该
+后端生效容量（pc 覆盖或 os.cap）失败、耗时 0，以 now 只读补充令牌并
+推进固定窗后任一 B/C/S 桶或配额不足失败、耗时 v（S）或 0；首个全部
+通过的后端即 A 并停止，耗尽全部尝试为 R。桶补充与固定窗推进仅在只读投影上计算：每次尝试自当前真实桶/配额
 独立投影，不补充、不扣减、不回写。除共用时钟按 now 推进外不改任何运
 行态：不读写粘性映射、不建连、不记 mr/fm/fh，失败批次天然回滚。S 的
 尝试延迟为 min(v,timeout)，其余为 0，latency 为各次耗时之和。结果键序
@@ -964,7 +978,7 @@ def parse_quota_span(value):
 
 
 def parse_queue_param(value):
-    # os 的 cap/q/ttl ∈ [1, 10^6]，非 bool 整数。
+    # os 的 cap/q/ttl 与 pc 的每后端 cap ∈ [1, 10^6]，非 bool 整数。
     if (
         not isinstance(value, int)
         or isinstance(value, bool)
@@ -1673,7 +1687,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg", "qs", "qg",
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
-        "oq",
+        "oq", "pc", "pg",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -2051,6 +2065,26 @@ def parse_op(raw_op):
         if list(raw_op) != ["op", "now"]:
             fail(EXIT_INPUT, "INPUT")
         return ("oq", parse_metric_num(raw_op["now"]))
+
+    if name == "pc":
+        # 每后端接纳容量覆盖：精确键序 op,id,cap（键须按此序出现）；cap 为
+        # 1..10^6 非 bool 整数。键序、类型或范围在此判 INPUT；id 现存与否
+        # 留执行期判 BACKEND。
+        if list(raw_op) != ["op", "id", "cap"]:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "pc",
+            parse_backend_id(raw_op["id"]),
+            parse_queue_param(raw_op["cap"]),
+        )
+
+    if name == "pg":
+        # 每后端容量覆盖查询：精确键序 op,id（键须按此序出现）；键序或 id
+        # 类型非法在此判 INPUT，未知 id 与未配置覆盖留执行期依次判
+        # BACKEND、STATE。
+        if list(raw_op) != ["op", "id"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("pg", parse_backend_id(raw_op["id"]))
 
     if name == "mr":
         if keys != {"op", "id", "ok", "ms", "retries", "remaps", "now"}:
@@ -2623,6 +2657,12 @@ def run(raw):
     # oa 查重与 oc 任意位置删除均 O(1) 且其余项 FIFO 相对次序不变。
     queue_cfg = None
     wait_queue = OrderedDict()
+    # 每后端接纳容量覆盖（pc）：backend_id -> cap，仅保存 pc 登记的覆盖；
+    # 未登记的后端容量取 os.cap。同值幂等、异值覆盖，调低不关闭既有连接、
+    # 不改 FIFO 项，连接释放后按新值自然恢复；remove 同步删除，同 id 重加
+    # 不继承，ci/cb 成功整体清空。oa/ot 接纳与 oi/od/oq 投影判容量时覆盖
+    # 优先于 os.cap。额外空间 O(B)。
+    cap_overrides = {}
     # 过载分钟历史（oh）：window=now//60 -> [immediate, queued, dequeued,
     # expired, peak]，全池一份（不按后端分）。oa 返回 A/Q 在其 now 窗记
     # immediate/queued，ot 的接纳/过期项在其 now 窗记 dequeued/expired，
@@ -2829,6 +2869,12 @@ def run(raw):
         if endpoint is not None:
             conn_endpoints[cid] = endpoint
 
+    def effective_cap(backend_id):
+        """该后端当前生效的每后端接纳容量：已 pc 配置覆盖取覆盖值，否则取
+        os.cap（queue_cfg[0]）。调用方须保证已 os；O(1)。"""
+        override = cap_overrides.get(backend_id)
+        return queue_cfg[0] if override is None else override
+
     def evaluate_admit(backend_id, cid, flow, c, s, costs, now):
         """对已路由的后端按 la 规则补充检查但不消费：先补充在配桶、推进在配
         固定窗（均不回写扣减），令牌不足、配额 used+成本>limit、目标非 A 或
@@ -2862,7 +2908,7 @@ def run(raw):
                 for quota, cost in chosen_quotas
             )
             or record["drain"]["state"] != "A"
-            or record["conns"] >= queue_cfg[0]
+            or record["conns"] >= effective_cap(backend_id)
         ):
             return "block", backend_id
         # 接纳才按成本耗令牌、增配额 used 并按 open 建连接；全部满足后统一
@@ -3095,8 +3141,8 @@ def run(raw):
             # 到达此后的尝试延迟：S 为 v（即 min(v,timeout)，v≤timeout），
             # 其余为 0；capacity/quota 失败与成功都按此计尝试耗时。
             latency += cost
-            if record["conns"] >= queue_cfg[0]:
-                # 连接数达 os 的 cap：capacity 失败。
+            if record["conns"] >= effective_cap(backend_id):
+                # 连接数达该后端生效容量（pc 覆盖或 os.cap）：capacity 失败。
                 counts["capacity"] += 1
                 continue
             # 三桶三配额：以 now 只读补充/推进（每次尝试独立投影，不回写
@@ -3188,8 +3234,8 @@ def run(raw):
                 # S 且 v>timeout：本尝试失败。
                 entry["result"] = "S"
                 continue
-            if record["conns"] >= queue_cfg[0]:
-                # 连接数达 os 的 cap：capacity 失败。
+            if record["conns"] >= effective_cap(backend_id):
+                # 连接数达该后端生效容量（pc 覆盖或 os.cap）：capacity 失败。
                 entry["result"] = "C"
                 continue
             # 三桶三配额：以 now 只读补充/推进（每次尝试独立投影，不回写
@@ -3473,6 +3519,7 @@ def run(raw):
         nonlocal sticky_map, alert, alert_events, overload_hist
         nonlocal mo_seq, mo_cache, queue_mode
         nonlocal full_mode, evict_count, evict_last
+        nonlocal cap_overrides
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -3590,6 +3637,9 @@ def run(raw):
         ring_vnodes = config["vnodes"]
         queue_cfg = config["overload"]
         wait_queue = OrderedDict()
+        # ci/cb 成功清空全部每后端容量覆盖（覆盖为运行态，不随配置导出导入；
+        # 同 id 后端重加同样不继承旧覆盖）。
+        cap_overrides = {}
         # ci/cb 成功清空过载分钟历史。
         overload_hist = {}
         # 热加载三项：sticky/idle 取登记值（null 即未登记，idle 作用于
@@ -3765,6 +3815,8 @@ def run(raw):
             del backends[backend_id]
             buckets.pop(("B", backend_id), None)
             quotas.pop(("B", backend_id), None)
+            # remove 删除该后端的容量覆盖；同 id 重加不继承。
+            cap_overrides.pop(backend_id, None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -4519,12 +4571,13 @@ def run(raw):
                     evicted_cid, _ = wait_queue.popitem(last=False)
                     evict_count = min(METRIC_CAP, evict_count + 1)
                     evict_last = evicted_cid
-                # 不可用原因历史：Q 入队且所选后端连接数已达 os.cap 时记
+                # 不可用原因历史：Q 入队且所选后端连接数已达其生效容量
+                # （pc 覆盖或 os.cap）时记
                 # overload（所选后端来自只含 healthy/C/A 的环，阻塞在此只可能
-                # 因令牌不足、固定窗配额不足或连接达 cap；配额不足只入队，
+                # 因令牌不足、固定窗配额不足或连接达生效容量；配额不足只入队，
                 # 不报 RATE）；P 态/队满尾拒绝的 OVERLOAD 已在上方回滚，不记。
                 # 同次至多记一次。
-                if backends[routed[0]]["conns"] >= queue_cfg[0]:
+                if backends[routed[0]]["conns"] >= effective_cap(routed[0]):
                     record_reason(routed[0], "overload", now)
                 # 三项成本随请求入队，ot 重试时按此成本扣减。新键追加到
                 # OrderedDict 队尾，即 FIFO 入队（重复已在上方拒绝）。
@@ -4648,6 +4701,37 @@ def run(raw):
                 bp_state = "N"
             results.append({"op": "oc", "cid": cid, "ok": True})
 
+        elif op[0] == "pc":
+            _, backend_id, cap = op
+            # 错误优先级：键序、cap 类型/范围已在解析期判 INPUT；id 须现存，
+            # 未知报 BACKEND。同值幂等，异值覆盖；不要求已 os（覆盖先于 os
+            # 登记亦可，os 配置后即生效）。调低不关闭既有连接、不改 FIFO 项。
+            if backend_id not in backends:
+                fail(EXIT_BACKEND, "BACKEND")
+            cap_overrides[backend_id] = cap
+            results.append({"op": "pc", "ok": True})
+
+        elif op[0] == "pg":
+            _, backend_id = op
+            # 判定顺序：键序/id 类型已在解析期判 INPUT；未知 id 报 BACKEND；
+            # 已现存但未配置覆盖报 STATE。
+            if backend_id not in backends:
+                fail(EXIT_BACKEND, "BACKEND")
+            cap = cap_overrides.get(backend_id)
+            if cap is None:
+                # 未配置覆盖：即使已 os 也报 STATE（os.cap 非覆盖值）。
+                fail(EXIT_STATE, "STATE")
+            connections_now = backends[backend_id]["conns"]
+            results.append(
+                {
+                    "op": "pg",
+                    "id": backend_id,
+                    "cap": cap,
+                    "connections": connections_now,
+                    "available": max(cap - connections_now, 0),
+                }
+            )
+
         elif op[0] == "bp":
             _, low, high = op
             if queue_cfg is None:
@@ -4725,7 +4809,6 @@ def run(raw):
                 # 未 os 报 STATE（STATE 前置同 og/oc；时钟倒退已在批前
                 # 通用时钟判定中先报 INPUT）。
                 fail(EXIT_STATE, "STATE")
-            cap = queue_cfg[0]
             ttl = queue_cfg[2]
             queued = list(wait_queue.values())
             # 当前环仅含 healthy、熔断 C、排空 A 后端；令牌摘要升序列表与环
@@ -4769,8 +4852,8 @@ def run(raw):
                 entry_obj["backend"] = target
                 blocked = []
                 record = backends[target]
-                if record["conns"] >= cap:
-                    # C：目标后端活动连接数已达 os.cap。
+                if record["conns"] >= effective_cap(target):
+                    # C：目标后端活动连接数已达其生效容量（pc 覆盖或 os.cap）。
                     blocked.append("C")
                 # T：按 now 只读补充后，任一在配 B/C/S 桶令牌不足（不回写）。
                 token_short = False
