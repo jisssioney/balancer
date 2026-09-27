@@ -1468,6 +1468,90 @@ def parse_config(value):
     }
 
 
+def render_config_v9(config):
+    """把 parse_config 的规范化结构渲染为 ce.config 同款规范化 version=9
+    对象：逐层键序、值格式与数组排序完全一致（version 首置，backends 紧随，
+    backends 按规范化即输入加入序，项 id,weight,d,fail,success,circuit,
+    drain,endpoint；limits/quotas 已按 scope 的 B/C/S 序、id 的 UTF-8 字节
+    严格升序，直接输出；overload/sticky/idle/backpressure 为 null 或登记值；
+    scheduler 精确为 {"pick":...}；faults 按后端加入序、段 a 升序，空计划为
+    []；queue 末置，精确键序 dequeue,full）。规范化各数组已排序，整体
+    O(B+M+T+Q)，与配置元素数线性。返回全新结构，不别名入参的任何可变项。"""
+    exported_backends = []
+    for (backend_id, weight, d, fail_threshold, success_threshold,
+         circuit_params, drain_t, endpoint) in config["backends"]:
+        exported_backends.append(
+            {
+                "id": backend_id,
+                "weight": weight,
+                "d": d,
+                "fail": fail_threshold,
+                "success": success_threshold,
+                "circuit": (
+                    None
+                    if circuit_params is None
+                    else {
+                        "n": circuit_params[0],
+                        "m": circuit_params[1],
+                        "r": circuit_params[2],
+                        "w": circuit_params[3],
+                        "q": circuit_params[4],
+                    }
+                ),
+                "drain": drain_t,
+                "endpoint": (
+                    None
+                    if endpoint is None
+                    else {"host": endpoint[0], "port": endpoint[1]}
+                ),
+            }
+        )
+    # 规范化 limits 已按 (scope 秩, id UTF-8 字节) 严格升序，直接逐项渲染。
+    exported_limits = [
+        {"scope": scope, "id": bucket_id, "r": r, "b": b}
+        for scope, bucket_id, r, b in config["limits"]
+    ]
+    overload = config["overload"]
+    exported_overload = (
+        None if overload is None else {"cap": overload[0], "q": overload[1], "ttl": overload[2]}
+    )
+    sticky_ttl = config["sticky"]
+    idle_ttl = config["idle"]
+    backpressure = config["backpressure"]
+    # faults 按后端加入序（backends 数组序）、同后端段按 a 升序输出，与
+    # apply_config 后 ce 的导出次序一致；空计划为 []。faults 数组自身的
+    # 出现次序不决定输出次序。
+    faults_plan = config["faults"]
+    exported_faults = [
+        {"id": backend_id, "k": k, "a": a, "z": z, "v": v}
+        for backend_id, *_ in config["backends"]
+        for k, a, z, v in faults_plan.get(backend_id, ())
+    ]
+    exported_quotas = [
+        {"scope": scope, "id": quota_id, "limit": limit, "span": span}
+        for scope, quota_id, limit, span in config["quotas"]
+    ]
+    dequeue_mode, full_policy = config["queue"]
+    return {
+        "version": 9,
+        "backends": exported_backends,
+        "vnodes": config["vnodes"],
+        "limits": exported_limits,
+        "overload": exported_overload,
+        "sticky": None if sticky_ttl is None else {"ttl": sticky_ttl},
+        "idle": None if idle_ttl is None else {"ttl": idle_ttl},
+        "backpressure": (
+            None
+            if backpressure is None
+            else {"low": backpressure[0], "high": backpressure[1]}
+        ),
+        "scheduler": {"pick": config["scheduler"]},
+        "faults": exported_faults,
+        "quotas": exported_quotas,
+        "queue": {"dequeue": dequeue_mode, "full": full_policy},
+    }
+
+
 def parse_op(raw_op):
     """校验单个操作的形状，返回规范化元组；不合格式直接 INPUT 退出。"""
     if not isinstance(raw_op, dict):
@@ -1483,7 +1567,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
-        "ce", "ci", "cl", "cb",
+        "ce", "ci", "cl", "cb", "cv",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
@@ -2194,13 +2278,20 @@ def parse_op(raw_op):
             parse_fault_num(raw_op["now"]),
         )
 
-    if name in ("ce", "ci"):
+    if name in ("ce", "ci", "cv"):
         if name == "ce":
             if keys != {"op"}:
                 fail(EXIT_INPUT, "INPUT")
             return ("ce",)
         if keys != {"op", "config", "now"}:
             fail(EXIT_INPUT, "INPUT")
+        if name == "cv":
+            # 配置预检：now ∈ [0,10^9] 非 bool 整数并进入共用非递减时钟
+            # （倒退在执行期与其余操作同序判定）；config 沿用 ci 的
+            # version1..9 结构、逐层键序、规范化与交叉引用。
+            now = parse_warm_now(raw_op["now"])
+            config = parse_config(raw_op["config"])
+            return ("cv", config, now)
         # now 为非负非 bool 整数，时钟倒退在执行期与其余操作同序判定。
         parse_now(raw_op["now"])
         config = parse_config(raw_op["config"])
@@ -3353,7 +3444,7 @@ def run(raw):
             "oq",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
-            "ci", "cb", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cv", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh",
         ):
             now = op[-1]
@@ -4972,6 +5063,35 @@ def run(raw):
             mo_cache = (seq, now, result)
             mo_seq = seq + 1
             results.append(result)
+
+        elif op[0] == "cv":
+            # 配置预检：只校验、不应用配置。B 限流、B 配额与 faults 对未知
+            # 后端的引用同 ci 判 BACKEND（先于活动状态判定）；活动连接或
+            # 排队项只令 applicable=false，从不报 STATE，其他状态（rev
+            # 耗尽等）同样不构成预检错误。时钟已在上方与其余操作同序推进
+            # （倒退在该处判 INPUT）；预检不改配置、连接、队列、粘性、桶、
+            # 配额、指标、告警、rev 或提交历史。输出 config 为规范化
+            # version=9 对象，键序、值格式与数组排序同 ce.config。
+            _, config, _ = op
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            results.append(
+                {
+                    "op": "cv",
+                    "applicable": not (connections or wait_queue),
+                    "connections": len(connections),
+                    "queued": len(wait_queue),
+                    "config": render_config_v9(config),
+                }
+            )
 
         elif op[0] == "ce":
             # 导出纯配置（登记值），不含任何运行态。
