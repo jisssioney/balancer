@@ -152,6 +152,18 @@ admitted 按原 FIFO 顺序，各项使用同一 ot.now，前项扣减对后项�
 修改仅影响当前 ce，不改已存提交快照；record/replay 逐字节覆盖。
 S 模式 ot 时间 O(qBV log(BV))、额外空间 O(q)。
 
+排队投影：oq 精确键序 op,now（键须按此序出现），now 为 [0,10^9] 非
+bool 整数，纳入共用非递减时钟；未 os 报 STATE/4，键序、now 类型/范围
+或时钟倒退报 INPUT/2。只读：除推进共用时钟外不改任何状态（不写粘性
+映射、不补充令牌桶、不推进配额窗口），失败批回滚。返回键序 op,items，
+items 按 FIFO 列等待项，项键序 cid,backend,expires,expired,blocked：
+expires=入队 now+ttl，expired 为 now≥expires 的 bool。到期项取
+backend=null、expired=true、blocked=["E"]；未到期项按其 key、c、s 与
+三项成本对当前环、粘性、桶和配额作只读投影（路由口径同 oa）：无合格
+后端取 backend=null、blocked=["R"]，否则 backend 为目标 id，blocked
+按 C,T,Q 序列出连接达 cap、任一令牌不足、任一配额不足，无阻塞为 []。
+时间 O(qBV log(BV))、空间 O(q+BV)，仅用标准库。
+
 FIFO 满载策略：rp 精确键序 op,mode（键须按此序出现），mode 仅 T/H：T 为
 队满尾拒绝（默认，即既有 OVERLOAD/7 行为），H 为队满头淘汰；同值幂等，
 返回键序 op,ok（ok=true）。rg 键序仅 op，只读，返回键序
@@ -161,8 +173,9 @@ last 为最近淘汰的 cid 或 null。oa 需排队时先判背压：P 态报 OV
 FIFO 队首并把新项放队尾——旧项不耗或返还令牌、配额，入队路由已产生的
 粘性映射保留，淘汰 cid 可立即复用，其余项 FIFO 相对次序不变，新入队
 照常更新 oh、peak 与背压。H 模式 oa 结果键序
-op,cid,state,backend,evicted：立即接纳或普通入队时 evicted=null，淘汰时
-为旧 cid；T 模式保持原四键。rp/rg 键序、类型或值非法报 INPUT/2。ci/cb
+op,cid,state,backend,evicted：A 时 backend 为选中 id，Q 时亦为路由
+id；evicted 仅头淘汰时为旧 cid，其余（立即接纳或普通入队）为 null。
+T 模式保持原四键。rp/rg 键序、类型或值非法报 INPUT/2。ci/cb
 按 queue.full 原子载入（v1..v8 规范化为 T）并清空队列、置 evicted=0、
 last=null，失败批回滚队列、指标、粘性、策略与计数；登记策略随 ce 经
 version=9 的 queue.full 导出（evicted、last 不导出），提交后的 rp 修改
@@ -1465,7 +1478,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
+        "os", "oa", "ot", "og", "oc", "oh", "oq", "bp", "bq", "qp", "rp", "rg",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
         "ce", "ci", "cl", "cb",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -1774,6 +1787,14 @@ def parse_op(raw_op):
         if keys != {"op"}:
             fail(EXIT_INPUT, "INPUT")
         return ("og",)
+
+    if name == "oq":
+        # 排队投影（只读）：精确键序 op,now（键须按此序出现）；now 为
+        # [0,10^9] 非 bool 整数，纳入共用非递减时钟；未 os 留执行期报
+        # STATE。键序、now 类型/范围非法报 INPUT。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("oq", parse_warm_now(raw_op["now"]))
 
     if name == "oc":
         # 精确键集 op,cid，无 now；cid 沿用非空字符串校验。
@@ -3284,7 +3305,7 @@ def run(raw):
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
+            "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot", "oq",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
             "ci", "cb", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
@@ -4199,14 +4220,15 @@ def run(raw):
                     # N 态照常入队，队长达到 high 即转 P（滞回上沿）。
                     bp_state = "P"
                 if full_mode == "H":
-                    # H 模式结果键序 op,cid,state,backend,evicted：普通入队
-                    # evicted=null，淘汰时为旧 cid。
+                    # H 模式结果键序 op,cid,state,backend,evicted：Q 时
+                    # backend 亦为路由 id；普通入队 evicted=null，淘汰时为
+                    # 旧 cid。
                     results.append(
                         {
                             "op": "oa",
                             "cid": cid,
                             "state": "Q",
-                            "backend": None,
+                            "backend": routed[0],
                             "evicted": evicted_cid,
                         }
                     )
@@ -4284,6 +4306,114 @@ def run(raw):
             results.append(
                 {"op": "og", "queue": list(wait_queue)}
             )
+
+        elif op[0] == "oq":
+            _, now = op
+            if queue_cfg is None:
+                # 未 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            cap, _, ttl = queue_cfg
+            # 排队投影（只读）：除推进共用时钟外不改任何状态——不写粘性
+            # 映射、不补充令牌桶、不推进配额窗口。路由与 select_route 同
+            # 口径（ss 后按三键限时粘性，未 ss 沿用二键语义）；环在单次
+            # oq 期间不变，首次需要时构建一次并复用其摘要列表。
+            sticky_now = now if sticky_ttl is not None else None
+            ring_tokens = None
+            ring_digests = None
+            items = []
+            for queued_cid, item in wait_queue.items():
+                expires = item[8] + ttl
+                if now >= expires:
+                    # 到期项：backend=null、expired=true、blocked=["E"]。
+                    items.append(
+                        {
+                            "cid": queued_cid,
+                            "backend": None,
+                            "expires": expires,
+                            "expired": True,
+                            "blocked": ["E"],
+                        }
+                    )
+                    continue
+                # 路由投影：粘性项可用才沿用，否则按环哈希取目标；未配环
+                # 或环上无合格后端记 None（blocked=["R"]）。
+                target = None
+                if ring_vnodes is not None:
+                    entry = sticky_map.get(item[4])
+                    if entry is not None:
+                        old_b, old_expires = entry
+                        if (
+                            sticky_now is None
+                            or old_expires is None
+                            or sticky_now < old_expires
+                        ) and backend_routable(backends.get(old_b)):
+                            target = old_b
+                    if target is None:
+                        if ring_tokens is None:
+                            ring_tokens = build_ring(backends, ring_vnodes)
+                            ring_digests = [
+                                token[0] for token in ring_tokens
+                            ]
+                        if ring_tokens:
+                            key_hash = int.from_bytes(
+                                hashlib.sha256(
+                                    item[4].encode("utf-8")
+                                ).digest(),
+                                "big",
+                            )
+                            index = bisect.bisect_left(ring_digests, key_hash)
+                            if index == len(ring_tokens):
+                                index = 0  # 越界回绕到环首
+                            target = ring_tokens[index][3]
+                if target is None:
+                    items.append(
+                        {
+                            "cid": queued_cid,
+                            "backend": None,
+                            "expires": expires,
+                            "expired": False,
+                            "blocked": ["R"],
+                        }
+                    )
+                    continue
+                # 阻塞投影：按 C,T,Q 序——目标连接达 cap、任一在配桶投影
+                # 令牌不足、任一在配配额投影 used+成本>limit。
+                blocked = []
+                if backends[target]["conns"] >= cap:
+                    blocked.append("C")
+                checks = (
+                    ("B", target, item[5]),
+                    ("C", item[2], item[6]),
+                    ("S", item[3], item[7]),
+                )
+                for scope, check_id, cost in checks:
+                    bucket = buckets.get((scope, check_id))
+                    if bucket is not None and min(
+                        bucket["b"],
+                        bucket["t"] + (now - bucket["at"]) * bucket["r"],
+                    ) < cost:
+                        blocked.append("T")
+                        break
+                for scope, check_id, cost in checks:
+                    quota = quotas.get((scope, check_id))
+                    if quota is not None:
+                        used = quota["used"]
+                        if now // quota["span"] != quota["window"]:
+                            # 投影跨窗：窗内用量按 0 计（不写回）。
+                            used = 0
+                        if used + cost > quota["limit"]:
+                            blocked.append("Q")
+                            break
+                items.append(
+                    {
+                        "cid": queued_cid,
+                        "backend": target,
+                        "expires": expires,
+                        "expired": False,
+                        "blocked": blocked,
+                    }
+                )
+            results.append({"op": "oq", "items": items})
 
         elif op[0] == "oc":
             _, cid = op

@@ -3499,9 +3499,11 @@ class FullQueuePolicyTest(unittest.TestCase):
              "evicted": None},
         )
         self.assertEqual(results[6]["evicted"], None)
+        # Q 时 backend 亦为路由 id；evicted 仅头淘汰时为旧 cid。
+        self.assertEqual(results[6]["backend"], "a")
         self.assertEqual(
             results[7],
-            {"op": "oa", "cid": "c4", "state": "Q", "backend": None,
+            {"op": "oa", "cid": "c4", "state": "Q", "backend": "a",
              "evicted": "c2"},
         )
         self.assertEqual(results[8], {"op": "og", "queue": ["c3", "c4"]})
@@ -3584,6 +3586,184 @@ class FullQueuePolicyTest(unittest.TestCase):
             self.oa("c4", 0),
             {"op": "rg"},
             {"op": "og"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
+class QueueProjectionTest(unittest.TestCase):
+    """oq 排队投影（只读）：FIFO 列项、到期/路由/阻塞投影、时钟与校验。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self, cap=1, q=5, ttl=10):
+        # 环上唯一后端 a，cap=1 便于制造入队。
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": cap, "q": q, "ttl": ttl},
+        ]
+
+    def oa(self, cid, now, c="k", s="k", key="k", bc=1, cc=1, sc=1):
+        return {"op": "oa", "cid": cid, "flow": FLOW, "c": c, "s": s,
+                "key": key, "bc": bc, "cc": cc, "sc": sc, "now": now}
+
+    def test_empty_queue_and_key_order(self):
+        ops = self.base_ops() + [{"op": "oq", "now": 0}]
+        results = self.run_ops(ops)
+        self.assertEqual(list(results[3]), ["op", "items"])
+        self.assertEqual(results[3], {"op": "oq", "items": []})
+
+    def test_fifo_items_expiry_and_cap_block(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),               # A（占满 cap=1）
+            self.oa("c2", 0),               # Q，expires=10
+            self.oa("c3", 2),               # Q，expires=12
+            {"op": "oq", "now": 3},
+            {"op": "oq", "now": 10},
+        ]
+        results = self.run_ops(ops)
+        first = results[6]["items"]
+        # 项键序 cid,backend,expires,expired,blocked；FIFO 顺序。
+        self.assertEqual(
+            [list(item) for item in first],
+            [["cid", "backend", "expires", "expired", "blocked"]] * 2,
+        )
+        self.assertEqual(
+            first,
+            [
+                {"cid": "c2", "backend": "a", "expires": 10,
+                 "expired": False, "blocked": ["C"]},
+                {"cid": "c3", "backend": "a", "expires": 12,
+                 "expired": False, "blocked": ["C"]},
+            ],
+        )
+        # now=10：c2 到期取 null、true、["E"]；c3 未到期仍投影。
+        self.assertEqual(
+            results[7]["items"],
+            [
+                {"cid": "c2", "backend": None, "expires": 10,
+                 "expired": True, "blocked": ["E"]},
+                {"cid": "c3", "backend": "a", "expires": 12,
+                 "expired": False, "blocked": ["C"]},
+            ],
+        )
+
+    def test_token_and_quota_blocks(self):
+        ops = self.base_ops(cap=5, q=10, ttl=100) + [
+            {"op": "ls", "scope": "C", "id": "c1", "r": 1, "b": 1, "now": 0},
+            {"op": "qs", "scope": "S", "id": "s2",
+             "limit": 1, "span": 1000, "now": 0},
+            self.oa("cA", 0, c="c1", s="s1"),   # A：耗尽 C/c1 令牌
+            self.oa("cB", 0, c="c1", s="s1"),   # Q：令牌不足
+            self.oa("cC", 0, c="c3", s="s2"),   # A：耗尽 S/s2 配额
+            self.oa("cD", 0, c="c3", s="s2"),   # Q：配额不足
+            {"op": "oq", "now": 0},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            results[9]["items"],
+            [
+                {"cid": "cB", "backend": "a", "expires": 100,
+                 "expired": False, "blocked": ["T"]},
+                {"cid": "cD", "backend": "a", "expires": 100,
+                 "expired": False, "blocked": ["Q"]},
+            ],
+        )
+
+    def test_no_eligible_backend_is_r(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),               # A
+            self.oa("c2", 0),               # Q
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "oq", "now": 1},
+        ]
+        results = self.run_ops(ops)
+        # 唯一后端不健康：环上无合格后端，blocked=["R"]。
+        self.assertEqual(
+            results[7]["items"],
+            [{"cid": "c2", "backend": None, "expires": 10,
+              "expired": False, "blocked": ["R"]}],
+        )
+
+    def test_projection_is_read_only(self):
+        ops = self.base_ops(cap=5, q=10, ttl=100) + [
+            {"op": "ls", "scope": "C", "id": "c1", "r": 1, "b": 1, "now": 0},
+            {"op": "qs", "scope": "B", "id": "a",
+             "limit": 1, "span": 10, "now": 0},
+            self.oa("cA", 0, c="c1", s="s1"),   # A：耗令牌与配额
+            self.oa("cB", 0, c="c1", s="s1"),   # Q
+            {"op": "oq", "now": 10},            # 投影跨窗/补充：无阻塞
+            {"op": "oq", "now": 10},            # 幂等：重报结果一致
+            {"op": "qg", "scope": "B", "id": "a", "now": 10},
+            self.oa("cC", 10, c="c1", s="s1"),  # oq 未耗令牌：仍可接纳
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            results[7]["items"],
+            [{"cid": "cB", "backend": "a", "expires": 100,
+              "expired": False, "blocked": []}],
+        )
+        self.assertEqual(results[8], results[7])
+        # oq 未扣配额：qg 推进到窗 1 后 used 仍为 0。
+        self.assertEqual(results[9]["window"], 1)
+        self.assertEqual(results[9]["used"], 0)
+        # oq 未耗令牌：同时刻 oa 立即接纳。
+        self.assertEqual(results[10]["state"], "A")
+
+    def test_not_configured_is_state(self):
+        self.assert_failure([{"op": "oq", "now": 0}], 4, "STATE")
+
+    def test_input_violations(self):
+        configured = [{"op": "os", "cap": 1, "q": 2, "ttl": 5}]
+        # 键序非法（须精确 op,now）。
+        self.assert_failure(
+            configured + [{"op": "oq", "now": 0, "x": 1}], 2, "INPUT"
+        )
+        self.assert_failure(configured + [{"op": "oq"}], 2, "INPUT")
+        self.assert_failure(
+            configured + [{"now": 0, "op": "oq"}], 2, "INPUT"
+        )
+        # now 类型/范围非法：bool、负数、超 10^9、浮点。
+        for bad_now in (True, -1, 10 ** 9 + 1, 1.5, "0"):
+            self.assert_failure(
+                configured + [{"op": "oq", "now": bad_now}], 2, "INPUT"
+            )
+
+    def test_clock_regression_is_input(self):
+        ops = self.base_ops() + [
+            {"op": "oq", "now": 5},
+            {"op": "oq", "now": 4},
+        ]
+        self.assert_failure(ops, 2, "INPUT")
+
+    def test_record_replay_round_trip(self):
+        ops = self.base_ops() + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "oq", "now": 2},
         ]
         raw = encode_ops(ops)
         run_code, run_stdout, run_stderr = run_balancer("run", raw)
