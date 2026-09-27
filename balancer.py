@@ -652,6 +652,21 @@ backends 项保持在既有七键后追加 endpoint（null 或键序 host,port�
 faults，version7 在九键后追加 faults 且项按 fp 同款校验，成功原子重建并
 载入目标时间线、失败回滚。ep/fw
 为 O(1)，额外空间 O(B+C)，仅用标准库；其余子命令与既有操作行为不变。
+
+全池运行态快照：br 精确键序 op,now（键须按此序出现），now 为 0..10^9
+非 bool 整数，进入共用非递减时钟。结果键序 op,now,backends；backends
+按加入序，项键序 id,health,circuit,drain,fault,connections,ready,
+blocked：health 为 healthy/unhealthy；未配熔断时 circuit=C，否则取
+C/O/H；drain 取 A/D/X；fault 按 now 的时间线取 N/D/S（fq 同款
+effect：段间隙与未登记为 N，窗口内 D 为 D、F 按 ((now-a)//v)%2=0 取
+D 否则 N、S 取 S）；connections 为非负整数。healthy、circuit=C、
+drain=A 且 fault≠D 时 ready=true，否则 false；blocked 按
+health,circuit,drain,fault 顺序列出未满足条件的字符串，允许多项，
+ready 时为空数组，S 不阻断；空池 backends=[]。键序、now 类型或范围、
+时钟倒退报 INPUT/2；成功仅推进时钟，失败批回滚。br 只读，不触发熔断
+O 到期转 H 等任何状态迁移；时间 O(Blog(T+1))、空间 O(B)，T 为单后端
+故障段数；紧凑 UTF-8 固定键序 JSON、末尾一换行及 record/replay 逐字
+节契约照常，仅用标准库，其他子命令行为不变。
 """
 
 import base64
@@ -1614,6 +1629,7 @@ def parse_op(raw_op):
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
+        "br",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
         "ts", "tk", "tg", "tx",
@@ -2167,6 +2183,13 @@ def parse_op(raw_op):
         if keys != {"op", "now"}:
             fail(EXIT_INPUT, "INPUT")
         return ("fq", parse_now(raw_op["now"]))
+
+    if name == "br":
+        # 全池运行态快照：精确键序 op,now（键须按此序出现），只读；now 为
+        # 0..10^9 非 bool 整数，纳入共用非递减时钟。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("br", parse_metric_num(raw_op["now"]))
 
     if name == "fx":
         if keys != {"op", "cid", "flow", "key", "timeout", "now"}:
@@ -3537,6 +3560,7 @@ def run(raw):
             "ms", "mx", "rh", "ra", "ma",
             "ci", "cb", "cv", "cd", "pd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh",
+            "br",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -5477,6 +5501,46 @@ def run(raw):
             results.append(
                 {"op": "fq", "faults": faults, "down": down, "slow": slow}
             )
+
+        elif op[0] == "br":
+            # 全池运行态快照：除共用时钟按 now 推进外不改任何运行态，失败
+            # 批次天然回滚。backends 按加入序，项键序
+            # id,health,circuit,drain,fault,connections,ready,blocked。
+            # fault 按 now 取唯一活动段的 fq 同款 effect（fault_a 二分，
+            # 单后端 O(log T)）；ready 要求 healthy、熔断 C（含未配）、
+            # 排空 A 且 fault≠D（S 不阻断）；blocked 按
+            # health,circuit,drain,fault 顺序列出未满足项，ready 时为空。
+            # 时间 O(B log(T+1))、额外空间 O(B)。
+            _, now = op
+            snapshot = []
+            for backend_id, record in backends.items():
+                healthy = record["healthy"]
+                circuit = record["circuit"]
+                circuit_state = "C" if circuit is None else circuit["state"]
+                drain_state = record["drain"]["state"]
+                effect = fault_effect(active_fault(record, now), now)
+                blocked = []
+                if not healthy:
+                    blocked.append("health")
+                if circuit_state != "C":
+                    blocked.append("circuit")
+                if drain_state != "A":
+                    blocked.append("drain")
+                if effect == "D":
+                    blocked.append("fault")
+                snapshot.append(
+                    {
+                        "id": backend_id,
+                        "health": "healthy" if healthy else "unhealthy",
+                        "circuit": circuit_state,
+                        "drain": drain_state,
+                        "fault": effect,
+                        "connections": record["conns"],
+                        "ready": not blocked,
+                        "blocked": blocked,
+                    }
+                )
+            results.append({"op": "br", "now": now, "backends": snapshot})
 
         elif op[0] == "hm":
             # H pick 记账只读查询：未知 id 报 BACKEND；不改变任何计数，失败
