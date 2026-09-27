@@ -7335,5 +7335,309 @@ class LatencyPercentileTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class ErrorRateAlertTest(unittest.TestCase):
+    """ea 后端错误率告警：状态机、定点 rate、缓存/跳窗/变阈值与各类清除。"""
+
+    def results(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def mr(ok, now, backend="b"):
+        return {"op": "mr", "id": backend, "ok": ok, "ms": 1,
+                "retries": 0, "remaps": 0, "now": now}
+
+    @staticmethod
+    def ea(w, now, hi=5000, lo=1000, n=1, backend="b"):
+        return {"op": "ea", "id": backend, "w": w, "hi": hi,
+                "lo": lo, "n": n, "now": now}
+
+    def test_rate_floor_and_fixed_point(self):
+        # w0：3 请求 1 错误 → v=floor(10000/3)=3333 → "33.33"；空窗 "0.00"。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0), self.mr(True, 1), self.mr(True, 2),
+            self.ea(0, 60),
+            self.ea(1, 120),
+        ]
+        ea_results = [r for r in self.results(ops) if r["op"] == "ea"]
+        self.assertEqual(ea_results[0]["requests"], 3)
+        self.assertEqual(ea_results[0]["errors"], 1)
+        self.assertEqual(ea_results[0]["rate"], "33.33")
+        self.assertEqual(ea_results[1]["requests"], 0)
+        self.assertEqual(ea_results[1]["rate"], "0.00")
+
+    def test_hi_boundary_inclusive_triggers_alarm(self):
+        # v==hi 即满足 v>=hi：1/3 → v=3333，hi=3333、n=1 当窗转 A。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0), self.mr(True, 1), self.mr(True, 2),
+            self.ea(0, 60, hi=3333, lo=0, n=1),
+        ]
+        result = self.results(ops)[-1]
+        self.assertEqual(result["state"], "A")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["run"], 0)
+
+    def test_n_run_accumulates_and_resets_on_mismatch(self):
+        # n=2：N 态需连续两窗 v>=hi；方向不符窗把连续数清 0。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0), self.ea(0, 60, n=2),          # run=1
+            self.mr(True, 60), self.ea(1, 120, n=2),         # v=0 复位 0
+            self.mr(False, 120), self.ea(2, 180, n=2),       # run=1
+            self.mr(False, 180), self.ea(3, 240, n=2),       # run=2 转 A
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "ea"]
+        self.assertEqual(seq, [
+            ("N", 1, False),
+            ("N", 0, False),
+            ("N", 1, False),
+            ("A", 0, True),
+        ])
+
+    def test_A_to_N_on_lo(self):
+        # n=1：w0 全错转 A；w1 无请求 v=0<=lo 转回 N，转换后 run 清 0。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0), self.ea(0, 60, lo=0),
+            self.ea(1, 120, lo=0),
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "ea"]
+        self.assertEqual(seq, [("A", 0, True), ("N", 0, True)])
+
+    def test_same_window_threshold_cache_no_advance(self):
+        # 同窗同阈值重报原样返回（含 changed），不推进状态机；时钟可继续走。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0),
+            self.ea(0, 60),
+            self.ea(0, 120),
+            self.ea(1, 120),
+        ]
+        ea_results = [r for r in self.results(ops) if r["op"] == "ea"]
+        self.assertEqual(ea_results[0], ea_results[1])
+        self.assertTrue(ea_results[1]["changed"])
+        # w1 为首评后的下一窗，正常推进（w1 空窗 v=0，A→N）。
+        self.assertEqual(ea_results[2]["w"], 1)
+        self.assertEqual(ea_results[2]["state"], "N")
+
+    def test_same_window_changed_threshold_is_state(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.ea(0, 60),
+            self.ea(0, 60, hi=5001),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_skip_and_regression_window_are_state(self):
+        base = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.ea(0, 60),
+        ]
+        # 跳窗 w=2。
+        self.assert_failure(encode_ops(base + [self.ea(2, 180)]), 4, "STATE")
+        # 已逐窗到 w1 后回退评 w0。
+        self.assert_failure(
+            encode_ops(base + [self.ea(1, 120), self.ea(0, 120)]),
+            4, "STATE",
+        )
+
+    def test_threshold_change_next_window_is_state(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.ea(0, 60, hi=5000),
+            self.ea(1, 120, hi=5001),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_per_backend_independent(self):
+        # 两个后端独立固化阈值与状态：同窗 w0 下 b 全错转 A、c 全对停留 N，
+        # 且各 id 可有不同的 (hi,lo,n) 而互不触发变阈值 STATE。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            self.mr(False, 0, "b"),
+            self.mr(True, 0, "c"),
+            self.ea(0, 60, hi=5000, lo=1000, n=1, backend="b"),
+            self.ea(0, 60, hi=100, lo=10, n=1, backend="c"),
+        ]
+        ea_results = [r for r in self.results(ops) if r["op"] == "ea"]
+        by_id = {r["id"]: r for r in ea_results}
+        self.assertEqual(by_id["b"]["state"], "A")
+        self.assertTrue(by_id["b"]["changed"])
+        self.assertEqual(by_id["c"]["state"], "N")
+        self.assertFalse(by_id["c"]["changed"])
+
+    def test_readd_clears_alarm(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0),
+            self.ea(0, 60),                       # A
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            self.ea(1, 120, hi=9999, lo=0),      # 未首评：N、changed=false
+        ]
+        result = self.results(ops)[-1]
+        self.assertEqual(result["state"], "N")
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["run"], 0)
+
+    def test_ci_clears_alarm(self):
+        # ce 导出当前规范化配置，ci 成功后 ea 回到未首评。
+        exported = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ce"},
+        ])[-1]["config"]
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0),
+            self.ea(0, 60),
+            {"op": "ci", "config": exported, "now": 120},
+            self.ea(1, 120),
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "ea"]
+        self.assertEqual(seq[0], ("A", 0, True))
+        self.assertEqual(seq[1], ("N", 0, False))
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            encode_ops([self.ea(0, 60, backend="z")]), 3, "BACKEND"
+        )
+
+    def test_unknown_id_precedes_window_state(self):
+        # 即使 w 窗未结束（本应 STATE），未知 id 也先判 BACKEND。
+        self.assert_failure(
+            encode_ops([self.ea(1, 60, backend="z")]), 3, "BACKEND"
+        )
+
+    def test_key_order_and_shape_rejections(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        # hi/lo 乱序。
+        self.assert_failure(
+            head + b'{"op":"ea","id":"b","w":0,"hi":2,"n":1,'
+                    b'"lo":1,"now":60}]}',
+            2, "INPUT",
+        )
+        # 缺 n。
+        self.assert_failure(
+            head + b'{"op":"ea","id":"b","w":0,"hi":2,"lo":1,"now":60}]}',
+            2, "INPUT",
+        )
+        # 多键。
+        self.assert_failure(
+            head + b'{"op":"ea","id":"b","w":0,"hi":2,"lo":1,"n":1,'
+                    b'"now":60,"x":1}]}',
+            2, "INPUT",
+        )
+
+    def test_type_range_and_relation_rejections(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        tail = b']}'
+        cases = [
+            b'{"op":"ea","id":"b","w":0,"hi":0,"lo":0,"n":1,"now":60}',     # hi 下界
+            b'{"op":"ea","id":"b","w":0,"hi":10001,"lo":0,"n":1,"now":60}',# hi 上界
+            b'{"op":"ea","id":"b","w":0,"hi":1,"lo":-1,"n":1,"now":60}',    # lo 下界
+            b'{"op":"ea","id":"b","w":0,"hi":10000,"lo":10000,"n":1,"now":60}',  # lo 上界
+            b'{"op":"ea","id":"b","w":0,"hi":1,"lo":1,"n":1,"now":60}',     # lo==hi
+            b'{"op":"ea","id":"b","w":0,"hi":2,"lo":1,"n":0,"now":60}',     # n 下界
+            b'{"op":"ea","id":"b","w":0,"hi":2,"lo":1,"n":61,"now":60}',    # n 上界
+            b'{"op":"ea","id":"b","w":0,"hi":true,"lo":0,"n":1,"now":60}',  # bool
+            b'{"op":"ea","id":"b","w":0,"hi":2.0,"lo":1,"n":1,"now":60}',   # 浮点
+            b'{"op":"ea","id":"b","w":0,"hi":"2","lo":1,"n":1,"now":60}',   # 字符串
+            b'{"op":"ea","id":"b","w":-1,"hi":2,"lo":1,"n":1,"now":60}',    # w 下界
+            b'{"op":"ea","id":"b","w":0,"hi":2,"lo":1,"n":1,"now":-1}',     # now 下界
+        ]
+        for body in cases:
+            self.assert_failure(head + body + tail, 2, "INPUT")
+
+    def test_window_out_of_range_is_state(self):
+        # 类型/范围合法但窗口越界：w==now//60（窗未结束）或 w 超出最近 60
+        # 窗保留下界，均执行期判 STATE（先于阈值/缓存判定）。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.ea(1, 60),
+            ]),
+            4, "STATE",
+        )
+        # now=3600：当前窗 60、下界 1，w=0 越界 → STATE。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.ea(0, 3600),
+            ]),
+            4, "STATE",
+        )
+
+    def test_clock_regression_is_input(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "mg", "id": "b", "now": 120},
+            self.ea(0, 60),
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_failed_batch_is_atomic(self):
+        # 合法 ea 之后跳窗触发 STATE：整批无任何 stdout（不产生部分结果）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.ea(0, 60),
+            self.ea(2, 180),
+        ]
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        self.assertEqual(stderr, b'{"error":"STATE"}\n')
+
+    def test_output_key_order_and_single_newline(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0),
+            self.ea(0, 60),
+        ])
+        _, out, _ = run_balancer("run", raw)
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+        result = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(
+            list(result),
+            ["op", "id", "w", "state", "requests", "errors",
+             "rate", "run", "changed"],
+        )
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(False, 0), self.mr(True, 1),
+            self.ea(0, 60),
+            self.ea(0, 60),
+            self.mr(True, 60),
+            self.ea(1, 120),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+
 if __name__ == "__main__":
     unittest.main()
