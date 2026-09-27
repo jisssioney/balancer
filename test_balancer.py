@@ -5834,5 +5834,302 @@ class HashDryRunTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
 
 
+class PerBackendCapOverrideTest(unittest.TestCase):
+    """pc/pg：每后端接纳容量覆盖；oa/ot 接纳与 oi/od/oq 投影用有效容量。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return code, out, err
+
+    def results(self, ops):
+        _, out, _ = self.run_ops(ops)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def setup(self, cap=3, q=5, ttl=10, ids=("b",)):
+        ops = [{"op": "add", "id": backend_id, "weight": 1}
+               for backend_id in ids]
+        ops.append({"op": "chash", "vnodes": 1})
+        ops.append({"op": "os", "cap": cap, "q": q, "ttl": ttl})
+        return ops
+
+    def oa(self, cid, now=0):
+        return {"op": "oa", "cid": cid, "flow": FLOW, "c": "c",
+                "s": "s", "key": "k", "now": now}
+
+    def test_pc_pg_ok_and_exact_key_order(self):
+        code, out, err = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 3},
+            {"op": "pg", "id": "b"},
+        ])
+        results = json.loads(out.decode("utf-8"))["results"]
+        self.assertEqual(results[1], {"op": "pc", "ok": True})
+        self.assertEqual(
+            results[2],
+            {"op": "pg", "id": "b", "cap": 3,
+             "connections": 0, "available": 3},
+        )
+        # 紧凑 JSON 固定键序逐字节。
+        self.assertIn(
+            b'{"op":"pg","id":"b","cap":3,"connections":0,"available":3}',
+            out,
+        )
+        self.assertTrue(out.endswith(b"\n"))
+
+    def test_same_value_idempotent_different_overrides(self):
+        results = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 3},
+            {"op": "pc", "id": "b", "cap": 3},
+            {"op": "pg", "id": "b"},
+            {"op": "pc", "id": "b", "cap": 7},
+            {"op": "pg", "id": "b"},
+        ])
+        self.assertEqual(results[3]["cap"], 3)
+        self.assertEqual(results[5]["cap"], 7)
+
+    def test_pc_works_without_os(self):
+        # 覆盖登记不要求已 os。
+        results = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 2},
+            {"op": "pg", "id": "b"},
+        ])
+        self.assertEqual(results[2]["cap"], 2)
+
+    def test_cap_bounds_and_types(self):
+        base = [{"op": "add", "id": "b", "weight": 1}]
+        for cap in (0, -1, 10 ** 6 + 1, True, 1.0, "1", None):
+            self.assert_failure(
+                base + [{"op": "pc", "id": "b", "cap": cap}], 2, "INPUT"
+            )
+
+    def test_pc_pg_key_order_and_keyset_input(self):
+        for op in (
+            {"op": "pc", "id": "b"},
+            {"op": "pc", "id": "b", "cap": 1, "x": 0},
+            {"op": "pc", "cap": 1},
+            {"op": "pc", "id": "", "cap": 1},
+            {"cap": 1, "id": "b", "op": "pc"},
+            {"op": "pg", "id": ""},
+            {"op": "pg"},
+            {"op": "pg", "id": "b", "x": 0},
+            {"id": "b", "op": "pg"},
+        ):
+            self.assert_failure([op], 2, "INPUT")
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            [{"op": "pc", "id": "z", "cap": 1}], 3, "BACKEND"
+        )
+        self.assert_failure([{"op": "pg", "id": "z"}], 3, "BACKEND")
+
+    def test_error_precedence_input_before_backend(self):
+        # cap 越界先于未知 id：INPUT/2。
+        self.assert_failure(
+            [{"op": "pc", "id": "z", "cap": 0}], 2, "INPUT"
+        )
+        # 键序非法先于未知 id：INPUT/2。
+        self.assert_failure(
+            [{"id": "z", "op": "pg"}], 2, "INPUT"
+        )
+
+    def test_pg_without_override_is_state(self):
+        self.assert_failure([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pg", "id": "b"},
+        ], 4, "STATE")
+
+    def test_lower_cap_keeps_connections_and_clamps_available(self):
+        results = self.results(self.setup(cap=3) + [
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 0},
+            {"op": "pc", "id": "b", "cap": 1},
+            {"op": "pg", "id": "b"},
+        ])
+        # 不关闭既有连接：connections=2，available 截零不为负。
+        self.assertEqual(
+            results[-1],
+            {"op": "pg", "id": "b", "cap": 1,
+             "connections": 2, "available": 0},
+        )
+
+    def test_lower_cap_blocks_new_oa_until_release(self):
+        ops = self.setup(cap=3) + [
+            self.oa("c1"),
+            {"op": "pc", "id": "b", "cap": 1},
+            self.oa("c2"),                       # 满载入队 Q
+        ]
+        results = self.results(ops)
+        self.assertEqual(results[3]["state"], "A")
+        self.assertEqual(results[5]["state"], "Q")
+        # 连接释放后 ot 自然恢复接纳，不主动动 FIFO 项。
+        ops += [
+            {"op": "close", "cid": "c1", "now": 5},
+            {"op": "ot", "now": 6},
+        ]
+        results = self.results(ops)
+        self.assertEqual(results[-1]["admitted"], ["c2"])
+
+    def test_raise_cap_admits_beyond_os_cap(self):
+        results = self.results(self.setup(cap=1) + [
+            {"op": "pc", "id": "b", "cap": 2},
+            self.oa("c1"),
+            self.oa("c2"),
+            self.oa("c3"),
+        ])
+        states = [r["state"] for r in results[-3:]]
+        self.assertEqual(states, ["A", "A", "Q"])
+
+    def test_ot_admits_after_cap_raised(self):
+        results = self.results(self.setup(cap=2, ttl=100) + [
+            self.oa("c1"),
+            {"op": "pc", "id": "b", "cap": 1},
+            self.oa("c2"),                       # Q
+            {"op": "pc", "id": "b", "cap": 3},
+            {"op": "ot", "now": 5},
+        ])
+        self.assertEqual(results[5]["state"], "Q")
+        self.assertEqual(
+            results[-1], {"op": "ot", "expired": [], "admitted": ["c2"]}
+        )
+
+    def test_oi_od_capacity_uses_effective_cap(self):
+        oi_op = {"op": "oi", "key": "k", "c": "c", "s": "s",
+                 "bc": 1, "cc": 1, "sc": 1, "timeout": 5, "max": 3, "now": 0}
+        od_op = dict(oi_op, op="od")
+        results = self.results(self.setup(cap=5) + [
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "pc", "id": "b", "cap": 1},
+            oi_op,
+            od_op,
+        ])
+        oi_res = [r for r in results if r["op"] == "oi"][0]
+        od_res = [r for r in results if r["op"] == "od"][0]
+        self.assertEqual(oi_res["state"], "R")
+        self.assertEqual(oi_res["capacity"], 1)
+        self.assertEqual(od_res["trace"][0]["result"], "C")
+        # 提高覆盖后投影恢复 A。
+        results = self.results(self.setup(cap=5) + [
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "pc", "id": "b", "cap": 1},
+            {"op": "pc", "id": "b", "cap": 5},
+            oi_op,
+        ])
+        self.assertEqual(results[-1]["state"], "A")
+
+    def test_oq_blocked_c_uses_effective_cap(self):
+        results = self.results(self.setup(cap=5, ttl=100) + [
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "pc", "id": "b", "cap": 1},
+            self.oa("q1"),
+            {"op": "oq", "now": 0},
+        ])
+        item = results[-1]["items"][0]
+        self.assertEqual(item["cid"], "q1")
+        self.assertEqual(item["backend"], "b")
+        self.assertEqual(item["blocked"], ["C"])
+        # 调高后不再 C。
+        results = self.results(self.setup(cap=5, ttl=100) + [
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "pc", "id": "b", "cap": 1},
+            self.oa("q1"),
+            {"op": "pc", "id": "b", "cap": 5},
+            {"op": "oq", "now": 1},
+        ])
+        self.assertEqual(results[-1]["items"][0]["blocked"], [])
+
+    def test_remove_deletes_override_and_readd_does_not_inherit(self):
+        self.assert_failure([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 7},
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pg", "id": "b"},
+        ], 4, "STATE")
+
+    def test_failed_batch_rolls_back_override(self):
+        # 前序 pc 成功，后续 BACKEND 失败：整批无 stdout、无部分生效。
+        code, stdout, stderr = run_balancer("run", encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 2},
+            {"op": "pg", "id": "nope"},
+        ]))
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(stderr, b'{"error":"BACKEND"}\n')
+
+    def ci_config(self):
+        return {
+            "version": 9,
+            "backends": [{
+                "id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                "circuit": None, "drain": None, "endpoint": None,
+            }],
+            "vnodes": None, "limits": [], "overload": None,
+            "sticky": None, "idle": None, "backpressure": None,
+            "scheduler": {"pick": "W"}, "faults": [], "quotas": [],
+            "queue": {"dequeue": "F", "full": "T"},
+        }
+
+    def test_ci_clears_override_and_ce_does_not_export_it(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 4},
+            {"op": "ce"},
+        ]
+        _, out, _ = self.run_ops(ops)
+        config = json.loads(out.decode("utf-8"))["results"][-1]["config"]
+        # 覆盖为纯运行态，不出现在 ce 导出。
+        self.assertNotIn("cap_overrides", config)
+        self.assertNotIn("pc", json.dumps(config))
+        self.assert_failure(ops + [
+            {"op": "ci", "config": self.ci_config(), "now": 0},
+            {"op": "pg", "id": "b"},
+        ], 4, "STATE")
+
+    def test_cb_clears_override(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 2},
+            {"op": "ci", "config": self.ci_config(), "now": 0},
+            {"op": "cl"},
+        ]
+        _, out, _ = self.run_ops(ops)
+        rev = json.loads(out.decode("utf-8"))["results"][-1]["current"]
+        self.assert_failure(ops + [
+            {"op": "cb", "rev": rev, "now": 1},
+            {"op": "pg", "id": "b"},
+        ], 4, "STATE")
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 2},
+            {"op": "pg", "id": "b"},
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, b"")
+
+
 if __name__ == "__main__":
     unittest.main()
