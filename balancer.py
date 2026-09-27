@@ -795,6 +795,17 @@ def parse_warm_now(value):
     return value
 
 
+def parse_base(value):
+    # ci 乐观并发指纹：精确为小写 64 位十六进制串（ct.digest 的形状）。
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(ch not in "0123456789abcdef" for ch in value)
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_threshold(value):
     # bool 是 int 的子类，必须显式排除。
     if (
@@ -1564,7 +1575,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
-        "ce", "ci", "cl", "cb", "cv",
+        "ce", "ci", "cl", "cb", "cv", "ct",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
@@ -2280,23 +2291,36 @@ def parse_op(raw_op):
             if keys != {"op"}:
                 fail(EXIT_INPUT, "INPUT")
             return ("ce",)
-        if keys != {"op", "config", "now"}:
+        if keys == {"op", "config", "now"}:
+            # 原三键形式：不带指纹，base 占位为 None。
+            base = None
+        elif list(raw_op) == ["op", "config", "base", "now"]:
+            # 四键乐观并发形式：精确键序 op,config,base,now；base 为
+            # 小写 64 位十六进制指纹，乱序或缺多键均判 INPUT。
+            base = parse_base(raw_op["base"])
+        else:
             fail(EXIT_INPUT, "INPUT")
         # now 为非负非 bool 整数，时钟倒退在执行期与其余操作同序判定。
         parse_now(raw_op["now"])
         config = parse_config(raw_op["config"])
-        return ("ci", config, raw_op["now"])
+        return ("ci", config, base, raw_op["now"])
 
     if name == "cv":
-        # 配置预检：精确键集 op,config,now；config 校验与规范化同 ci，
-        # now ∈ [0,10^9] 非 bool 整数，进入共用非递减时钟（倒退在执行期
-        # 与其余操作同序判 INPUT）。B 限流/配额与 faults 引用未知后端留
-        # 执行期判 BACKEND；不应用配置。
-        if keys != {"op", "config", "now"}:
+        # 配置预检：精确键序 op,config,now（乱序即 INPUT）；config 校验与
+        # 规范化同 ci，now ∈ [0,10^9] 非 bool 整数，进入共用非递减时钟
+        # （倒退在执行期与其余操作同序判 INPUT）。B 限流/配额与 faults
+        # 引用未知后端留执行期判 BACKEND；不应用配置。
+        if list(raw_op) != ["op", "config", "now"]:
             fail(EXIT_INPUT, "INPUT")
         parse_warm_now(raw_op["now"])
         config = parse_config(raw_op["config"])
         return ("cv", config, raw_op["now"])
+
+    if name == "ct":
+        # 当前配置指纹查询：精确键集仅 op，只读且不推进时钟。
+        if keys != {"op"}:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ct",)
 
     if name == "cl":
         # 配置提交历史查询：精确键集仅 op，只读。
@@ -3275,6 +3299,15 @@ def run(raw):
             # dequeue,full；不含等待项、evicted、last 等运行态。
             "queue": {"dequeue": queue_mode, "full": full_mode},
         }
+
+    def config_digest():
+        """当前配置的乐观并发指纹：ce.config 规范化 version=9 对象按逐层
+        键序序列化为 UTF-8 紧凑 JSON（非 ASCII 不转义、无末尾换行）后的
+        SHA-256 小写 64 位十六进制。时空 O(N)，N 为规范化配置大小。"""
+        canonical = json.dumps(
+            export_config(), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
 
     def apply_config(config, now):
         """ci/cb 共用的原子替换：以 now 重建默认运行态（全部 healthy、d>0
@@ -5069,8 +5102,12 @@ def run(raw):
             # 导出纯配置（登记值），不含任何运行态。
             results.append({"op": "ce", "config": export_config()})
 
+        elif op[0] == "ct":
+            # 当前配置指纹（只读）：不推进时钟，配置与运行态均不变。
+            results.append({"op": "ct", "digest": config_digest()})
+
         elif op[0] == "ci":
-            _, config, now = op
+            _, config, base, now = op
             # B 限流、B 配额与 faults 引用未知后端：BACKEND，先于活动状态
             # 判定。
             config_backend_ids = {entry[0] for entry in config["backends"]}
@@ -5083,6 +5120,11 @@ def run(raw):
             for fault_id in config["faults"]:
                 if fault_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
+            # 乐观并发：携带 base 时与操作前指纹比较，不等即 STATE，先于
+            # 活动连接或排队检查；全部校验先于任何变更，失败天然回滚时钟、
+            # 配置、运行态、rev 与历史。
+            if base is not None and base != config_digest():
+                fail(EXIT_STATE, "STATE")
             # 有活动连接或排队项时拒绝热加载：STATE。
             if connections or wait_queue:
                 fail(EXIT_STATE, "STATE")
