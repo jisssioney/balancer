@@ -852,6 +852,399 @@ class ConfigDigestTest(unittest.TestCase):
         self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
         self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
 
+    def test_ci_base_now_bound_is_input(self):
+        # 乐观并发形式的 now 仅收 0..10^9 非 bool 整数：负数、越界、bool、
+        # 字符串、浮点、None 一律 INPUT/2 且整批回滚。
+        results = self.run_ops([{"op": "ct"}])
+        digest = results[0]["digest"]
+        for bad in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
+            self.assert_failure(
+                encode_ops([
+                    {"op": "ci", "config": config_v9(1), "base": digest,
+                     "now": bad},
+                ]),
+                2, "INPUT",
+            )
+        # 上界 10^9 本身合法。
+        results = self.run_ops([
+            {"op": "ci", "config": config_v9(1), "base": digest,
+             "now": 10 ** 9},
+        ])
+        self.assertEqual(results[0], {"op": "ci", "ok": True})
+
+    def test_ci_base_bad_now_rolls_back_batch(self):
+        # base 形式 now 非法：整批无 stdout，前面成功的 ci 也不落状态。
+        ops = [
+            {"op": "ci", "config": config_v9(1), "now": 0},
+            {"op": "ci", "config": config_v9(2), "base": "0" * 64,
+             "now": 10 ** 9 + 1},
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_ci_three_key_now_still_unbounded(self):
+        # 原三键形式的 now 无上界（仅非负非 bool 整数），行为不变。
+        results = self.run_ops(
+            [{"op": "ci", "config": config_v9(1), "now": 10 ** 9 + 5}]
+        )
+        self.assertEqual(results[0], {"op": "ci", "ok": True})
+
+
+class ConfigDiffTest(unittest.TestCase):
+    """后端配置变更预览 cd：比较当前与候选规范化配置的 backends，不应用。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def backend(self, bid, weight=1, d=0, fail=3, success=2, circuit=None,
+                drain=None, endpoint=None):
+        return {
+            "id": bid,
+            "weight": weight,
+            "d": d,
+            "fail": fail,
+            "success": success,
+            "circuit": circuit,
+            "drain": drain,
+            "endpoint": endpoint,
+        }
+
+    def make_config(self, backends, **overrides):
+        # 以最小 v9 配置为底，整体替换 backends。
+        config = config_v9(1, **overrides)
+        config["backends"] = list(backends)
+        return config
+
+    def cd(self, backends, now=0, **overrides):
+        return {"op": "cd", "config": self.make_config(backends, **overrides),
+                "now": now}
+
+    def test_cd_empty_state_result_shape(self):
+        results = self.run_ops([{"op": "ct"}, self.cd([self.backend("a")])])
+        result = results[1]
+        # 精确结果键序 op,base,target,added,removed,changed,order。
+        self.assertEqual(
+            list(result),
+            ["op", "base", "target", "added", "removed", "changed", "order"],
+        )
+        self.assertEqual(result["op"], "cd")
+        # base 即同批 ct 对空配置的指纹；target 为候选规范化配置的指纹。
+        self.assertEqual(result["base"], results[0]["digest"])
+        empty = config_v9(1)
+        empty["backends"] = []
+        self.assertEqual(result["base"], digest_of(empty))
+        self.assertEqual(result["target"], digest_of(self.make_config(
+            [self.backend("a")]
+        )))
+        self.assertRegex(result["base"], r"^[0-9a-f]{64}$")
+        self.assertEqual(result["added"], ["a"])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["order"], True)
+
+    def test_cd_identical_config_is_empty_diff(self):
+        config = self.make_config([self.backend("a", weight=2)])
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "ct"},
+            self.cd([self.backend("a", weight=2)], now=1),
+        ])
+        result = results[2]
+        self.assertEqual(result["base"], result["target"])
+        self.assertEqual(result["base"], results[1]["digest"])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["order"], False)
+
+    def test_cd_added_and_removed_follow_each_side_order(self):
+        current = [self.backend("a"), self.backend("x"), self.backend("b")]
+        candidate = [
+            self.backend("c"), self.backend("a"), self.backend("b"),
+            self.backend("d"),
+        ]
+        results = self.run_ops([
+            {"op": "ci", "config": self.make_config(current), "now": 0},
+            self.cd(candidate, now=1),
+        ])
+        result = results[1]
+        # added 按候选加入序（跳过共有 a/b），removed 按当前加入序。
+        self.assertEqual(result["added"], ["c", "d"])
+        self.assertEqual(result["removed"], ["x"])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["order"], True)
+
+    def test_cd_changed_fields_in_fixed_order(self):
+        circuit = {"n": 1, "m": 1, "r": 1, "w": 1, "q": 1}
+        endpoint = {"host": "127.0.0.1", "port": 80}
+        current = [self.backend("a"), self.backend("b", weight=4)]
+        candidate = [
+            self.backend(
+                "a", weight=5, d=2, fail=4, success=6, circuit=circuit,
+                drain=7, endpoint=endpoint,
+            ),
+            self.backend("b", weight=4),
+        ]
+        results = self.run_ops([
+            {"op": "ci", "config": self.make_config(current), "now": 0},
+            self.cd(candidate, now=1),
+        ])
+        result = results[1]
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        # changed 按候选序，仅共有且变化者；项键序 id,fields；fields 固定
+        # 按 weight,d,fail,success,circuit,drain,endpoint 列差异。
+        self.assertEqual(
+            result["changed"],
+            [{
+                "id": "a",
+                "fields": ["weight", "d", "fail", "success",
+                           "circuit", "drain", "endpoint"],
+            }],
+        )
+        self.assertEqual(list(result["changed"][0]), ["id", "fields"])
+        self.assertEqual(result["order"], False)
+
+    def test_cd_changed_field_subset_order_independent(self):
+        # 仅 endpoint 与 weight 变化：仍按固定序输出，与登记顺序无关。
+        current = [self.backend("a")]
+        candidate = [self.backend(
+            "a", weight=9, endpoint={"host": "10.0.0.1", "port": 443}
+        )]
+        results = self.run_ops([
+            {"op": "ci", "config": self.make_config(current), "now": 0},
+            self.cd(candidate, now=1),
+        ])
+        self.assertEqual(
+            results[1]["changed"], [{"id": "a", "fields": ["weight", "endpoint"]}]
+        )
+
+    def test_cd_changed_follows_candidate_order_with_reversal(self):
+        current = [self.backend("a", weight=1), self.backend("b", weight=1)]
+        candidate = [self.backend("b", weight=8), self.backend("a", weight=9)]
+        results = self.run_ops([
+            {"op": "ci", "config": self.make_config(current), "now": 0},
+            self.cd(candidate, now=1),
+        ])
+        result = results[1]
+        # changed 按候选序：b 先于 a；同 id 集合仅顺序不同故 order=true。
+        self.assertEqual(
+            result["changed"],
+            [
+                {"id": "b", "fields": ["weight"]},
+                {"id": "a", "fields": ["weight"]},
+            ],
+        )
+        self.assertEqual(result["order"], True)
+
+    def test_cd_pure_reorder_is_order_only(self):
+        backends = [self.backend("a"), self.backend("b")]
+        results = self.run_ops([
+            {"op": "ci", "config": self.make_config(backends), "now": 0},
+            self.cd([self.backend("b"), self.backend("a")], now=1),
+        ])
+        result = results[1]
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["order"], True)
+
+    def test_cd_does_not_apply_or_commit(self):
+        # cd 后 ce 仍为原配置、cl 无提交；再次 cd 看到的仍是旧现状。
+        ops = [
+            {"op": "ci", "config": self.make_config([self.backend("a")]),
+             "now": 0},
+            self.cd([self.backend("a"), self.backend("z")], now=1),
+            {"op": "ce"},
+            {"op": "cl"},
+            self.cd([self.backend("a"), self.backend("z")], now=2),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            [b["id"] for b in results[2]["config"]["backends"]], ["a"]
+        )
+        # cd 不产生提交：cl 仍只有先前 ci 的 rev 1。
+        self.assertEqual(results[3]["current"], 1)
+        self.assertEqual(len(results[3]["commits"]), 1)
+        # 候选未应用：z 在第二次 cd 中仍为 added。
+        self.assertEqual(results[4]["added"], ["z"])
+
+    def test_cd_active_connection_and_queue_are_not_errors(self):
+        # 活动连接不报错：差异照常计算。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+            self.cd([self.backend("a", weight=5), self.backend("b")], now=1),
+        ]
+        results = self.run_ops(ops)
+        result = results[-1]
+        self.assertEqual(result["added"], ["b"])
+        self.assertEqual(
+            result["changed"], [{"id": "a", "fields": ["weight"]}]
+        )
+        # 排队项同样不报错。
+        ops = [
+            {"op": "add", "id": "o", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+            {"op": "open", "cid": "y", "flow": self.FLOW, "now": 0},
+            {
+                "op": "oa", "cid": "z", "flow": self.FLOW, "c": "k",
+                "s": "k", "key": "k", "now": 0,
+            },
+            self.cd([self.backend("o"), self.backend("q")], now=1),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["added"], ["q"])
+
+    def test_cd_accepts_v1_and_normalizes(self):
+        config_v1 = {
+            "version": 1,
+            "backends": [{
+                "id": "a", "weight": 2, "d": 0, "fail": 3, "success": 2,
+                "circuit": None, "drain": None,
+            }],
+            "vnodes": None,
+            "limits": [],
+            "overload": None,
+        }
+        results = self.run_ops([{"op": "cd", "config": config_v1, "now": 0}])
+        result = results[0]
+        # target 为规范化 v9 配置（endpoint=null、queue 默认 F/T）的指纹。
+        normalized = config_v9(2)
+        self.assertEqual(result["target"], digest_of(normalized))
+        self.assertEqual(result["added"], ["a"])
+
+    def test_cd_unknown_backend_references_are_backend(self):
+        # 错误类型与优先级同 cv：B 限流、B 配额、faults 引用未知后端 BACKEND。
+        bad_limit = self.make_config(
+            [self.backend("a")],
+            limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}],
+        )
+        bad_quota = self.make_config(
+            [self.backend("a")],
+            quotas=[{"scope": "B", "id": "ghost", "limit": 1, "span": 1}],
+        )
+        bad_fault = self.make_config(
+            [self.backend("a")],
+            faults=[{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}],
+        )
+        for bad in (bad_limit, bad_quota, bad_fault):
+            self.assert_failure(
+                encode_ops([{"op": "cd", "config": bad, "now": 0}]),
+                3, "BACKEND",
+            )
+
+    def test_cd_invalid_config_is_input(self):
+        bad_version = config_v9(1)
+        bad_version["version"] = 8
+        missing = config_v9(1)
+        del missing["scheduler"]
+        for bad in (bad_version, missing, {"version": 9}, []):
+            self.assert_failure(
+                encode_ops([{"op": "cd", "config": bad, "now": 0}]),
+                2, "INPUT",
+            )
+
+    def test_cd_bad_now_is_input(self):
+        for bad in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
+            self.assert_failure(
+                encode_ops([{"op": "cd", "config": config_v9(1), "now": bad}]),
+                2, "INPUT",
+            )
+
+    def test_cd_now_boundary_values_are_ok(self):
+        results = self.run_ops([
+            {"op": "cd", "config": config_v9(1), "now": 0},
+            {"op": "cd", "config": config_v9(2), "now": 10 ** 9},
+        ])
+        self.assertEqual(len(results), 2)
+
+    def test_cd_exact_key_order(self):
+        # 精确键序 op,config,now：乱序、多键、缺键均 INPUT。
+        self.assert_failure(
+            encode_ops(
+                [{"op": "cd", "now": 0, "config": config_v9(1)}]
+            ),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops(
+                [{"config": config_v9(1), "op": "cd", "now": 0}]
+            ),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops(
+                [{"op": "cd", "config": config_v9(1), "now": 0, "x": 1}]
+            ),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "cd", "config": config_v9(1)}]),
+            2, "INPUT",
+        )
+
+    def test_cd_clock_regression_is_input_and_advances_clock(self):
+        # 时钟倒退 INPUT/2；相等 now 合法。
+        self.assert_failure(
+            encode_ops([
+                {"op": "cd", "config": config_v9(1), "now": 10},
+                {"op": "cd", "config": config_v9(2), "now": 5},
+            ]),
+            2, "INPUT",
+        )
+        results = self.run_ops([
+            {"op": "cd", "config": config_v9(1), "now": 10},
+            {"op": "cd", "config": config_v9(2), "now": 10},
+        ])
+        self.assertEqual(len(results), 2)
+        # cd 成功推进共用时钟：其后旧时刻的其他操作报倒退。
+        self.assert_failure(
+            encode_ops([
+                {"op": "cd", "config": config_v9(1), "now": 10},
+                {"op": "cv", "config": config_v9(2), "now": 9},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_cd_failure_rolls_back_batch(self):
+        # 批内靠后的 cd 失败：整批无 stdout，前面成功的 ci 也不落任何状态。
+        ops = [
+            {"op": "ci", "config": config_v9(1), "now": 0},
+            {"op": "cd", "config": config_v9(2), "now": 1},
+            {"op": "cd", "config": config_v9(3), "now": "x"},
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_record_replay_covers_cd(self):
+        ops = [
+            {"op": "ci", "config": self.make_config([self.backend("a")]),
+             "now": 0},
+            self.cd([self.backend("a", weight=7), self.backend("b")], now=1),
+            {"op": "ct"},
+        ]
+        raw = encode_ops(ops)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+
 
 class FaultHotReloadTest(unittest.TestCase):
     """version=7 faults 时间线纳入 ce/ci/cl/cb 热加载。"""
