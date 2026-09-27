@@ -1611,7 +1611,7 @@ def parse_op(raw_op):
         "os", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
-        "ce", "ci", "cl", "cb", "cv", "ct", "cd",
+        "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "hm", "fm", "fh",
@@ -2369,6 +2369,18 @@ def parse_op(raw_op):
         parse_warm_now(raw_op["now"])
         config = parse_config(raw_op["config"])
         return ("cd", config, raw_op["now"])
+
+    if name == "pd":
+        # 策略配置差异预览：精确键序 op,config,now（键须按此序出现，乱序报
+        # INPUT）；config 校验、规范化与错误优先级同 cv，now ∈ [0,10^9]
+        # 非 bool 整数，进入共用非递减时钟（倒退在执行期与其余操作同序判
+        # INPUT）。B 限流/配额与 faults 引用未知候选后端留执行期判
+        # BACKEND；不应用候选配置。
+        if list(raw_op) != ["op", "config", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        parse_warm_now(raw_op["now"])
+        config = parse_config(raw_op["config"])
+        return ("pd", config, raw_op["now"])
 
     if name == "ct":
         # 配置指纹查询：精确键序仅 op，只读且不推进时钟。
@@ -3523,7 +3535,7 @@ def run(raw):
             "oq",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
-            "ci", "cb", "cv", "cd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cv", "cd", "pd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh",
         ):
             now = op[-1]
@@ -5276,6 +5288,50 @@ def run(raw):
                     ],
                     "changed": changed,
                     "order": candidate_ids != current_ids,
+                }
+            )
+
+        elif op[0] == "pd":
+            _, config, now = op
+            # B 限流、B 配额与 faults 引用未知候选后端：BACKEND，判定顺序与
+            # 优先级同 cv；活动连接或排队项不影响预览，不报 STATE。
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 预览不应用候选：比较当前 ce.config 与候选规范化 version=9 配置
+            # 的非 backends 部分。base/target 为两份完整规范化配置的 ct 摘要；
+            # changes 按 vnodes,limits,overload,sticky,idle,backpressure,
+            # scheduler,faults,quotas,queue 列差异项，项键序 section,before,
+            # after，before/after 复用对应 ce 字段的导出值（类型、键序、数组
+            # 排序与值格式一致）；仅 backends 变化时 changes 为空。成功仅推进
+            # 时钟（已在共用时钟块完成），其余状态不变。O(N)，N 为规范化配置
+            # 大小。
+            current_export = export_config()
+            candidate_export = export_normalized_config(config)
+            changes = []
+            for section in (
+                "vnodes", "limits", "overload", "sticky", "idle",
+                "backpressure", "scheduler", "faults", "quotas", "queue",
+            ):
+                before = current_export[section]
+                after = candidate_export[section]
+                if before != after:
+                    changes.append(
+                        {"section": section, "before": before, "after": after}
+                    )
+            results.append(
+                {
+                    "op": "pd",
+                    "base": config_digest(current_export),
+                    "target": config_digest(candidate_export),
+                    "changes": changes,
                 }
             )
 

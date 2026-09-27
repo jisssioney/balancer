@@ -1246,7 +1246,335 @@ class ConfigDiffTest(unittest.TestCase):
         self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
 
 
-class FaultHotReloadTest(unittest.TestCase):
+class PolicyDiffTest(unittest.TestCase):
+    """策略配置差异预览 pd：比较当前与候选规范化配置的非 backends 部分。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def pd(self, config, now=0):
+        return {"op": "pd", "config": config, "now": now}
+
+    def test_pd_result_shape_and_digests(self):
+        results = self.run_ops([{"op": "ct"}, self.pd(config_v9(1))])
+        result = results[1]
+        # 精确结果键序 op,base,target,changes。
+        self.assertEqual(list(result), ["op", "base", "target", "changes"])
+        self.assertEqual(result["op"], "pd")
+        # base 即同批 ct 对当前（空）配置的指纹；target 为候选规范化指纹。
+        self.assertEqual(result["base"], results[0]["digest"])
+        empty = config_v9(1)
+        empty["backends"] = []
+        self.assertEqual(result["base"], digest_of(empty))
+        self.assertEqual(result["target"], digest_of(config_v9(1)))
+        self.assertRegex(result["target"], r"^[0-9a-f]{64}$")
+        # 仅 backends 不同：changes 为空。
+        self.assertEqual(result["changes"], [])
+
+    def test_pd_identical_config_is_empty_diff(self):
+        results = self.run_ops([
+            {"op": "ci", "config": config_v9(2), "now": 0},
+            {"op": "ct"},
+            self.pd(config_v9(2), now=1),
+        ])
+        result = results[2]
+        self.assertEqual(result["base"], result["target"])
+        self.assertEqual(result["base"], results[1]["digest"])
+        self.assertEqual(result["changes"], [])
+
+    def test_pd_sections_in_fixed_order(self):
+        # 候选同时改 vnodes/limits/overload/sticky/idle/backpressure/
+        # scheduler/faults/quotas/queue：changes 按固定节序列出，与配置
+        # 内登记先后无关；项键序 section,before,after。
+        candidate = config_v9(
+            1,
+            faults=[{"id": "a", "k": "D", "a": 0, "z": 10, "v": 0}],
+            quotas=[{"scope": "C", "id": "c", "limit": 5, "span": 60}],
+            dequeue="S",
+            vnodes=64,
+            limits=[{"scope": "S", "id": "s", "r": 2, "b": 3}],
+            overload={"cap": 4, "q": 8, "ttl": 30},
+            sticky={"ttl": 10},
+            idle={"ttl": 20},
+            backpressure={"low": 1, "high": 2},
+            scheduler={"pick": "L"},
+        )
+        results = self.run_ops([self.pd(candidate)])
+        changes = results[0]["changes"]
+        self.assertEqual(
+            [item["section"] for item in changes],
+            [
+                "vnodes", "limits", "overload", "sticky", "idle",
+                "backpressure", "scheduler", "faults", "quotas", "queue",
+            ],
+        )
+        for item in changes:
+            self.assertEqual(list(item), ["section", "before", "after"])
+        by_section = {item["section"]: item for item in changes}
+        self.assertEqual(
+            by_section["vnodes"], {"section": "vnodes", "before": None, "after": 64}
+        )
+        self.assertEqual(
+            by_section["limits"]["after"],
+            [{"scope": "S", "id": "s", "r": 2, "b": 3}],
+        )
+        self.assertEqual(by_section["overload"]["before"], None)
+        self.assertEqual(
+            by_section["overload"]["after"], {"cap": 4, "q": 8, "ttl": 30}
+        )
+        self.assertEqual(by_section["sticky"]["after"], {"ttl": 10})
+        self.assertEqual(by_section["idle"]["after"], {"ttl": 20})
+        self.assertEqual(
+            by_section["backpressure"]["after"], {"low": 1, "high": 2}
+        )
+        self.assertEqual(
+            by_section["scheduler"],
+            {"section": "scheduler",
+             "before": {"pick": "W"}, "after": {"pick": "L"}},
+        )
+        self.assertEqual(
+            by_section["faults"]["after"],
+            [{"id": "a", "k": "D", "a": 0, "z": 10, "v": 0}],
+        )
+        self.assertEqual(
+            by_section["quotas"]["after"],
+            [{"scope": "C", "id": "c", "limit": 5, "span": 60}],
+        )
+        self.assertEqual(
+            by_section["queue"],
+            {"section": "queue",
+             "before": {"dequeue": "F", "full": "T"},
+             "after": {"dequeue": "S", "full": "T"}},
+        )
+
+    def test_pd_before_reflects_current_config(self):
+        # before 取自当前 ce 配置（含运行期 qp/rp 修改后的登记值）。
+        ops = [
+            {"op": "ci", "config": config_v9(1, vnodes=32), "now": 0},
+            {"op": "qp", "mode": "S"},
+            self.pd(config_v9(1, vnodes=32), now=1),
+        ]
+        results = self.run_ops(ops)
+        changes = results[-1]["changes"]
+        self.assertEqual(
+            changes,
+            [{
+                "section": "queue",
+                "before": {"dequeue": "S", "full": "T"},
+                "after": {"dequeue": "F", "full": "T"},
+            }],
+        )
+
+    def test_pd_backends_only_change_is_empty_changes(self):
+        # 仅 backends 变化（含增删与字段变更）：changes 为空，base/target
+        # 仍为两份完整配置的指纹。
+        current = config_v9(1)
+        candidate = config_v9(9)
+        candidate["backends"].append(
+            {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
+             "circuit": None, "drain": None, "endpoint": None}
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": current, "now": 0},
+            self.pd(candidate, now=1),
+        ])
+        result = results[1]
+        self.assertEqual(result["changes"], [])
+        self.assertEqual(result["base"], digest_of(current))
+        self.assertEqual(result["target"], digest_of(candidate))
+
+    def test_pd_does_not_apply_or_commit(self):
+        # pd 后 ce 仍为原配置、cl 无提交；再次 pd 看到的仍是旧现状。
+        ops = [
+            {"op": "ci", "config": config_v9(1), "now": 0},
+            self.pd(config_v9(1, vnodes=64), now=1),
+            {"op": "ce"},
+            {"op": "cl"},
+            self.pd(config_v9(1, vnodes=64), now=2),
+        ]
+        results = self.run_ops(ops)
+        self.assertIsNone(results[2]["config"]["vnodes"])
+        self.assertEqual(results[3]["current"], 1)
+        self.assertEqual(len(results[3]["commits"]), 1)
+        # 候选未应用：第二次 pd 的 before 仍是 null。
+        self.assertEqual(
+            results[4]["changes"],
+            [{"section": "vnodes", "before": None, "after": 64}],
+        )
+
+    def test_pd_active_connection_and_queue_are_not_errors(self):
+        # 活动连接不报错：差异照常计算。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+            self.pd(config_v9(1, vnodes=8), now=1),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            results[-1]["changes"],
+            [{"section": "vnodes", "before": None, "after": 8}],
+        )
+        # 排队项同样不报错。
+        ops = [
+            {"op": "add", "id": "o", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+            {"op": "open", "cid": "y", "flow": self.FLOW, "now": 0},
+            {
+                "op": "oa", "cid": "z", "flow": self.FLOW, "c": "k",
+                "s": "k", "key": "k", "now": 0,
+            },
+            self.pd(config_v9(1, idle={"ttl": 5}), now=1),
+        ]
+        results = self.run_ops(ops)
+        # chash/os 的登记值随 ce 导出，与候选差异一并按节序列出。
+        self.assertEqual(
+            results[-1]["changes"],
+            [
+                {"section": "vnodes", "before": 1, "after": None},
+                {"section": "overload",
+                 "before": {"cap": 1, "q": 2, "ttl": 10}, "after": None},
+                {"section": "idle", "before": None, "after": {"ttl": 5}},
+            ],
+        )
+
+    def test_pd_accepts_v1_and_normalizes(self):
+        # v1 候选规范化为 v9：target 为规范化指纹，queue 默认 F/T 不差异。
+        config_v1 = {
+            "version": 1,
+            "backends": [{
+                "id": "a", "weight": 2, "d": 0, "fail": 3, "success": 2,
+                "circuit": None, "drain": None,
+            }],
+            "vnodes": None,
+            "limits": [],
+            "overload": None,
+        }
+        results = self.run_ops([self.pd(config_v1)])
+        result = results[0]
+        self.assertEqual(result["target"], digest_of(config_v9(2)))
+        self.assertEqual(result["changes"], [])
+
+    def test_pd_unknown_backend_references_are_backend(self):
+        # 错误类型与优先级同 cv：B 限流、B 配额、faults 引用未知候选后端。
+        bad_limit = config_v9(
+            1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}]
+        )
+        bad_quota = config_v9(
+            1, quotas=[{"scope": "B", "id": "ghost", "limit": 1, "span": 1}]
+        )
+        bad_fault = config_v9(
+            1, faults=[{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}]
+        )
+        for bad in (bad_limit, bad_quota, bad_fault):
+            self.assert_failure(
+                encode_ops([self.pd(bad)]),
+                3, "BACKEND",
+            )
+
+    def test_pd_invalid_config_is_input(self):
+        bad_version = config_v9(1)
+        bad_version["version"] = 8
+        missing = config_v9(1)
+        del missing["scheduler"]
+        for bad in (bad_version, missing, {"version": 9}, []):
+            self.assert_failure(
+                encode_ops([self.pd(bad)]),
+                2, "INPUT",
+            )
+
+    def test_pd_bad_now_is_input(self):
+        for bad in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
+            self.assert_failure(
+                encode_ops([self.pd(config_v9(1), now=bad)]),
+                2, "INPUT",
+            )
+
+    def test_pd_now_boundary_values_are_ok(self):
+        results = self.run_ops([
+            self.pd(config_v9(1), now=0),
+            self.pd(config_v9(2), now=10 ** 9),
+        ])
+        self.assertEqual(len(results), 2)
+
+    def test_pd_exact_key_order(self):
+        # 精确键序 op,config,now：乱序、多键、缺键均 INPUT。
+        self.assert_failure(
+            encode_ops([{"op": "pd", "now": 0, "config": config_v9(1)}]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"config": config_v9(1), "op": "pd", "now": 0}]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "pd", "config": config_v9(1), "now": 0, "x": 1}]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "pd", "config": config_v9(1)}]),
+            2, "INPUT",
+        )
+
+    def test_pd_clock_regression_is_input_and_advances_clock(self):
+        # 时钟倒退 INPUT/2；相等 now 合法。
+        self.assert_failure(
+            encode_ops([
+                self.pd(config_v9(1), now=10),
+                self.pd(config_v9(2), now=5),
+            ]),
+            2, "INPUT",
+        )
+        results = self.run_ops([
+            self.pd(config_v9(1), now=10),
+            self.pd(config_v9(2), now=10),
+        ])
+        self.assertEqual(len(results), 2)
+        # pd 成功推进共用时钟：其后旧时刻的其他操作报倒退。
+        self.assert_failure(
+            encode_ops([
+                self.pd(config_v9(1), now=10),
+                {"op": "cv", "config": config_v9(2), "now": 9},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_pd_failure_rolls_back_batch(self):
+        # 批内靠后的 pd 失败：整批无 stdout，前面成功的 ci 也不落任何状态。
+        ops = [
+            {"op": "ci", "config": config_v9(1), "now": 0},
+            self.pd(config_v9(2), now=1),
+            self.pd(config_v9(3), now="x"),
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_record_replay_covers_pd(self):
+        ops = [
+            {"op": "ci", "config": config_v9(1), "now": 0},
+            self.pd(config_v9(1, vnodes=16, scheduler={"pick": "R"}), now=1),
+            {"op": "ct"},
+        ]
+        raw = encode_ops(ops)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
     """version=7 faults 时间线纳入 ce/ci/cl/cb 热加载。"""
 
     FLOW = ["s", 1, "t", 2, "tcp"]
