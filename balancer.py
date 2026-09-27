@@ -299,6 +299,19 @@ max(0,now//60-59) 报 STATE/4。已删除后端不汇总，同 id 重加只计�
 后端数、R 为窗数），仅用标准库，record/replay 逐字节覆盖 ma；
 mr/mg/mh 行为不变。
 
+后端延迟分位查询：lp 精确键序 op,id,from,to,p,now（键须按此序出现），
+from/to/now 为 0..10^9、p 为 1..100 的非 bool 整数，须
+from≤to≤now//60 且 to-from<60，now 纳入共用非递减时钟。lp 只读汇总
+mh 区间内五个 latency 桶：各桶跨窗求和并封顶 10^18，samples 为五桶之
+和再封顶 10^18；rank=ceil(p*samples/100)，自桶 0 起累计并截至 samples，
+取首个累计 ≥ rank 者为 bucket，桶上界依次为 1、10、100、1000、null
+（upper）。samples=0 时 rank=0 且 bucket=upper=null。结果键序
+op,id,from,to,p,samples,buckets,rank,bucket,upper；buckets 为五整数
+数组，bucket 为 0..4 整数或 null，upper 为整数或 null。键序、类型、
+范围、关系或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，from 早于
+max(0,now//60-59) 报 STATE/4。lp 只读，失败批回滚；时间 O(R)、额外
+空间 O(1)，仅用标准库；record/replay 逐字节覆盖 lp，其余操作不变。
+
 全池增量快照：mo 精确键序 op,seq,now（键须按此序出现），seq 为
 1..10^18、now 为 0..10^9 的非 bool 整数，now 纳入共用非递减时钟。
 首次 seq=1，此后须逐次递增 1；同 seq、now 重报原样返回缓存结果且不
@@ -1739,7 +1752,7 @@ def parse_op(raw_op):
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo",
+        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "lp", "mo",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -2230,6 +2243,31 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("ma", start, end, now)
+
+    if name == "lp":
+        # 后端延迟分位查询：精确键序 op,id,from,to,p,now（键须按此序出现），
+        # 只读；from/to/now 为 0..10^9、p 为 1..100 的非 bool 整数；窗关系同
+        # mh/ma，from 过早的 STATE 留执行期判（未知 id 先 BACKEND）。
+        if list(raw_op) != ["op", "id", "from", "to", "p", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        percentile = raw_op["p"]
+        if (
+            not isinstance(percentile, int)
+            or isinstance(percentile, bool)
+            or not 1 <= percentile <= 100
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "lp",
+            parse_backend_id(raw_op["id"]),
+            start, end, percentile, now,
+        )
 
     if name == "mo":
         # 全池增量快照：精确键序 op,seq,now（键须按此序出现），seq 为
@@ -3745,7 +3783,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "oq",
             "mr", "mg", "mh",
-            "ms", "mx", "rh", "ra", "ma",
+            "ms", "mx", "rh", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
         ):
@@ -5267,6 +5305,63 @@ def run(raw):
                     }
                 )
             results.append({"op": "ma", "windows": windows})
+
+        elif op[0] == "lp":
+            # 后端延迟分位查询（只读）：未知 id 报 BACKEND；from 早于最近
+            # 60 窗下界报 STATE（同 mh/ma）；不改任何度量，失败批次天然回滚。
+            # 汇总 from..to 各窗五 latency 桶：每桶跨窗求和并封顶 10^18，
+            # samples 为五桶之和再封顶 10^18；rank=ceil(p*samples/100)，自桶
+            # 0 起累计（截至 samples）取首个累计 ≥ rank 者；桶上界依次为
+            # 1、10、100、1000、null。samples=0 时 rank=0、bucket/upper=null。
+            _, backend_id, start, end, percentile, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = record["metrics"]
+            buckets = [0, 0, 0, 0, 0]
+            for window in range(start, end + 1):
+                metrics = history.get(window)
+                if metrics is None:
+                    # 缺窗：五桶皆 0，不计入。
+                    continue
+                latency = metrics[4]
+                for i in range(5):
+                    buckets[i] = min(METRIC_CAP, buckets[i] + latency[i])
+            samples = min(METRIC_CAP, sum(buckets))
+            if samples == 0:
+                rank = 0
+                bucket = None
+                upper = None
+            else:
+                # ceil(p*samples/100)；samples>0 且 p≥1 故 rank≥1。
+                rank = (percentile * samples + 99) // 100
+                cumulative = 0
+                bucket = 0
+                for i in range(5):
+                    # 累计截至 samples，封顶后的五桶之和可能超过 samples。
+                    cumulative = min(samples, cumulative + buckets[i])
+                    if cumulative >= rank:
+                        bucket = i
+                        break
+                upper = (1, 10, 100, 1000, None)[bucket]
+            results.append(
+                {
+                    "op": "lp",
+                    "id": backend_id,
+                    "from": start,
+                    "to": end,
+                    "p": percentile,
+                    "samples": samples,
+                    "buckets": buckets,
+                    "rank": rank,
+                    "bucket": bucket,
+                    "upper": upper,
+                }
+            )
 
         elif op[0] == "oh":
             # 过载分钟历史（只读）：未 os 报 STATE；from 早于最近 60 窗下界
