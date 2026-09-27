@@ -486,6 +486,20 @@ D/S 的后端数（同一后端同一 now 至多一个活动段，故即活动�
 外空间 O(T)，单后端活动段查找 O(log T_b)（T 为总段数、T_b 为该后端段
 数）。
 
+全池运行态快照：br 精确键序 op,now（键须按此序出现），now 为 0..10^9
+非 bool 整数，进入共用非递减时钟。返回键序 op,now,backends；backends
+按加入序列出全部现存后端，项键序
+id,health,circuit,drain,fault,connections,ready,blocked：health 为
+healthy/unhealthy；未配熔断时 circuit=C，否则取 C/O/H；drain 取
+A/D/X；fault 按 now 的时间线取 N/D/S（同 fq 的 effect 口径）；
+connections 为活动连接数。healthy、circuit=C、drain=A 且 fault≠D 时
+ready=true，否则 false；blocked 按 health,circuit,drain,fault 顺序
+列出未满足条件的字符串，允许多项，ready 时为空数组，S 不阻断；空池
+backends=[]。键序、now 类型或范围、时钟倒退报 INPUT/2；br 除推进
+时钟外不改任何状态，成功仅推进时钟，失败批回滚。br 时间
+O(B log(T+1))、空间 O(B)（T 为单后端故障段数），仅用标准库；
+record/replay 逐字节覆盖。
+
 故障重试：fr 键集 op,cid,flow,key,timeout,max,now，cid/flow/key 同
 fx，timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数，now 纳入
 共用非递减时钟。自 key 哈希点按 fx 顺序遍历不同后端至多 max 个（环同
@@ -1614,6 +1628,7 @@ def parse_op(raw_op):
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
+        "br",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
         "ts", "tk", "tg", "tx",
@@ -2167,6 +2182,14 @@ def parse_op(raw_op):
         if keys != {"op", "now"}:
             fail(EXIT_INPUT, "INPUT")
         return ("fq", parse_now(raw_op["now"]))
+
+    if name == "br":
+        # 全池运行态快照：精确键序 op,now（键须按此序出现）；now 为
+        # 0..10^9 非 bool 整数，纳入共用非递减时钟；键序/类型/范围在此判
+        # INPUT，时钟倒退由批前通用时钟判定报 INPUT。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("br", parse_metric_num(raw_op["now"]))
 
     if name == "fx":
         if keys != {"op", "cid", "flow", "key", "timeout", "now"}:
@@ -3536,7 +3559,7 @@ def run(raw):
             "mr", "mg", "mh",
             "ms", "mx", "rh", "ra", "ma",
             "ci", "cb", "cv", "cd", "pd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
-            "fa", "fe", "ah", "oh",
+            "fa", "fe", "ah", "oh", "br",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -5477,6 +5500,48 @@ def run(raw):
             results.append(
                 {"op": "fq", "faults": faults, "down": down, "slow": slow}
             )
+
+        elif op[0] == "br":
+            # 全池运行态快照：除共用时钟按 now 推进外不改任何运行态，失败
+            # 批次天然回滚。backends 按加入序，项键序
+            # id,health,circuit,drain,fault,connections,ready,blocked。
+            # fault 取 fq 同款 effect（N/D/S）；ready 要求 healthy、熔断
+            # C（含未配）、排空 A 且 fault≠D（S 不阻断）；blocked 按
+            # health,circuit,drain,fault 顺序列出未满足项，ready 时为空。
+            # 活动段查找为 O(log T_b)，整体时间 O(B log(T+1))、空间 O(B)。
+            _, now = op
+            snapshot = []
+            for backend_id, record in backends.items():
+                circuit = record["circuit"]
+                circuit_state = (
+                    "C" if circuit is None else circuit["state"]
+                )
+                drain_state = record["drain"]["state"]
+                effect = fault_effect(active_fault(record, now), now)
+                blocked = []
+                if not record["healthy"]:
+                    blocked.append("health")
+                if circuit_state != "C":
+                    blocked.append("circuit")
+                if drain_state != "A":
+                    blocked.append("drain")
+                if effect == "D":
+                    blocked.append("fault")
+                snapshot.append(
+                    {
+                        "id": backend_id,
+                        "health": (
+                            "healthy" if record["healthy"] else "unhealthy"
+                        ),
+                        "circuit": circuit_state,
+                        "drain": drain_state,
+                        "fault": effect,
+                        "connections": record["conns"],
+                        "ready": not blocked,
+                        "blocked": blocked,
+                    }
+                )
+            results.append({"op": "br", "now": now, "backends": snapshot})
 
         elif op[0] == "hm":
             # H pick 记账只读查询：未知 id 报 BACKEND；不改变任何计数，失败

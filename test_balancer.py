@@ -5131,5 +5131,229 @@ class OqProjectionTest(unittest.TestCase):
         )
 
 
+class BrSnapshotTest(unittest.TestCase):
+    """全池运行态快照 br：四态合成、ready/blocked 规则与输入校验。"""
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def br_of(self, ops, now):
+        code, stdout, stderr = run_balancer(
+            "run", encode_ops(ops + [{"op": "br", "now": now}])
+        )
+        self.assertEqual((code, stderr), (0, b""))
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        return results[-1]
+
+    def test_empty_pool(self):
+        snap = self.br_of([], 0)
+        self.assertEqual(snap, {"op": "br", "now": 0, "backends": []})
+
+    def test_healthy_defaults_and_join_order(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 2},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+        ]
+        snap = self.br_of(ops, 0)
+        # 加入序 b,a；open 选权重高者 b，connections 随之反映。
+        self.assertEqual([item["id"] for item in snap["backends"]],
+                         ["b", "a"])
+        self.assertEqual(
+            snap["backends"][0],
+            {
+                "id": "b", "health": "healthy", "circuit": "C",
+                "drain": "A", "fault": "N", "connections": 1,
+                "ready": True, "blocked": [],
+            },
+        )
+        self.assertEqual(snap["backends"][1]["connections"], 0)
+
+    def test_each_blocked_reason(self):
+        ops = [
+            {"op": "add", "id": "h", "weight": 1},
+            {"op": "hset", "id": "h", "fail": 1, "success": 1},
+            {"op": "probe", "id": "h", "ok": False, "now": 0},
+            {"op": "add", "id": "c", "weight": 1},
+            {"op": "cs", "id": "c", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "c", "ok": False, "now": 0},
+            {"op": "add", "id": "d", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "ds", "id": "d", "t": 10},
+            {"op": "dr", "id": "d", "now": 0},
+            {"op": "add", "id": "f", "weight": 1},
+            {"op": "fs", "id": "f", "k": "D", "a": 0, "z": 50, "v": 0},
+        ]
+        snap = self.br_of(ops, 5)
+        blocked = {
+            item["id"]: item["blocked"] for item in snap["backends"]
+        }
+        self.assertEqual(blocked, {
+            "h": ["health"],
+            "c": ["circuit"],
+            "d": ["drain"],
+            "f": ["fault"],
+        })
+        for item in snap["backends"]:
+            self.assertFalse(item["ready"])
+        # d 持有一个连接，drain 为 D（非 X）。
+        states = {item["id"]: item for item in snap["backends"]}
+        self.assertEqual(states["d"]["drain"], "D")
+        self.assertEqual(states["d"]["connections"], 1)
+        self.assertEqual(states["c"]["circuit"], "O")
+        self.assertEqual(states["h"]["health"], "unhealthy")
+        self.assertEqual(states["f"]["fault"], "D")
+
+    def test_blocked_multiple_in_fixed_order(self):
+        # 同一后端同时未满足四项：按 health,circuit,drain,fault 序列出。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 0},
+            {"op": "ds", "id": "a", "t": 10},
+            {"op": "dr", "id": "a", "now": 0},
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 50, "v": 0},
+        ]
+        snap = self.br_of(ops, 5)
+        item = snap["backends"][0]
+        self.assertEqual(
+            item["blocked"], ["health", "circuit", "drain", "fault"]
+        )
+        self.assertFalse(item["ready"])
+        self.assertEqual(item["drain"], "X")  # 无连接，dr 直接转 X。
+
+    def test_slow_and_flap_non_fault_phase_do_not_block(self):
+        ops = [
+            {"op": "add", "id": "s", "weight": 1},
+            {"op": "fs", "id": "s", "k": "S", "a": 0, "z": 50, "v": 7},
+            {"op": "add", "id": "f", "weight": 1},
+            {"op": "fs", "id": "f", "k": "F", "a": 0, "z": 100, "v": 10},
+        ]
+        # now=5：S 段为 S 不阻断；F 段 (5//10)%2=0 故障相位，阻断。
+        snap = self.br_of(ops, 5)
+        states = {item["id"]: item for item in snap["backends"]}
+        self.assertEqual(states["s"]["fault"], "S")
+        self.assertTrue(states["s"]["ready"])
+        self.assertEqual(states["s"]["blocked"], [])
+        self.assertEqual(states["f"]["fault"], "D")
+        self.assertEqual(states["f"]["blocked"], ["fault"])
+        # now=15：F 段 (15//10)%2=1 非故障相位，恢复 ready。
+        snap = self.br_of(ops, 15)
+        states = {item["id"]: item for item in snap["backends"]}
+        self.assertEqual(states["f"]["fault"], "N")
+        self.assertTrue(states["f"]["ready"])
+
+    def test_fault_gap_and_expired_segment_are_n(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "D", "a": 10, "z": 20, "v": 0},
+        ]
+        # 段前与段后（含端点 z）均为 N。
+        for now in (0, 9, 20, 100):
+            snap = self.br_of(ops, now)
+            item = snap["backends"][0]
+            self.assertEqual(item["fault"], "N")
+            self.assertTrue(item["ready"])
+        snap = self.br_of(ops, 10)
+        self.assertEqual(snap["backends"][0]["fault"], "D")
+
+    def test_clock_shared_and_non_decreasing(self):
+        # 等值 now 合法（非递减）；倒退报 INPUT。
+        ops = [
+            {"op": "br", "now": 5},
+            {"op": "br", "now": 5},
+        ]
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stderr), (0, b""))
+        self.assert_failure(
+            [{"op": "br", "now": 5}, {"op": "br", "now": 4}], 2, "INPUT"
+        )
+        # 与其他带 now 操作共用同一时钟。
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "probe", "id": "a", "ok": True, "now": 5},
+                {"op": "br", "now": 4},
+            ],
+            2,
+            "INPUT",
+        )
+
+    def test_input_errors(self):
+        # 键序反：直接发原始字节（绕过 encode_ops 的键序规范化）。
+        code, stdout, stderr = run_balancer(
+            "run", b'{"ops":[{"now":0,"op":"br"}]}'
+        )
+        self.assertEqual((code, stdout), (2, b""))
+        self.assertEqual(stderr, b'{"error":"INPUT"}\n')
+        # 多键、缺键。
+        self.assert_failure([{"op": "br", "now": 0, "x": 1}], 2, "INPUT")
+        self.assert_failure([{"op": "br"}], 2, "INPUT")
+        # now 类型/范围：bool、负数、超 10^9、字符串、浮点、null。
+        for bad in (True, False, -1, 10 ** 9 + 1, "0", 1.0, None):
+            self.assert_failure([{"op": "br", "now": bad}], 2, "INPUT")
+        # 边界 0 与 10^9 合法。
+        for good in (0, 10 ** 9):
+            code, stdout, stderr = run_balancer(
+                "run", encode_ops([{"op": "br", "now": good}])
+            )
+            self.assertEqual((code, stderr), (0, b""))
+
+    def test_failure_rolls_back_batch(self):
+        # 批内后续操作失败：整批无 stdout，时钟与状态不留痕。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "br", "now": 3},
+            {"op": "br", "now": 2},
+        ]
+        self.assert_failure(ops, 2, "INPUT")
+
+    def test_result_byte_layout(self):
+        raw = encode_ops(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "br", "now": 0},
+            ]
+        )
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertIn(
+            b'{"op":"br","now":0,"backends":[{"id":"a","health":"healthy",'
+            b'"circuit":"C","drain":"A","fault":"N","connections":0,'
+            b'"ready":true,"blocked":[]}]}',
+            out,
+        )
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertNotIn(b"\n", out[:-1])
+
+    def test_record_replay_round_trip(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "F", "a": 0, "z": 100, "v": 10},
+            {"op": "br", "now": 5},
+            {"op": "br", "now": 15},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
