@@ -148,7 +148,7 @@ CONNECTION/5，按 INPUT、STATE、CONNECTION 顺序判定。失败批次回滚�
 规则扣减并建连，阻塞项移至队尾并保持相对次序、继续检查后项；expired、
 admitted 按原 FIFO 顺序，各项使用同一 ot.now，前项扣减对后项可见，失败批
 回滚运行态。ci/cb 按 queue.dequeue 原子载入（v1..v8 规范化为 F）；登记
-值随 ce 经 version=9 的 queue.dequeue 导出；rp/qp 提交（ci/cb）后的后续
+值随 ce 经 version=10 的 queue.dequeue 导出；rp/qp 提交（ci/cb）后的后续
 修改仅影响当前 ce，不改已存提交快照；record/replay 逐字节覆盖。
 S 模式 ot 时间 O(qBV log(BV))、额外空间 O(q)。
 
@@ -166,7 +166,7 @@ id，evicted 仅头淘汰时为旧 cid，立即接纳或普通入队为 null；T
 原四键（Q 的 backend 为 null）。rp/rg 键序、类型或值非法报 INPUT/2。ci/cb
 按 queue.full 原子载入（v1..v8 规范化为 T）并清空队列、置 evicted=0、
 last=null，失败批回滚队列、指标、粘性、策略与计数；登记策略随 ce 经
-version=9 的 queue.full 导出（evicted、last 不导出），提交后的 rp 修改
+version=10 的 queue.full 导出（evicted、last 不导出），提交后的 rp 修改
 仅影响当前 ce，不改已存提交快照。rp、rg 及新增判定均 O(1)，额外空间
 O(1)，仅用标准库。
 
@@ -319,8 +319,8 @@ record/replay 逐字节契约，其余子命令与既有操作行为不变。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,
-scheduler,faults,quotas,queue}：
-version=9；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
+scheduler,faults,quotas,queue,capacities}：
+version=10；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
 endpoint}，circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，endpoint
 为 null 或键序 {host,port} 的登记端点，均只含登记值不含运行态；
 vnodes=null 或整数；limits 项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的
@@ -336,23 +336,27 @@ F/S 须 v>0），同 id 各段 [a,z) 不重叠（相邻端点可接），按后�
 段 a 升序输出，空计划为 []，不含 effect 或运行态；quotas 为数组，项
 键序 scope,id,limit,span（scope 仅 B/C/S，id 为非空 UTF-8 串，limit
 ∈ [1,10^18]、span ∈ [1,10^9] 非 bool 整数），按 scope 的 B/C/S 序、
-id 的 UTF-8 字节升序输出，只含登记值，不含 window、used；queue 末置，
+id 的 UTF-8 字节升序输出，只含登记值，不含 window、used；queue 末二置，
 精确键序 {dequeue,full}：dequeue 为 "F"/"S"（ot 遇阻即停/跳过阻塞），
 full 为 "T"/"H"（队满尾拒绝/头淘汰），只含登记策略，不含等待项、
-evicted 或 last。ci 精确键集
+evicted 或 last；capacities 末置，为每后端接纳容量覆盖数组，项精确键序
+id,cap（id 引用本配置后端，cap ∈ [1,10^6] 非 bool 整数），输入顺序不限，
+按后端加入序输出、仅列显式覆盖，空为 []（即各后端沿用 overload.cap），
+只含登记值，不含连接等运行态。ci 精确键集
 op,config,now（原形式，键序不限），另接受精确键序 op,config,base,now
 的乐观并发形式：base 为小写 64 位十六进制串（ct 输出的配置指纹），
 格式非法判 INPUT/2；候选完成既有校验后比较 base 与操作前指纹，不等
 判 STATE/4 且先于活动连接或排队检查，相等则沿用 ci 全部成功语义。
 ct 精确键序仅 op，返回键序 op,digest：digest 为 ce.config 规范化
-version=9 对象按逐层键序序列化为 UTF-8 紧凑 JSON（非 ASCII 不转义、
+version=10 对象按逐层键序序列化为 UTF-8 紧凑 JSON（非 ASCII 不转义、
 无末尾换行）后的 SHA-256 小写 64 位十六进制；ct 只读且不推进时钟，
 时空 O(N)（N 为规范化配置大小）。cv 精确键序 op,config,now（键须按
 此序出现）：config 校验与规范化同 ci，now ∈ [0,10^9] 非 bool 整数并
-纳入共用非递减时钟；B 限流/配额与 faults 引用未知后端判 BACKEND/3，
+纳入共用非递减时钟；B 限流/配额、faults 与 capacities 引用未知后端判
+BACKEND/3，
 其余配置错误与 ci 同型同优先级；不应用配置，活动连接或排队项仅令
 applicable=false，返回键序 op,applicable,connections,queued,config
-（config 为规范化 version=9 回显）。cd 精确键序 op,config,now（键须
+（config 为规范化 version=10 回显）。cd 精确键序 op,config,now（键须
 按此序出现）：config 校验、规范化与错误优先级同 cv，now 同上并进入
 共用非递减时钟；比较当前 ce.config 与候选规范化配置的 backends，不
 应用候选，活动连接或排队项不报错。结果键序
@@ -371,12 +375,13 @@ config 校验与规范化同 cv/cd/pd，now ∈ [0,10^9] 非 bool 整数并进�
 （SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，按摘要、加入序、i 排序；
 key 哈希取首个不小于它的令牌、越界回绕），按 keys 原序各自独立映射。
 结果键序 op,base,target,cases,summary：base/target 为当前/候选规范化
-version=9 配置的 ct 摘要字符串；cases 按 keys 原序，项键序
+version=10 配置的 ct 摘要字符串；cases 按 keys 原序，项键序
 key,before,after,changed，before/after 为当前/候选环选中的后端 id
 字符串，changed 为 bool；summary 键序 total,stable,remapped，均为非负
 整数，total 等于 keys 长度，stable 为前后相同的项数、remapped 为变化
 项数。键序、keys（容器、项数、元素非空或编码）、now 非法或时钟倒退报
-INPUT/2；候选 B 限流/B 配额/faults 引用未知后端报 BACKEND/3（优先级同
+INPUT/2；候选 B 限流/B 配额/faults/capacities 引用未知后端报 BACKEND/3
+（优先级同
 cv/cd/pd）；当前或候选任一 vnodes 为 null 或 backends 为空报 STATE/4。
 hd 成功仅推进时钟且不改任何状态，失败批回滚。N 为两环令牌总数、K 为
 keys 长度，时间 O(N log N + K log N)，空间 O(N+K)，仅用标准库；紧凑
@@ -394,16 +399,20 @@ version=8 在既有十键末追加 quotas 且须精确含该键（v1..v7 一律�
 quotas=[]），backends 项同 v6；version=9 在既有十一键末追加 queue 且须
 精确含该键、精确为键序 dequeue,full 的两键对象（dequeue 仅 F/S、full
 仅 T/H；v1..v8 一律视 dequeue=F、full=T），quotas 同 v8，backends 项同
-v6。
+v6；version=10 在既有十二键末追加 capacities 且须精确末置该键（v1..v9
+一律视 capacities=[]），为项精确键序 id,cap 的数组，输入顺序不限，id
+引用本配置后端、cap ∈ [1,10^6] 非 bool 整数、id 不重复。
 各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp 与 fs/fp 的类型与范围。
 scheduler
 缺失（v1/v2）合法，v3 多键、类型错误或 pick 非 W/R，v4 的 pick 非 W/R/L，
-v5..v9 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
-连同其余非法结构、键集、键序、版本、queue 结构/类型或枚举值、范围、
+v5..v10 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
+连同其余非法结构、键集、键序、版本、queue 结构/类型或枚举值、capacities
+容器/项键序/类型/范围/编码或重复 id、范围、
 重复后端/限流项/故障段/
 配额项、编码、
 交叉约束（含同 id 段重叠）或时钟倒退判
-INPUT/2，B 限流、B 配额或 faults 引用未知后端判 BACKEND/3，base 与操作前
+INPUT/2，B 限流、B 配额、faults 或 capacities 引用未知后端判 BACKEND/3，
+base 与操作前
 指纹不等判 STATE/4，有活动连接或
 排队项
 判 STATE/4，依次判错。成功时原子替换配置并以 now 重建默认运行态（全部
@@ -417,8 +426,10 @@ sticky/idle 以登记值作用于新连接（idle
 为新连接的空闲
 时限，无连接故仅登记），backpressure 携带时置 N、未携带时取消；队列
 dequeue/full 策略按 queue 原子载入（v1..v8 默认 F/T），清空队列并置
-evicted=0、last=null；失败回滚
-不变更。R 模式 pick 按既有健康、熔断闭合、排空 A 条件取得按加入序排列
+evicted=0、last=null；每后端接纳容量覆盖按 capacities 原子替换（v1..v9
+或 [] 清空，已删除后端不保留），其后 pc 只改当前 ce、不改已存提交快照；
+失败回滚
+时钟、配置、运行态、rev 与历史，不变更。R 模式 pick 按既有健康、熔断闭合、排空 A 条件取得按加入序排列
 的可选列表 E，E 空报 STATE/4，否则返回 E[ticket%len(E)] 并将 ticket 加
 一；R 忽略权重且不改平滑 current，结果仍键序 op,id。add/remove 或健康、
 熔断、排空状态迁移均不重置 ticket；W 及其余旧操作不变。L 模式 pick 仅
@@ -437,16 +448,17 @@ op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配�
 时间、O(1) 额外
 空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
-配置提交与回滚：ci 成功后把规范化 version=9 配置存为提交，rev 从 1 起
+配置提交与回滚：ci 成功后把规范化 version=10 配置存为提交，rev 从 1 起
 递增，仅保留最近 16 条；失败不分配、不改历史，初始无提交。cl 精确键集
 仅 op，返回键序 op,current,commits：current 为最新 rev 或 null，
 commits 按 rev 升序，项键序 rev,config，config 复用 ce 的逐层键序与
-值格式（含 faults、quotas 与 queue）。cb 精确键集 op,rev,now：rev 为 1..10^18
+值格式（含 faults、quotas、queue 与末置 capacities）。cb 精确键集 op,rev,now：rev 为 1..10^18
 非 bool
 整数且须仍被保留，now 沿用 ci 并进入共用非递减时钟；按目标快照执行 ci
 的原子替换与默认运行态重建（恢复目标 faults 时间线并重置故障运行态，
 恢复目标 quotas 并以 cb.now 重置各配额 window=now//span、used=0，
-恢复目标 queue 的 dequeue/full 策略、清空队列并置 evicted=0、last=null），
+恢复目标 queue 的 dequeue/full 策略、清空队列并置 evicted=0、last=null，
+按快照 capacities 原子恢复每后端接纳容量覆盖、旧版或 [] 清空），
 成功另建新 rev，返回键序 op,target,rev,ok（ok=true），
 原历史保留后再按 16 条淘汰。目标不存在或 rev 耗尽（下一个 rev 将超过
 10^18）报 STATE/4；键集、rev 类型/范围或时钟非法报 INPUT/2；有活动
@@ -679,8 +691,8 @@ str(ipaddress.ip_address(host))==host，port 为 1..65535 非 bool 整数；
 endpoint（未配置仍建连、无快照）。fw 键集 op,cid，返回键序
 op,cid,backend,host,port，取建连时的快照、不受后续 ep 变更影响；无快
 照报 STATE/4，未知 cid 报 CONNECTION/5；删除连接（close/dg/tx）同步
-删除快照。ce 统一导出当前规范化 version=9（九键末为 faults，其后为
-quotas 与末置 queue），
+删除快照。ce 统一导出当前规范化 version=10（九键末为 faults，其后为
+quotas、queue 与末置 capacities），
 backends 项保持在既有七键后追加 endpoint（null 或键序 host,port）；ci
 兼容 version1..5 并视 endpoint=null，version6 须含 endpoint 但结构无
 faults，version7 在九键后追加 faults 且项按 fp 同款校验，成功原子重建并
@@ -1250,8 +1262,13 @@ def parse_config(value):
     对象等同报 INPUT。version=9 在既有十一键末追加 queue（精确两键对象，
     键序 dequeue,full；dequeue 仅 F/S，full 仅 T/H），十二键结构只可能为
     v9 且十二键须严格按声明顺序出现（queue 末置，任何乱序报 INPUT）；
-    v1..v8 结构不含 queue，一律视为 dequeue=F、full=T。返回的规范化结构
-    额外含 "queue": (dequeue, full)。"""
+    v1..v8 结构不含 queue，一律视为 dequeue=F、full=T。version=10 在既有
+    十二键末追加 capacities（数组，项精确键序 id,cap；id 引用本配置后端，
+    cap ∈ [1,10^6] 非 bool 整数，id 重复报 INPUT），十三键结构只可能为
+    v10 且十三键须严格按声明顺序出现（capacities 末置，任何乱序报 INPUT）；
+    v1..v9 结构不含 capacities，一律视为空（[]，即各后端沿用 overload.cap）。
+    输入数组顺序不限，规范化按后端加入序输出、仅列显式覆盖。返回的规范化
+    结构额外含 "queue": (dequeue, full) 与 "capacities": {id: cap}。"""
     if not isinstance(value, dict):
         fail(EXIT_INPUT, "INPUT")
     config_keys = set(value)
@@ -1264,6 +1281,8 @@ def parse_config(value):
     v8_keys = v7_keys | {"quotas"}
     # v9 在既有十一键末追加 queue；十二键结构只可能为 v9。
     v9_keys = v8_keys | {"queue"}
+    # v10 在既有十二键末追加 capacities；十三键结构只可能为 v10。
+    v10_keys = v9_keys | {"capacities"}
     if config_keys == v1_keys:
         version = 1
     elif config_keys == v2_keys:
@@ -1292,6 +1311,15 @@ def parse_config(value):
         ]:
             fail(EXIT_INPUT, "INPUT")
         version = 9
+    elif config_keys == v10_keys:
+        # v10 十三键须严格按声明顺序出现，capacities 末置：任何乱序报 INPUT。
+        if list(value) != [
+            "version", "backends", "vnodes", "limits", "overload",
+            "sticky", "idle", "backpressure", "scheduler", "faults",
+            "quotas", "queue", "capacities",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        version = 10
     else:
         fail(EXIT_INPUT, "INPUT")
     raw_version = value["version"]
@@ -1457,7 +1485,7 @@ def parse_config(value):
     if version >= 3:
         # scheduler 精确为 {"pick":...} 单键对象：缺失（v1/v2 键集不含该
         # 键，已在上文分流）不会出现；多键、非对象、键名错误或 pick 非
-        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5..v9 收
+        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5..v10 收
         # W/R/L/H。
         raw_scheduler = value["scheduler"]
         if (
@@ -1517,11 +1545,11 @@ def parse_config(value):
         # v1..v7 结构不含 quotas，一律视为空（成功即清空全部配额）。
         normalized_quotas = []
 
-    if version == 9:
-        # queue 精确为两键对象且键须按 dequeue,full 顺序出现：dequeue 仅
-        # F/S（遇阻即停/跳过阻塞），full 仅 T/H（尾拒绝/头淘汰）；不含
-        # 等待项、evicted 或 last 等运行态。结构、键序、类型或枚举值非法
-        # 判 INPUT。
+    if version >= 9:
+        # queue 精确为两键对象且键须按 dequeue,full 顺序出现（v9 与 v10 均
+        # 携带该键）：dequeue 仅 F/S（遇阻即停/跳过阻塞），full 仅 T/H
+        # （尾拒绝/头淘汰）；不含等待项、evicted 或 last 等运行态。结构、
+        # 键序、类型或枚举值非法判 INPUT。
         raw_queue = value["queue"]
         if not isinstance(raw_queue, dict) or list(raw_queue) != [
             "dequeue", "full",
@@ -1541,6 +1569,29 @@ def parse_config(value):
         # v1..v8 结构不含 queue：dequeue 默认 F，full 默认 T。
         queue_policy = ("F", "T")
 
+    if version >= 10:
+        # capacities 精确为数组，项精确键序 id,cap（键须按此序出现）：
+        # id 沿用非空 UTF-8 串校验、cap ∈ [1,10^6] 非 bool 整数；id 重复
+        # 报 INPUT。数组输入顺序不限（不要求排序），规范化按后端加入序输出、
+        # 仅列显式覆盖。结构、键序、类型、范围、编码或重复 id 判 INPUT；
+        # id 是否为本配置后端留执行期判 BACKEND（同 B 限流与 faults）。
+        raw_capacities = value["capacities"]
+        if not isinstance(raw_capacities, list):
+            fail(EXIT_INPUT, "INPUT")
+        capacities = OrderedDict()
+        for item in raw_capacities:
+            if not isinstance(item, dict) or list(item) != ["id", "cap"]:
+                fail(EXIT_INPUT, "INPUT")
+            capacity_id = parse_backend_id(item["id"])
+            capacity_cap = parse_queue_param(item["cap"])
+            if capacity_id in capacities:
+                fail(EXIT_INPUT, "INPUT")
+            capacities[capacity_id] = capacity_cap
+    else:
+        # v1..v9 结构不含 capacities：一律视为空（[]，各后端沿用
+        # overload.cap）；成功即清空全部每后端覆盖。
+        capacities = OrderedDict()
+
     return {
         "backends": normalized_backends,
         "vnodes": vnodes,
@@ -1553,16 +1604,18 @@ def parse_config(value):
         "faults": faults_plan,
         "quotas": normalized_quotas,
         "queue": queue_policy,
+        "capacities": capacities,
     }
 
 
 def export_normalized_config(config):
-    """把 parse_config 的规范化结构导出为 version=9 配置对象：逐层键序、
+    """把 parse_config 的规范化结构导出为 version=10 配置对象：逐层键序、
     值格式与数组排序同 ce.config（backends 按配置出现序，项 id,weight,d,
     fail,success,circuit,drain,endpoint；limits/quotas 已由 parse_config
     强制按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；faults 按后端出现序、
-    段 a 升序，项键序 id,k,a,z,v；queue 末置，键序 dequeue,full）。纯
-    登记值、不含任何运行态；返回全新结构。O(N)，N 为 config 元素数。"""
+    段 a 升序，项键序 id,k,a,z,v；queue 末二置，键序 dequeue,full；
+    capacities 末置，按后端出现序仅列显式覆盖，项键序 id,cap）。纯登记值、
+    不含任何运行态；返回全新结构。O(N)，N 为 config 元素数。"""
     exported_backends = []
     for (backend_id, weight, d, fail_threshold, success_threshold,
          circuit_params, drain_t, endpoint) in config["backends"]:
@@ -1610,11 +1663,18 @@ def export_normalized_config(config):
         {"scope": scope, "id": quota_id, "limit": limit, "span": span}
         for scope, quota_id, limit, span in config["quotas"]
     ]
+    # capacities 末置：按后端出现序仅列显式覆盖，项键序 id,cap；空为 []。
+    capacities = config["capacities"]
+    exported_capacities = [
+        {"id": entry[0], "cap": capacities[entry[0]]}
+        for entry in config["backends"]
+        if entry[0] in capacities
+    ]
     sticky_ttl = config["sticky"]
     idle_ttl = config["idle"]
     backpressure = config["backpressure"]
     return {
-        "version": 9,
+        "version": 10,
         "backends": exported_backends,
         "vnodes": config["vnodes"],
         "limits": exported_limits,
@@ -1634,11 +1694,12 @@ def export_normalized_config(config):
         "faults": exported_faults,
         "quotas": exported_quotas,
         "queue": {"dequeue": config["queue"][0], "full": config["queue"][1]},
+        "capacities": exported_capacities,
     }
 
 
 def config_digest(exported):
-    """ce.config 规范化 version=9 对象的指纹：按逐层键序序列化为 UTF-8
+    """ce.config 规范化 version=10 对象的指纹：按逐层键序序列化为 UTF-8
     紧凑 JSON（非 ASCII 不转义、无末尾换行）后取 SHA-256，返回小写 64 位
     十六进制。exported 为 export_config 产出的结构。O(N)，N 为规范化
     配置大小。"""
@@ -2643,11 +2704,14 @@ def run(raw):
     # oa 查重与 oc 任意位置删除均 O(1) 且其余项 FIFO 相对次序不变。
     queue_cfg = None
     wait_queue = OrderedDict()
-    # 每后端接纳容量覆盖（pc/pg）：backend_id -> cap，仅在 pc 显式配置时存
-    # 在；oa/ot 接纳与 oi/od/oq 投影判定 capacity 时，已配 pc 用其 cap，否则
-    # 用 os.cap。同值幂等、异值覆盖（即使活动连接数超过新值也不关连接，连接
-    # 释放后自然恢复）；remove 删除覆盖且同 id 重加不继承，ci/cb 成功清空。
-    # 不随 ce/ci 导出导入（纯运行态）。dict 查找/写入 O(1)，额外空间 O(B)。
+    # 每后端接纳容量覆盖（pc/pg 与配置 capacities）：backend_id -> cap，仅在
+    # 显式配置（pc 或载入的 capacities）时存在；oa/ot 接纳与 oi/od/oq 投影
+    # 判定 capacity 时，已配覆盖用其 cap，否则用 os.cap。同值幂等、异值覆盖
+    # （即使活动连接数超过新值也不关连接，连接释放后自然恢复）；remove 删除
+    # 覆盖且同 id 重加不继承。覆盖即当前配置的一部分：ce 按后端加入序导出为
+    # capacities，ci/cb 成功按候选 capacities 原子替换（旧版或 [] 清空）；
+    # 提交快照不随后续 pc 变化，pc 只改当前 ce。dict 查找/写入 O(1)，空间
+    # O(B)。
     cap_overrides = {}
     # 过载分钟历史（oh）：window=now//60 -> [immediate, queued, dequeued,
     # expired, peak]，全池一份（不按后端分）。oa 返回 A/Q 在其 now 窗记
@@ -2706,7 +2770,7 @@ def run(raw):
     # 同窗重报不推进状态机，自然不重复追加；remove 及同 id 重加不影响
     # （仅改变后续 fe 的 v），ci 成功清空。
     alert_events = deque()
-    # 配置提交历史（cl/cb）：(rev, 规范化 version=9 配置快照) 按 rev 升序，
+    # 配置提交历史（cl/cb）：(rev, 规范化 version=10 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
     # export_config 产出的全新结构（含 faults 登记时间线与 queue 策略），
@@ -3386,15 +3450,18 @@ def run(raw):
 
     def export_config():
         """ce 与提交快照共用的配置导出：纯登记值、不含任何运行态，逐层键序
-        固定（version=9；backends 按加入序，项 id,weight,d,fail,success,
+        固定（version=10；backends 按加入序，项 id,weight,d,fail,success,
         circuit,drain,endpoint；limits 按 scope 的 B/C/S 序、id 的 UTF-8
         字节升序；overload/sticky/idle/backpressure 为 null 或登记值；
         scheduler 精确为 {"pick":...}；faults 按后端加入序、段 a 升序，
         项键序 id,k,a,z,v，空计划为 []，不含 effect 或运行态；quotas 末二
         置，项键序 scope,id,limit,span，按 scope 的 B/C/S 序、id 的 UTF-8
-        字节升序，不含 window、used；queue 末置，精确键序 dequeue,full，
-        仅登记出队与满载策略（F/S、T/H），不含等待项、evicted 或 last）。
-        返回全新结构，调用方可安全存为快照（不随后续运行态变化）。"""
+        字节升序，不含 window、used；queue 末二置，精确键序 dequeue,full，
+        仅登记出队与满载策略（F/S、T/H），不含等待项、evicted 或 last；
+        capacities 末置，按后端加入序仅列显式接纳容量覆盖（pc 设置、ci/cb
+        随配置原子替换），项键序 id,cap，无覆盖为 []）。
+        返回全新结构，调用方可安全存为快照（不随后续运行态变化；提交后 pc
+        只改当前 ce，不改已存快照）。"""
         exported_backends = []
         for backend_id, record in backends.items():
             circuit = record["circuit"]
@@ -3470,8 +3537,16 @@ def run(raw):
                 ),
             )
         ]
+        # capacities 末置：按后端加入序仅列当前显式接纳容量覆盖（pc 设置，
+        # ci/cb 随配置原子替换；提交后 pc 只改当前 ce，不改已存快照），
+        # 项键序 id,cap，无覆盖为 []。
+        exported_capacities = [
+            {"id": backend_id, "cap": cap_overrides[backend_id]}
+            for backend_id in backends
+            if backend_id in cap_overrides
+        ]
         return {
-            "version": 9,
+            "version": 10,
             "backends": exported_backends,
             "vnodes": ring_vnodes,
             "limits": exported_limits,
@@ -3486,9 +3561,11 @@ def run(raw):
             "scheduler": {"pick": pick_mode},
             "faults": exported_faults,
             "quotas": exported_quotas,
-            # queue 末置：仅登记出队（F/S）与满载（T/H）策略，键序
+            # queue 末二置：仅登记出队（F/S）与满载（T/H）策略，键序
             # dequeue,full；不含等待项、evicted、last 等运行态。
             "queue": {"dequeue": queue_mode, "full": full_mode},
+            # capacities 末置：仅登记每后端接纳容量覆盖，项键序 id,cap。
+            "capacities": exported_capacities,
         }
 
     def apply_config(config, now):
@@ -3624,8 +3701,10 @@ def run(raw):
         ring_vnodes = config["vnodes"]
         queue_cfg = config["overload"]
         wait_queue = OrderedDict()
-        # ci/cb 成功清空每后端接纳容量覆盖（纯运行态，不导出不继承）。
-        cap_overrides = {}
+        # 每后端接纳容量覆盖随配置原子替换：v10 按 capacities 恢复显式覆盖
+        # （此时 capacities 的 id 已由调用方校验为现存候选后端），v1..v9 或
+        # v10 的 [] 已规范化为空即清空全部覆盖（各后端沿用 overload.cap）。
+        cap_overrides = dict(config["capacities"])
         # ci/cb 成功清空过载分钟历史。
         overload_hist = {}
         # 热加载三项：sticky/idle 取登记值（null 即未登记，idle 作用于
@@ -5323,7 +5402,7 @@ def run(raw):
 
         elif op[0] == "ct":
             # 配置指纹（只读，不推进时钟）：当前 ce.config 规范化
-            # version=9 对象的 SHA-256，键序 op,digest。
+            # version=10 对象的 SHA-256，键序 op,digest。
             results.append(
                 {"op": "ct", "digest": config_digest(export_config())}
             )
@@ -5342,6 +5421,10 @@ def run(raw):
             for fault_id in config["faults"]:
                 if fault_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
+            # v10 capacities 的 id 引用本配置后端：未知报 BACKEND，同优先级。
+            for capacity_id in config["capacities"]:
+                if capacity_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
             if base is not None and base != config_digest(export_config()):
                 # 乐观并发保护：base 与操作前指纹不等即拒绝热加载，
                 # 先于活动连接或排队检查。
@@ -5356,7 +5439,7 @@ def run(raw):
             # 载入 faults 时间线，故障运行态统计/基线仍重置；queue 策略随
             # 配置载入，v1..v8 为默认 F/T）。
             apply_config(config, now)
-            # 成功后把规范化 version=9 配置存为提交：rev 从 1 起递增，
+            # 成功后把规范化 version=10 配置存为提交：rev 从 1 起递增，
             # 仅保留最近 16 条；失败不分配、不改历史。export_config 产出
             # 全新结构，提交后的 qp/rp 修改不影响已存快照。
             commit_history.append((next_rev, export_config()))
@@ -5378,6 +5461,10 @@ def run(raw):
                     fail(EXIT_BACKEND, "BACKEND")
             for fault_id in config["faults"]:
                 if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # v10 capacities 的 id 引用本配置后端：未知报 BACKEND，同优先级。
+            for capacity_id in config["capacities"]:
+                if capacity_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
             # 预检不应用配置：活动连接或排队项仅令 applicable=false，不报
             # STATE；成功仅推进时钟（已在共用时钟块完成），配置、连接、
@@ -5406,8 +5493,12 @@ def run(raw):
             for fault_id in config["faults"]:
                 if fault_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
+            # v10 capacities 的 id 引用本配置后端：未知报 BACKEND，同优先级。
+            for capacity_id in config["capacities"]:
+                if capacity_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
             # 预览不应用候选：比较当前 ce.config 与候选规范化配置的
-            # backends。base/target 为 ct 摘要（规范化 version=9 对象的
+            # backends。base/target 为 ct 摘要（规范化 version=10 对象的
             # SHA-256）；added/removed 为 id 数组，分别按候选/当前加入序；
             # changed 按候选序列出共有且变化者，fields 按
             # weight,d,fail,success,circuit,drain,endpoint 列差异；order
@@ -5467,12 +5558,17 @@ def run(raw):
             for fault_id in config["faults"]:
                 if fault_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
-            # 预览不应用候选：比较当前 ce.config 与候选规范化 version=9 配置
+            # v10 capacities 的 id 引用本配置后端：未知报 BACKEND，同优先级。
+            for capacity_id in config["capacities"]:
+                if capacity_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 预览不应用候选：比较当前 ce.config 与候选规范化 version=10 配置
             # 的非 backends 部分。base/target 为两份完整规范化配置的 ct 摘要；
             # changes 按 vnodes,limits,overload,sticky,idle,backpressure,
-            # scheduler,faults,quotas,queue 列差异项，项键序 section,before,
-            # after，before/after 复用对应 ce 字段的导出值（类型、键序、数组
-            # 排序与值格式一致）；仅 backends 变化时 changes 为空。成功仅推进
+            # scheduler,faults,quotas,queue,capacities 列差异项，项键序
+            # section,before,after，before/after 复用对应 ce 字段的导出值
+            # （类型、键序、数组排序与值格式一致）；仅 backends 变化时
+            # changes 为空。成功仅推进
             # 时钟（已在共用时钟块完成），其余状态不变。O(N)，N 为规范化配置
             # 大小。
             current_export = export_config()
@@ -5481,6 +5577,7 @@ def run(raw):
             for section in (
                 "vnodes", "limits", "overload", "sticky", "idle",
                 "backpressure", "scheduler", "faults", "quotas", "queue",
+                "capacities",
             ):
                 before = current_export[section]
                 after = candidate_export[section]
@@ -5516,6 +5613,10 @@ def run(raw):
                     fail(EXIT_BACKEND, "BACKEND")
             for fault_id in config["faults"]:
                 if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # v10 capacities 的 id 引用本配置后端：未知报 BACKEND，同优先级。
+            for capacity_id in config["capacities"]:
+                if capacity_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
             candidate_export = export_normalized_config(config)
             candidate_ids = [item["id"] for item in candidate_export["backends"]]
@@ -5599,10 +5700,10 @@ def run(raw):
             # 有活动连接或排队项时拒绝回滚：STATE。
             if connections or wait_queue:
                 fail(EXIT_STATE, "STATE")
-            # 快照即规范化 version=9 配置（含 queue 策略），重解析后沿用
-            # ci 的替换语义；快照来自 export_config，必然合法，不会抛
+            # 快照即规范化 version=10 配置（含 queue 策略与 capacities），
+            # 重解析后沿用 ci 的替换语义；快照来自 export_config，必然合法，不会抛
             # INPUT。queue.dequeue/full 随快照恢复，队列清空且淘汰计数、
-            # 最近淘汰 cid 重置（0、null）。
+            # 最近淘汰 cid 重置（0、null）；capacities 随快照恢复覆盖。
             apply_config(parse_config(snapshot), now)
             # 原历史保留，追加新 rev 后再按 16 条淘汰。
             commit_history.append((next_rev, export_config()))

@@ -220,6 +220,15 @@ def config_v9(weight, faults=(), quotas=(), dequeue="F", full="T", **overrides):
     return config
 
 
+def config_v10(weight, faults=(), quotas=(), dequeue="F", full="T",
+               capacities=(), **overrides):
+    """最小 version=10 配置：十二键同 v9 且末置 capacities（id,cap 项）。"""
+    config = config_v9(weight, faults, quotas, dequeue, full, **overrides)
+    config["version"] = 10
+    config["capacities"] = [dict(item) for item in capacities]
+    return config
+
+
 class ConfigCommitTest(unittest.TestCase):
     """配置提交与回滚（ci 提交、cl 历史、cb 回滚）。"""
 
@@ -236,8 +245,8 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(result, {"op": "cl", "current": None, "commits": []})
 
     def test_ci_commits_normalized_v9(self):
-        # version=1 旧结构成功加载后，提交为规范化 version=9 配置
-        # （faults 空计划、quotas 空数组、queue 默认 F/T）。
+        # version=1 旧结构成功加载后，提交为规范化 version=10 配置
+        # （faults 空计划、quotas 空数组、queue 默认 F/T、capacities 空）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -267,7 +276,7 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(commit["rev"], 1)
         self.assertEqual(
             commit["config"],
-            config_v9(2),
+            config_v10(2),
         )
 
     def test_failed_ci_does_not_commit(self):
@@ -314,9 +323,9 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(
             results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
         )
-        # 回滚后当前配置即 rev=1 的规范化 v9 快照（faults、quotas 均空，
-        # queue 默认 F/T）。
-        self.assertEqual(results[3]["config"], config_v9(1))
+        # 回滚后当前配置即 rev=1 的规范化 v10 快照（faults、quotas 均空，
+        # queue 默认 F/T、capacities 空）。
+        self.assertEqual(results[3]["config"], config_v10(1))
 
     def test_cb_restores_runtime_state(self):
         # 回滚按目标快照重建默认运行态：调度策略、限流桶、预热自 cb.now 起算。
@@ -413,10 +422,10 @@ class ConfigPrecheckTest(unittest.TestCase):
         self.assertEqual(result["applicable"], True)
         self.assertEqual(result["connections"], 0)
         self.assertEqual(result["queued"], 0)
-        self.assertEqual(result["config"], config_v9(2))
+        self.assertEqual(result["config"], config_v10(2))
 
     def test_cv_normalizes_v1_to_v9(self):
-        # version=1 旧结构回显为规范化 version=9（同 ci 提交格式）。
+        # version=1 旧结构回显为规范化 version=10（同 ci 提交格式）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -439,7 +448,7 @@ class ConfigPrecheckTest(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         result = json.loads(out)["results"][0]
-        self.assertEqual(result["config"], config_v9(2))
+        self.assertEqual(result["config"], config_v10(2))
 
     def test_cv_config_matches_ci_export(self):
         # 富 v9 配置：cv 回显与 ci 成功后 ce 导出逐字节同构。
@@ -664,12 +673,12 @@ class ConfigDigestTest(unittest.TestCase):
         result = results[0]
         # 结果精确键序 op,digest。
         self.assertEqual(list(result), ["op", "digest"])
-        empty_config = config_v9(1)
+        empty_config = config_v10(1)
         empty_config["backends"] = []
         self.assertEqual(result["digest"], digest_of(empty_config))
 
     def test_ct_matches_ce_config(self):
-        # ct 指纹即同一批内 ce.config 规范化 version=9 对象的摘要。
+        # ct 指纹即同一批内 ce.config 规范化 version=10 对象的摘要。
         ops = [
             {"op": "add", "id": "a", "weight": 2},
             {"op": "chash", "vnodes": 8},
@@ -922,8 +931,9 @@ class ConfigDiffTest(unittest.TestCase):
         }
 
     def make_config(self, backends, **overrides):
-        # 以最小 v9 配置为底，整体替换 backends。
-        config = config_v9(1, **overrides)
+        # 以最小 v10 配置为底（规范化回显即 v10，digest 直接可比），整体
+        # 替换 backends。
+        config = config_v10(1, **overrides)
         config["backends"] = list(backends)
         return config
 
@@ -942,7 +952,7 @@ class ConfigDiffTest(unittest.TestCase):
         self.assertEqual(result["op"], "cd")
         # base 即同批 ct 对空配置的指纹；target 为候选规范化配置的指纹。
         self.assertEqual(result["base"], results[0]["digest"])
-        empty = config_v9(1)
+        empty = config_v10(1)
         empty["backends"] = []
         self.assertEqual(result["base"], digest_of(empty))
         self.assertEqual(result["target"], digest_of(self.make_config(
@@ -1122,8 +1132,9 @@ class ConfigDiffTest(unittest.TestCase):
         }
         results = self.run_ops([{"op": "cd", "config": config_v1, "now": 0}])
         result = results[0]
-        # target 为规范化 v9 配置（endpoint=null、queue 默认 F/T）的指纹。
-        normalized = config_v9(2)
+        # target 为规范化 v10 配置（endpoint=null、queue 默认 F/T、capacities
+        # 空）的指纹。
+        normalized = config_v10(2)
         self.assertEqual(result["target"], digest_of(normalized))
         self.assertEqual(result["added"], ["a"])
 
@@ -1276,10 +1287,10 @@ class PolicyDiffTest(unittest.TestCase):
         self.assertEqual(result["op"], "pd")
         # base 即同批 ct 对当前（空）配置的指纹；target 为候选规范化指纹。
         self.assertEqual(result["base"], results[0]["digest"])
-        empty = config_v9(1)
+        empty = config_v10(1)
         empty["backends"] = []
         self.assertEqual(result["base"], digest_of(empty))
-        self.assertEqual(result["target"], digest_of(config_v9(1)))
+        self.assertEqual(result["target"], digest_of(config_v10(1)))
         self.assertRegex(result["target"], r"^[0-9a-f]{64}$")
         # 仅 backends 不同：changes 为空。
         self.assertEqual(result["changes"], [])
@@ -1381,8 +1392,8 @@ class PolicyDiffTest(unittest.TestCase):
     def test_pd_backends_only_change_is_empty_changes(self):
         # 仅 backends 变化（含增删与字段变更）：changes 为空，base/target
         # 仍为两份完整配置的指纹。
-        current = config_v9(1)
-        candidate = config_v9(9)
+        current = config_v10(1)
+        candidate = config_v10(9)
         candidate["backends"].append(
             {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
              "circuit": None, "drain": None, "endpoint": None}
@@ -1452,7 +1463,8 @@ class PolicyDiffTest(unittest.TestCase):
         )
 
     def test_pd_accepts_v1_and_normalizes(self):
-        # v1 候选规范化为 v9：target 为规范化指纹，queue 默认 F/T 不差异。
+        # v1 候选规范化为 v10：target 为规范化指纹，queue 默认 F/T、capacities
+        # 空，均不差异。
         config_v1 = {
             "version": 1,
             "backends": [{
@@ -1465,7 +1477,7 @@ class PolicyDiffTest(unittest.TestCase):
         }
         results = self.run_ops([self.pd(config_v1)])
         result = results[0]
-        self.assertEqual(result["target"], digest_of(config_v9(2)))
+        self.assertEqual(result["target"], digest_of(config_v10(2)))
         self.assertEqual(result["changes"], [])
 
     def test_pd_unknown_backend_references_are_backend(self):
@@ -1596,7 +1608,7 @@ class PolicyDiffTest(unittest.TestCase):
     def seg(self, backend="a", k="D", a=0, z=10, v=0):
         return {"id": backend, "k": k, "a": a, "z": z, "v": v}
 
-    def test_ce_exports_v9_with_faults_quotas_and_queue_last(self):
+    def test_ce_exports_v10_with_capacities_last(self):
         results = self.run_ops([{"op": "add", "id": "a", "weight": 1},
                                 {"op": "ce"}])
         config = results[-1]["config"]
@@ -1604,14 +1616,16 @@ class PolicyDiffTest(unittest.TestCase):
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue"],
+             "queue", "capacities"],
         )
-        self.assertEqual(config["version"], 9)
+        self.assertEqual(config["version"], 10)
         self.assertEqual(config["faults"], [])
         self.assertEqual(config["quotas"], [])
         # queue 精确键序 dequeue,full，默认 F/T；不含 evicted、last。
         self.assertEqual(list(config["queue"]), ["dequeue", "full"])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
+        # capacities 末置，未 pc 时为空数组。
+        self.assertEqual(config["capacities"], [])
 
     def test_ci_loads_faults_observed_by_fq(self):
         # 乱序提交（段与后端），ce/fq 按后端加入序、段 a 升序规范化。
@@ -1865,7 +1879,7 @@ class PolicyDiffTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
         # ce 输出逐字节固定键序、紧凑、单换行。
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":9', run_stdout)
+        self.assertIn(b'"version":10', run_stdout)
 
 
 class FaultTimelineTest(unittest.TestCase):
@@ -2597,15 +2611,15 @@ class QuotaWindowTest(unittest.TestCase):
             {"op": "ce"},
         ]
         results = self.run_ops(ops)
-        # ce 导出 version=9：精确十二键，queue 末置；v1..v7 热加载视
-        # quotas=[]、queue 为默认 F/T，故 quotas 为空。
+        # ce 导出 version=10：精确十三键，capacities 末置；v1..v7 热加载
+        # 视 quotas=[]、queue 为默认 F/T、capacities 为 []，故 quotas 为空。
         self.assertEqual(
             list(results[4]["config"]),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue"],
+             "queue", "capacities"],
         )
-        self.assertEqual(results[4]["config"]["version"], 9)
+        self.assertEqual(results[4]["config"]["version"], 10)
         self.assertEqual(results[4]["config"]["quotas"], [])
         self.assertEqual(
             results[4]["config"]["queue"], {"dequeue": "F", "full": "T"}
@@ -2688,11 +2702,12 @@ class QuotaHotReloadTest(unittest.TestCase):
             {"op": "ce"},
         ])
         config = results[-1]["config"]
-        self.assertEqual(config["version"], 9)
-        # queue 末置、键序 dequeue,full，默认 F/T。
+        self.assertEqual(config["version"], 10)
+        # capacities 末置、键序 dequeue,full 的 queue 在其前。
         self.assertEqual(list(config), [
             "version", "backends", "vnodes", "limits", "overload", "sticky",
             "idle", "backpressure", "scheduler", "faults", "quotas", "queue",
+            "capacities",
         ])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
         # 按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；项键序
@@ -2870,13 +2885,14 @@ class QuotaHotReloadTest(unittest.TestCase):
         self.assertEqual(
             commits[2]["config"]["quotas"], [self.quota("C", "c", 5, 10)]
         )
-        self.assertEqual(commits[2]["config"]["version"], 9)
-        # cl/cb 快照一律规范化为 version=9，queue 默认 F/T。
+        self.assertEqual(commits[2]["config"]["version"], 10)
+        # cl/cb 快照一律规范化为 version=10，queue 默认 F/T、capacities 空。
         for commit in commits:
-            self.assertEqual(commit["config"]["version"], 9)
+            self.assertEqual(commit["config"]["version"], 10)
             self.assertEqual(
                 commit["config"]["queue"], {"dequeue": "F", "full": "T"}
             )
+            self.assertEqual(commit["config"]["capacities"], [])
 
     def test_record_replay_covers_v8_quotas(self):
         config = config_v8(
@@ -2898,7 +2914,7 @@ class QuotaHotReloadTest(unittest.TestCase):
             (run_code, run_stdout, run_stderr),
         )
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":9', run_stdout)
+        self.assertIn(b'"version":10', run_stdout)
         self.assertIn(b'"quotas":[{', run_stdout)
 
     @staticmethod
@@ -2957,7 +2973,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
 
     # ---- 导出与默认 ----
 
-    def test_ce_twelve_keys_queue_last_with_default_ft(self):
+    def test_ce_thirteen_keys_capacities_last_with_default_ft(self):
         results = self.run_ops([
             {"op": "ci", "config": config_v8(1), "now": 0},
             {"op": "ce"},
@@ -2967,11 +2983,12 @@ class V9QueueHotReloadTest(unittest.TestCase):
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue"],
+             "queue", "capacities"],
         )
-        self.assertEqual(config["version"], 9)
+        self.assertEqual(config["version"], 10)
         self.assertEqual(list(config["queue"]), ["dequeue", "full"])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
+        self.assertEqual(config["capacities"], [])
 
     def test_v1_through_v8_default_to_ft(self):
         be7 = [{
@@ -3011,7 +3028,9 @@ class V9QueueHotReloadTest(unittest.TestCase):
                 {"dequeue": "F", "full": "T"},
                 version,
             )
-            self.assertEqual(results[1]["config"]["version"], 9)
+            # 旧版输入统一规范化导出 version=10，capacities 为空数组。
+            self.assertEqual(results[1]["config"]["version"], 10)
+            self.assertEqual(results[1]["config"]["capacities"], [])
 
     def test_v9_loads_and_exports_sh(self):
         cfg = self.config(dequeue="S", full="H")
@@ -3183,14 +3202,15 @@ class V9QueueHotReloadTest(unittest.TestCase):
 
     # ---- cl/cb 规范化与回滚 ----
 
-    def test_cl_normalizes_to_v9_with_loaded_queue(self):
+    def test_cl_normalizes_to_v10_with_loaded_queue(self):
         cfg = self.config(dequeue="S", full="H")
         results = self.run_ops([
             {"op": "ci", "config": cfg, "now": 0}, {"op": "cl"},
         ])
         commit = results[1]["commits"][0]["config"]
-        self.assertEqual(commit["version"], 9)
+        self.assertEqual(commit["version"], 10)
         self.assertEqual(commit["queue"], {"dequeue": "S", "full": "H"})
+        self.assertEqual(commit["capacities"], [])
 
     def test_post_commit_qp_rp_change_does_not_mutate_commit(self):
         # 提交时为 S/H；之后 qp/rp 改回 F/T；cl 快照仍为 S/H，当前 ce 为 F/T。
@@ -3251,13 +3271,14 @@ class V9QueueHotReloadTest(unittest.TestCase):
             results[3], {"op": "cb", "target": 1, "rev": 2, "ok": True}
         )
         commits = results[4]["commits"]
-        # 两个快照均规范化为 v9 且均携带恢复后的 S/H。
+        # 两个快照均规范化为 v10 且均携带恢复后的 S/H、capacities 空。
         self.assertEqual(len(commits), 2)
         for commit in commits:
-            self.assertEqual(commit["config"]["version"], 9)
+            self.assertEqual(commit["config"]["version"], 10)
             self.assertEqual(
                 commit["config"]["queue"], {"dequeue": "S", "full": "H"}
             )
+            self.assertEqual(commit["config"]["capacities"], [])
 
     # ---- STATE/4 ----
 
@@ -3329,7 +3350,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
         )
         # 单换行、紧凑、固定键序。
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":9', run_stdout)
+        self.assertIn(b'"version":10', run_stdout)
         self.assertIn(b'"queue":{"dequeue":"S","full":"H"}', run_stdout)
 
 
@@ -5382,7 +5403,7 @@ class HashDryRunTest(unittest.TestCase):
         return item
 
     def make_config(self, ids, vnodes, backends=None, **overrides):
-        config = config_v9(1, **overrides)
+        config = config_v10(1, **overrides)
         config["backends"] = (
             list(backends)
             if backends is not None
@@ -6070,6 +6091,7 @@ class PerBackendCapOverrideTest(unittest.TestCase):
         self.assertEqual(stderr, b'{"error":"BACKEND"}\n')
 
     def ci_config(self):
+        # version=9 输入（无 capacities 键）：成功热加载视 capacities=[]。
         return {
             "version": 9,
             "backends": [{
@@ -6082,21 +6104,244 @@ class PerBackendCapOverrideTest(unittest.TestCase):
             "queue": {"dequeue": "F", "full": "T"},
         }
 
-    def test_ci_clears_override_and_ce_does_not_export_it(self):
+    def ci_config_v10(self, capacities=(), backends=("b",)):
+        # version=10 输入：十三键末置 capacities；backends 可指定。
+        config = self.ci_config()
+        config["version"] = 10
+        config["backends"] = [{
+            "id": bid, "weight": 1, "d": 0, "fail": 3, "success": 2,
+            "circuit": None, "drain": None, "endpoint": None,
+        } for bid in backends]
+        config["capacities"] = [dict(item) for item in capacities]
+        return config
+
+    def test_ce_exports_pc_override_as_capacities(self):
+        # 覆盖现为配置一部分：ce 按后端加入序导出为 capacities（项 id,cap），
+        # 但不出现 cap_overrides/pc 运行态字样。
         ops = [
             {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "a", "weight": 1},
             {"op": "pc", "id": "b", "cap": 4},
+            {"op": "pc", "id": "a", "cap": 2},
             {"op": "ce"},
         ]
         _, out, _ = self.run_ops(ops)
         config = json.loads(out.decode("utf-8"))["results"][-1]["config"]
-        # 覆盖为纯运行态，不出现在 ce 导出。
+        self.assertEqual(config["version"], 10)
         self.assertNotIn("cap_overrides", config)
         self.assertNotIn("pc", json.dumps(config))
-        self.assert_failure(ops + [
+        # 按后端加入序 b,a 输出，仅列显式覆盖。
+        self.assertEqual(
+            config["capacities"],
+            [{"id": "b", "cap": 4}, {"id": "a", "cap": 2}],
+        )
+
+    def test_v9_ci_clears_override(self):
+        # version=9 输入无 capacities 键：成功热加载清空既有 pc 覆盖。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 4},
             {"op": "ci", "config": self.ci_config(), "now": 0},
             {"op": "pg", "id": "b"},
-        ], 4, "STATE")
+        ]
+        self.assert_failure(ops, 4, "STATE")
+
+    def test_v10_ci_restores_capacities_and_atomically_replaces(self):
+        # v10 capacities 成功时原子替换覆盖：未列入的旧覆盖被清除，列入的
+        # 按候选 cap 恢复（按 id 引用，与数组输入顺序无关）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 9},
+            {"op": "pc", "id": "a", "cap": 9},
+            {"op": "ci", "config": self.ci_config_v10(
+                [{"id": "a", "cap": 3}], backends=("b", "a")), "now": 0},
+            {"op": "pg", "id": "a"},
+            {"op": "ce"},
+        ]
+        _, out, _ = self.run_ops(ops)
+        results = json.loads(out.decode("utf-8"))["results"]
+        self.assertEqual(results[5]["cap"], 3)
+        # b 未列入即清空；ce 仅列 a（按加入序 b,a，仅 a 有覆盖）。
+        self.assertEqual(results[6]["config"]["capacities"],
+                         [{"id": "a", "cap": 3}])
+
+    def test_v10_empty_capacities_clears_overrides(self):
+        # 显式 [] 同样清空覆盖（沿用 overload.cap）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 4},
+            {"op": "ci", "config": self.ci_config_v10([]), "now": 0},
+            {"op": "pg", "id": "b"},
+        ]
+        self.assert_failure(ops, 4, "STATE")
+
+    def test_pc_after_commit_only_changes_current_ce_not_snapshot(self):
+        # ci 提交快照固定；其后 pc 只改当前 ce，cl 快照不变；cb 恢复快照覆盖。
+        ops = [
+            {"op": "ci", "config": self.ci_config_v10(
+                [{"id": "b", "cap": 5}]), "now": 0},
+            {"op": "pc", "id": "b", "cap": 8},
+            {"op": "cl"},
+            {"op": "ce"},
+            {"op": "cb", "rev": 1, "now": 1},
+            {"op": "pg", "id": "b"},
+        ]
+        _, out, _ = self.run_ops(ops)
+        results = json.loads(out.decode("utf-8"))["results"]
+        self.assertEqual(results[2]["commits"][0]["config"]["capacities"],
+                         [{"id": "b", "cap": 5}])
+        self.assertEqual(results[3]["config"]["capacities"],
+                         [{"id": "b", "cap": 8}])
+        self.assertEqual(results[5]["cap"], 5)
+
+    def test_capacities_unknown_id_is_backend(self):
+        for op_name in ("ci", "cv", "cd", "pd"):
+            config = self.ci_config_v10([{"id": "ghost", "cap": 1}])
+            self.assert_failure(
+                [{"op": op_name, "config": config, "now": 0}], 3, "BACKEND"
+            )
+
+    def test_capacities_validation_errors_are_input(self):
+        def ci_with_capacities(raw_capacities_json):
+            base = json.dumps(self.ci_config_v10([]), separators=(",", ":"))
+            config = json.loads(base.replace(
+                '"capacities":[]', '"capacities":' + raw_capacities_json))
+            return [{"op": "ci", "config": config, "now": 0}]
+
+        bad_fragments = [
+            '{}',                              # 非数组
+            '[{"id":"b"}]',                    # 缺 cap
+            '[{"cap":1}]',                     # 缺 id
+            '[{"id":"b","cap":0}]',           # cap 下界
+            '[{"id":"b","cap":true}]',        # bool
+            '[{"id":"b","cap":1000001}]',     # cap 上界
+            '[{"id":"b","cap":"1"}]',         # cap 类型
+            '[{"cap":1,"id":"b"}]',           # 项键序反
+            '[{"id":"b","cap":1},{"id":"b","cap":2}]',  # id 重复
+        ]
+        for fragment in bad_fragments:
+            self.assert_failure(ci_with_capacities(fragment), 2, "INPUT")
+        # cap 边界值合法。
+        for good in (1, 10 ** 6):
+            code, _, _ = self.run_ops([
+                {"op": "ci", "config": self.ci_config_v10(
+                    [{"id": "b", "cap": good}]), "now": 0}
+            ])
+            self.assertEqual(code, 0, good)
+
+    def test_capacities_must_be_last_and_complete_for_v10(self):
+        # v10 缺 capacities（十二键）报 INPUT。
+        missing = self.ci_config()
+        missing["version"] = 10
+        self.assert_failure(
+            [{"op": "ci", "config": missing, "now": 0}], 2, "INPUT"
+        )
+        # 十三键但 version=9 报 INPUT（形状与版本不符）。
+        mismatch = self.ci_config_v10([])
+        mismatch["version"] = 9
+        self.assert_failure(
+            [{"op": "ci", "config": mismatch, "now": 0}], 2, "INPUT"
+        )
+        # capacities 置于 queue 之前（乱序）报 INPUT（dict 保序即 JSON 键序）。
+        canonical = self.ci_config_v10([])
+        reordered = {}
+        for key in canonical:
+            if key == "queue":
+                reordered["capacities"] = []
+                reordered["queue"] = canonical["queue"]
+            elif key == "capacities":
+                continue
+            else:
+                reordered[key] = canonical[key]
+        self.assertEqual(list(reordered)[-2:], ["capacities", "queue"])
+        self.assert_failure(
+            [{"op": "ci", "config": reordered, "now": 0}], 2, "INPUT"
+        )
+
+    def test_cv_echo_normalizes_capacities_in_join_order(self):
+        # 输入乱序：cv 回显按后端加入序、仅列显式覆盖，version=10。
+        config = self.ci_config_v10(
+            [{"id": "a", "cap": 6}, {"id": "b", "cap": 2}],
+            backends=("b", "a"),
+        )
+        results = self.results([{"op": "cv", "config": config, "now": 0}])
+        echoed = results[0]["config"]
+        self.assertEqual(echoed["version"], 10)
+        self.assertEqual(list(echoed)[-1], "capacities")
+        # 按加入序 b,a（与输入顺序无关）。
+        self.assertEqual(
+            echoed["capacities"],
+            [{"id": "b", "cap": 2}, {"id": "a", "cap": 6}],
+        )
+
+    def test_pd_capacities_section_after_queue(self):
+        # 当前无覆盖，候选给 b 配 cap=4：changes 末节为 capacities。
+        candidate = self.ci_config_v10([{"id": "b", "cap": 4}])
+        results = self.results([
+            {"op": "ci", "config": self.ci_config_v10([]), "now": 0},
+            {"op": "pd", "config": candidate, "now": 1},
+        ])
+        changes = results[1]["changes"]
+        self.assertEqual([item["section"] for item in changes], ["capacities"])
+        self.assertEqual(changes[0], {
+            "section": "capacities",
+            "before": [],
+            "after": [{"id": "b", "cap": 4}],
+        })
+
+    def test_cb_restores_capacities_snapshot(self):
+        # rev1 携带 b=5；pc 改当前 ce 为 9，cb 回滚 rev1 后 pg 见 5。
+        ops = [
+            {"op": "ci", "config": self.ci_config_v10(
+                [{"id": "b", "cap": 5}]), "now": 0},
+            {"op": "pc", "id": "b", "cap": 9},
+            {"op": "cb", "rev": 1, "now": 1},
+            {"op": "pg", "id": "b"},
+        ]
+        results = self.results(ops)
+        self.assertEqual(results[3]["cap"], 5)
+
+    def test_failed_v10_ci_keeps_existing_overrides(self):
+        # capacities 引用未知 id：ci 整批失败（BACKEND），既有 pc 覆盖保留，
+        # 同批后续不执行（进程级原子）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 4},
+            {"op": "ci", "config": self.ci_config_v10(
+                [{"id": "ghost", "cap": 1}]), "now": 0},
+        ]
+        self.assert_failure(ops, 3, "BACKEND")
+        # 新进程等价核验：成功路径下覆盖确实存在（ce 导出）。
+        _, out, _ = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "pc", "id": "b", "cap": 4},
+            {"op": "ce"},
+        ])
+        config = json.loads(out.decode())["results"][-1]["config"]
+        self.assertEqual(config["capacities"], [{"id": "b", "cap": 4}])
+
+    def test_capacities_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "ci", "config": self.ci_config_v10(
+                [{"id": "b", "cap": 3}]), "now": 0},
+            {"op": "pg", "id": "b"},
+            {"op": "ce"},
+            {"op": "cl"},
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual((rep_code, rep_stdout, rep_stderr),
+                         (run_code, run_stdout, b""))
+        # 末置 capacities、单换行、紧凑固定键序。
+        self.assertEqual(run_stdout.count(b"\n"), 1)
+        self.assertIn(
+            b'"queue":{"dequeue":"F","full":"T"},"capacities":'
+            b'[{"id":"b","cap":3}]',
+            run_stdout,
+        )
 
     def test_cb_clears_override(self):
         ops = [
