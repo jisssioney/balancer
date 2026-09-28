@@ -4177,6 +4177,274 @@ class OverloadHistoryTest(unittest.TestCase):
         )
 
 
+class WaitHistoryTest(unittest.TestCase):
+    """wh 排队等待历史：离队等待时长五桶、四类事件、只读查询、清空与回滚。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self, ttl=10, cap=1, q=10):
+        # 环上唯一后端 a，cap=1 便于制造入队。
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": cap, "q": q, "ttl": ttl},
+        ]
+
+    def oa(self, cid, now, key="k"):
+        return {"op": "oa", "cid": cid, "flow": FLOW,
+                "c": "k", "s": "k", "key": key, "now": now}
+
+    ZERO = [0, 0, 0, 0, 0]
+
+    def test_wh_empty_windows_and_key_order(self):
+        ops = self.base_ops() + [
+            {"op": "wh", "from": 0, "to": 0, "now": 0},
+        ]
+        result = self.run_ops(ops)[3]
+        self.assertEqual(list(result), ["op", "windows"])
+        self.assertEqual(len(result["windows"]), 1)
+        window = result["windows"][0]
+        self.assertEqual(
+            list(window),
+            ["window", "admitted", "expired", "cancelled", "evicted"],
+        )
+        self.assertEqual(
+            window,
+            {"window": 0, "admitted": self.ZERO, "expired": self.ZERO,
+             "cancelled": self.ZERO, "evicted": self.ZERO},
+        )
+        # 四项均为长度 5 的非负整数数组，空窗全零。
+        for field in ("admitted", "expired", "cancelled", "evicted"):
+            self.assertEqual(window[field], [0, 0, 0, 0, 0])
+
+    def test_wh_admitted_delay_buckets(self):
+        # c1 占唯一连接，c2..c6 均于 now=0 入队；逐个 close+ot，接纳延迟
+        # 0/1/10/100/101 分别落桶 ≤0、≤1、≤10、≤100、>100。
+        ops = self.base_ops(ttl=100000) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0), self.oa("c3", 0), self.oa("c4", 0),
+            self.oa("c5", 0), self.oa("c6", 0),
+            {"op": "close", "cid": "c1", "now": 0},
+            {"op": "ot", "now": 0},
+            {"op": "close", "cid": "c2", "now": 1},
+            {"op": "ot", "now": 1},
+            {"op": "close", "cid": "c3", "now": 10},
+            {"op": "ot", "now": 10},
+            {"op": "close", "cid": "c4", "now": 100},
+            {"op": "ot", "now": 100},
+            {"op": "close", "cid": "c5", "now": 101},
+            {"op": "ot", "now": 101},
+            {"op": "wh", "from": 0, "to": 1, "now": 101},
+        ]
+        windows = self.run_ops(ops)[-1]["windows"]
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0]["window"], 0)
+        # 延迟 0/1/10 在窗 0，分别落桶 0/1/2。
+        self.assertEqual(windows[0]["admitted"], [1, 1, 1, 0, 0])
+        self.assertEqual(windows[0]["expired"], self.ZERO)
+        self.assertEqual(windows[0]["cancelled"], self.ZERO)
+        self.assertEqual(windows[0]["evicted"], self.ZERO)
+        self.assertEqual(windows[1]["window"], 1)
+        # 延迟 100/101 在窗 1，分别落桶 3/4。
+        self.assertEqual(windows[1]["admitted"], [0, 0, 0, 1, 1])
+        for field in ("expired", "cancelled", "evicted"):
+            self.assertEqual(windows[1][field], self.ZERO)
+
+    def test_wh_cancelled_uses_logical_clock(self):
+        # c2 于 now=0 入队；oc 无 now，按当前逻辑时钟记 cancelled。oq 把时钟
+        # 推进到 5 后取消：d=5 落 ≤10 桶，事件归窗 0。
+        ops = self.base_ops() + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "oq", "now": 5},
+            {"op": "oc", "cid": "c2"},
+            {"op": "wh", "from": 0, "to": 0, "now": 5},
+        ]
+        window = self.run_ops(ops)[-1]["windows"][0]
+        self.assertEqual(window["cancelled"], [0, 0, 1, 0, 0])
+        self.assertEqual(window["admitted"], self.ZERO)
+        self.assertEqual(window["expired"], self.ZERO)
+        self.assertEqual(window["evicted"], self.ZERO)
+
+    def test_wh_evicted_uses_head_oa_now(self):
+        # H 模式 q=1：c0 建连、c1 排队占满队，c2 于 now=5 入队头淘汰 c1，
+        # evicted 按该次 oa.now=5（d=5，≤10 桶）记账。
+        ops = self.base_ops(q=1) + [
+            {"op": "rp", "mode": "H"},
+            self.oa("c0", 0, key="k0"),
+            self.oa("c1", 0, key="k1"),
+            self.oa("c2", 5, key="k2"),
+            {"op": "wh", "from": 0, "to": 0, "now": 5},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[6]["evicted"], "c1")
+        window = results[-1]["windows"][0]
+        self.assertEqual(window["evicted"], [0, 0, 1, 0, 0])
+        self.assertEqual(window["admitted"], self.ZERO)
+        self.assertEqual(window["expired"], self.ZERO)
+        self.assertEqual(window["cancelled"], self.ZERO)
+
+    def test_wh_expired_delay_bucket(self):
+        # c2 于 now=0 入队、ttl=10，c1 仍占连接；ot@10 时 c2 过期：d=10 落
+        # ≤10 桶，expired 归离队时刻窗 0。
+        ops = self.base_ops(ttl=10) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "ot", "now": 10},
+            {"op": "wh", "from": 0, "to": 0, "now": 10},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[5]["expired"], ["c2"])
+        window = results[-1]["windows"][0]
+        # d=10 落 ≤10 桶（索引 2）。
+        self.assertEqual(window["expired"], [0, 0, 1, 0, 0])
+        self.assertEqual(window["admitted"], self.ZERO)
+
+    def test_wh_only_successful_dequeue_counted(self):
+        # 立即接纳（A）从不入队，不记；ot 遇阻塞放回（无成功离队）不记。
+        ops = self.base_ops(ttl=100000) + [
+            self.oa("c1", 0),                  # A：不记 wh
+            self.oa("c2", 0),                  # Q
+            {"op": "ot", "now": 5},            # c2 阻塞放回：不记
+            {"op": "wh", "from": 0, "to": 0, "now": 5},
+        ]
+        window = self.run_ops(ops)[-1]["windows"][0]
+        self.assertEqual(window["admitted"], self.ZERO)
+        self.assertEqual(window["expired"], self.ZERO)
+        self.assertEqual(window["cancelled"], self.ZERO)
+        self.assertEqual(window["evicted"], self.ZERO)
+
+    def test_wh_failed_batch_rolls_back(self):
+        # oc 取消成功记账后，批内后续操作失败：整批回滚，wh 记账不落盘。
+        self.assert_failure(
+            self.base_ops() + [
+                self.oa("c1", 0),
+                self.oa("c2", 0),
+                {"op": "oc", "cid": "c2"},    # 取消（已记账）
+                {"op": "oc", "cid": "ghost"},  # CONNECTION：整批失败
+                {"op": "wh", "from": 0, "to": 0, "now": 0},
+            ],
+            5, "CONNECTION",
+        )
+
+    def test_wh_unconfigured_os_is_state(self):
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1},
+             {"op": "wh", "from": 0, "to": 0, "now": 0}],
+            4, "STATE",
+        )
+
+    def test_wh_premature_from_is_state(self):
+        # now=3600 时当前窗为 60，from 早于下界 1 报 STATE。
+        self.assert_failure(
+            self.base_ops() + [{"op": "wh", "from": 0, "to": 0, "now": 3600}],
+            4, "STATE",
+        )
+
+    def test_wh_input_violations(self):
+        bad_ops = [
+            # 键序不符（须 op,from,to,now）。
+            b'{"ops":[{"op":"wh","to":0,"from":0,"now":0}]}',
+            # 缺键、多键。
+            b'{"ops":[{"op":"wh","from":0,"to":0}]}',
+            b'{"ops":[{"op":"wh","from":0,"to":0,"now":0,"x":1}]}',
+            # bool 不是合法数值。
+            b'{"ops":[{"op":"wh","from":false,"to":0,"now":0}]}',
+            # 范围：now 超 10^9、from 为负。
+            b'{"ops":[{"op":"wh","from":0,"to":0,"now":1000000001}]}',
+            b'{"ops":[{"op":"wh","from":-1,"to":0,"now":0}]}',
+            # 关系：from>to、to-from>=60、to>now//60。
+            b'{"ops":[{"op":"wh","from":2,"to":1,"now":180}]}',
+            b'{"ops":[{"op":"wh","from":0,"to":60,"now":3600}]}',
+            b'{"ops":[{"op":"wh","from":0,"to":2,"now":60}]}',
+        ]
+        for raw in bad_ops:
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, b"")
+            self.assertEqual(stderr, b'{"error":"INPUT"}\n')
+        # 时钟倒退报 INPUT。
+        self.assert_failure(
+            self.base_ops() + [
+                {"op": "wh", "from": 0, "to": 1, "now": 120},
+                {"op": "wh", "from": 0, "to": 0, "now": 60},
+            ],
+            2, "INPUT",
+        )
+
+    def test_ci_cb_ca_clear_wait_history(self):
+        config = config_v7(
+            1, vnodes=1, overload={"cap": 1, "q": 4, "ttl": 100}
+        )
+        # ci 成功清空排队等待历史。
+        ops = self.base_ops(ttl=100) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "oc", "cid": "c2"},
+            {"op": "close", "cid": "c1", "now": 1},
+            {"op": "ci", "config": config, "now": 2},
+            {"op": "wh", "from": 0, "to": 0, "now": 2},
+        ]
+        window = self.run_ops(ops)[-1]["windows"][0]
+        self.assertEqual(window["cancelled"], self.ZERO)
+        # cb 回滚成功同样清空。
+        ops = [
+            {"op": "ci", "config": config, "now": 0},
+            self.oa("c1", 1),
+            self.oa("c2", 1),
+            {"op": "oq", "now": 3},
+            {"op": "oc", "cid": "c2"},
+            {"op": "close", "cid": "c1", "now": 4},
+            {"op": "cb", "rev": 1, "now": 5},
+            {"op": "wh", "from": 0, "to": 0, "now": 5},
+        ]
+        window = self.run_ops(ops)[-1]["windows"][0]
+        self.assertEqual(window["cancelled"], self.ZERO)
+        # cp 预约、ca 生效成功清空。
+        ops = self.base_ops(ttl=100) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "oc", "cid": "c2"},
+            {"op": "close", "cid": "c1", "now": 1},
+            {"op": "cp", "config": config, "at": 2, "now": 2},
+            {"op": "ca", "now": 2},
+            {"op": "wh", "from": 0, "to": 0, "now": 2},
+        ]
+        window = self.run_ops(ops)[-1]["windows"][0]
+        self.assertEqual(window["cancelled"], self.ZERO)
+
+    def test_record_replay_covers_wh(self):
+        ops = self.base_ops(ttl=10) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "oq", "now": 4},
+            {"op": "oc", "cid": "c2"},
+            {"op": "ot", "now": 20},
+            {"op": "wh", "from": 0, "to": 0, "now": 20},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 class RecordReplayTest(unittest.TestCase):
     """核心输入经 record、replay 逐字节复现退出码、stdout、stderr。"""
 
