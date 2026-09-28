@@ -674,6 +674,27 @@ INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4。ci 成功清空告警现
 态与历史，失败回滚；remove 及同 id 重加不清历史，仅影响后续 fe 的
 v；批内失败回滚事件。fe 记账 O(1)，ah 时间 O(60)、空间 O(60)。
 
+后端错误率告警与转换历史：ea 精确键序 op,id,w,hi,lo,n,now（键须按此序
+出现），以后端 id 为键各自独立；id 沿用非空字符串校验，w/now 为 0..10^9
+非 bool 整数，hi 1..10000、lo 0..9999、lo<hi、n 1..60 均非 bool 整数，
+now 进入共用非递减时钟。首评固化 (hi,lo,n) 并自 N 态起评，此后阈值须相同
+且 w 仅同前（同窗原样返回首评结果，不推进状态机）或 +1；w 窗须已结束且在
+最近 60 窗内。v 取该后端 w 窗 mh 同款计数：无请求 v=0，否则
+floor(10000*errors/requests)，rate 为 v/100 两位定点串。N 态连续 n 窗
+v≥hi 转 A，A 态连续 n 窗 v≤lo 转 N，方向不符与转换后连续数清 0；返回键
+序 op,id,w,state,requests,errors,rate,run,changed。ea 使状态在 N/A 间转
+换时为该后端追加一次历史事件，同窗重报或未转换不记录；事件键序
+window,from,to,rate,hi,lo,n：window/hi/lo/n 为整数，from/to 仅 N 或 A，
+rate 沿用该次 ea 的两位定点字符串；每次 ea 成功后删除该后端 window<w-59
+的事件。eh 精确键序 op,id,from,to,now；id 沿用后端标识校验，from/to/now
+为 0..10^9 非 bool 整数，now 进入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60。返回键序 op,id,events；events 取闭区间
+[from,to] 内事件，按 window 升序并按上述键序输出，无事件为 []。eh 只读，
+不推进告警也不清理历史。非法键序、id、数值、关系或时钟倒退报 INPUT/2，
+未知 id 报 BACKEND/3，from 早于 max(0,now//60-59) 报 STATE/4，按此序判
+定。remove 后同 id 重加及 ci/cb 成功清空其告警与历史；失败批回滚历史和
+告警状态。ea 记账 O(1)，eh 时间 O(60)、空间 O(60B)。
+
 连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
@@ -1777,7 +1798,7 @@ def parse_op(raw_op):
         "br",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
-        "ea",
+        "ea", "eh",
         "ts", "tk", "tg", "tx",
         "ep", "fw",
         "ru",
@@ -2524,6 +2545,22 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("ea", parse_backend_id(raw_op["id"]), w, hi, lo, n, now)
 
+    if name == "eh":
+        # 后端错误率告警转换历史：精确键序 op,id,from,to,now（键须按此序
+        # 出现），只读；id 沿用非空字符串校验（未知 id 留执行期判
+        # BACKEND）；from/to/now 为 0..10^9 非 bool 整数，窗关系
+        # from≤to≤now//60 且 to-from<60（非法即 INPUT）；from 过早的
+        # STATE 留执行期判（未知 id 先 BACKEND）。
+        if list(raw_op) != ["op", "id", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("eh", parse_backend_id(raw_op["id"]), start, end, now)
+
     if name == "fr":
         if keys != {"op", "cid", "flow", "key", "timeout", "max", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -2885,6 +2922,16 @@ def run(raw):
     # 不推进状态机）。每后端独立；remove 删除其告警，同 id 重加回到未首评，
     # ci/cb 成功整体清空。dict 查找/写入 O(1)，额外空间 O(B)。
     err_alerts = {}
+    # 后端错误率告警转换历史（eh）：以后端 id 为键，每后端一个 deque，仅在
+    # ea 使状态在 N/A 间转换时追加一个事件，键序
+    # window,from,to,rate,hi,lo,n（from/to 为转换前后状态，仅 N/A；rate 沿
+    # 用该次 ea 的两位定点串；hi/lo/n 为固化阈值）；同窗重报在 ea 中已原样
+    # 返回、不推进状态机，自然不重复追加；未转换不记录。每次 ea 成功后删除
+    # window<w-59 的事件，w 对每后端严格递增故队列按 window 升序且至多 60
+    # 项。remove 删除该后端历史，同 id 重加回到空历史；ci/cb 成功整体清空。
+    # eh 只读，不推进告警也不清理历史。追加与前端裁剪摊还 O(1)，eh 时间
+    # O(60)，空间 O(60B)。
+    err_alert_events = {}
     # 配置提交历史（cl/cb）：(rev, 规范化 version=10 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
@@ -3696,6 +3743,7 @@ def run(raw):
         nonlocal backends, buckets, quotas, ring_vnodes, queue_cfg, wait_queue
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal sticky_map, alert, alert_events, overload_hist, err_alerts
+        nonlocal err_alert_events
         nonlocal mo_seq, mo_cache, queue_mode
         nonlocal full_mode, evict_count, evict_last, cap_overrides
 
@@ -3846,8 +3894,10 @@ def run(raw):
         # ci 成功清除全池故障告警状态（fe 回到未首评）与转换历史。
         alert = None
         alert_events = deque()
-        # ci/cb 成功清空全部后端错误率告警（ea 各 id 均回到未首评）。
+        # ci/cb 成功清空全部后端错误率告警（ea 各 id 均回到未首评）与转换
+        # 历史（eh 各 id 事件清空）。
         err_alerts = {}
+        err_alert_events = {}
         # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
@@ -3864,7 +3914,7 @@ def run(raw):
             "ms", "mx", "rh", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
-            "ru", "ea",
+            "ru", "ea", "eh",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -4011,8 +4061,10 @@ def run(raw):
             # remove 删除接纳容量覆盖；同 id 重加不继承（cap_overrides 以现存
             # 后端为键，新记录无覆盖）。
             cap_overrides.pop(backend_id, None)
-            # remove 删除该后端错误率告警；同 id 重加回到未首评。
+            # remove 删除该后端错误率告警与转换历史；同 id 重加回到未首评、
+            # 空历史。
             err_alerts.pop(backend_id, None)
+            err_alert_events.pop(backend_id, None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -6400,6 +6452,7 @@ def run(raw):
             else:
                 state = entry["state"]
                 run_count = entry["run"]
+            prev_state = state
             changed = False
             if state == "N":
                 if v >= hi:
@@ -6432,6 +6485,33 @@ def run(raw):
                 "run": run_count,
                 "changed": changed,
             }
+            if changed:
+                # 状态转换：为该后端追加事件（键序 window,from,to,rate,hi,
+                # lo,n），记录触发窗、转换前后状态、该次 ea 的两位定点 rate
+                # 与固化阈值；未转换不记录。同窗重报在上方已 continue，不会
+                # 走到这里，故不重复。
+                events = err_alert_events.get(backend_id)
+                if events is None:
+                    events = deque()
+                    err_alert_events[backend_id] = events
+                events.append(
+                    {
+                        "window": w,
+                        "from": prev_state,
+                        "to": state,
+                        "rate": rate,
+                        "hi": hi,
+                        "lo": lo,
+                        "n": n,
+                    }
+                )
+            # 每次 ea 成功后删除该后端 window<w-59 的事件；w 严格递增，前端
+            # 裁剪摊还 O(1)。无事件的 id 不预建 deque。
+            events = err_alert_events.get(backend_id)
+            if events is not None:
+                cutoff = w - 59
+                while events and events[0]["window"] < cutoff:
+                    events.popleft()
             err_alerts[backend_id] = {
                 "hi": hi,
                 "lo": lo,
@@ -6442,6 +6522,34 @@ def run(raw):
                 "result": dict(result),
             }
             results.append(result)
+
+        elif op[0] == "eh":
+            # 后端错误率告警转换历史（只读）：未知 id 报 BACKEND，from 早于
+            # 最近 60 窗下界报 STATE（与 rh/mh 同序）；不推进告警状态机也不
+            # 清理历史，失败批次天然回滚。返回键序 op,id,events；events 仅含
+            # 区间 [from,to] 内事件，按 window 升序（事件本就按评估窗递增入
+            # 队），项键序 window,from,to,rate,hi,lo,n；无事件为 []。逐项拷
+            # 贝，避免结果被批次内后续评估污染。每后端事件至多 60 项，时间
+            # O(60)。
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            events = err_alert_events.get(backend_id)
+            out_events = (
+                []
+                if events is None
+                else [
+                    dict(event)
+                    for event in events
+                    if start <= event["window"] <= end
+                ]
+            )
+            results.append({"op": "eh", "id": backend_id, "events": out_events})
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
