@@ -7639,6 +7639,336 @@ class ErrorRateAlertTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class PercentileAlertTest(unittest.TestCase):
+    """pa 后端延迟分位告警：分位桶状态机、缓存/跳窗/变参与各类清除。"""
+
+    def results(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def mr(ms, now, backend="b", ok=True):
+        return {"op": "mr", "id": backend, "ok": ok, "ms": ms,
+                "retries": 0, "remaps": 0, "now": now}
+
+    @staticmethod
+    def pa(w, now, p=50, hi=4, lo=0, n=1, backend="b"):
+        return {"op": "pa", "id": backend, "w": w, "p": p,
+                "hi": hi, "lo": lo, "n": n, "now": now}
+
+    def add(self, backend="b"):
+        return {"op": "add", "id": backend, "weight": 1}
+
+    def test_no_samples_is_null_and_state_N(self):
+        result = self.results([self.add(), self.pa(0, 60)])[-1]
+        self.assertEqual(result["state"], "N")
+        self.assertEqual(result["samples"], 0)
+        self.assertIsNone(result["bucket"])
+        self.assertIsNone(result["upper"])
+        self.assertEqual(result["run"], 0)
+        self.assertFalse(result["changed"])
+
+    def test_bucket_uppers_follow_lp_bounds(self):
+        # 桶上界依次为 1、10、100、1000、null：ms=1/10/100/1000/1001。
+        for ms, bucket, upper in (
+            (1, 0, 1), (10, 1, 10), (100, 2, 100),
+            (1000, 3, 1000), (1001, 4, None),
+        ):
+            result = self.results([
+                self.add(), self.mr(ms, 0),
+                self.pa(0, 60, hi=4, lo=0),
+            ])[-1]
+            self.assertEqual(result["bucket"], bucket, ms)
+            self.assertEqual(result["upper"], upper, ms)
+
+    def test_percentile_rank_boundary(self):
+        # 三桶0样本（ms=1）+ 一桶4（ms=1001）：p=75 rank=3 落桶0，
+        # p=76 rank=4 落桶4（分位规则同 lp）。两批各自首评。
+        seed = [self.mr(1, 0), self.mr(1, 1), self.mr(1, 2),
+                self.mr(1001, 3)]
+        r75 = self.results([self.add()] + seed + [self.pa(0, 60, p=75)])[-1]
+        r76 = self.results([self.add()] + seed + [self.pa(0, 60, p=76)])[-1]
+        self.assertEqual((r75["samples"], r75["bucket"], r75["upper"]),
+                         (4, 0, 1))
+        self.assertEqual((r76["samples"], r76["bucket"], r76["upper"]),
+                         (4, 4, None))
+
+    def test_hi_boundary_inclusive_triggers_alarm(self):
+        # bucket==hi 即满足 bucket>=hi，n=1 当窗转 A。
+        result = self.results([
+            self.add(), self.mr(1001, 0),
+            self.pa(0, 60, hi=4, lo=0, n=1),
+        ])[-1]
+        self.assertEqual(result["bucket"], 4)
+        self.assertEqual(result["state"], "A")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["run"], 0)
+
+    def test_below_hi_stays_N(self):
+        # bucket=3 < hi=4：停留 N、run=0。
+        result = self.results([
+            self.add(), self.mr(1000, 0),
+            self.pa(0, 60, hi=4, lo=0, n=1),
+        ])[-1]
+        self.assertEqual((result["state"], result["run"], result["changed"]),
+                         ("N", 0, False))
+
+    def test_n_run_accumulates_and_resets_on_mismatch(self):
+        ops = [
+            self.add(),
+            self.mr(1001, 0), self.pa(0, 60, n=2),        # run=1
+            self.mr(1, 60), self.pa(1, 120, n=2),         # bucket0 清 0
+            self.mr(1001, 120), self.pa(2, 180, n=2),     # run=1
+            self.mr(1001, 180), self.pa(3, 240, n=2),     # run=2 转 A
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "pa"]
+        self.assertEqual(seq, [
+            ("N", 1, False),
+            ("N", 0, False),
+            ("N", 1, False),
+            ("A", 0, True),
+        ])
+
+    def test_no_samples_resets_run_in_N(self):
+        # N 态先积 run=1，下一空窗 bucket=null 方向不符清 0。
+        ops = [
+            self.add(),
+            self.mr(1001, 0), self.pa(0, 60, n=2),
+            self.pa(1, 120, n=2),
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "pa"]
+        self.assertEqual(seq, [("N", 1, False), ("N", 0, False)])
+
+    def test_A_to_N_on_lo(self):
+        # n=1：w0 桶4 转 A；w1 桶0<=lo 转回 N，run 清 0。
+        ops = [
+            self.add(),
+            self.mr(1001, 0), self.pa(0, 60, lo=0),
+            self.mr(1, 60), self.pa(1, 120, lo=0),
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "pa"]
+        self.assertEqual(seq, [("A", 0, True), ("N", 0, True)])
+
+    def test_no_samples_does_not_clear_A(self):
+        # A 态空窗 bucket=null：既不满足 bucket<=lo 也不计入，run 保持 0。
+        ops = [
+            self.add(),
+            self.mr(1001, 0), self.pa(0, 60),
+            self.pa(1, 120),
+        ]
+        seq = [(r["state"], r["run"], r["changed"], r["bucket"])
+               for r in self.results(ops) if r["op"] == "pa"]
+        self.assertEqual(seq, [
+            ("A", 0, True, 4),
+            ("A", 0, False, None),
+        ])
+
+    def test_same_window_params_cache_no_advance(self):
+        ops = [
+            self.add(), self.mr(1001, 0),
+            self.pa(0, 60),
+            self.pa(0, 120),
+            self.pa(1, 120),
+        ]
+        pa_results = [r for r in self.results(ops) if r["op"] == "pa"]
+        self.assertEqual(pa_results[0], pa_results[1])
+        # w1 空窗，A 态 bucket=null 不转换，仍停留 A。
+        self.assertEqual(pa_results[2]["w"], 1)
+        self.assertEqual(pa_results[2]["state"], "A")
+
+    def test_same_window_changed_param_is_state(self):
+        ops = [
+            self.add(),
+            self.pa(0, 60, p=50),
+            self.pa(0, 60, p=51),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_skip_and_regression_window_are_state(self):
+        base = [self.add(), self.pa(0, 60)]
+        self.assert_failure(
+            encode_ops(base + [self.pa(2, 180)]), 4, "STATE"
+        )
+        self.assert_failure(
+            encode_ops(base + [self.pa(1, 120), self.pa(0, 120)]),
+            4, "STATE",
+        )
+
+    def test_param_change_next_window_is_state(self):
+        ops = [
+            self.add(),
+            self.pa(0, 60, hi=4),
+            self.pa(1, 120, hi=3),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_per_backend_independent(self):
+        # b 首评桶4 转 A、c 首评桶0 停留 N，各 id 固化参数互不影响。
+        ops = [
+            self.add("b"), self.add("c"),
+            self.mr(1001, 0, "b"), self.mr(1, 0, "c"),
+            self.pa(0, 60, p=50, hi=4, lo=0, n=1, backend="b"),
+            self.pa(0, 60, p=90, hi=1, lo=0, n=1, backend="c"),
+        ]
+        by_id = {r["id"]: r for r in self.results(ops) if r["op"] == "pa"}
+        self.assertEqual(by_id["b"]["state"], "A")
+        self.assertTrue(by_id["b"]["changed"])
+        self.assertEqual(by_id["c"]["state"], "N")
+        self.assertFalse(by_id["c"]["changed"])
+
+    def test_readd_clears_alarm(self):
+        ops = [
+            self.add(), self.mr(1001, 0), self.pa(0, 60),   # A
+            {"op": "remove", "id": "b"},
+            self.add(),
+            self.pa(5, 360, hi=4, lo=0),                    # 重新首评 N
+        ]
+        result = self.results(ops)[-1]
+        self.assertEqual(result["state"], "N")
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["run"], 0)
+
+    def test_ci_clears_alarm(self):
+        exported = self.results([self.add(), {"op": "ce"}])[-1]["config"]
+        ops = [
+            self.add(), self.mr(1001, 0), self.pa(0, 60),
+            {"op": "ci", "config": exported, "now": 120},
+            self.pa(1, 120),
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "pa"]
+        self.assertEqual(seq[0], ("A", 0, True))
+        self.assertEqual(seq[1], ("N", 0, False))
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            encode_ops([self.pa(0, 60, backend="z")]), 3, "BACKEND"
+        )
+
+    def test_unknown_id_precedes_window_state(self):
+        self.assert_failure(
+            encode_ops([self.pa(1, 60, backend="z")]), 3, "BACKEND"
+        )
+
+    def test_key_order_and_shape_rejections(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        # hi/lo 乱序。
+        self.assert_failure(
+            head + b'{"op":"pa","id":"b","w":0,"p":50,"hi":2,"n":1,'
+                    b'"lo":1,"now":60}]}',
+            2, "INPUT",
+        )
+        # p 与 w 乱序。
+        self.assert_failure(
+            head + b'{"op":"pa","id":"b","p":50,"w":0,"hi":2,"lo":1,'
+                    b'"n":1,"now":60}]}',
+            2, "INPUT",
+        )
+        # 缺 n。
+        self.assert_failure(
+            head + b'{"op":"pa","id":"b","w":0,"p":50,"hi":2,"lo":1,'
+                    b'"now":60}]}',
+            2, "INPUT",
+        )
+        # 多键。
+        self.assert_failure(
+            head + b'{"op":"pa","id":"b","w":0,"p":50,"hi":2,"lo":1,'
+                    b'"n":1,"now":60,"x":1}]}',
+            2, "INPUT",
+        )
+
+    def test_type_range_and_relation_rejections(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        tail = b']}'
+        cases = [
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":-1,"lo":0,"n":1,"now":60}',   # hi 下界
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":5,"lo":0,"n":1,"now":60}',     # hi 上界
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":0,"lo":-1,"n":1,"now":60}',    # lo 下界
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":4,"lo":4,"n":1,"now":60}',     # lo 上界
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":0,"lo":0,"n":1,"now":60}',     # lo==hi
+            b'{"op":"pa","id":"b","w":0,"p":0,"hi":1,"lo":0,"n":1,"now":60}',      # p 下界
+            b'{"op":"pa","id":"b","w":0,"p":101,"hi":1,"lo":0,"n":1,"now":60}',    # p 上界
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":2,"lo":1,"n":0,"now":60}',     # n 下界
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":2,"lo":1,"n":61,"now":60}',    # n 上界
+            b'{"op":"pa","id":"b","w":-1,"p":50,"hi":2,"lo":1,"n":1,"now":60}',    # w 下界
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":2,"lo":1,"n":1,"now":-1}',     # now 下界
+            b'{"op":"pa","id":"b","w":0,"p":true,"hi":2,"lo":1,"n":1,"now":60}',   # p bool
+            b'{"op":"pa","id":"b","w":0,"p":50,"hi":true,"lo":1,"n":1,"now":60}',  # hi bool
+            b'{"op":"pa","id":"b","w":0,"p":50.0,"hi":2,"lo":1,"n":1,"now":60}',   # 浮点
+            b'{"op":"pa","id":"b","w":0,"p":"50","hi":2,"lo":1,"n":1,"now":60}',   # 字符串
+            b'{"op":"pa","id":123,"w":0,"p":50,"hi":2,"lo":1,"n":1,"now":60}',     # id 非串
+        ]
+        for body in cases:
+            self.assert_failure(head + body + tail, 2, "INPUT")
+
+    def test_window_out_of_range_is_state(self):
+        # w==now//60（窗未结束）或超出最近 60 窗下界，均 STATE，先于参数判定。
+        self.assert_failure(
+            encode_ops([self.add(), self.pa(1, 60)]), 4, "STATE"
+        )
+        self.assert_failure(
+            encode_ops([self.add(), self.pa(0, 3600)]), 4, "STATE"
+        )
+
+    def test_clock_regression_is_input(self):
+        ops = [
+            self.add(),
+            {"op": "mg", "id": "b", "now": 120},
+            self.pa(0, 60),
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_failed_batch_is_atomic(self):
+        ops = [self.add(), self.pa(0, 60), self.pa(2, 180)]
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        self.assertEqual(stderr, b'{"error":"STATE"}\n')
+
+    def test_output_key_order_and_single_newline(self):
+        raw = encode_ops([
+            self.add(), self.mr(1001, 0), self.pa(0, 60),
+        ])
+        _, out, _ = run_balancer("run", raw)
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+        result = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(
+            list(result),
+            ["op", "id", "w", "p", "state", "samples", "bucket",
+             "upper", "run", "changed"],
+        )
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            self.add(),
+            self.mr(1001, 0), self.pa(0, 60), self.pa(0, 60),
+            self.mr(1, 60), self.pa(1, 120),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+
 class ErrorRateAlertHistoryTest(unittest.TestCase):
     """eh 后端错误率告警转换历史：转换记账、区间查询、优先级与各类清除。"""
 
