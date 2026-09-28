@@ -9270,5 +9270,489 @@ class ReasonTimelineTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
 
 
+class RetryTimelineTest(unittest.TestCase):
+    """rr 重试/重映射时刻历史：mr 与 fx/fr 自动度量记账、区间窗序、错误与
+    清除。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def results(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def rr(backend, start, end, now):
+        return {"op": "rr", "id": backend, "from": start, "to": end,
+                "now": now}
+
+    @staticmethod
+    def mr(backend, ok, ms, retries, remaps, now):
+        return {"op": "mr", "id": backend, "ok": ok, "ms": ms,
+                "retries": retries, "remaps": remaps, "now": now}
+
+    @staticmethod
+    def triple(count, first, last):
+        return {"count": count, "first": first, "last": last}
+
+    def hash_key_for(self, target, ids):
+        """vnodes=1 下取首个哈希落点为 target 的 key（镜像环令牌规则）。"""
+        tokens = sorted(
+            (
+                int.from_bytes(
+                    hashlib.sha256(
+                        i.encode("utf-8") + b"\x00" + b"0"
+                    ).digest(),
+                    "big",
+                ),
+                i,
+            )
+            for i in ids
+        )
+        digests = [token[0] for token in tokens]
+        for n in range(10000):
+            key = "k%d" % n
+            key_hash = int.from_bytes(
+                hashlib.sha256(key.encode("utf-8")).digest(), "big"
+            )
+            idx = bisect.bisect_left(digests, key_hash) % len(tokens)
+            if tokens[idx][1] == target:
+                return key
+        self.fail("no hash key for %r" % target)
+
+    def test_mr_positive_records_count_first_last(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 5, 2, 3, 10),
+            self.rr("b", 0, 0, 59),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        self.assertEqual(window["retries"], self.triple(2, 10, 10))
+        self.assertEqual(window["remaps"], self.triple(3, 10, 10))
+
+    def test_zero_values_not_recorded(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 5, 0, 0, 10),
+            self.rr("b", 0, 0, 59),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        zero = self.triple(0, None, None)
+        self.assertEqual(window["retries"], zero)
+        self.assertEqual(window["remaps"], zero)
+
+    def test_last_updates_first_stable_same_window(self):
+        # 同窗三次写入：count 累加，first 留首次 now，last 随最近 now。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 1, 0, 10),
+            self.mr("b", True, 1, 2, 0, 20),
+            self.mr("b", True, 1, 3, 0, 50),
+            self.rr("b", 0, 0, 59),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        self.assertEqual(window["retries"], self.triple(6, 10, 50))
+        # remaps 始终零：不记。
+        self.assertEqual(window["remaps"], self.triple(0, None, None))
+
+    def test_retries_and_remaps_tracked_independently(self):
+        # 仅其中一项为正时另一项不建 first/last。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 0, 4, 10),
+            self.mr("b", False, 1, 5, 0, 20),
+            self.rr("b", 0, 0, 59),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        self.assertEqual(window["retries"], self.triple(5, 20, 20))
+        self.assertEqual(window["remaps"], self.triple(4, 10, 10))
+
+    def test_count_matches_mh(self):
+        # rr 同窗 count 恒等于 mh 同窗 retries/remaps 累计。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 4, 6, 0),
+            self.mr("b", False, 1, 0, 2, 30),
+            self.mr("b", True, 1, 7, 0, 65),
+            {"op": "mh", "id": "b", "from": 0, "to": 1, "now": 119},
+            self.rr("b", 0, 1, 119),
+        ]
+        results = self.results(ops)
+        mh = next(r for r in results if r["op"] == "mh")
+        rr = next(r for r in results if r["op"] == "rr")
+        for window in range(2):
+            self.assertEqual(
+                rr["windows"][window]["retries"]["count"],
+                mh["windows"][window]["retries"],
+            )
+            self.assertEqual(
+                rr["windows"][window]["remaps"]["count"],
+                mh["windows"][window]["remaps"],
+            )
+        self.assertEqual(rr["windows"][1]["retries"],
+                         self.triple(7, 65, 65))
+        self.assertEqual(rr["windows"][1]["remaps"],
+                         self.triple(0, None, None))
+
+    def test_cross_window_closed_range_ascending(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 1, 0, 10),
+            self.mr("b", True, 1, 0, 4, 50),
+            self.mr("b", True, 1, 2, 0, 65),
+            self.mr("b", True, 1, 3, 1, 125),
+            self.rr("b", 0, 2, 179),
+        ]
+        windows = self.results(ops)[-1]["windows"]
+        self.assertEqual([w["window"] for w in windows], [0, 1, 2])
+        zero = self.triple(0, None, None)
+        self.assertEqual(windows[0]["retries"], self.triple(1, 10, 10))
+        self.assertEqual(windows[0]["remaps"], self.triple(4, 50, 50))
+        self.assertEqual(windows[1]["retries"], self.triple(2, 65, 65))
+        self.assertEqual(windows[1]["remaps"], zero)
+        self.assertEqual(windows[2]["retries"], self.triple(3, 125, 125))
+        self.assertEqual(windows[2]["remaps"], self.triple(1, 125, 125))
+        for window in windows:
+            self.assertEqual(list(window), ["window", "retries", "remaps"])
+            self.assertEqual(
+                list(window["retries"]), ["count", "first", "last"]
+            )
+
+    def test_never_written_is_zero_null_null(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 0, 0),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        zero = self.triple(0, None, None)
+        self.assertEqual(window["retries"], zero)
+        self.assertEqual(window["remaps"], zero)
+
+    def test_result_key_order(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 0, 0),
+        ]
+        result = self.results(ops)[-1]
+        self.assertEqual(list(result), ["op", "id", "windows"])
+
+    def test_output_byte_layout_and_single_newline(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 0, 0),
+        ])
+        _, out, _ = run_balancer("run", raw)
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+        fragment = (
+            b'{"op":"rr","id":"b","windows":[{"window":0,'
+            b'"retries":{"count":0,"first":null,"last":null},'
+            b'"remaps":{"count":0,"first":null,"last":null}}]}'
+        )
+        self.assertIn(fragment, out)
+
+    def test_fx_auto_metric_records_timeline(self):
+        # a 在 D 段，fx 自 a 重映射至 b：自动度量只归属结果 b，retries=
+        # remaps=1；a 无度量。
+        key = self.hash_key_for("a", ["a", "b"])
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 100, "v": 0},
+            {"op": "fx", "cid": "c", "flow": self.FLOW, "key": key,
+             "timeout": 10, "now": 5},
+            self.rr("b", 0, 0, 59),
+            self.rr("a", 0, 0, 59),
+        ]
+        rrs = {r["id"]: r["windows"][0]
+               for r in self.results(ops) if r["op"] == "rr"}
+        self.assertEqual(rrs["b"]["retries"], self.triple(1, 5, 5))
+        self.assertEqual(rrs["b"]["remaps"], self.triple(1, 5, 5))
+        zero = self.triple(0, None, None)
+        self.assertEqual(rrs["a"]["retries"], zero)
+        self.assertEqual(rrs["a"]["remaps"], zero)
+
+    def test_fr_auto_metrics_record_timeline(self):
+        # 三后端皆 D，fr 耗尽 3 次拒绝：首项 a 记总 retries=remaps=2，
+        # 余项 b 记 0。
+        key = self.hash_key_for("a", ["a", "b", "c"])
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+        ]
+        for backend in ("a", "b", "c"):
+            ops.append(
+                {"op": "fs", "id": backend, "k": "D", "a": 0, "z": 100,
+                 "v": 0}
+            )
+        ops += [
+            {"op": "fr", "cid": "c", "flow": self.FLOW, "key": key,
+             "timeout": 10, "max": 3, "now": 5},
+            self.rr("a", 0, 0, 59),
+            self.rr("b", 0, 0, 59),
+        ]
+        rrs = {r["id"]: r["windows"][0]
+               for r in self.results(ops) if r["op"] == "rr"}
+        self.assertEqual(rrs["a"]["retries"], self.triple(2, 5, 5))
+        self.assertEqual(rrs["a"]["remaps"], self.triple(2, 5, 5))
+        zero = self.triple(0, None, None)
+        self.assertEqual(rrs["b"]["retries"], zero)
+        self.assertEqual(rrs["b"]["remaps"], zero)
+
+    def test_key_order_and_key_set_is_input(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rr","id":"b","to":0,"from":0,"now":0}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rr","id":"b","from":0,"to":0}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rr","id":"b","from":0,"to":0,"now":0,"x":1}]}',
+            2, "INPUT",
+        )
+
+    def test_bad_numbers_are_input(self):
+        bad_values = ("true", "-1", "1000000001", "1.5", '"0"', "null")
+        templates = {
+            "from": '{"op":"rr","id":"b","from":%s,"to":0,"now":0}',
+            "to": '{"op":"rr","id":"b","from":0,"to":%s,"now":0}',
+            "now": '{"op":"rr","id":"b","from":0,"to":0,"now":%s}',
+        }
+        for field, template in templates.items():
+            for value in bad_values:
+                raw = ('{"ops":[%s]}' % (template % value)).encode("utf-8")
+                self.assert_failure(raw, 2, "INPUT")
+
+    def test_window_relations_are_input(self):
+        self.assert_failure(
+            encode_ops([{"op": "add", "id": "b", "weight": 1},
+                        self.rr("b", 1, 0, 0)]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "add", "id": "b", "weight": 1},
+                        self.rr("b", 0, 2, 119)]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "add", "id": "b", "weight": 1},
+                        self.rr("b", 0, 60, 3600)]),
+            2, "INPUT",
+        )
+
+    def test_window_relation_boundaries_ok(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 1, 60, 3600),
+            self.rr("b", 16666666, 16666666, 10 ** 9),
+        ]
+        rrs = [r for r in self.results(ops) if r["op"] == "rr"]
+        self.assertEqual(len(rrs[0]["windows"]), 60)
+        self.assertEqual(len(rrs[1]["windows"]), 1)
+
+    def test_bad_id_is_input(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rr","id":"","from":0,"to":0,"now":0}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rr","id":7,"from":0,"to":0,"now":0}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rr","id":"\\ud800","from":0,"to":0,"now":0}]}',
+            2, "INPUT",
+        )
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            encode_ops([self.rr("x", 0, 0, 0)]), 3, "BACKEND"
+        )
+
+    def test_unknown_id_with_stale_from_is_backend(self):
+        self.assert_failure(
+            encode_ops([self.rr("x", 0, 0, 3600)]), 3, "BACKEND"
+        )
+
+    def test_unknown_id_with_bad_relation_is_input(self):
+        self.assert_failure(
+            encode_ops([self.rr("x", 1, 0, 0)]), 2, "INPUT"
+        )
+
+    def test_clock_regression_is_input(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 1, 1, 100),
+            self.rr("b", 1, 1, 59),
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_rr_advances_clock(self):
+        # rr 推进时钟：rr(now=100) 后更早时刻的 mg(now=99) 报时钟倒退。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 1, 100),
+            {"op": "mg", "id": "b", "now": 99},
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+        # 同刻或更晚仍可。
+        results = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 1, 100),
+            {"op": "mg", "id": "b", "now": 100},
+        ])
+        self.assertEqual(results[-1]["op"], "mg")
+
+    def test_stale_window_is_state(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 0, 3600),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+        results = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 1, 1, 3600),
+        ])
+        self.assertEqual(results[-1]["windows"][0]["window"], 1)
+
+    def test_retains_last_60_windows(self):
+        # w0 写入在 now=3600（w60）仍保留 w1..w60，w0 已淘汰不可查。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 1, 1, 60),
+            self.rr("b", 1, 60, 3600),
+        ]
+        windows = self.results(ops)[-1]["windows"]
+        self.assertEqual([w["window"] for w in windows], list(range(1, 61)))
+        self.assertEqual(windows[0]["retries"], self.triple(1, 60, 60))
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.rr("b", 0, 0, 3600),
+            ]),
+            4, "STATE",
+        )
+
+    def test_remove_readd_clears_timeline(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 3, 2, 0),
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 0, 0),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        zero = self.triple(0, None, None)
+        self.assertEqual(window["retries"], zero)
+        self.assertEqual(window["remaps"], zero)
+
+    @staticmethod
+    def v1_config():
+        return {
+            "version": 1,
+            "backends": [
+                {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                 "circuit": None, "drain": None}
+            ],
+            "vnodes": None,
+            "limits": [],
+            "overload": None,
+        }
+
+    def test_ci_success_clears_timeline(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 3, 2, 0),
+            {"op": "ci", "config": self.v1_config(), "now": 60},
+            self.rr("b", 1, 1, 60),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        zero = self.triple(0, None, None)
+        self.assertEqual(window["retries"], zero)
+        self.assertEqual(window["remaps"], zero)
+
+    def test_cb_success_clears_timeline(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ci", "config": self.v1_config(), "now": 60},
+            self.mr("b", True, 1, 3, 2, 120),
+            {"op": "cb", "rev": 1, "now": 180},
+            self.rr("b", 3, 3, 180),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        zero = self.triple(0, None, None)
+        self.assertEqual(window["retries"], zero)
+        self.assertEqual(window["remaps"], zero)
+
+    def test_rr_is_read_only(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 2, 3, 10),
+            self.rr("b", 0, 0, 59),
+            self.rr("b", 0, 0, 59),
+        ]
+        results = self.results(ops)
+        rrs = [r for r in results if r["op"] == "rr"]
+        self.assertEqual(rrs[0], rrs[1])
+
+    def test_failure_after_rr_rolls_back_batch(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 0, 5),
+            {"op": "probe", "id": "b", "ok": "notabool", "now": 6},
+        ]
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (2, b""))
+        self.assertEqual(stderr, b'{"error":"INPUT"}\n')
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", True, 1, 2, 3, 3),
+            self.mr("b", False, 1, 1, 0, 66),
+            self.rr("b", 0, 1, 66),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+    def test_record_replay_covers_failing_rr(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr("b", 0, 0, 3600),
+        ])
+        _, rec_stdout, _ = run_balancer("record", raw)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual(record["exit"], 4)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, 4)
+        self.assertEqual(rep_stdout, b"")
+        self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
+
+
 if __name__ == "__main__":
     unittest.main()

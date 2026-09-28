@@ -333,6 +333,20 @@ ci/cb 成功清空，rt 只读、不推进历史，失败批次天然回滚。rt
 （R 为窗数）、空间 O(60B)，仅用标准库；沿用紧凑 UTF-8 固定键序 JSON、
 单末尾换行及 record/replay 逐字节契约，其他操作不变。
 
+重试/重映射时刻历史：mr 及 fx/fr 向后端写入正数 retries/remaps 时，按
+window=now//60 记账：count 增加该数并封顶 10^18，first 为本窗首次写入
+的 now，last 为最近一次；封顶后仍更新 last，零值不记，同窗 count 须
+等于 mh 同窗对应计数。rr 精确键序 op,id,from,to,now；id 为非空可编码
+UTF-8 串，三数为 0..10^9 非 bool 整数，now 进入非递减时钟，须
+from≤to≤now//60 且 to-from<60。结果键序 op,id,windows；windows 含闭
+区间并升序，项键序 window,retries,remaps，二项为键序 count,first,last
+的对象；无记录取 0,null,null。键序、id、数值、关系非法或时钟倒退报
+INPUT/2；未知 id 报 BACKEND/3；from 早于 max(0,now//60-59) 报
+STATE/4。只保留最近 60 窗；remove 后重加及 ci/cb 成功清空；rr 推进时
+钟，失败批回滚。记账 O(1)，rr 时间 O(R)（R 为窗数）、空间 O(60B)，仅
+用标准库；沿用紧凑 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节
+契约，其他操作不变且不属本题范围。
+
 全池不可用原因汇总：ra 精确键序 op,from,to,now（键须按此序出现），
 from/to/now 为 0..10^9 非 bool 整数，now 纳入共用非递减时钟，须
 from≤to≤now//60 且 to-from<60；ra 只读汇总全池 rh 分钟窗，返回键序
@@ -1818,7 +1832,7 @@ def parse_op(raw_op):
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "ra", "ma", "mo", "lp", "pa", "ph",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -2385,6 +2399,22 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("rt", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "rr":
+        # 重试/重映射时刻历史查询：精确键序 op,id,from,to,now（键须按此序
+        # 出现），只读；id 为非空可编码 UTF-8 串，from/to/now 为 0..10^9
+        # 非 bool 整数；窗关系 from≤to≤now//60 且 to-from<60，非法即
+        # INPUT；now 纳入共用非递减时钟（倒退执行期判 INPUT）。from 过早
+        # 与未知 id 留执行期判。
+        if list(raw_op) != ["op", "id", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("rr", parse_backend_id(raw_op["id"]), start, end, now)
 
     if name == "ra":
         # 全池不可用原因汇总：精确键序 op,from,to,now（键须按此序出现），
@@ -3288,6 +3318,44 @@ def run(raw):
         # 上界 [1,10,100,1000]：桶依次为 ≤1、≤10、≤100、≤1000、>1000。
         bucket = bisect.bisect_left((1, 10, 100, 1000), ms)
         metrics[4][bucket] = min(METRIC_CAP, metrics[4][bucket] + 1)
+        # 重试/重映射时刻历史（rr）：与 mr 同窗同入口写入，仅正数记账，
+        # 零值不建窗；count 增量即 retries/remaps，故同窗 count 恒等于
+        # mh 的 retries/remaps 累计（封顶规则一致）。
+        record_retries(record, window, retries, remaps, now)
+
+    def record_retries(record, window, retries, remaps, now):
+        """重试/重映射时刻记账（O(1)）：window=now//60 窗的 retries/remaps
+        两项，每项布局 [count,first,last]。count 增加写入的正数并封顶
+        10^18，first 仅本窗首次写入时记 now，last 每次写入都更新（封顶后
+        亦然）；零值不记。每后端只保留最近 60 窗，空窗不预建；remove 后
+        重加与 ci/cb 成功随新记录清空。"""
+        if retries <= 0 and remaps <= 0:
+            return
+        history = record["retry_hist"]
+        entry = history.get(window)
+        if entry is None:
+            # 首次记账该窗：新建两项 [count,first,last]；时钟非递减，顺带
+            # 丢弃 60 窗前旧窗。
+            entry = {
+                "retries": [0, None, None],
+                "remaps": [0, None, None],
+            }
+            history[window] = entry
+            cutoff = window - 59
+            for old in [w for w in history if w < cutoff]:
+                del history[old]
+        for amount, item in (
+            (retries, entry["retries"]),
+            (remaps, entry["remaps"]),
+        ):
+            if amount <= 0:
+                # 零值不记：不触碰 count/first/last。
+                continue
+            item[0] = min(METRIC_CAP, item[0] + amount)
+            # first 仅首次写入时记录；last 每次都更新（封顶后亦然）。
+            if item[1] is None:
+                item[1] = now
+            item[2] = now
 
     def record_reason(backend_id, reason, now):
         """不可用原因分钟历史记账（O(1)）：reason ∈ health/drain/circuit/
@@ -3962,6 +4030,8 @@ def run(raw):
                 "fault_hist": {},
                 # ci 成功清空不可用原因分钟历史。
                 "reason_hist": {},
+                # ci/cb 成功清空重试/重映射时刻历史。
+                "retry_hist": {},
             }
 
         new_backends = {}
@@ -4048,7 +4118,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "oq",
             "mr", "mg", "mh",
-            "ms", "mx", "rh", "rt", "ra", "ma", "lp",
+            "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
             "ru", "ea", "eh", "pa", "ph",
@@ -4184,6 +4254,13 @@ def run(raw):
                 # last 仍更新），仅在状态转换或 oa 因连接达 cap 入队时记账。
                 # remove 后重加与 ci 成功即清空。
                 "reason_hist": {},
+                # 重试/重映射时刻历史（rr）：window -> 固定键序
+                # retries,remaps 的对象，每项布局 [count,first,last]，仅
+                # 保留最近 60 窗，空窗不预建；仅在 mr、fx/fr 自动度量写入
+                # 正数 retries/remaps 时记账，计数封顶 10^18，first/last
+                # 为首次/最近写入的 now（封顶后 last 仍更新）。remove 后
+                # 重加与 ci/cb 成功即清空。
+                "retry_hist": {},
             }
             results.append({"op": "add", "ok": True})
 
@@ -5606,6 +5683,41 @@ def run(raw):
                         }
                 windows.append(entry)
             results.append({"op": "rt", "id": backend_id, "windows": windows})
+
+        elif op[0] == "rr":
+            # 重试/重映射时刻历史只读查询：校验次序同 rt——未知 id 报
+            # BACKEND，from 早于最近 60 窗下界报 STATE；不改任何历史，失败
+            # 批次天然回滚。返回键序 op,id,windows；windows 覆盖闭区间
+            # from..to 并升序，项键序 window,retries,remaps，两项各为键序
+            # count,first,last 的对象：count 为该窗该项写入的正数之和（封顶
+            # 10^18），first/last 为首次/最近写入的 now（封顶后 last 仍更
+            # 新），无记录取 0,null,null。逐项拷贝当下值，避免结果被批次
+            # 内后续记账污染。
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = record["retry_hist"]
+            windows = []
+            for window in range(start, end + 1):
+                entry = history.get(window)
+                item = {"window": window}
+                for name in ("retries", "remaps"):
+                    # 无该窗或该项无写入：0,null,null；first 仅首次写入时
+                    # 记录，last 每次写入更新（计数封顶后亦然）。
+                    if entry is None or entry[name][0] == 0:
+                        item[name] = {"count": 0, "first": None, "last": None}
+                    else:
+                        count, first, last = entry[name]
+                        item[name] = {
+                            "count": count, "first": first, "last": last,
+                        }
+                windows.append(item)
+            results.append({"op": "rr", "id": backend_id, "windows": windows})
 
         elif op[0] == "ra":
             # 全池不可用原因汇总（只读）：from 早于最近 60 窗下界报 STATE
