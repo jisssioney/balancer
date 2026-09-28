@@ -141,7 +141,7 @@ chash）；oc 非法键集或 cid 报 INPUT/2，cid 不在队列（活动中或�
 CONNECTION/5，按 INPUT、STATE、CONNECTION 顺序判定。失败批次回滚队列顺序、
 成员索引与背压状态；入队、ot 接纳或过期、oc 取消及 ci 成功清队列均同步成员
 索引，oa 查重与 oc 删除均 O(1)，og 仍 O(q)。非法键、类型、范围、编码或时钟
-倒退报 INPUT。qp 精确键序 op,mode（键须按此序出现），mode 仅 F/S：登记 ot
+倒退报 INPUT。qp 精确键序 op,mode（键须按此序出现），mode 仅 F/S/P：登记 ot
 的出队策略，默认 F，同值幂等，返回键序 op,ok（ok=true）；键序、类型或值
 非法报 INPUT/2。F 保持 ot 遇首个阻塞项即停；S 模式 ot 先按原规则删除到期
 项，再将其余项按 FIFO 各检查一次：可接纳项沿用路由、容量、令牌桶与配额
@@ -151,6 +151,23 @@ admitted 按原 FIFO 顺序，各项使用同一 ot.now，前项扣减对后项�
 值随 ce 经 version=10 的 queue.dequeue 导出；rp/qp 提交（ci/cb）后的后续
 修改仅影响当前 ce，不改已存提交快照；record/replay 逐字节覆盖。
 S 模式 ot 时间 O(qBV log(BV))、额外空间 O(q)。
+
+老化优先出队：qa 精确键序 op,step,items（键须按此序出现），step 为
+1..10^9 非 bool 整数，items 至多 1000 项，项精确键序 s,p（键须按此序
+出现），s 为互异非空 UTF-8 串、p 为 0..10^9 非 bool 整数；键序、结构、
+字段或重复 s 非法报 INPUT/2。成功时 (step,{s:p}) 原子替换整份登记，返回
+键序 op,ok（ok=true）；未登记服务类 p 视为 0。qp mode 新增 P；无 qa 登记
+选 P 报 STATE/4。P 模式 ot 先按 FIFO 删除到期项（与 F/S 同），再把其余项
+按 score=min(10^18,p+(ot.now-入队 now)//step) 降序、FIFO 序升序排序后各
+尝试一次：沿用 F/S 的路由、容量、令牌桶与配额判定，各项使用同一
+ot.now，前项扣减对后项可见，仅接纳项出队并扣减建连，阻塞项（含路由不
+可用）留队且存活项保持 FIFO 相对序；结果仍键序 op,expired,admitted，
+expired 按 FIFO、admitted 按尝试序（score 序），F/S 的两数组序不变。P 不
+持久化：进入 P 时保留最近 F/S 登记值；P 态 ce、cl 的 queue.dequeue 仍为
+该影子值且不导出 qa；qp 切 F/S 会更新该影子并退出 P；ci/cb/ca 成功即清 qa
+登记、退出 P 并采用所载 F/S。qa 时间 O(P log P)、无登记时 O(P) 空（P 为
+items 项数），P 模式 ot 时间 O(q log q+qBV log(BV))、额外空间 O(q+BV)，
+仅用标准库；其余错误判定不变，失败批回滚。
 
 FIFO 满载策略：rp 精确键序 op,mode（键须按此序出现），mode 仅 T/H：T 为
 队满尾拒绝（默认，即既有 OVERLOAD/7 行为），H 为队满头淘汰；同值幂等，
@@ -454,6 +471,7 @@ F/S 须 v>0），同 id 各段 [a,z) 不重叠（相邻端点可接），按后�
 ∈ [1,10^18]、span ∈ [1,10^9] 非 bool 整数），按 scope 的 B/C/S 序、
 id 的 UTF-8 字节升序输出，只含登记值，不含 window、used；queue 末置，
 精确键序 {dequeue,full}：dequeue 为 "F"/"S"（ot 遇阻即停/跳过阻塞），
+P 为非持久运行态（不导出，P 态仍导出进入 P 时保留的最近 F/S 影子值），
 full 为 "T"/"H"（队满尾拒绝/头淘汰），只含登记策略，不含等待项、
 evicted 或 last；capacities 末置，为数组，项精确键序 {id,cap}（id
 引用本配置后端，cap ∈ [1,10^6] 非 bool 整数），按后端加入序仅列显式
@@ -1126,6 +1144,28 @@ def parse_bp_num(value):
         not isinstance(value, int)
         or isinstance(value, bool)
         or not 0 <= value <= 10 ** 6
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_aging_step(value):
+    # qa 的 step ∈ [1,10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_aging_p(value):
+    # qa 各项 p ∈ [0,10^9]，非 bool 整数（允许 0，且须显式排除 bool）。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= 10 ** 9
     ):
         fail(EXIT_INPUT, "INPUT")
     return value
@@ -1871,7 +1911,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "bp", "bq", "qp", "rp", "rg",
+        "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "bp", "bq", "qp", "qa", "rp", "rg",
         "lh",
         "lt",
         "oq",
@@ -2297,14 +2337,41 @@ def parse_op(raw_op):
         return ("bq",)
 
     if name == "qp":
-        # 队列出队策略：精确键序 op,mode（键须按此序出现）；mode 仅 F/S，
-        # 键序、类型或值非法报 INPUT。
+        # 队列出队策略：精确键序 op,mode（键须按此序出现）；mode 仅 F/S/P，
+        # 键序、类型或值非法报 INPUT。F/S 登记 ot 策略（默认 F）；P 为老化
+        # 优先出队（须已 qa 登记，否则执行期报 STATE）。
         if list(raw_op) != ["op", "mode"]:
             fail(EXIT_INPUT, "INPUT")
         mode = raw_op["mode"]
-        if not isinstance(mode, str) or mode not in ("F", "S"):
+        if not isinstance(mode, str) or mode not in ("F", "S", "P"):
             fail(EXIT_INPUT, "INPUT")
         return ("qp", mode)
+
+    if name == "qa":
+        # 老化优先级登记：精确键序 op,step,items（键须按此序出现）。step 为
+        # 1..10^9 非 bool 整数；items 至多 1000 项，项精确键序 s,p（键须按
+        # 此序出现），s 为互异非空 UTF-8 串，p 为 0..10^9 非 bool 整数。
+        # 键序、结构、字段或重复 s 非法报 INPUT；成功原子替换整份登记。
+        if list(raw_op) != ["op", "step", "items"]:
+            fail(EXIT_INPUT, "INPUT")
+        step = parse_aging_step(raw_op["step"])
+        raw_items = raw_op["items"]
+        if (
+            not isinstance(raw_items, list)
+            or isinstance(raw_items, bool)
+            or len(raw_items) > 1000
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        aging_items = OrderedDict()
+        for item in raw_items:
+            if not isinstance(item, dict) or list(item) != ["s", "p"]:
+                fail(EXIT_INPUT, "INPUT")
+            s = parse_key(item["s"])
+            if s in aging_items:
+                # items 内 s 互异。
+                fail(EXIT_INPUT, "INPUT")
+            aging_items[s] = parse_aging_p(item["p"])
+        return ("qa", step, aging_items)
 
     if name == "rp":
         # FIFO 满载策略：精确键序 op,mode（键须按此序出现）；mode 仅 T/H
@@ -3158,6 +3225,14 @@ def run(raw):
     # ci/cb 按 queue.dequeue 载入（v1..v8 默认 F）；登记值随 ce/ci 经 v9
     # queue.dequeue 导出导入；rp/qp 提交后的后续修改仅影响当前 ce，不改提交。
     queue_mode = "F"
+    # 老化优先出队（qp mode=P）运行态：P 不持久化——aging 为 qa 登记的
+    # (step, {s: p}) 或 None（未登记），P 时 ot 按
+    # score=min(10^18,p+(ot.now-入队 now)//step) 降序、FIFO 序升序各尝试
+    # 一次。进入 P 时 dequeue_shadow 保留最近的 F/S 登记值（初值 F）：P 态
+    # ce/cl 的 queue.dequeue 仍导出该影子值且不导出 qa；qp 切 F/S 会更新
+    # 影子并退出 P；ci/cb/ca 成功清 aging、退出 P 并采用所载 F/S。
+    aging = None
+    dequeue_shadow = "F"
     # FIFO 满载策略（rp）：T 为队满尾拒绝（默认），H 为队满头淘汰——删除
     # 队首并把新项放队尾。evict_count 为累计淘汰数（封顶 10^18），
     # evict_last 为最近淘汰的 cid（无则 None）；旧项不耗或返还令牌、配额，
@@ -4196,8 +4271,10 @@ def run(raw):
             "faults": exported_faults,
             "quotas": exported_quotas,
             # queue：仅登记出队（F/S）与满载（T/H）策略，键序
-            # dequeue,full；不含等待项、evicted、last 等运行态。
-            "queue": {"dequeue": queue_mode, "full": full_mode},
+            # dequeue,full；不含等待项、evicted、last 等运行态。P 为非
+            # 持久运行态，P 时 dequeue 仍导出进入 P 时保留的最近 F/S
+            # 影子值（dequeue_shadow），且不导出 qa 老化登记。
+            "queue": {"dequeue": dequeue_shadow, "full": full_mode},
             "capacities": exported_capacities,
         }
 
@@ -4219,7 +4296,7 @@ def run(raw):
         nonlocal err_events, percent_alerts, percent_events
         nonlocal mo_seq, mo_cache, queue_mode
         nonlocal full_mode, evict_count, evict_last, cap_overrides
-        nonlocal limit_hist
+        nonlocal limit_hist, aging, dequeue_shadow
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -4363,8 +4440,11 @@ def run(raw):
         bp_state = "N"
         # 队列策略按配置 queue 原子载入：dequeue 仅 F/S（v1..v8 规范化为
         # F），full 仅 T/H（v1..v8 规范化为 T）；同时清空排队项，满载淘汰
-        # 计数与最近淘汰 cid 清零。
+        # 计数与最近淘汰 cid 清零。P 为非持久运行态：ci/cb/ca 成功清 qa
+        # 登记、退出 P 并采用所载 F/S（影子初始化为该值）。
         queue_mode = config["queue"][0]
+        dequeue_shadow = config["queue"][0]
+        aging = None
         full_mode = config["queue"][1]
         evict_count = 0
         evict_last = None
@@ -5445,6 +5525,44 @@ def run(raw):
                         # 排队等待历史：接纳成功离队，记录入队 now 供 d=
                         # ot.now-入队 now 落五桶（实际记账在循环外统一进行）。
                         admitted_pairs.append(item[8])
+            elif queue_mode == "P":
+                # P 模式（老化优先出队）：其余各项按
+                # score=min(10^18,p+(ot.now-入队 now)//step) 降序、FIFO 序
+                # 升序排序（p 为该等待项服务类 s 的 qa 登记值，未登记为 0），
+                # 各尝试一次：可接纳项沿用路由、容量、令牌桶与配额规则扣减
+                # 并建连（各项使用同一 ot.now，前项扣减对后项可见），阻塞项
+                # （含路由不可用）留队。仅接纳项出队，故存活项 wait_queue
+                # 的 FIFO 相对次序自然保持；admitted 依尝试序（score 序），
+                # 非 FIFO。排序 O(q log q)，接纳沿用 O(BV log(BV)) 上界，
+                # 额外空间 O(q)。
+                aging_step, aging_items = aging
+                candidates = list(wait_queue.items())
+                scored = [
+                    (
+                        min(
+                            METRIC_CAP,
+                            aging_items.get(item[3], 0)
+                            + (now - item[8]) // aging_step,
+                        ),
+                        fifo_index,
+                        queued_cid,
+                        item,
+                    )
+                    for fifo_index, (queued_cid, item) in enumerate(candidates)
+                ]
+                # score 降序、FIFO 序升序：以 (-score, fifo_index) 升序等价。
+                scored.sort(key=lambda entry: (-entry[0], entry[1]))
+                for _, _, queued_cid, item in scored:
+                    status, _ = try_admit(
+                        item[0], item[1], item[2], item[3], item[4],
+                        (item[5], item[6], item[7]), now,
+                    )
+                    if status == "admit":
+                        wait_queue.pop(queued_cid)
+                        admitted.append(queued_cid)
+                        # 排队等待历史：接纳成功离队，记录入队 now 供 d=
+                        # ot.now-入队 now 落五桶（实际记账在循环外统一进行）。
+                        admitted_pairs.append(item[8])
             else:
                 # F 模式：自队首重试接纳，至首个阻塞即停（每个键至多一次
                 # route）。逐项以本次 ot 的 now 补充桶并按 window=now//span
@@ -5560,10 +5678,28 @@ def run(raw):
 
         elif op[0] == "qp":
             _, mode = op
-            # 登记 ot 的出队策略：默认 F，同值幂等，异值切换；仅改策略，
-            # 不动队列、背压与任何运行态，不要求已 os。
-            queue_mode = mode
+            # 登记 ot 的出队策略：F/S/P，默认 F，同值幂等。F/S 仅改登记
+            # 策略（并同步影子），不动队列、背压与任何运行态，不要求已
+            # os；P 为老化优先出队，须已 qa 登记（否则 STATE），进入时保留
+            # 最近 F/S 于影子；qp 切 F/S 会更新影子并退出 P。
+            if mode == "P":
+                if aging is None:
+                    # 无 qa 登记选 P 报 STATE。
+                    fail(EXIT_STATE, "STATE")
+                queue_mode = "P"
+            else:
+                dequeue_shadow = mode
+                queue_mode = mode
             results.append({"op": "qp", "ok": True})
+
+        elif op[0] == "qa":
+            # 老化优先级登记原子替换：以 (step, {s: p}) 整体替换既有登记；
+            # 校验已在解析期完成（键序、结构、字段、范围与重复 s 均 INPUT），
+            # 失败批次天然回滚。登记不要求已 os，不影响当前出队模式（P 态
+            # 下替换登记即对后续 ot 生效，仍在 P）；未登记服务类 p=0。
+            _, step, aging_items = op
+            aging = (step, dict(aging_items))
+            results.append({"op": "qa", "ok": True})
 
         elif op[0] == "rp":
             _, mode = op
