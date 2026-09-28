@@ -1834,6 +1834,7 @@ def parse_op(raw_op):
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
+        "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "br",
@@ -2833,6 +2834,41 @@ def parse_op(raw_op):
         config = parse_config(raw_op["config"])
         return ("hd", config, keys, raw_op["now"])
 
+    if name == "cp":
+        # 配置预约：精确键序 op,config,at,now（键须按此序出现，乱序报
+        # INPUT）；config 校验、规范化与错误优先级同 cv（B 限流/配额、
+        # faults 与 capacities 引用未知后端留执行期判 BACKEND）；at、now
+        # 均为 0..10^9 非 bool 整数，now 进入共用非递减时钟（倒退在执行
+        # 期与其余操作同序判 INPUT），at 仅表示触发时刻、不推进时钟，
+        # at<cp.now 留执行期判 INPUT。成功保存 v10 快照但不应用。
+        if list(raw_op) != ["op", "config", "at", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        at = raw_op["at"]
+        if (
+            not isinstance(at, int)
+            or isinstance(at, bool)
+            or not 0 <= at <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        parse_warm_now(raw_op["now"])
+        config = parse_config(raw_op["config"])
+        return ("cp", config, at, raw_op["now"])
+
+    if name == "cq":
+        # 预约查询：精确键序 op,now；now ∈ [0,10^9] 非 bool 整数并进入
+        # 共用非递减时钟；只读快照、不受连接与队列限制，O(1)。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("cq", parse_warm_now(raw_op["now"]))
+
+    if name == "ca":
+        # 预约生效：精确键序 op,now；now ∈ [0,10^9] 非 bool 整数并进入
+        # 共用非递减时钟；仅 now≥at 时按快照执行 ci 的原子替换、默认态
+        # 重建并新建 rev。无预约、now<at、有连接或排队项留执行期判 STATE。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ca", parse_warm_now(raw_op["now"]))
+
     if name == "ct":
         # 配置指纹查询：精确键序仅 op，只读且不推进时钟。
         if list(raw_op) != ["op"]:
@@ -3090,6 +3126,13 @@ def run(raw):
     # O(16(B+M+T+Q))。
     commit_history = []
     next_rev = 1
+    # 配置预约（cp/cq/ca）：无预约为 None，否则为
+    # (snapshot, at, digest)——snapshot 为 cp 当时规范化 version=10 配置的
+    # 全新导出结构（不随后续运行态变化），at 为触发时刻（只表示时刻、不推进
+    # 时钟），digest 为快照的 ct 摘要。cp 成功即整体替换，cq 只读 O(1)，
+    # ca 成功、ci/cb 成功均清除；其余操作不影响预约。额外空间 O(N)，N 为
+    # 规范化配置大小。
+    reservation = None
     results = []
 
     def backend_routable(record, drain_strict=False):
@@ -4122,6 +4165,7 @@ def run(raw):
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
             "ru", "ea", "eh", "pa", "ph",
+            "cp", "cq", "ca",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -5991,6 +6035,8 @@ def run(raw):
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
+            # ci 成功清除既有配置预约。
+            reservation = None
             results.append({"op": "ci", "ok": True})
 
         elif op[0] == "cv":
@@ -6254,8 +6300,88 @@ def run(raw):
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
+            # cb 成功清除既有配置预约。
+            reservation = None
             results.append(
                 {"op": "cb", "target": target_rev, "rev": new_rev, "ok": True}
+            )
+
+        elif op[0] == "cp":
+            # 配置预约：at>=now 为时间字段判定（先于 BACKEND）；B 限流、
+            # B 配额、faults 与 capacities 引用未知后端报 BACKEND，优先级同
+            # cv。成功把候选规范化为 version=10 快照保存但不应用、不建 rev、
+            # 不改任何运行态；同 digest、at 重报幂等（原样返回且不重存快
+            # 照）。快照为 export_normalized_config 产出的全新结构，额外
+            # 时间 O(N)、空间 O(N)，N 为规范化配置大小。
+            _, config, at, now = op
+            if at < now:
+                # at 仅表示触发时刻：早于本次 now 非法。时间字段判定先于
+                # cv 的配置后端引用 BACKEND 检查（同全局 INPUT 先于 BACKEND
+                # 的优先级）。
+                fail(EXIT_INPUT, "INPUT")
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for override_id in config["capacities"]:
+                if override_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            snapshot = export_normalized_config(config)
+            digest = config_digest(snapshot)
+            # 同 digest、at 重报幂等：原样返回且不重存快照（保留原预约）；
+            # 否则整体替换为新预约（含同 digest 不同 at 或同 at 不同配置）。
+            if reservation is None or (reservation[2], reservation[1]) != (
+                digest, at
+            ):
+                reservation = (snapshot, at, digest)
+            results.append({"op": "cp", "digest": digest, "at": at})
+
+        elif op[0] == "cq":
+            # 预约查询（只读，O(1)）：不受连接、队列限制；pending 为 bool，
+            # 无预约时 digest、at 均为 null。成功仅推进时钟（已在共用时钟
+            # 块完成），不改预约。
+            _, now = op
+            if reservation is None:
+                results.append(
+                    {"op": "cq", "pending": False, "digest": None, "at": None}
+                )
+            else:
+                _, at, digest = reservation
+                results.append(
+                    {"op": "cq", "pending": True, "digest": digest, "at": at}
+                )
+
+        elif op[0] == "ca":
+            # 预约生效：无预约、now<at、有活动连接或排队项报 STATE；rev 耗尽
+            # 同 ci 报 STATE。全部校验先于任何变更。通过后按保存的 v10 快照
+            # 执行 ci 的原子替换、以 now 重建默认运行态并新建 rev（快照来自
+            # export_normalized_config，重解析必然合法），成功清除预约；
+            # 失败天然原子回滚（预约、时钟、配置、rev 均不变）。
+            _, now = op
+            if reservation is None:
+                fail(EXIT_STATE, "STATE")
+            snapshot, at, digest = reservation
+            if now < at:
+                fail(EXIT_STATE, "STATE")
+            if connections or wait_queue:
+                fail(EXIT_STATE, "STATE")
+            if next_rev > 10 ** 18:
+                fail(EXIT_STATE, "STATE")
+            apply_config(parse_config(snapshot), now)
+            commit_history.append((next_rev, export_config()))
+            new_rev = next_rev
+            next_rev += 1
+            if len(commit_history) > 16:
+                commit_history.pop(0)
+            reservation = None
+            results.append(
+                {"op": "ca", "digest": digest, "rev": new_rev, "ok": True}
             )
 
         elif op[0] == "fs":
