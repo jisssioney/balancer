@@ -1831,7 +1831,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
-        "oq",
+        "oq", "lh",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
@@ -2183,6 +2183,27 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("oh", start, end, now)
+
+    if name == "lh":
+        # 多维限流分钟历史：精确键序 op,scope,id,from,to,now（键须按此序
+        # 出现），只读；scope 仅 B/C/S，id 沿用 ls 的 key 校验（非空可
+        # UTF-8 编码串），from/to/now 为 0..10^9 非 bool 整数，now 进入
+        # 共用非递减时钟（倒退执行期判 INPUT）。窗关系
+        # from≤to≤now//60 且 to-from<60，非法即 INPUT；未知 B 后端报
+        # BACKEND，该 id 无桶和配额或 from 早于
+        # max(0,now//60-59) 留执行期判 STATE。
+        if list(raw_op) != ["op", "scope", "id", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        scope = raw_op["scope"]
+        if scope not in ("B", "C", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("lh", scope, parse_key(raw_op["id"]), start, end, now)
 
     if name == "bp":
         if keys != {"op", "low", "high"}:
@@ -3034,6 +3055,16 @@ def run(raw):
     # peak 为该窗入队后队长峰值；计数封顶 10^18，只保留最近 60 窗，空窗
     # 不预建。ci/cb 成功清空；oh 只读。
     overload_hist = {}
+    # 多维限流分钟历史（lh）：以 (scope, id) 为键，window=now//60 ->
+    # [admitted, units, token, quota]。oa/ot 检查已配置桶或配额的 B 后端、
+    # C 客户端、S 服务类三维时按接纳结果记账：接纳则 admitted 加 1、units
+    # 加该维成本；未接纳且该维在配桶补充后令牌不足则 token 加 1，配额
+    # used+成本>limit 则 quota 加 1，二者可同增；仅容量（或排空）阻塞不
+    # 记。每维至多一行记账、O(1)，计数封顶 10^18，每键只保留最近 60 窗；
+    # 失败批不记（随整批回滚）。ls/qs 重配不清，remove 同 id 重加及
+    # ci/cb 成功整体清空；lh 除共用时钟外只读。额外空间 O(60K)，K 为配置
+    # 的桶/配额维数。
+    limit_hist = {}
     # 确定性滞回背压：bp_cfg 未 bp 时为 None，否则为 (low, high)；bp_state
     # 为 N/P。首配或异参重配按当前队长 >=high 置 P，否则 N；同参幂等不改
     # 状态。low < high <= queue_cfg[1]（os.q）；登记值随 ce/ci 导出导入，
@@ -3306,18 +3337,26 @@ def run(raw):
         for quota, _ in chosen_quotas:
             roll_quota(quota, now)
         record = backends[backend_id]
-        if (
-            not all(bucket["t"] >= cost for bucket, cost in chosen)
-            or not all(
-                quota["used"] + cost <= quota["limit"]
-                for quota, cost in chosen_quotas
-            )
-            or record["drain"]["state"] != "A"
+        token_short = not all(
+            bucket["t"] >= cost for bucket, cost in chosen
+        )
+        quota_short = not all(
+            quota["used"] + cost <= quota["limit"]
+            for quota, cost in chosen_quotas
+        )
+        capacity_block = (
+            record["drain"]["state"] != "A"
             or record["conns"] >= effective_cap(backend_id)
-        ):
+        )
+        if token_short or quota_short or capacity_block:
+            # 多维限流历史按补充/滚窗后的实际状态记账；仅容量（或排空）阻塞
+            # 而各在配维令牌、配额均足时，record_limit 内部逐维跳过。
+            record_limit(backend_id, c, s, costs, now, False)
             return "block", backend_id
         # 接纳才按成本耗令牌、增配额 used 并按 open 建连接；全部满足后统一
-        # 扣减，天然原子（其间无 fail 路径）。
+        # 扣减，天然原子（其间无 fail 路径）。先记账再扣减（接纳分支不读
+        # 令牌/配额余量），失败批随整体回滚，天然不记。
+        record_limit(backend_id, c, s, costs, now, True)
         for bucket, cost in chosen:
             bucket["t"] -= cost
         for quota, cost in chosen_quotas:
@@ -3444,6 +3483,59 @@ def run(raw):
             for old in [w for w in overload_hist if w < cutoff]:
                 del overload_hist[old]
         return row
+
+    def limit_window(scope, dim_id, now):
+        """取该维 now//60 窗的多维限流历史计数行（惰性建窗，空窗不预建），
+        只保留最近 60 窗：时钟非递减，新建窗时丢弃下界之前的旧窗。行布局
+        [admitted, units, token, quota]。记账 O(1)，空间 O(60K)。"""
+        window = now // 60
+        rows = limit_hist.setdefault((scope, dim_id), {})
+        row = rows.get(window)
+        if row is None:
+            row = [0, 0, 0, 0]
+            rows[window] = row
+            cutoff = window - 59
+            for old in [w for w in rows if w < cutoff]:
+                del rows[old]
+        return row
+
+    def record_limit(backend_id, c, s, costs, now, admitted):
+        """oa/ot 评估后按 B/C/S 三维记账多维限流分钟历史：仅在该维配置了桶
+        或配额时记一行；接纳则 admitted+1、units+该维成本；未接纳且在配桶
+        补充后令牌不足记 token，配额 used+成本>limit 记 quota（可同增）；
+        未配桶/配额的维度与仅容量（或排空）阻塞均不记。须在 evaluate_admit
+        补充/滚窗之后调用，故直接读取补充后的 t 与滚窗后的 used/window。
+        每维 O(1)，三维常数时间。"""
+        for scope, dim_id, cost in (
+            ("B", backend_id, costs[0]),
+            ("C", c, costs[1]),
+            ("S", s, costs[2]),
+        ):
+            bucket = buckets.get((scope, dim_id))
+            quota = quotas.get((scope, dim_id))
+            if bucket is None and quota is None:
+                # 该维既无桶也无配额：不记账。
+                continue
+            token_short = (
+                bucket is not None and bucket["t"] < cost
+            )
+            quota_short = (
+                quota is not None and quota["used"] + cost > quota["limit"]
+            )
+            if not admitted and not token_short and not quota_short:
+                # 仅容量（或排空）阻塞、本维令牌与配额均足：不记。
+                continue
+            row = limit_window(scope, dim_id, now)
+            if admitted:
+                row[0] = min(METRIC_CAP, row[0] + 1)
+                row[1] = min(METRIC_CAP, row[1] + cost)
+                continue
+            if token_short:
+                # 令牌不足（补充后仍小于该维成本）。
+                row[2] = min(METRIC_CAP, row[2] + 1)
+            if quota_short:
+                # 固定窗配额不足（与令牌不足可同增）。
+                row[3] = min(METRIC_CAP, row[3] + 1)
 
     def active_fault(record, now):
         """按 now 在故障时间线中取唯一活动段：段按 a 升序且 [a,z) 互不
@@ -3990,6 +4082,7 @@ def run(raw):
         nonlocal err_events, percent_alerts, percent_events
         nonlocal mo_seq, mo_cache, queue_mode
         nonlocal full_mode, evict_count, evict_last, cap_overrides
+        nonlocal limit_hist
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -4120,6 +4213,8 @@ def run(raw):
         cap_overrides = dict(config["capacities"])
         # ci/cb 成功清空过载分钟历史。
         overload_hist = {}
+        # ci/cb 成功清空多维限流分钟历史（全部 B/C/S 维）。
+        limit_hist = {}
         # 热加载三项：sticky/idle 取登记值（null 即未登记，idle 作用于
         # 此后新建连接）；backpressure 携带时置 N，未携带（含 v1）即取消。
         sticky_ttl = config["sticky"]
@@ -4163,7 +4258,7 @@ def run(raw):
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
-            "fa", "fe", "ah", "oh", "br",
+            "fa", "fe", "ah", "oh", "br", "lh",
             "ru", "ea", "eh", "pa", "ph",
             "cp", "cq", "ca",
         ):
@@ -4318,6 +4413,9 @@ def run(raw):
             del backends[backend_id]
             buckets.pop(("B", backend_id), None)
             quotas.pop(("B", backend_id), None)
+            # remove 清空该 B 后端的多维限流分钟历史；同 id 重加不继承。
+            # C/S 维历史以其各自 scope/id 为键，不受后端增删影响。
+            limit_hist.pop(("B", backend_id), None)
             # remove 删除接纳容量覆盖；同 id 重加不继承（cap_overrides 以现存
             # 后端为键，新记录无覆盖）。
             cap_overrides.pop(backend_id, None)
@@ -5884,6 +5982,52 @@ def run(raw):
                     }
                 )
             results.append({"op": "oh", "windows": windows})
+
+        elif op[0] == "lh":
+            # 多维限流分钟历史（只读）：未知 B 后端报 BACKEND（先于无配置
+            # 与 from 过早的 STATE）；该 (scope,id) 当前既无桶也无配额报
+            # STATE（ls/qs 重配不清历史，故仅以在配桶/配额判存在）；from
+            # 早于最近 60 窗下界报 STATE。除共用时钟推进外不改任何计数，
+            # 失败批次天然回滚。返回键序 op,scope,id,windows；windows 覆盖
+            # from..to 闭区间并升序，项键序 window,admitted,units,token,
+            # quota，空窗全 0。逐窗拷贝避免被批次内后续记账污染。O(R)，
+            # R=to-from+1≤60。
+            _, scope, dim_id, start, end, now = op
+            if scope == "B" and dim_id not in backends:
+                # 未知 B 后端优先于 STATE。
+                fail(EXIT_BACKEND, "BACKEND")
+            if (scope, dim_id) not in buckets and (scope, dim_id) not in quotas:
+                # 该 id 当前无桶和配额。
+                fail(EXIT_STATE, "STATE")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            rows = limit_hist.get((scope, dim_id), {})
+            windows = []
+            for window in range(start, end + 1):
+                row = rows.get(window)
+                if row is None:
+                    admitted = units = token = quota = 0
+                else:
+                    admitted, units, token, quota = row
+                windows.append(
+                    {
+                        "window": window,
+                        "admitted": admitted,
+                        "units": units,
+                        "token": token,
+                        "quota": quota,
+                    }
+                )
+            results.append(
+                {
+                    "op": "lh",
+                    "scope": scope,
+                    "id": dim_id,
+                    "windows": windows,
+                }
+            )
 
         elif op[0] == "mo":
             # 全池增量快照。同 seq、now 重报原样返回缓存结果，不推进时钟、
