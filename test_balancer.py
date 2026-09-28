@@ -168,6 +168,300 @@ class RaRejectionTest(unittest.TestCase):
         )
 
 
+EMPTY_TIMES = {"count": 0, "first": None, "last": None}
+
+
+def rt_empty_window(window):
+    return {
+        "window": window,
+        "health": dict(EMPTY_TIMES),
+        "drain": dict(EMPTY_TIMES),
+        "circuit": dict(EMPTY_TIMES),
+        "overload": dict(EMPTY_TIMES),
+    }
+
+
+class RtEventTimesTest(unittest.TestCase):
+    """rt：不可用原因事件时刻（count/first/last）分钟窗查询。"""
+
+    def run_rt(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0)
+        self.assertEqual(err, b"")
+        output = json.loads(out.decode("utf-8"))
+        rt_results = [r for r in output["results"] if r["op"] == "rt"]
+        self.assertTrue(rt_results)
+        return rt_results
+
+    def test_first_last_same_window(self):
+        # 同窗两次 health 转换（now=60、65，窗 1）：first=60、last=65。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 60},
+            {"op": "probe", "id": "b", "ok": True, "now": 61},
+            {"op": "probe", "id": "b", "ok": False, "now": 65},
+            {"op": "rt", "id": "b", "from": 1, "to": 1, "now": 119},
+        ]
+        windows = self.run_rt(ops)[0]["windows"]
+        self.assertEqual(
+            windows,
+            [
+                {
+                    "window": 1,
+                    "health": {"count": 2, "first": 60, "last": 65},
+                    "drain": dict(EMPTY_TIMES),
+                    "circuit": dict(EMPTY_TIMES),
+                    "overload": dict(EMPTY_TIMES),
+                }
+            ],
+        )
+
+    def test_per_window_first_last_and_empty_windows(self):
+        # 窗 0（now=10）与窗 1（now=70）各一次 health；区间含空窗。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 10},
+            {"op": "probe", "id": "b", "ok": True, "now": 11},
+            {"op": "probe", "id": "b", "ok": False, "now": 70},
+            {"op": "rt", "id": "b", "from": 0, "to": 2, "now": 179},
+        ]
+        windows = self.run_rt(ops)[0]["windows"]
+        self.assertEqual(
+            windows,
+            [
+                {
+                    "window": 0,
+                    "health": {"count": 1, "first": 10, "last": 10},
+                    "drain": dict(EMPTY_TIMES),
+                    "circuit": dict(EMPTY_TIMES),
+                    "overload": dict(EMPTY_TIMES),
+                },
+                {
+                    "window": 1,
+                    "health": {"count": 1, "first": 70, "last": 70},
+                    "drain": dict(EMPTY_TIMES),
+                    "circuit": dict(EMPTY_TIMES),
+                    "overload": dict(EMPTY_TIMES),
+                },
+                rt_empty_window(2),
+            ],
+        )
+
+    def test_fresh_backend_all_empty(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "rt", "id": "b", "from": 0, "to": 0, "now": 0},
+        ]
+        windows = self.run_rt(ops)[0]["windows"]
+        self.assertEqual(windows, [rt_empty_window(0)])
+
+    def test_core_reasons_first_last_zero(self):
+        # 核心批次四原因各发生于 now=0：rt 的 count=1、first=last=0。
+        ops = core_ops()
+        for backend_id in ("h", "d", "c", "o"):
+            ops.append(
+                {"op": "rt", "id": backend_id, "from": 0, "to": 0, "now": 0}
+            )
+        rt_results = self.run_rt(ops)
+        self.assertEqual([r["id"] for r in rt_results], ["h", "d", "c", "o"])
+        hit = {
+            "h": "health", "d": "drain", "c": "circuit", "o": "overload",
+        }
+        for result in rt_results:
+            self.assertEqual(list(result), ["op", "id", "windows"])
+            window = result["windows"][0]
+            self.assertEqual(list(window),
+                             ["window", "health", "drain", "circuit",
+                              "overload"])
+            for reason in ("health", "drain", "circuit", "overload"):
+                entry = window[reason]
+                self.assertEqual(list(entry), ["count", "first", "last"])
+                if reason == hit[result["id"]]:
+                    self.assertEqual(
+                        entry, {"count": 1, "first": 0, "last": 0}
+                    )
+                else:
+                    self.assertEqual(entry, EMPTY_TIMES)
+
+    def test_last_advances_within_window(self):
+        # drain 同因两次事件（dr D 后 du 回 A 再 dr D），now 不同：
+        # count=2、first 较早、last 最近。
+        ops = [
+            {"op": "add", "id": "d", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "ds", "id": "d", "t": 100},
+            {"op": "dr", "id": "d", "now": 0},
+            {"op": "du", "id": "d", "now": 10},
+            {"op": "dr", "id": "d", "now": 20},
+            {"op": "rt", "id": "d", "from": 0, "to": 0, "now": 59},
+        ]
+        window = self.run_rt(ops)[0]["windows"][0]
+        self.assertEqual(
+            window["drain"], {"count": 2, "first": 0, "last": 20}
+        )
+        self.assertEqual(window["health"], EMPTY_TIMES)
+
+    def test_sixty_window_retention(self):
+        # now=0 事件落窗 0；now=3600（窗 60）查询时窗 0 已淘汰。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 0},
+            {"op": "rt", "id": "b", "from": 1, "to": 1, "now": 3600},
+        ]
+        windows = self.run_rt(ops)[0]["windows"]
+        self.assertEqual(windows, [rt_empty_window(1)])
+
+    def test_remove_readd_clears(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 0},
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "rt", "id": "b", "from": 0, "to": 0, "now": 0},
+        ]
+        windows = self.run_rt(ops)[0]["windows"]
+        self.assertEqual(windows, [rt_empty_window(0)])
+
+    def test_ci_clears(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {"op": "ci", "config": config_v10(1), "now": 5},
+            {"op": "rt", "id": "a", "from": 0, "to": 0, "now": 5},
+        ]
+        windows = self.run_rt(ops)[0]["windows"]
+        self.assertEqual(windows, [rt_empty_window(0)])
+
+    def test_cb_clears(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {"op": "ci", "config": config_v10(1), "now": 5},
+            {"op": "cb", "rev": 1, "now": 10},
+            {"op": "rt", "id": "a", "from": 0, "to": 0, "now": 10},
+        ]
+        windows = self.run_rt(ops)[0]["windows"]
+        self.assertEqual(windows, [rt_empty_window(0)])
+
+    def test_record_replay_covers_rt(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 60},
+            {"op": "probe", "id": "b", "ok": True, "now": 61},
+            {"op": "probe", "id": "b", "ok": False, "now": 65},
+            {"op": "rt", "id": "b", "from": 1, "to": 1, "now": 119},
+        ]
+        raw = encode_ops(ops)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual(rec_code, 0)
+        self.assertEqual(rec_stderr, b"")
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual((rep_code, rep_stderr), (0, b""))
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        self.assertEqual(run_code, 0)
+        self.assertEqual(rep_stdout, run_stdout)
+
+
+class RtRejectionTest(unittest.TestCase):
+    """rt 的非法键序、id、数值关系与时钟、窗口约束。"""
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def test_key_order_is_input(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","to":0,"from":0,"now":0}]}',
+            2, "INPUT",
+        )
+
+    def test_extra_and_missing_keys_are_input(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","from":0,"to":0,"now":0,"x":1}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","from":0,"to":0}]}', 2, "INPUT"
+        )
+
+    def test_bool_number_is_input(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","from":0,"to":0,"now":true}]}',
+            2, "INPUT",
+        )
+
+    def test_out_of_range_is_input(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","from":0,"to":0,"now":1000000001}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","from":-1,"to":0,"now":0}]}',
+            2, "INPUT",
+        )
+
+    def test_window_relations_are_input(self):
+        # from>to、to>now//60、to-from>=60 均为 INPUT。
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"rt","id":"b","from":1,"to":0,"now":60}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"rt","id":"b","from":0,"to":2,"now":60}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"rt","id":"b","from":0,"to":60,"now":3600}]}',
+            2, "INPUT",
+        )
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"ghost","from":0,"to":0,"now":0}]}',
+            3, "BACKEND",
+        )
+
+    def test_premature_window_is_state(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"add","id":"b","weight":1},'
+            b'{"op":"rt","id":"b","from":0,"to":0,"now":3600}]}',
+            4, "STATE",
+        )
+
+    def test_clock_regression_is_input(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "probe", "id": "b", "ok": True, "now": 5},
+            {"op": "rt", "id": "b", "from": 0, "to": 0, "now": 0},
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_failed_batch_rolls_back(self):
+        # rt 只读；其后时钟倒退致整批失败，无 stdout（记账未发生可见变更）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 5},
+            {"op": "rt", "id": "b", "from": 0, "to": 0, "now": 5},
+            {"op": "probe", "id": "b", "ok": True, "now": 4},
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+
 def config_v6(weight, **overrides):
     """最小 version=6 配置：单后端 a，可按键覆盖顶层字段。"""
     config = {
