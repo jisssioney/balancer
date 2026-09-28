@@ -240,6 +240,19 @@ window,requests,qps,errors,error_rate,latency,retries,remaps；整数与五
 桶为 0、两字符串为 0.00。mh 不改度量，失败原子回滚；record/replay 逐
 字节覆盖 mh。mh 时间 O(R)、额外空间 O(60B)。
 
+重试/重映射时刻历史：mr 及 fx/fr 自动度量向后端写入正数 retries/remaps
+时，按 window=now//60 平行记账：count 增加该数并封顶 10^18，first 为本窗
+首次写入的 now，last 为最近一次写入的 now；计数封顶后 last 仍更新，零值
+不记。同窗 retries 与 remaps 分别记账，count 恒等于 mh 同窗对应计数。
+rr 精确键序 op,id,from,to,now（键须按此序出现），id 为非空可编码 UTF-8
+串，from/to/now 为 0..10^9 非 bool 整数，now 纳入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60；键序、id、数值、关系非法或时钟倒退报
+INPUT/2，未知 id 报 BACKEND/3，from 早于 max(0,now//60-59) 报 STATE/4。
+结果键序 op,id,windows；windows 含 from 至 to 所有窗并升序，项键序
+window,retries,remaps，二者为键序 count,first,last 的对象；无记录窗取
+0,null,null。仅保留最近 60 窗；remove 后重加及 ci/cb 成功清空。rr 推进
+时钟、失败批回滚。记账 O(1)，rr 时间 O(R)、额外空间 O(60B)。
+
 后端延迟分位查询：lp 精确键序 op,id,from,to,p,now（键须按此序出现），
 from/to/now 为 0..10^9、p 为 1..100 的非 bool 整数，now 纳入共用非递减
 时钟，须 from≤to≤now//60 且 to-from<60。汇总 mh 区间内五个 latency
@@ -1818,7 +1831,7 @@ def parse_op(raw_op):
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "ra", "ma", "mo", "lp", "pa", "ph",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "ra", "ma", "mo", "lp", "pa", "ph", "rr",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -2254,6 +2267,20 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("mh", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "rr":
+        # 重试/重映射时刻历史只读查询：精确键序 op,id,from,to,now（键须按
+        # 此序出现）；校验口径与 mh 相同。now 纳入共用非递减时钟（倒退
+        # 执行期判 INPUT），未知 id 与 from 过早留执行期判 BACKEND/STATE。
+        if list(raw_op) != ["op", "id", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("rr", parse_backend_id(raw_op["id"]), start, end, now)
 
     if name == "lp":
         # 后端延迟分位查询：精确键序 op,id,from,to,p,now（键须按此序出现），
@@ -3265,10 +3292,40 @@ def run(raw):
         backend_id = routed[0]
         return evaluate_admit(backend_id, cid, flow, c, s, costs, now)
 
+    def add_retry_totals(history, window, retries, remaps, now):
+        """重试/重映射时刻平行记账（O(1)）：随 mr/fx/fr 写入，仅正数
+        retries/remaps 记账（零值不记、空窗不预建），各 count 封顶 10^18；
+        first 为该窗该类首次写入的 now，last 为最近写入的 now，封顶后 last
+        仍更新。同窗两类独立计数，count 与 metrics 同窗 retries/remaps
+        累计恒等。每后端仅保留最近 60 窗：新窗首次写入时丢弃下界之前的
+        旧窗（条目仅在正数写入时新增，故事后长度恒 ≤60）。"""
+        if retries <= 0 and remaps <= 0:
+            return
+        entry = history.get(window)
+        if entry is None:
+            entry = {
+                "retries": [0, None, None],
+                "remaps": [0, None, None],
+            }
+            history[window] = entry
+            cutoff = window - 59
+            for old in [w for w in history if w < cutoff]:
+                del history[old]
+        for kind, amount in (
+            ("retries", retries), ("remaps", remaps),
+        ):
+            if amount > 0:
+                row = entry[kind]
+                row[0] = min(METRIC_CAP, row[0] + amount)
+                if row[1] is None:
+                    row[1] = now
+                row[2] = now
+
     def record_metric(backend_id, ok, ms, retries, remaps, now):
         """按 mr 语义累加一条度量：写入 window=now//60 所属窗，每后端只保留
         最近 60 窗，五延迟桶 [≤1,≤10,≤100,≤1000,>1000]，各计数封顶 10^18。
-        mr 与 fx/fr 完成后的自动度量按操作顺序共用此入口。"""
+        mr 与 fx/fr 完成后的自动度量按操作顺序共用此入口；正数
+        retries/remaps 同时平行写入 rr 的时刻历史（同窗 count 恒等）。"""
         record = backends[backend_id]
         window = now // 60
         history = record["metrics"]
@@ -3288,6 +3345,10 @@ def run(raw):
         # 上界 [1,10,100,1000]：桶依次为 ≤1、≤10、≤100、≤1000、>1000。
         bucket = bisect.bisect_left((1, 10, 100, 1000), ms)
         metrics[4][bucket] = min(METRIC_CAP, metrics[4][bucket] + 1)
+        # 正数 retries/remaps 的时刻平行记账，rr 只读该历史。
+        add_retry_totals(
+            record["retry_hist"], window, retries, remaps, now
+        )
 
     def record_reason(backend_id, reason, now):
         """不可用原因分钟历史记账（O(1)）：reason ∈ health/drain/circuit/
@@ -3938,6 +3999,8 @@ def run(raw):
                 # 后端 IP 端点登记值（v1..v5 已规范化为 None）。
                 "endpoint": endpoint,
                 "metrics": {},
+                # ci/cb 重建默认运行态：重试/重映射时刻历史清空。
+                "retry_hist": {},
                 # ci/cb 重建默认运行态：mo 增量基线清零。
                 "mo_base": [None, 0, 0, 0, 0, [0, 0, 0, 0, 0]],
                 # ci 成功清零 H pick 记账。
@@ -4048,6 +4111,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "oq",
             "mr", "mg", "mh",
+            "rr",
             "ms", "mx", "rh", "rt", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
@@ -4160,6 +4224,11 @@ def run(raw):
                 # 度量历史：window -> [requests, errors, retries, remaps,
                 # [五个延迟桶]]，仅保留最近 60 窗；空表示从未 mr。
                 "metrics": {},
+                # 重试/重映射时刻历史（rr）：window -> 固定键序
+                # retries,remaps 的对象，每类布局 [count,first,last]，
+                # 随 mr/fx/fr 正数写入平行记账，仅保留最近 60 窗，空窗不
+                # 预建；remove 后重加与 ci/cb 成功即清空。
+                "retry_hist": {},
                 # mo 增量基线：[window, requests, errors, retries, remaps,
                 # [五延迟桶]]，window 为基线所属窗；上次 mo 与本次同窗时
                 # 作为减数，跨窗或初始（window=None）增量按零。add 与
@@ -5400,6 +5469,46 @@ def run(raw):
                     }
                 )
             results.append({"op": "mh", "id": backend_id, "windows": windows})
+
+        elif op[0] == "rr":
+            # 重试/重映射时刻历史只读查询：判定次序与 mh 相同——未知 id
+            # BACKEND，from 早于最近 60 窗下界 STATE；无记录窗（空窗或该类
+            # 从未写入）取 count=0、first=null、last=null。时间 O(R)、额外
+            # 空间 O(R)（R=to-from+1≤60），不写历史，失败批天然回滚。
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = record["retry_hist"]
+            windows = []
+            for window in range(start, end + 1):
+                entry = history.get(window)
+                if entry is None:
+                    retries_row = [0, None, None]
+                    remaps_row = [0, None, None]
+                else:
+                    retries_row = entry["retries"]
+                    remaps_row = entry["remaps"]
+                windows.append(
+                    {
+                        "window": window,
+                        "retries": {
+                            "count": retries_row[0],
+                            "first": retries_row[1],
+                            "last": retries_row[2],
+                        },
+                        "remaps": {
+                            "count": remaps_row[0],
+                            "first": remaps_row[1],
+                            "last": remaps_row[2],
+                        },
+                    }
+                )
+            results.append({"op": "rr", "id": backend_id, "windows": windows})
 
         elif op[0] == "lp":
             # 后端延迟分位查询（只读）：未知 id 报 BACKEND，from 早于最近

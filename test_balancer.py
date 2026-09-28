@@ -7335,6 +7335,376 @@ class LatencyPercentileTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class RetryRemapHistoryTest(unittest.TestCase):
+    """rr 重试/重映射时刻历史：平行记账、空窗口与各类拒绝、清空契约。"""
+
+    def rr(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        results = json.loads(out.decode("utf-8"))["results"]
+        return results, out
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def mr(self, backend_id, retries, remaps, now, ok=True):
+        return {
+            "op": "mr", "id": backend_id, "ok": ok, "ms": 1,
+            "retries": retries, "remaps": remaps, "now": now,
+        }
+
+    def rr_op(self, backend_id, start, end, now):
+        return {"op": "rr", "id": backend_id, "from": start,
+                "to": end, "now": now}
+
+    def row(self, count, first, last):
+        return {"count": count, "first": first, "last": last}
+
+    def test_first_last_and_zero_not_recorded(self):
+        # 首次写入定 first；last 随最近写入；零值不记（remaps 首条为 0，
+        # 窗口仍由 retries 的正数写入建立，remaps 无记录取 0/null/null）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", 3, 0, 10),
+            self.mr("b", 0, 2, 30),
+            self.mr("b", 2, 5, 59),
+            self.rr_op("b", 0, 0, 59),
+        ]
+        results, _ = self.rr(ops)
+        self.assertEqual(
+            results[-1],
+            {
+                "op": "rr", "id": "b",
+                "windows": [{
+                    "window": 0,
+                    "retries": self.row(5, 10, 59),
+                    "remaps": self.row(7, 30, 59),
+                }],
+            },
+        )
+
+    def test_zero_write_window_is_empty(self):
+        # 全零 mr 不建立时刻条目，rr 取 0/null/null。
+        results, _ = self.rr([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", 0, 0, 0),
+            self.rr_op("b", 0, 0, 0),
+        ])
+        self.assertEqual(
+            results[-1]["windows"],
+            [{
+                "window": 0,
+                "retries": self.row(0, None, None),
+                "remaps": self.row(0, None, None),
+            }],
+        )
+
+    def test_count_matches_mh_per_window(self):
+        # rr 各窗 count 恒等于 mh 同窗 retries/remaps 计数，含跨窗。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", 3, 2, 10),
+            self.mr("b", 1, 4, 70),
+            self.rr_op("b", 0, 1, 119),
+            {"op": "mh", "id": "b", "from": 0, "to": 1, "now": 119},
+        ]
+        results, _ = self.rr(ops)
+        rr_windows = [r for r in results if r["op"] == "rr"][0]["windows"]
+        mh_windows = [r for r in results if r["op"] == "mh"][0]["windows"]
+        for rr_window, mh_window in zip(rr_windows, mh_windows):
+            self.assertEqual(rr_window["window"], mh_window["window"])
+            self.assertEqual(
+                rr_window["retries"]["count"], mh_window["retries"]
+            )
+            self.assertEqual(
+                rr_window["remaps"]["count"], mh_window["remaps"]
+            )
+
+    def test_windows_ascending_and_inclusive(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", 1, 1, 0),
+            self.mr("b", 1, 1, 120),
+            self.rr_op("b", 0, 2, 120),
+        ]
+        results, _ = self.rr(ops)
+        windows = results[-1]["windows"]
+        self.assertEqual([w["window"] for w in windows], [0, 1, 2])
+        # 中间空窗与尾空窗均取 0/null/null。
+        self.assertEqual(
+            windows[1],
+            {"window": 1,
+             "retries": self.row(0, None, None),
+             "remaps": self.row(0, None, None)},
+        )
+
+    def test_retention_keeps_last_60_windows(self):
+        # 写入 0..60 共 61 窗后，窗 0 被丢弃；其条目取 0/null/null，窗 1
+        # 仍在保留范围内。
+        ops = [{"op": "add", "id": "b", "weight": 1}]
+        for window in range(61):
+            ops.append(self.mr("b", 1, 1, window * 60 + 1))
+        ops.append(self.rr_op("b", 1, 2, 60 * 60 + 1))
+        results, _ = self.rr(ops)
+        windows = results[-1]["windows"]
+        self.assertEqual([w["window"] for w in windows], [1, 2])
+        self.assertEqual(windows[0]["retries"], self.row(1, 61, 61))
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.rr_op("z", 0, 0, 0),
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_unknown_id_precedes_state(self):
+        self.assert_failure(
+            encode_ops([self.rr_op("z", 0, 0, 3600)]),
+            3, "BACKEND",
+        )
+
+    def test_from_before_window_floor_is_state(self):
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.rr_op("b", 0, 0, 3600),
+            ]),
+            4, "STATE",
+        )
+
+    def test_boundary_from_is_allowed(self):
+        # now//60=60 时下界 max(0,60-59)=1，from=1 合法、from=0 为 STATE。
+        for start, expected in ((1, 0), (0, 4)):
+            raw = encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.rr_op("b", start, 1, 3600),
+            ])
+            code, _, _ = run_balancer("run", raw)
+            self.assertEqual(code, expected)
+
+    def test_clock_regression_is_input(self):
+        # rr 推进共用时钟；此前刻 10 后 rr now=5 报 INPUT。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.mr("b", 0, 0, 10),
+                self.rr_op("b", 0, 0, 5),
+            ]),
+            2, "INPUT",
+        )
+
+    def test_key_order_type_range_relation_are_input(self):
+        bad_ops = [
+            # 键须按 op,id,from,to,now 次序出现。
+            {"op": "rr", "id": "b", "now": 0, "from": 0, "to": 0},
+            # 多余/缺失键。
+            {"op": "rr", "id": "b", "from": 0, "to": 0,
+             "now": 0, "x": 1},
+            {"op": "rr", "id": "b", "from": 0, "to": 0},
+            # bool 非整数。
+            {"op": "rr", "id": "b", "from": False, "to": 0, "now": 0},
+            # 越界。
+            {"op": "rr", "id": "b", "from": 0, "to": 0,
+             "now": 10 ** 9 + 1},
+            {"op": "rr", "id": "b", "from": -1, "to": 0, "now": 0},
+            # 关系非法：from>to、to>now//60、to-from>=60。
+            {"op": "rr", "id": "b", "from": 2, "to": 1, "now": 120},
+            {"op": "rr", "id": "b", "from": 0, "to": 1, "now": 0},
+            {"op": "rr", "id": "b", "from": 0, "to": 60, "now": 3600},
+            # id 空串或非串。
+            {"op": "rr", "id": "", "from": 0, "to": 0, "now": 0},
+            {"op": "rr", "id": 1, "from": 0, "to": 0, "now": 0},
+        ]
+        for bad in bad_ops:
+            raw = encode_ops([
+                {"op": "add", "id": "b", "weight": 1}, bad,
+            ])
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual(
+                (code, stdout, stderr),
+                (2, b"", b'{"error":"INPUT"}\n'),
+                bad,
+            )
+
+    def test_compact_key_order_and_single_newline(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr_op("b", 0, 0, 0),
+        ])
+        _, out, _ = run_balancer("run", raw)
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+        result = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(list(result), ["op", "id", "windows"])
+        window = result["windows"][0]
+        self.assertEqual(list(window), ["window", "retries", "remaps"])
+        self.assertEqual(list(window["retries"]), ["count", "first", "last"])
+        self.assertIn(
+            b'"retries":{"count":0,"first":null,"last":null}', out
+        )
+
+    def test_remove_and_readd_clears_history(self):
+        results, _ = self.rr([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", 5, 5, 0),
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            self.rr_op("b", 0, 0, 0),
+        ])
+        window = results[-1]["windows"][0]
+        self.assertEqual(window["retries"], self.row(0, None, None))
+        self.assertEqual(window["remaps"], self.row(0, None, None))
+
+    def test_ci_success_clears_history(self):
+        setup = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", 9, 8, 0),
+            {"op": "ce"},
+        ]
+        code, out, _ = run_balancer("run", encode_ops(setup))
+        self.assertEqual(code, 0)
+        config = json.loads(out.decode("utf-8"))["results"][-1]["config"]
+        results, _ = self.rr(setup[:-1] + [
+            {"op": "ci", "config": config, "now": 60},
+            self.rr_op("b", 1, 1, 60),
+        ])
+        window = results[-1]["windows"][0]
+        self.assertEqual(window["retries"], self.row(0, None, None))
+        self.assertEqual(window["remaps"], self.row(0, None, None))
+
+    def test_cb_success_clears_history(self):
+        # ci 提交 rev1 后写入历史，cb 回滚到 rev1 重建默认运行态，历史清空。
+        code, out, _ = run_balancer(
+            "run", encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                {"op": "ce"},
+            ])
+        )
+        self.assertEqual(code, 0)
+        config = json.loads(out.decode("utf-8"))["results"][-1]["config"]
+        results, _ = self.rr([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ci", "config": config, "now": 0},
+            self.mr("b", 3, 4, 10),
+            {"op": "cb", "rev": 1, "now": 60},
+            self.rr_op("b", 1, 1, 60),
+        ])
+        window = results[-1]["windows"][0]
+        self.assertEqual(window["retries"], self.row(0, None, None))
+        self.assertEqual(window["remaps"], self.row(0, None, None))
+
+    def test_failed_batch_has_no_output(self):
+        # rr 只读；其后操作失败时整批回滚（无 stdout），历史不暴露。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.mr("b", 1, 1, 0),
+                self.rr_op("b", 0, 0, 0),
+                self.rr_op("z", 0, 0, 0),
+            ]),
+            3, "BACKEND",
+        )
+
+    def test_fx_records_remap_totals(self):
+        # 单后端 D 故障：fx 结果 state=R，自动 mr 写 retries=remaps=1，
+        # rr 与 mh 同窗计数一致。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "fs", "id": "b", "k": "D", "a": 0, "z": 100, "v": 0},
+            {"op": "fx", "cid": "y", "flow": FLOW,
+             "key": "k", "timeout": 5, "now": 20},
+            self.rr_op("b", 0, 0, 20),
+            {"op": "mh", "id": "b", "from": 0, "to": 0, "now": 20},
+        ]
+        results, _ = self.rr(ops)
+        fx = [r for r in results if r["op"] == "fx"][0]
+        self.assertEqual((fx["state"], fx["remaps"]), ("R", 1))
+        rr_window = [r for r in results if r["op"] == "rr"][0]["windows"][0]
+        mh_window = [r for r in results if r["op"] == "mh"][0]["windows"][0]
+        self.assertEqual(rr_window["retries"], self.row(1, 20, 20))
+        self.assertEqual(rr_window["remaps"], self.row(1, 20, 20))
+        self.assertEqual(
+            rr_window["retries"]["count"], mh_window["retries"]
+        )
+        self.assertEqual(
+            rr_window["remaps"]["count"], mh_window["remaps"]
+        )
+
+    def test_fr_records_retry_totals(self):
+        # b 故障、c 健康；选一个哈希首落 b 的 key，fr 先失败后成功，
+        # b 的自动 mr 记 retries=remaps=1（首项总值），rr/mh 一致。
+        def token(backend_id):
+            digest = hashlib.sha256(
+                backend_id.encode("utf-8") + b"\x00" + b"0"
+            ).digest()
+            return int.from_bytes(digest, "big")
+
+        def first_backend(key):
+            digest = int.from_bytes(
+                hashlib.sha256(key.encode("utf-8")).digest(), "big"
+            )
+            tokens = sorted([(token("b"), "b"), (token("c"), "c")])
+            return tokens[bisect.bisect_left(
+                [t for t, _ in tokens], digest
+            ) % len(tokens)][1]
+        key = next(str(i) for i in range(10000)
+                   if first_backend(str(i)) == "b")
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "fs", "id": "b", "k": "D", "a": 0, "z": 100, "v": 0},
+            {"op": "fr", "cid": "x", "flow": FLOW, "key": key,
+             "timeout": 5, "max": 3, "now": 10},
+            self.rr_op("b", 0, 0, 10),
+            {"op": "mh", "id": "b", "from": 0, "to": 0, "now": 10},
+        ]
+        results, _ = self.rr(ops)
+        fr = [r for r in results if r["op"] == "fr"][0]
+        self.assertEqual(
+            (fr["state"], fr["backend"], fr["attempts"], fr["retries"]),
+            ("A", "c", 2, 1),
+        )
+        rr_window = [r for r in results if r["op"] == "rr"][0]["windows"][0]
+        mh_window = [r for r in results if r["op"] == "mh"][0]["windows"][0]
+        self.assertEqual(rr_window["retries"], self.row(1, 10, 10))
+        self.assertEqual(rr_window["remaps"], self.row(1, 10, 10))
+        self.assertEqual(
+            rr_window["retries"]["count"], mh_window["retries"]
+        )
+        self.assertEqual(
+            rr_window["remaps"]["count"], mh_window["remaps"]
+        )
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr("b", 3, 0, 10),
+            self.mr("b", 1, 2, 70),
+            self.rr_op("b", 0, 1, 119),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+
 class ErrorRateAlertTest(unittest.TestCase):
     """ea 后端错误率告警：状态机、定点 rate、缓存/跳窗/变阈值与各类清除。"""
 
