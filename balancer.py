@@ -1846,7 +1846,7 @@ def parse_op(raw_op):
         "ss",
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
-        "lh",
+        "lh", "lt",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
@@ -2215,6 +2215,30 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("lh", scope, parse_key(raw_op["id"]), start, end, now)
+
+    if name == "lt":
+        # 限流热点查询：精确键序 op,scope,from,to,k,now（键须按此序出现），
+        # 只读；scope 仅 B/C/S，from/to/now ∈ [0,10^9]、k ∈ [1,1000] 均为
+        # 非 bool 整数，now 纳入共用非递减时钟；窗关系 from≤to≤now//60 且
+        # to-from<60，键序、scope、数值或关系非法即 INPUT。from 过早与无
+        # 在配标识留执行期判 STATE。
+        if list(raw_op) != ["op", "scope", "from", "to", "k", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        scope = raw_op["scope"]
+        if scope not in ("B", "C", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        if (
+            not isinstance(raw_op["k"], int)
+            or isinstance(raw_op["k"], bool)
+            or not 1 <= raw_op["k"] <= 1000
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("lt", scope, start, end, raw_op["k"], now)
 
     if name == "bp":
         if keys != {"op", "low", "high"}:
@@ -3044,6 +3068,10 @@ def run(raw):
     # window/used 为当前窗口序号（now//span）与窗内已用量，last 为最近一次
     # qs 的 (limit,span,now)，用于同参重报幂等判定。
     quotas = {}
+    # 各 scope 在配标识索引（有桶或配额）：scope -> {id}，为 lt 热点查询
+    # 维护。ls/qs 新增 (scope,id) 时加入，remove 删 B 时丢弃，ci/cb 随桶
+    # 与配额整体重建；重配不清历史但标识集合不变。额外空间 O(U)。
+    scope_ids = {"B": set(), "C": set(), "S": set()}
     # 排队接纳：queue_cfg 未 os 时为 None，否则为 (cap, q, ttl)；wait_queue
     # 为 FIFO 有序映射 cid -> (cid, flow, c, s, key, bc, cc, sc, enqueue_now)，
     # 容量上限 q；bc/cc/sc 为入队请求的三项令牌成本。OrderedDict 即哈希表加
@@ -3071,7 +3099,8 @@ def run(raw):
     # 的维时记账：接纳 admitted+1、units+该维成本；未接纳且令牌不足记
     # token，配额不足记 quota（可同增），仅容量阻塞不记；计数封顶
     # 10^18，只保留最近 60 窗，空窗不预建。ls/qs 重配不清；remove 删除
-    # 该 id（B），同 id 重加不继承，ci/cb 成功整体清空。lh 除时钟外只读。
+    # 该 id（B），同 id 重加不继承，ci/cb 成功整体清空。lh/lt 除时钟外
+    # 只读（lt 汇总各在配标识的窗行，清理策略与 lh 同源）。
     # 额外空间 O(60K)。
     limit_hist = {}
     # 确定性滞回背压：bp_cfg 未 bp 时为 None，否则为 (low, high)；bp_state
@@ -4112,7 +4141,7 @@ def run(raw):
         nonlocal err_events, percent_alerts, percent_events
         nonlocal mo_seq, mo_cache, queue_mode
         nonlocal full_mode, evict_count, evict_last, cap_overrides
-        nonlocal limit_hist
+        nonlocal limit_hist, scope_ids
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -4234,6 +4263,13 @@ def run(raw):
                 "last": None,
             }
         quotas = new_quotas
+        # 在配标识索引随桶与配额原子重建。
+        new_scope_ids = {"B": set(), "C": set(), "S": set()}
+        for scope, bucket_id, _, _ in config["limits"]:
+            new_scope_ids[scope].add(bucket_id)
+        for scope, quota_id, _, _ in config["quotas"]:
+            new_scope_ids[scope].add(quota_id)
+        scope_ids = new_scope_ids
         ring_vnodes = config["vnodes"]
         queue_cfg = config["overload"]
         wait_queue = OrderedDict()
@@ -4285,7 +4321,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
-            "oq", "lh",
+            "oq", "lh", "lt",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
@@ -4444,6 +4480,8 @@ def run(raw):
             del backends[backend_id]
             buckets.pop(("B", backend_id), None)
             quotas.pop(("B", backend_id), None)
+            # 桶与配额均已丢，该 B 标识退出在配索引（仅其一在配时同样移除）。
+            scope_ids["B"].discard(backend_id)
             # remove 同时删除该后端多维限流历史；同 id 重加不继承（ls/qs
             # 重配不清历史，但 remove 即整体删除）。
             limit_hist.pop(("B", backend_id), None)
@@ -5041,6 +5079,7 @@ def run(raw):
                     "at": now,
                     "last": (r, b, now),
                 }
+                scope_ids[scope].add(bucket_id)
             else:
                 if bucket["last"] == (r, b, now):
                     # 同 (r, b, now) 重报幂等，不补令牌、不推进时钟。
@@ -5112,6 +5151,7 @@ def run(raw):
                     "used": 0,
                     "last": (limit, span, now),
                 }
+                scope_ids[scope].add(quota_id)
             else:
                 if quota["last"] == (limit, span, now):
                     # 同 (limit, span, now) 重报幂等，不推进窗口、不清已用。
@@ -6054,6 +6094,70 @@ def run(raw):
                 )
             results.append(
                 {"op": "lh", "scope": scope, "id": hist_id, "windows": windows}
+            )
+
+        elif op[0] == "lt":
+            # 限流热点查询（只读）：该 scope 无任何在配标识（有桶或配额）
+            # 或 from 早于最近 60 窗下界报 STATE；仅推进共用时钟，不改任何
+            # 计数，失败批次天然回滚。汇总各在配标识闭区间 [from,to] 内
+            # lh 同账的 admitted、units、token、quota，各值封顶 10^18；
+            # blocked=token+quota 并封顶。按 blocked 降序、id 的 UTF-8 字节
+            # 升序取至多 k 项（含全零项；无历史的在配标识亦为全零）。返回
+            # 键序 op,scope,from,to,items；项键序
+            # id,admitted,units,token,quota,blocked。时间 O(UR+UlogU)、
+            # 空间 O(U)，U 为该 scope 在配标识数、R 为窗数（≤60）。
+            _, scope, start, end, limit_k, now = op
+            active = scope_ids[scope]
+            if not active:
+                # 该 scope 无在配标识：无热点可查。
+                fail(EXIT_STATE, "STATE")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            items = []
+            for identity in active:
+                admitted = units = token = quota = 0
+                history = limit_hist.get((scope, identity))
+                if history is not None:
+                    for window in range(start, end + 1):
+                        row = history.get(window)
+                        if row is not None:
+                            admitted += row[0]
+                            units += row[1]
+                            token += row[2]
+                            quota += row[3]
+                admitted = min(METRIC_CAP, admitted)
+                units = min(METRIC_CAP, units)
+                token = min(METRIC_CAP, token)
+                quota = min(METRIC_CAP, quota)
+                blocked = min(METRIC_CAP, token + quota)
+                items.append(
+                    (blocked, identity.encode("utf-8"), identity,
+                     admitted, units, token, quota)
+                )
+            # blocked 降序、UTF-8 字节序升序（与 lh 同源 id，必为合法
+            # UTF-8，编码不会失败）；至多取 k 项。
+            items.sort(key=lambda entry: (-entry[0], entry[1]))
+            results.append(
+                {
+                    "op": "lt",
+                    "scope": scope,
+                    "from": start,
+                    "to": end,
+                    "items": [
+                        {
+                            "id": identity,
+                            "admitted": admitted,
+                            "units": units,
+                            "token": token,
+                            "quota": quota,
+                            "blocked": blocked,
+                        }
+                        for blocked, _, identity, admitted, units, token, quota
+                        in items[:limit_k]
+                    ],
+                }
             )
 
         elif op[0] == "mo":
