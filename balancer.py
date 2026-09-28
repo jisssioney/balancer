@@ -253,6 +253,22 @@ BACKEND/3；from 早于 max(0,now//60-59) 报 STATE/4。lp 只读，失败批回
 紧凑 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节契约照常；时间
 O(R)、额外空间 O(1)，仅标准库；其余操作不变。
 
+后端延迟分位告警：pa 精确键序 op,id,w,p,hi,lo,n,now（键须按此序出现），
+id 沿用后端标识（未知 id 报 BACKEND/3），w、now 为 0..10^9，p 为 1..100，
+hi、lo 为 0..4，n 为 1..60，皆为非 bool 整数且 lo<hi；now 纳入共用非
+递减时钟，须 max(0,now//60-59)≤w<now//60（w 窗已结束且在最近 60 窗
+保留范围内）。取 w 窗五个延迟桶按 lp 规则计算 samples、bucket、upper
+（单窗 lp 口径）；无样本三者为 0、null、null 且连续数清零。首评固化
+p、hi、lo、n 并从 N 态开始；N 态连续 n 窗 bucket≥hi 转 A，A 态连续 n
+窗 bucket≤lo 转 N，方向不符清 run，转换后 run=0。后续 w 仅可同前或
++1；同窗同参返回缓存结果且不推进状态机。结果键序
+op,id,w,p,state,samples,bucket,upper,run,changed；state 仅 N/A，
+changed 仅转换为 true。键序、id、类型、范围、关系或时钟倒退报
+INPUT/2；未知后端报 BACKEND/3；窗未结束或过旧、跳窗（含回退）或变参
+报 STATE/4。remove 后重加及 ci/cb 成功清告警，失败批回滚。pa 时间
+O(1)、额外空间 O(B)，仅标准库；紧凑 UTF-8 JSON、单换行及 record/replay
+逐字节契约照常，其他子命令不变。
+
 后端采样历史：ms 键集 op,id,now（now 为 [0,10^9] 非 bool 整数，纳入共用
 非递减时钟），id 须现存否则 BACKEND。每次采样记录该后端当时的活动连接数
 与 removed——removed 沿用 mg 的取值与优先级（drain、health、circuit、
@@ -1770,7 +1786,7 @@ def parse_op(raw_op):
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo", "lp",
+        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo", "lp", "pa",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -2229,6 +2245,53 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("lp", parse_backend_id(raw_op["id"]),
                 start, end, percentile, now)
+
+    if name == "pa":
+        # 后端延迟分位告警：精确键序 op,id,w,p,hi,lo,n,now（键须按此序
+        # 出现）；id 沿用非空字符串校验（未知 id 留执行期判 BACKEND），
+        # w/now 为 0..10^9、p 为 1..100、hi/lo 为 0..4、n 为 1..60，皆为
+        # 非 bool 整数且 lo<hi；now 纳入共用非递减时钟（倒退执行期判
+        # INPUT）。键序/类型/范围/lo<hi 在此判 INPUT；窗关系
+        # max(0,now//60-59)≤w<now//60、跳窗与变参留执行期判 STATE。
+        if list(raw_op) != ["op", "id", "w", "p", "hi", "lo", "n", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        w = parse_metric_num(raw_op["w"])
+        now = parse_metric_num(raw_op["now"])
+        percentile = raw_op["p"]
+        if (
+            not isinstance(percentile, int)
+            or isinstance(percentile, bool)
+            or not 1 <= percentile <= 100
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        hi = raw_op["hi"]
+        # bool 是 int 的子类，必须显式排除。
+        if (
+            not isinstance(hi, int)
+            or isinstance(hi, bool)
+            or not 0 <= hi <= 4
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        lo = raw_op["lo"]
+        if (
+            not isinstance(lo, int)
+            or isinstance(lo, bool)
+            or not 0 <= lo <= 4
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if not lo < hi:
+            fail(EXIT_INPUT, "INPUT")
+        n = raw_op["n"]
+        if (
+            not isinstance(n, int)
+            or isinstance(n, bool)
+            or not 1 <= n <= 60
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "pa", parse_backend_id(raw_op["id"]),
+            w, percentile, hi, lo, n, now,
+        )
 
     if name == "ms":
         if keys != {"op", "id", "now"}:
@@ -2909,6 +2972,15 @@ def run(raw):
     # 剪均摊还 O(1)。remove 及同 id 重加删除其历史，ci/cb 成功整体清空；
     # eh 只读，不推进告警也不清理历史。额外空间 O(60B)。
     err_events = {}
+    # 后端延迟分位告警（pa）：以后端 id 为键，未首评为缺键，否则为
+    # {"p","hi","lo","n","state","run","w","result"}——(p,hi,lo,n) 为首评
+    # 固化的参数（p 1..100、hi 1..4、lo 0..3、lo<hi、n 1..60），state ∈
+    # N/A，run 为当前连续计数，w 为最近已评窗，result 为该窗结果（同窗同
+    # 参原样返回，不推进状态机）。窗值取该后端 w 窗五 latency 桶按 lp 规则
+    # 计算的 samples/bucket/upper（无样本 0/null/null）。每后端独立；
+    # remove 删除其告警，同 id 重加回到未首评，ci/cb 成功整体清空。dict
+    # 查找/写入 O(1)，额外空间 O(B)。
+    percent_alerts = {}
     # 配置提交历史（cl/cb）：(rev, 规范化 version=10 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
@@ -3720,7 +3792,7 @@ def run(raw):
         nonlocal backends, buckets, quotas, ring_vnodes, queue_cfg, wait_queue
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal sticky_map, alert, alert_events, overload_hist, err_alerts
-        nonlocal err_events
+        nonlocal err_events, percent_alerts
         nonlocal mo_seq, mo_cache, queue_mode
         nonlocal full_mode, evict_count, evict_last, cap_overrides
 
@@ -3875,6 +3947,8 @@ def run(raw):
         err_alerts = {}
         # ci/cb 成功同时清空全部后端 ea 告警转换历史。
         err_events = {}
+        # ci/cb 成功清空全部后端延迟分位告警（pa 各 id 均回到未首评）。
+        percent_alerts = {}
         # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
@@ -3891,7 +3965,7 @@ def run(raw):
             "ms", "mx", "rh", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
-            "ru", "ea", "eh",
+            "ru", "ea", "eh", "pa",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -4042,6 +4116,8 @@ def run(raw):
             err_alerts.pop(backend_id, None)
             # remove 同时删除该后端的告警转换历史；同 id 重加不继承。
             err_events.pop(backend_id, None)
+            # remove 删除该后端延迟分位告警；同 id 重加回到未首评。
+            percent_alerts.pop(backend_id, None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -6530,6 +6606,117 @@ def run(raw):
             results.append(
                 {"op": "eh", "id": backend_id, "events": events}
             )
+
+        elif op[0] == "pa":
+            # 后端延迟分位告警（每后端独立状态机）：首评固化 (p,hi,lo,n)
+            # 并自 N 态起评；此后参数须相同且 w 仅同前（同窗同参原样返回
+            # 首评结果，不推进时钟外的状态机）或 +1，变参或跳窗（含回退）
+            # 报 STATE。窗口越界（w 未结束或超出最近 60 窗保留下界）同样
+            # STATE；窗口判定先于参数/缓存，与 ea 同序。窗值取该后端 w 窗
+            # 五 latency 桶按 lp 规则计算的 samples、bucket、upper（单窗即
+            # 区间 [w,w] 的 lp；无样本 0、null、null）。N 态连续 n 窗
+            # bucket>=hi 转 A，A 态连续 n 窗 bucket<=lo 转 N；方向不符与转
+            # 换后连续数清 0；转换时 changed=true。返回键序
+            # op,id,w,p,state,samples,bucket,upper,run,changed。时间 O(1)。
+            _, backend_id, w, percentile, hi, lo, n, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                # 未知 id 先于一切状态机判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if w >= current or w < max(0, current - 59):
+                # 窗未结束（含未来窗），或已超出最近 60 窗的保留下界。
+                fail(EXIT_STATE, "STATE")
+            entry = percent_alerts.get(backend_id)
+            if entry is not None:
+                if (percentile, hi, lo, n) != (
+                    entry["p"], entry["hi"], entry["lo"], entry["n"]
+                ):
+                    # 变参。
+                    fail(EXIT_STATE, "STATE")
+                if w == entry["w"]:
+                    # 同窗同参重报：原样返回首评结果，不推进状态机。
+                    results.append(dict(entry["result"]))
+                    continue
+                if w != entry["w"] + 1:
+                    # 跳窗（含回退）。
+                    fail(EXIT_STATE, "STATE")
+            metrics = record["metrics"].get(w)
+            if metrics is None:
+                # 无样本：三者为 0、null、null，run 清零（沿 lp 口径）。
+                samples = 0
+                bucket = None
+                upper = None
+            else:
+                latency = metrics[4]
+                latency_buckets = list(latency)
+                # 单窗无需封顶求和：桶计数本身已封顶 10^18，samples 沿用
+                # lp 的五桶和再封顶。
+                samples = min(METRIC_CAP, sum(latency_buckets))
+                # rank=ceil(p*samples/100)，按桶 0..4 累计（截至 samples）
+                # 取首个累计≥rank 者；p≤100 故 rank≤samples。
+                rank = (percentile * samples + 99) // 100
+                cumulative = 0
+                bucket = None
+                for i in range(5):
+                    cumulative = min(
+                        samples, cumulative + latency_buckets[i]
+                    )
+                    if cumulative >= rank:
+                        bucket = i
+                        break
+                # 桶上界依次为 1、10、100、1000、null。
+                upper = (1, 10, 100, 1000, None)[bucket]
+            if entry is None:
+                state = "N"
+                run_count = 0
+            else:
+                state = entry["state"]
+                run_count = entry["run"]
+            changed = False
+            if state == "N":
+                if bucket is not None and bucket >= hi:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "A"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符（含无样本 bucket=null）：连续数清 0。
+                    run_count = 0
+            else:
+                if bucket is not None and bucket <= lo:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "N"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符（含无样本 bucket=null）：连续数清 0。
+                    run_count = 0
+            result = {
+                "op": "pa",
+                "id": backend_id,
+                "w": w,
+                "p": percentile,
+                "state": state,
+                "samples": samples,
+                "bucket": bucket,
+                "upper": upper,
+                "run": run_count,
+                "changed": changed,
+            }
+            percent_alerts[backend_id] = {
+                "p": percentile,
+                "hi": hi,
+                "lo": lo,
+                "n": n,
+                "state": state,
+                "run": run_count,
+                "w": w,
+                "result": dict(result),
+            }
+            results.append(result)
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
