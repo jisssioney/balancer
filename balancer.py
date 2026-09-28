@@ -209,6 +209,22 @@ STATE/4。oh 只读；ci/cb 成功清历史，失败批回滚。记账 O(1)，ot
 O(q)，oh 为 O(R) 时间、O(60) 空间，仅标准库；紧凑 UTF-8 固定键序
 JSON、末尾一换行及 record/replay 逐字节契约照常，其他子命令不变。
 
+排队等待历史：等待项成功离队时记 d=离队时刻-入队 now：ot 接纳记
+admitted、ot 过期记 expired（离队时刻均为 ot.now），oc 成功取消按
+当前逻辑时钟 last_now 记 cancelled，H 模式 oa 头淘汰按被淘汰项的入队
+now 记 evicted；仅成功离队记账（放回首项的阻塞、失败批回滚不记）。
+事件归离队时刻 window=时刻//60，d 依次落入 ≤0、≤1、≤10、≤100、>100
+五桶，每桶封顶 10^18。wh 精确键序 op,from,to,now（键须按此序出现）；
+三数为 0..10^9 非 bool 整数，now 进入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60。返回键序 op,windows；windows 覆盖闭
+区间并升序，项键序 window,admitted,expired,cancelled,evicted，四项
+均为 5 个非负整数数组（依次为五桶计数），空窗全零。键序、类型、范围、
+关系或时钟倒退报 INPUT/2；未配置 os 或 from 早于
+max(0,now//60-59) 报 STATE/4。只保留最近 60 窗；ci/cb/ca 成功清空，
+wh 除时钟外只读，失败批回滚。记账 O(1)，wh 为 O(R) 时间、O(60) 空间，
+仅标准库；紧凑 UTF-8 固定键序 JSON、单末尾换行及 record/replay 逐字节
+行为照常，其他子命令既有要求不属本题范围且不得改变。
+
 多维限流历史：oa/ot 检查已配置桶或配额的 B 后端、C 客户端、S 服务类
 时，按 window=now//60 记账：接纳则该窗该维 admitted 加 1、units 加该维
 成本；未接纳且该维在配桶补充后令牌不足成本则 token 加 1，在配配额推进
@@ -1857,7 +1873,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
+        "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "bp", "bq", "qp", "rp", "rg",
         "lh",
         "lt",
         "oq",
@@ -2212,6 +2228,19 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("oh", start, end, now)
+
+    if name == "wh":
+        # 排队等待历史：精确键序 op,from,to,now（键须按此序出现），只读；
+        # 数值与窗关系约束同 oh，未 os 与 from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("wh", start, end, now)
 
     if name == "lh":
         # 多维限流历史：精确键序 op,scope,id,from,to,now（键须按此序出现），
@@ -3104,6 +3133,14 @@ def run(raw):
     # peak 为该窗入队后队长峰值；计数封顶 10^18，只保留最近 60 窗，空窗
     # 不预建。ci/cb 成功清空；oh 只读。
     overload_hist = {}
+    # 排队等待历史（wh）：window=离队时刻//60 -> 四类各五桶行
+    # [[admitted*5],[expired*5],[cancelled*5],[evicted*5]]，全池一份。
+    # 等待项成功离队时记 d=离队时刻-入队 now：ot 接纳/过期离队时刻为
+    # ot.now，oc 取消按当前逻辑时钟 last_now，H 头淘汰按被淘汰项的入队
+    # now（即本次 oa.now）；d 依次落入 ≤0、≤1、≤10、≤100、>100 五桶，
+    # 各桶封顶 10^18，只保留最近 60 窗，空窗不预建。ci/cb/ca 成功清空；
+    # wh 除时钟外只读。
+    wait_hist = {}
     # 多维限流历史（lh）：以 (scope, id) 唯一（scope ∈ B/C/S），window=
     # now//60 -> [admitted, units, token, quota]。oa/ot 检查在配桶或配额
     # 的维时记账：接纳 admitted+1、units+该维成本；未接纳且令牌不足记
@@ -3604,6 +3641,27 @@ def run(raw):
             for old in [w for w in overload_hist if w < cutoff]:
                 del overload_hist[old]
         return row
+
+    def record_wait_exit(kind, leave_now, enqueue_now):
+        """排队等待历史记账：等待项成功离队时以 d=leave_now-enqueue_now
+        归窗 leave_now//60；kind 为行下标 0..3（admitted/expired/
+        cancelled/evicted），d 依次落入 ≤0、≤1、≤10、≤100、>100 五桶，
+        各桶封顶 10^18；惰性建窗且只保留最近
+        60 窗，空窗不预建。仅成功离队调用，记账 O(1)。"""
+        window = leave_now // 60
+        row = wait_hist.get(window)
+        if row is None:
+            row = [[0] * 5 for _ in range(4)]
+            wait_hist[window] = row
+            cutoff = window - 59
+            for old in [w for w in wait_hist if w < cutoff]:
+                del wait_hist[old]
+        d = leave_now - enqueue_now
+        # 五桶 ≤0、≤1、≤10、≤100、>100：d≥0（时钟非递减），bisect_left
+        # 取首个不小于 d 的边界，越界（d>100）落末桶。
+        bucket = bisect.bisect_left((0, 1, 10, 100), d)
+        cells = row[kind]
+        cells[bucket] = min(METRIC_CAP, cells[bucket] + 1)
 
     def active_fault(record, now):
         """按 now 在故障时间线中取唯一活动段：段按 a 升序且 [a,z) 互不
@@ -4150,7 +4208,7 @@ def run(raw):
         nonlocal err_events, percent_alerts, percent_events
         nonlocal mo_seq, mo_cache, queue_mode
         nonlocal full_mode, evict_count, evict_last, cap_overrides
-        nonlocal limit_hist
+        nonlocal limit_hist, wait_hist
 
         def make_record(weight, d, fail_threshold, success_threshold,
                         circuit_params, drain_t, endpoint, fault_segments):
@@ -4284,6 +4342,8 @@ def run(raw):
         # ci/cb 成功清空多维限流历史（ls/qs 重配不清，但热加载/回滚整体
         # 重建运行态，同 id 历史不跨配置保留）。
         limit_hist = {}
+        # ci/cb/ca 成功清空排队等待历史（等待项不跨配置保留，历史同步清空）。
+        wait_hist = {}
         # 热加载三项：sticky/idle 取登记值（null 即未登记，idle 作用于
         # 此后新建连接）；backpressure 携带时置 N，未携带（含 v1）即取消。
         sticky_ttl = config["sticky"]
@@ -4327,7 +4387,7 @@ def run(raw):
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
-            "fa", "fe", "ah", "oh", "br",
+            "fa", "fe", "ah", "oh", "wh", "br",
             "ru", "ea", "eh", "pa", "ph",
             "cp", "cq", "ca",
         ):
@@ -5296,9 +5356,12 @@ def run(raw):
                     # 成员索引，淘汰 cid 可立即复用），新项随后落队尾。旧项
                     # 未耗令牌、配额，无需返还；入队路由已产生的粘性映射保留。
                     # evicted 封顶累加并更新 last。
-                    evicted_cid, _ = wait_queue.popitem(last=False)
+                    evicted_cid, evicted_item = wait_queue.popitem(last=False)
                     evict_count = min(METRIC_CAP, evict_count + 1)
                     evict_last = evicted_cid
+                    # 排队等待历史：头淘汰按本次 oa.now 离队记 evicted
+                    # （d=now-入队 now，同窗即落 ≤0 桶）。
+                    record_wait_exit(3, now, evicted_item[8])
                 # 不可用原因历史：Q 入队且所选后端连接数已达 os.cap 时记
                 # overload（所选后端来自只含 healthy/C/A 的环，阻塞在此只可能
                 # 因令牌不足、固定窗配额不足或连接达 cap；配额不足只入队，
@@ -5348,6 +5411,8 @@ def run(raw):
                 if now >= item[8] + ttl:
                     expired.append(queued_cid)
                     wait_queue.pop(queued_cid)
+                    # 排队等待历史：过期按本次 ot.now 离队记 expired。
+                    record_wait_exit(1, now, item[8])
             admitted = []
             if queue_mode == "S":
                 # S 模式：其余各项按 FIFO 各检查一次（逐项快照遍历，各项使用
@@ -5363,6 +5428,8 @@ def run(raw):
                     if status == "admit":
                         wait_queue.pop(queued_cid)
                         admitted.append(queued_cid)
+                        # 排队等待历史：接纳按本次 ot.now 离队记 admitted。
+                        record_wait_exit(0, now, item[8])
             else:
                 # F 模式：自队首重试接纳，至首个阻塞即停（每个键至多一次
                 # route）。逐项以本次 ot 的 now 补充桶并按 window=now//span
@@ -5379,6 +5446,8 @@ def run(raw):
                     )
                     if status == "admit":
                         admitted.append(queued_cid)
+                        # 排队等待历史：接纳按本次 ot.now 离队记 admitted。
+                        record_wait_exit(0, now, item[8])
                     else:
                         # 阻塞（含路由不可用）：连同该项整体放回队首后停止。
                         # 追加到队尾再移至队首，其余项次序保持不变。
@@ -5418,7 +5487,12 @@ def run(raw):
                 fail(EXIT_CONNECTION, "CONNECTION")
             # 成功：O(1) 从任意位置删除，其余项 FIFO 相对次序不变；不扣减或
             # 返还令牌、不建连接；入队路由已产生的粘性映射保留。
-            wait_queue.pop(cid)
+            cancelled_item = wait_queue.pop(cid)
+            # 排队等待历史：oc 无 now，取消按当前逻辑时钟 last_now 离队记
+            # cancelled（oc 前置的 now 操作已推进时钟；首批首个即 oc 时
+            # last_now 为 None，此时尚未有任何入队可能，cid 必不在队内，
+            # 故走到此处 last_now 必非 None）。
+            record_wait_exit(2, last_now, cancelled_item[8])
             if (
                 bp_cfg is not None
                 and bp_state == "P"
@@ -6051,6 +6125,42 @@ def run(raw):
                     }
                 )
             results.append({"op": "oh", "windows": windows})
+
+        elif op[0] == "wh":
+            # 排队等待历史（只读）：未 os 报 STATE；from 早于最近 60 窗下界
+            # 报 STATE（同 oh）；除时钟外不改任何状态，失败批次天然回滚。
+            # 返回键序 op,windows；windows 覆盖 from..to 并升序，项键序
+            # window,admitted,expired,cancelled,evicted，四项均为依次对应
+            # d 五桶 ≤0、≤1、≤10、≤100、>100 的 5 个非负整数数组，空窗
+            # 全零。逐窗逐数组拷贝，避免结果被批次内后续记账污染。
+            _, start, end, now = op
+            if queue_cfg is None:
+                # 未配置 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            windows = []
+            for window in range(start, end + 1):
+                row = wait_hist.get(window)
+                if row is None:
+                    admitted = expired = cancelled = evicted = [0] * 5
+                else:
+                    admitted = list(row[0])
+                    expired = list(row[1])
+                    cancelled = list(row[2])
+                    evicted = list(row[3])
+                windows.append(
+                    {
+                        "window": window,
+                        "admitted": admitted,
+                        "expired": expired,
+                        "cancelled": cancelled,
+                        "evicted": evicted,
+                    }
+                )
+            results.append({"op": "wh", "windows": windows})
 
         elif op[0] == "lh":
             # 多维限流历史（只读）：B 的未知 id 报 BACKEND（先于状态检查）；
