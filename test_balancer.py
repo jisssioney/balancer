@@ -900,6 +900,350 @@ class ConfigDigestTest(unittest.TestCase):
         self.assertEqual(results[0], {"op": "ci", "ok": True})
 
 
+class ConfigReservationTest(unittest.TestCase):
+    """配置预约：cp 登记快照不应用、cq 查询、ca 到点按快照提交。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def queued_setup(self):
+        # 制造一个排队项：唯一后端 a 容量 1 被 open x 占满，oa z 入队。
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+            {
+                "op": "oa", "cid": "z", "flow": self.FLOW,
+                "c": "k", "s": "k", "key": "k", "now": 0,
+            },
+        ]
+
+    def test_cp_saves_snapshot_without_applying(self):
+        digest = digest_of(config_v10(2))
+        results = self.run_ops(
+            [
+                {"op": "cp", "config": config_v10(2), "at": 5, "now": 0},
+                {"op": "cq", "now": 0},
+                {"op": "ce"},
+            ]
+        )
+        # 返回精确键序 op,digest,at。
+        self.assertEqual(list(results[0]), ["op", "digest", "at"])
+        self.assertEqual(results[0], {"op": "cp", "digest": digest, "at": 5})
+        # 已登记但不应用：ce 仍为空配置。
+        self.assertEqual(results[2]["config"]["backends"], [])
+
+    def test_cq_empty_and_pending(self):
+        results = self.run_ops([{"op": "cq", "now": 0}])
+        # 无预约：精确键序 op,pending,digest,at，后两项 null。
+        self.assertEqual(
+            list(results[0]), ["op", "pending", "digest", "at"]
+        )
+        self.assertEqual(
+            results[0],
+            {"op": "cq", "pending": False, "digest": None, "at": None},
+        )
+        digest = digest_of(config_v10(1))
+        results = self.run_ops(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 7, "now": 3},
+                {"op": "cq", "now": 4},
+            ]
+        )
+        self.assertEqual(
+            results[1],
+            {"op": "cq", "pending": True, "digest": digest, "at": 7},
+        )
+
+    def test_ca_applies_snapshot_and_clears_reservation(self):
+        digest = digest_of(config_v10(1))
+        results = self.run_ops(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 5, "now": 0},
+                {"op": "ca", "now": 5},
+                {"op": "cq", "now": 5},
+                {"op": "cl"},
+                {"op": "ct"},
+            ]
+        )
+        # 到点执行：精确键序 op,digest,rev,ok，新 rev 从 1 起。
+        self.assertEqual(list(results[1]), ["op", "digest", "rev", "ok"])
+        self.assertEqual(
+            results[1],
+            {"op": "ca", "digest": digest, "rev": 1, "ok": True},
+        )
+        # 成功清除预约。
+        self.assertEqual(
+            results[2],
+            {"op": "cq", "pending": False, "digest": None, "at": None},
+        )
+        # 快照已提交为 rev=1，当前指纹即快照摘要。
+        self.assertEqual(results[3]["current"], 1)
+        self.assertEqual(results[4]["digest"], digest)
+
+    def test_ca_idempotent_only_once_no_reservation(self):
+        # 同一预约只能成功执行一次：成功即清除，重放 ca 无预约报 STATE。
+        self.assert_failure(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 5, "now": 0},
+                {"op": "ca", "now": 5},
+                {"op": "ca", "now": 5},
+            ],
+            4, "STATE",
+        )
+
+    def test_ca_before_at_is_state(self):
+        self.assert_failure(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 5, "now": 0},
+                {"op": "ca", "now": 4},
+            ],
+            4, "STATE",
+        )
+
+    def test_cp_at_before_now_is_state(self):
+        self.assert_failure(
+            [{"op": "cp", "config": config_v10(1), "at": 4, "now": 5}],
+            4, "STATE",
+        )
+
+    def test_ca_without_reservation_is_state(self):
+        self.assert_failure([{"op": "ca", "now": 0}], 4, "STATE")
+
+    def test_cp_unaffected_by_connection_and_queue(self):
+        # cp/cq 不受活动连接、排队项限制，照常登记/查询。
+        ops = self.queued_setup()
+        results = self.run_ops(
+            ops
+            + [
+                {"op": "cp", "config": config_v10(1), "at": 9, "now": 0},
+                {"op": "cq", "now": 0},
+            ]
+        )
+        self.assertEqual(results[-2]["at"], 9)
+        self.assertTrue(results[-1]["pending"])
+
+    def test_ca_blocked_by_connection(self):
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "cp", "config": config_v10(1), "at": 5, "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                {"op": "ca", "now": 5},
+            ],
+            4, "STATE",
+        )
+
+    def test_ca_blocked_by_queued_item(self):
+        self.assert_failure(
+            self.queued_setup()
+            + [
+                {"op": "cp", "config": config_v10(1), "at": 5, "now": 0},
+                {"op": "ca", "now": 5},
+            ],
+            4, "STATE",
+        )
+
+    def test_cp_same_digest_at_is_idempotent(self):
+        config = config_v10(1)
+        results = self.run_ops(
+            [
+                {"op": "cp", "config": config, "at": 5, "now": 0},
+                {"op": "cp", "config": config, "at": 5, "now": 1},
+            ]
+        )
+        self.assertEqual(results[0], results[1])
+
+    def test_cp_different_digest_overwrites(self):
+        digest_a = digest_of(config_v10(1))
+        digest_b = digest_of(config_v10(3))
+        results = self.run_ops(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 5, "now": 0},
+                {"op": "cp", "config": config_v10(3), "at": 5, "now": 1},
+                {"op": "cq", "now": 1},
+            ]
+        )
+        # 同 at 不同 digest：覆盖旧预约，cq 取最新快照。
+        self.assertEqual(results[0]["digest"], digest_a)
+        self.assertEqual(results[1]["digest"], digest_b)
+        self.assertEqual(results[2]["digest"], digest_b)
+
+    def test_cp_same_digest_different_at_overwrites(self):
+        # 同 digest、不同 at 非同参重报：以新 at 覆盖。
+        results = self.run_ops(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 5, "now": 0},
+                {"op": "cp", "config": config_v10(1), "at": 8, "now": 1},
+                {"op": "cq", "now": 1},
+            ]
+        )
+        self.assertEqual(results[2]["at"], 8)
+        # 旧 at 已不可执行：now=5 早于新触发时刻。
+        self.assert_failure(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 8, "now": 0},
+                {"op": "ca", "now": 5},
+            ],
+            4, "STATE",
+        )
+
+    def test_ci_clears_reservation(self):
+        results = self.run_ops(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 9, "now": 0},
+                {"op": "ci", "config": config_v10(2), "now": 1},
+                {"op": "cq", "now": 1},
+            ]
+        )
+        self.assertFalse(results[2]["pending"])
+        # 已被清除，即便 now>=at 也无预约可执行。
+        self.assert_failure(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 9, "now": 0},
+                {"op": "ci", "config": config_v10(2), "now": 1},
+                {"op": "ca", "now": 9},
+            ],
+            4, "STATE",
+        )
+
+    def test_cb_clears_reservation(self):
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": config_v10(2), "now": 0},
+                {"op": "cp", "config": config_v10(1), "at": 9, "now": 1},
+                {"op": "cb", "rev": 1, "now": 2},
+                {"op": "cq", "now": 2},
+            ]
+        )
+        self.assertFalse(results[3]["pending"])
+
+    def test_cp_normalizes_v1_and_reports_v10_digest(self):
+        # config 沿用 cv 的 v1..v10 校验与规范化：v1 回显 v10 摘要。
+        config_v1 = {
+            "version": 1,
+            "backends": [
+                {
+                    "id": "a", "weight": 2, "d": 0, "fail": 3,
+                    "success": 2, "circuit": None, "drain": None,
+                }
+            ],
+            "vnodes": None,
+            "limits": [],
+            "overload": None,
+        }
+        results = self.run_ops(
+            [{"op": "cp", "config": config_v1, "at": 0, "now": 0}]
+        )
+        self.assertEqual(results[0]["digest"], digest_of(config_v10(2)))
+
+    def test_cp_unknown_backend_is_backend(self):
+        bad = config_v10(1, limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}])
+        self.assert_failure(
+            [{"op": "cp", "config": bad, "at": 0, "now": 0}], 3, "BACKEND"
+        )
+
+    def test_cp_invalid_config_is_input(self):
+        bad = config_v10(1)
+        bad["backends"][0]["weight"] = 0
+        self.assert_failure(
+            [{"op": "cp", "config": bad, "at": 0, "now": 0}], 2, "INPUT"
+        )
+
+    def test_exact_key_order(self):
+        # cp 精确键序 op,config,at,now，乱序 INPUT。
+        self.assert_failure(
+            [{"op": "cp", "config": config_v10(1), "now": 0, "at": 5}],
+            2, "INPUT",
+        )
+        for op in (
+            {"op": "cq", "at": 0, "now": 0},
+            {"op": "ca", "at": 0, "now": 0},
+            {"op": "cq"},
+            {"op": "ca"},
+        ):
+            self.assert_failure([op], 2, "INPUT")
+
+    def test_bad_times_are_input(self):
+        for at in (-1, 10 ** 9 + 1, True, "5", 1.5, None):
+            self.assert_failure(
+                [{"op": "cp", "config": config_v10(1), "at": at, "now": 0}],
+                2, "INPUT",
+            )
+        for now in (-1, 10 ** 9 + 1, True, "0", 1.5, None):
+            self.assert_failure(
+                [{"op": "cp", "config": config_v10(1), "at": 0, "now": now}],
+                2, "INPUT",
+            )
+            self.assert_failure([{"op": "cq", "now": now}], 2, "INPUT")
+            self.assert_failure([{"op": "ca", "now": now}], 2, "INPUT")
+
+    def test_clock_regression_is_input(self):
+        # cp.now、cq.now、ca.now 均在共用非递减时钟上，倒退 INPUT；
+        # at 不参与时钟推进，故 at 早于历史 now 合法。
+        self.assert_failure(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 9, "now": 5},
+                {"op": "cq", "now": 4},
+            ],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 9, "now": 5},
+                {"op": "ca", "now": 4},
+            ],
+            2, "INPUT",
+        )
+        results = self.run_ops(
+            [
+                {"op": "cp", "config": config_v10(1), "at": 5, "now": 5},
+                {"op": "cq", "now": 5},
+            ]
+        )
+        self.assertTrue(results[1]["pending"])
+
+    def test_ca_failure_rolls_back_batch(self):
+        # ca 未到点失败：整批无 stdout，前面的 cp 也不产生可观察输出
+        # （独立新批次 cq 仍无预约，验证未应用）。
+        ops = [
+            {"op": "cp", "config": config_v10(1), "at": 9, "now": 0},
+            {"op": "ca", "now": 5},
+        ]
+        self.assert_failure(ops, 4, "STATE")
+        results = self.run_ops([{"op": "cq", "now": 0}])
+        self.assertFalse(results[0]["pending"])
+
+    def test_record_replay_covers_cp_cq_ca(self):
+        ops = [
+            {"op": "cp", "config": config_v10(1), "at": 5, "now": 0},
+            {"op": "cq", "now": 0},
+            {"op": "ca", "now": 5},
+        ]
+        raw = encode_ops(ops)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+
+
 class ConfigDiffTest(unittest.TestCase):
     """后端配置变更预览 cd：比较当前与候选规范化配置的 backends，不应用。"""
 
