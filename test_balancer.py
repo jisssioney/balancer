@@ -10022,5 +10022,219 @@ class RetryTimelineTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
 
 
+class HardTtlTest(unittest.TestCase):
+    """连接硬时限（tm/te）与 tx/tk 的硬截止语义。"""
+
+    def open_ops(self, *cids):
+        ops = [{"op": "add", "id": "a", "weight": 1}]
+        for index, cid in enumerate(cids):
+            ops.append({
+                "op": "open", "cid": cid, "flow": FLOW, "now": index,
+            })
+        return ops
+
+    def run_ok(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out)["results"]
+
+    def run_fail(self, ops, exit_code, label):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, ('{"error":"%s"}\n' % label).encode("utf-8"))
+
+    def test_tm_same_idempotent_different_overwrites(self):
+        results = self.run_ok(self.open_ops("c1") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "tm", "ttl": 10},
+            {"op": "tm", "ttl": 20},
+            {"op": "te", "cid": "c1", "now": 15},
+        ])
+        self.assertEqual([r for r in results if r["op"] == "tm"],
+                         [{"op": "tm", "ok": True}] * 3)
+        # 覆盖为 20 后作用于 opened_at=0 的既有连接：now=15 仍 A。
+        self.assertEqual(results[-1], {
+            "op": "te", "cid": "c1", "idle": None, "lifetime": 20,
+            "deadline": 20, "state": "A", "reason": None,
+        })
+
+    def test_te_result_key_order(self):
+        results = self.run_ok(self.open_ops("c1") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "te", "cid": "c1", "now": 0},
+        ])
+        self.assertEqual(
+            list(results[-1]),
+            ["op", "cid", "idle", "lifetime", "deadline", "state", "reason"],
+        )
+
+    def test_te_hard_boundary_and_reason(self):
+        results = self.run_ok(self.open_ops("c1") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "te", "cid": "c1", "now": 9},
+            {"op": "te", "cid": "c1", "now": 10},
+        ])
+        self.assertEqual(results[-2]["state"], "A")
+        self.assertIsNone(results[-2]["reason"])
+        self.assertEqual(results[-1]["state"], "E")
+        self.assertEqual(results[-1]["reason"], "L")
+        self.assertEqual(results[-1]["idle"], None)
+        self.assertEqual(results[-1]["lifetime"], 10)
+        self.assertEqual(results[-1]["deadline"], 10)
+
+    def test_te_idle_only_reason_i(self):
+        results = self.run_ok(self.open_ops("c1") + [
+            {"op": "ts", "ttl": 5},
+            {"op": "te", "cid": "c1", "now": 5},
+        ])
+        self.assertEqual(results[-1], {
+            "op": "te", "cid": "c1", "idle": 5, "lifetime": None,
+            "deadline": 5, "state": "E", "reason": "I",
+        })
+
+    def test_te_deadline_is_min_and_simultaneous_prefers_l(self):
+        ops = self.open_ops("c1", "c2")
+        ops += [
+            {"op": "ts", "ttl": 10},
+            {"op": "tm", "ttl": 10},
+        ]
+        # c2 opened_at=1：空闲与硬截止同为 11，同时到期取 L。
+        results = self.run_ok(ops + [{"op": "te", "cid": "c2", "now": 11}])
+        self.assertEqual(results[-1]["deadline"], 11)
+        self.assertEqual(results[-1]["reason"], "L")
+        # 空闲更短：tk 提前 last 之外，空闲先到期报 I。
+        ops2 = self.open_ops("c3")
+        ops2 += [{"op": "ts", "ttl": 3}, {"op": "tm", "ttl": 10}]
+        results = self.run_ok(ops2 + [{"op": "te", "cid": "c3", "now": 3}])
+        self.assertEqual(results[-1]["deadline"], 3)
+        self.assertEqual(results[-1]["reason"], "I")
+
+    def test_te_without_any_ttl_is_state(self):
+        self.run_fail(
+            self.open_ops("c1") + [{"op": "te", "cid": "c1", "now": 0}],
+            4, "STATE",
+        )
+
+    def test_te_unknown_cid_is_connection(self):
+        self.run_fail(
+            self.open_ops("c1") + [
+                {"op": "tm", "ttl": 10},
+                {"op": "te", "cid": "ghost", "now": 0},
+            ],
+            5, "CONNECTION",
+        )
+
+    def test_tk_does_not_extend_hard_deadline(self):
+        # tm 单独配置时 tk 可用：now=5 刷新 last 成功，硬到期 now=10 失败。
+        self.run_ok(self.open_ops("c1") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "tk", "cid": "c1", "now": 5},
+        ])
+        self.run_fail(self.open_ops("c1") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "tk", "cid": "c1", "now": 10},
+        ], 5, "CONNECTION")
+
+    def test_tk_without_any_ttl_remains_state(self):
+        self.run_fail(
+            self.open_ops("c1") + [{"op": "tk", "cid": "c1", "now": 0}],
+            4, "STATE",
+        )
+
+    def test_tg_without_ts_unchanged_with_tm(self):
+        # tm 不改变 tg：未 ts 仍报 STATE。
+        self.run_fail(self.open_ops("c1") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "tg", "cid": "c1", "now": 0},
+        ], 4, "STATE")
+
+    def test_tx_uses_hard_deadline_in_build_order(self):
+        # c1 opened_at=0、c2 opened_at=1，tm.ttl=10：now=10 仅 c1 到期。
+        results = self.run_ok(self.open_ops("c1", "c2") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "tx", "now": 10},
+        ])
+        self.assertEqual(results[-1], {"op": "tx", "expired": ["c1"]})
+        # 被删连接随后 te 报 CONNECTION。
+        self.run_fail(self.open_ops("c1", "c2") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "tx", "now": 10},
+            {"op": "te", "cid": "c1", "now": 10},
+        ], 5, "CONNECTION")
+
+    def test_tx_deadline_min_of_idle_and_hard(self):
+        # c1：空闲截止 100+5=105，硬截止 0+10=10，按硬截止删除。
+        # c2：tk@5 后空闲截止 105，但硬截止 1+10=11，now=10 存活。
+        results = self.run_ok(self.open_ops("c1", "c2") + [
+            {"op": "ts", "ttl": 100},
+            {"op": "tm", "ttl": 10},
+            {"op": "tk", "cid": "c2", "now": 5},
+            {"op": "tx", "now": 10},
+        ])
+        self.assertEqual(results[-1]["expired"], ["c1"])
+
+    def test_tx_without_any_ttl_remains_state(self):
+        self.run_fail(
+            self.open_ops("c1") + [{"op": "tx", "now": 0}],
+            4, "STATE",
+        )
+
+    def test_te_clock_regression_is_input(self):
+        # open@10 推进时钟，te@9 倒退报 INPUT（先于 STATE/cid 校验）。
+        self.run_fail([
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 10},
+            {"op": "te", "cid": "c1", "now": 9},
+        ], 2, "INPUT")
+
+    def test_tm_te_input_validation(self):
+        bad_ops = [
+            # tm 键序/键集。
+            b'{"ops":[{"ttl":5,"op":"tm"}]}',
+            b'{"ops":[{"op":"tm"}]}',
+            b'{"ops":[{"op":"tm","ttl":5,"x":1}]}',
+            # tm ttl 类型/范围（非 bool 整数 1..10^9）。
+            b'{"ops":[{"op":"tm","ttl":0}]}',
+            b'{"ops":[{"op":"tm","ttl":true}]}',
+            b'{"ops":[{"op":"tm","ttl":5.5}]}',
+            b'{"ops":[{"op":"tm","ttl":-1}]}',
+            b'{"ops":[{"op":"tm","ttl":1000000001}]}',
+            b'{"ops":[{"op":"tm","ttl":"5"}]}',
+            # te 键序/键集。
+            b'{"ops":[{"now":1,"cid":"c","op":"te"}]}',
+            b'{"ops":[{"op":"te","cid":"c"}]}',
+            b'{"ops":[{"op":"te","now":1}]}',
+            # te now 类型/范围（非 bool 整数 0..10^9）。
+            b'{"ops":[{"op":"tm","ttl":5},{"op":"te","cid":"c","now":-1}]}',
+            b'{"ops":[{"op":"tm","ttl":5},{"op":"te","cid":"c","now":true}]}',
+            b'{"ops":[{"op":"tm","ttl":5},{"op":"te","cid":"c","now":1.5}]}',
+            b'{"ops":[{"op":"tm","ttl":5},{"op":"te","cid":"c","now":1000000001}]}',
+        ]
+        for raw in bad_ops:
+            code, out, err = run_balancer("run", raw)
+            self.assertEqual(code, 2, raw)
+            self.assertEqual(out, b"", raw)
+            self.assertEqual(err, b'{"error":"INPUT"}\n', raw)
+
+    def test_record_replay_covers_tm_te(self):
+        raw = encode_ops(self.open_ops("c1") + [
+            {"op": "tm", "ttl": 10},
+            {"op": "ts", "ttl": 5},
+            {"op": "te", "cid": "c1", "now": 4},
+            {"op": "tx", "now": 4},
+        ])
+        run_code, run_out, run_err = run_balancer("run", raw)
+        self.assertEqual(run_code, 0)
+        _, rec_out, _ = run_balancer("record", raw)
+        record = json.loads(rec_out.decode("utf-8"))
+        self.assertEqual(record["exit"], 0)
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_out, run_out)
+        self.assertEqual(rep_err, run_err)
+
+
 if __name__ == "__main__":
     unittest.main()

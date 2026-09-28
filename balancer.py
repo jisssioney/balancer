@@ -795,7 +795,7 @@ INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4。ci 成功清空告警现
 态与历史，失败回滚；remove 及同 id 重加不清历史，仅影响后续 fe 的
 v；批内失败回滚事件。fe 记账 O(1)，ah 时间 O(60)、空间 O(60)。
 
-连接空闲超时：ts 键集 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
+连接空闲超时：ts 键序 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置全局
 空闲时限，首配作用于既有与后续连接，同值幂等、异值报 STATE，登记值随
 ce/ci 导出导入；返回 op,ok。凡成功建连（open/oa/ot/fx/fr）均置 last=opened_at。
 tk 键集 op,cid,now：未到期（now < last+ttl）才置 last=now，返回 op,ok；
@@ -804,8 +804,24 @@ op,cid,backend,state,opened,last,deadline：deadline=last+ttl，state 为
 A（now<deadline）或 E，查询不删除。tx 键集 op,now：按建连顺序删除全部
 到期连接并递减后端并发，排空 D 后端末连消失则转 X、end=now；返回
 op,expired（cid 数组）。tk/tg/tx 的 now 纳入共用非递减时钟；未 ts 调用
-tk/tg/tx 报 STATE。close 与 dg 强关同样清理连接的空闲状态。ts/tk/tg 为
+tk/tg 报 STATE。close 与 dg 强关同样清理连接的空闲状态。ts/tk/tg 为
 O(1)，tx 为 O(C)，额外空间 O(C)。
+
+连接硬时限：tm 键序 op,ttl（ttl ∈ [1,10^9] 非 bool 整数）配置连接硬时
+限，未配时其余操作行为不变；同值幂等，异值覆盖并立即作用于既有与后续
+连接（不随 ce/ci 导出导入），返回 op,ok=true。硬截止恒为 opened_at+ttl，
+tk 只刷新空闲 last、不延长硬截止；tk 命中硬到期（now ≥ opened_at+ttl）
+同样报 CONNECTION/5 且不刷新 last。te 键序 op,cid,now（now ∈ [0,10^9]
+非 bool 整数）进入共用非递减时钟，返回键序
+op,cid,idle,lifetime,deadline,state,reason：未配 ts/tm 时 idle/lifetime
+为 null，否则分别为 last+ts.ttl 与 opened_at+tm.ttl；deadline 取非 null
+最小值。now<deadline 时 state=A、reason=null，否则 state=E，空闲到期
+reason=I、硬截止到 reason=L，同时到期取 L；ts 与 tm 均未配报 STATE/4。
+te 未知 cid 报 CONNECTION/5。tm/te 为 O(1)。tx 在已配 ts 或 tm 时可用：
+依建连序删除 now≥deadline（deadline 取空闲/硬截止非 null 最小值）的全部
+连接，沿用删除联动（并发递减、排空转 X、转发快照清理），结果仍为
+op,expired；ts、tm 均未配时 tx 报 STATE。tm/te 非法键序、类型、范围或
+te 时钟倒退报 INPUT/2。
 
 确定性操作记录：record 把原始 stdin 字节作为全新 run 输入执行，无论底层
 成功或按既有错误失败，均退出 0、stderr 为空，stdout 输出一行紧凑 JSON
@@ -1926,6 +1942,7 @@ def parse_op(raw_op):
         "fa", "fe", "ah",
         "ea", "eh",
         "ts", "tk", "tg", "tx",
+        "tm", "te",
         "ep", "fw",
         "ru",
     ):
@@ -3075,6 +3092,19 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("tx", parse_now(raw_op["now"]))
 
+    if name == "tm":
+        # 连接硬时限：精确键序 op,ttl；ttl ∈ [1,10^9] 非 bool 整数。
+        if list(raw_op) != ["op", "ttl"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("tm", parse_idle_ttl(raw_op["ttl"]))
+
+    if name == "te":
+        # 连接时限查询：精确键序 op,cid,now；now ∈ [0,10^9] 非 bool 整数
+        # 并进入共用非递减时钟；未知 cid 留执行期判 CONNECTION。
+        if list(raw_op) != ["op", "cid", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("te", parse_cid(raw_op["cid"]), parse_warm_now(raw_op["now"]))
+
     if name == "ep":
         # 后端 IP 端点登记：精确键集 op,id,host,port；未知 id 留执行期判
         # BACKEND。
@@ -3249,6 +3279,10 @@ def run(raw):
     # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
     # 异值重配报 STATE，登记值随 ce/ci 导出导入（ci 后作用于新连接）。
     ttl_cfg = None
+    # 连接硬时限：hard_ttl_cfg 未 tm 时为 None，否则为登记的全局硬时限；
+    # tm 同值幂等、异值覆盖并立即作用于既有连接（硬截止 opened_at+ttl
+    # 纯由该全局值与 opened_at 导出），不随 ce/ci 导出导入。
+    hard_ttl_cfg = None
     # pick 调度策略：W 为既有平滑加权（默认），R 为轮询，L 为最少连接；
     # 登记值随 ce/ci 导出导入（v1/v2 等价于 W，v3 仅 W/R，v4 收 W/R/L）。
     # rr_ticket 为 R 模式的轮询游标，仅 ci 成功重建为 0，add/remove 或
@@ -4484,7 +4518,7 @@ def run(raw):
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "br",
             "ru", "ea", "eh", "pa", "ph",
-            "cp", "cq", "ca",
+            "cp", "cq", "ca", "te",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -8004,15 +8038,30 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             results.append({"op": "ts", "ok": True})
 
+        elif op[0] == "tm":
+            _, ttl = op
+            # 连接硬时限：同值幂等；异值覆盖并立即作用于既有与后续连接——
+            # 硬截止恒为 opened_at+ttl，无需逐连改写。不随 ce/ci 导出导入。
+            hard_ttl_cfg = ttl
+            results.append({"op": "tm", "ok": True})
+
         elif op[0] == "tk":
             _, cid, now = op
-            if ttl_cfg is None:
+            # ts、tm 均未配时沿用旧行为报 STATE；已配任一项即可用。
+            if ttl_cfg is None and hard_ttl_cfg is None:
                 fail(EXIT_STATE, "STATE")
             connection = connections.get(cid)
             if connection is None:
                 fail(EXIT_CONNECTION, "CONNECTION")
-            if now >= connection[3] + ttl_cfg:
-                # 命中已到期连接同样报 CONNECTION，不刷新 last。
+            if ttl_cfg is not None and now >= connection[3] + ttl_cfg:
+                # 命中空闲到期同样报 CONNECTION，不刷新 last。
+                fail(EXIT_CONNECTION, "CONNECTION")
+            if (
+                hard_ttl_cfg is not None
+                and now >= connection[2] + hard_ttl_cfg
+            ):
+                # 命中硬到期同样报 CONNECTION；tk 只刷新空闲 last，
+                # 不延长硬截止（opened_at+tm.ttl）。
                 fail(EXIT_CONNECTION, "CONNECTION")
             connection[3] = now
             results.append({"op": "tk", "ok": True})
@@ -8038,14 +8087,70 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "te":
+            _, cid, now = op
+            # 连接时限快照查询：ts/tm 均未配报 STATE（先于未知 cid 判定，
+            # 同 tk/tg 的优先级）；未知 cid 报 CONNECTION。now 已在共用
+            # 时钟块完成非递减校验。
+            if ttl_cfg is None and hard_ttl_cfg is None:
+                fail(EXIT_STATE, "STATE")
+            connection = connections.get(cid)
+            if connection is None:
+                fail(EXIT_CONNECTION, "CONNECTION")
+            idle = (
+                connection[3] + ttl_cfg
+                if ttl_cfg is not None else None
+            )
+            lifetime = (
+                connection[2] + hard_ttl_cfg
+                if hard_ttl_cfg is not None else None
+            )
+            # deadline 取空闲/硬截止非 null 最小值。
+            deadline = idle if lifetime is None else (
+                lifetime if idle is None else min(idle, lifetime)
+            )
+            if now < deadline:
+                state = "A"
+                reason = None
+            else:
+                state = "E"
+                # 空闲与硬截止同时到期取 L。
+                if lifetime is not None and now >= lifetime:
+                    reason = "L"
+                else:
+                    reason = "I"
+            results.append(
+                {
+                    "op": "te",
+                    "cid": cid,
+                    "idle": idle,
+                    "lifetime": lifetime,
+                    "deadline": deadline,
+                    "state": state,
+                    "reason": reason,
+                }
+            )
+
         elif op[0] == "tx":
             _, now = op
-            if ttl_cfg is None:
+            # 已配 ts 或 tm 之一即可用；均未配报 STATE。
+            if ttl_cfg is None and hard_ttl_cfg is None:
                 fail(EXIT_STATE, "STATE")
-            # 按建连顺序（dict 保序）删除全部到期连接并递减后端并发。
+            # 按建连顺序（dict 保序）删除全部 now≥deadline 的连接并递减
+            # 后端并发；deadline 取空闲（last+ts.ttl）与硬截止
+            # （opened_at+tm.ttl）非 null 最小值。
             expired = []
             for cid, connection in list(connections.items()):
-                if now >= connection[3] + ttl_cfg:
+                # deadline 取空闲/硬截止非 null 最小值（进入本分支时至少
+                # 其一已配置）。
+                deadline = None
+                if ttl_cfg is not None:
+                    deadline = connection[3] + ttl_cfg
+                if hard_ttl_cfg is not None:
+                    hard_deadline = connection[2] + hard_ttl_cfg
+                    if deadline is None or hard_deadline < deadline:
+                        deadline = hard_deadline
+                if now >= deadline:
                     expired.append(cid)
                     del connections[cid]
                     conn_endpoints.pop(cid, None)
