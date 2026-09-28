@@ -224,6 +224,18 @@ to-from<60；返回键序 op,scope,id,windows；windows 覆盖 from 至 to 所�
 配桶也无在配配额，或 from 早于 max(0,now//60-59) 报 STATE/4。lh 除时钟
 外只读。记账 O(1)，lh 为 O(R)，空间 O(60K)，仅标准库。
 
+限流热点查询：lt 精确键序 op,scope,from,to,k,now（键须按此序出现），scope
+仅 B/C/S，from/to/now 为 0..10^9 非 bool 整数，k 为 1..1000 非 bool 整数，
+now 进入共用非递减时钟，须 from≤to≤now//60 且 to-from<60；now 推进共用
+时钟。汇总该 scope 全部在配（有桶或配额）标识在 from 至 to 闭区间内 lh 的
+admitted、units、token、quota，各值逐窗求和并封顶 10^18，blocked=token+
+quota 并封顶；按 blocked 降序、id 的 UTF-8 字节升序取至多 k 项。返回键序
+op,scope,from,to,items；items 项键序 id,admitted,units,token,quota,blocked，
+计数为非负整数，空窗全 0；该 scope 无任一在配标识报 STATE/4。键序、scope、
+数值、关系或时钟倒退报 INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4。
+lt 除推进时钟外只读，失败批回滚；历史清理同 lh。时间 O(UR+UlogU)、空间
+O(U)，U 为该 scope 在配标识数、R 为窗数，仅标准库。
+
 请求度量：mr 键集 op,id,ok,ms,retries,remaps,now，id 须现存否则 BACKEND，
 ok 仅 bool，ms/retries/remaps/now 四数均为 [0,10^9] 非 bool 整数，now 纳入
 共用非递减时钟。每后端按 window=now//60 只保留当前窗统计，换窗即全部清零；
@@ -1847,6 +1859,7 @@ def parse_op(raw_op):
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "lh",
+        "lt",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
@@ -2215,6 +2228,31 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("lh", scope, parse_key(raw_op["id"]), start, end, now)
+
+    if name == "lt":
+        # 限流热点查询：精确键序 op,scope,from,to,k,now（键须按此序出现），
+        # 只读；scope 仅 B/C/S，from/to/now 为 0..10^9 非 bool 整数，k 为
+        # 1..1000 非 bool 整数；数值与窗关系约束同 lh，from 过早、无在配
+        # 标识留执行期判。
+        if list(raw_op) != ["op", "scope", "from", "to", "k", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        scope = raw_op["scope"]
+        if scope not in ("B", "C", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        limit_k = raw_op["k"]
+        # bool 是 int 的子类，必须显式排除。
+        if (
+            not isinstance(limit_k, int)
+            or isinstance(limit_k, bool)
+            or not 1 <= limit_k <= 1000
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_metric_num(raw_op["now"])
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("lt", scope, start, end, limit_k, now)
 
     if name == "bp":
         if keys != {"op", "low", "high"}:
@@ -4285,7 +4323,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
-            "oq", "lh",
+            "oq", "lh", "lt",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
@@ -6054,6 +6092,71 @@ def run(raw):
                 )
             results.append(
                 {"op": "lh", "scope": scope, "id": hist_id, "windows": windows}
+            )
+
+        elif op[0] == "lt":
+            # 限流热点查询（只读）：汇总该 scope 全部在配（有桶或配额）标识
+            # 在 from..to 闭区间内 lh 的 admitted、units、token、quota；无任一
+            # 在配标识、from 早于最近 60 窗下界均报 STATE；不改任何计数，
+            # 失败批次天然回滚。blocked=token+quota（封顶 10^18）；按
+            # blocked 降序、id 的 UTF-8 字节升序取至多 k 项。返回键序
+            # op,scope,from,to,items；items 项键序
+            # id,admitted,units,token,quota,blocked。逐窗求和并封顶，拷贝出
+            # 的计数避免结果被批次内后续记账污染。
+            _, scope, start, end, limit_k, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            # 在配标识：该 scope 下有桶或配额者（B 的桶/配额均挂现存后端）。
+            active_ids = set()
+            for pair_scope, ident in buckets:
+                if pair_scope == scope:
+                    active_ids.add(ident)
+            for pair_scope, ident in quotas:
+                if pair_scope == scope:
+                    active_ids.add(ident)
+            if not active_ids:
+                # 该 scope 无在配标识：无热点可查。
+                fail(EXIT_STATE, "STATE")
+            items = []
+            for ident in active_ids:
+                admitted = units = token = quota = 0
+                history = limit_hist.get((scope, ident))
+                if history is not None:
+                    for window in range(start, end + 1):
+                        row = history.get(window)
+                        if row is None:
+                            # 空窗全 0。
+                            continue
+                        admitted = min(METRIC_CAP, admitted + row[0])
+                        units = min(METRIC_CAP, units + row[1])
+                        token = min(METRIC_CAP, token + row[2])
+                        quota = min(METRIC_CAP, quota + row[3])
+                blocked = min(METRIC_CAP, token + quota)
+                items.append(
+                    {
+                        "id": ident,
+                        "admitted": admitted,
+                        "units": units,
+                        "token": token,
+                        "quota": quota,
+                        "blocked": blocked,
+                    }
+                )
+            # blocked 降序、平手按 id 的 UTF-8 字节升序；取至多 k 项。
+            items.sort(
+                key=lambda item: (-item["blocked"], item["id"].encode("utf-8"))
+            )
+            del items[limit_k:]
+            results.append(
+                {
+                    "op": "lt",
+                    "scope": scope,
+                    "from": start,
+                    "to": end,
+                    "items": items,
+                }
             )
 
         elif op[0] == "mo":
