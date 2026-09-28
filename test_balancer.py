@@ -8821,5 +8821,454 @@ class PercentileAlertHistoryTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class ReasonTimelineTest(unittest.TestCase):
+    """rt 原因事件时刻查询：count/first/last 记账、区间窗序、错误与清除。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def results(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def rt(backend, start, end, now):
+        return {"op": "rt", "id": backend, "from": start, "to": end, "now": now}
+
+    @staticmethod
+    def triple(count, first, last):
+        return {"count": count, "first": first, "last": last}
+
+    def health_flip(self, backend, now):
+        # fail=success=1 后一次失败探测即产生一次 health 事件。
+        return [
+            {"op": "hset", "id": backend, "fail": 1, "success": 1},
+            {"op": "probe", "id": backend, "ok": False, "now": now},
+        ]
+
+    def test_first_last_all_four_reasons(self):
+        ops = [
+            {"op": "add", "id": "h", "weight": 1},
+            {"op": "add", "id": "d", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            {"op": "add", "id": "o", "weight": 1},
+        ]
+        ops += self.health_flip("h", 0)
+        ops += [
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+            {"op": "ds", "id": "d", "t": 10},
+            {"op": "dr", "id": "d", "now": 0},
+            {"op": "cs", "id": "c", "n": 1, "m": 1, "r": 1, "w": 1, "q": 1},
+            {"op": "cr", "id": "c", "ok": False, "now": 0},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 1, "ttl": 10},
+            {"op": "open", "cid": "y", "flow": self.FLOW, "now": 0},
+            {"op": "oa", "cid": "z", "flow": self.FLOW, "c": "k",
+             "s": "k", "key": "k", "now": 0},
+        ]
+        for backend in ("h", "d", "c", "o"):
+            ops.append(self.rt(backend, 0, 0, 0))
+        windows = {r["id"]: r["windows"][0]
+                   for r in self.results(ops) if r["op"] == "rt"}
+        expected = {
+            "h": ("health", 0), "d": ("drain", 0),
+            "c": ("circuit", 0), "o": ("overload", 0),
+        }
+        zero = self.triple(0, None, None)
+        for backend, (reason, moment) in expected.items():
+            window = windows[backend]
+            self.assertEqual(window["window"], 0)
+            for name in ("health", "drain", "circuit", "overload"):
+                if name == reason:
+                    self.assertEqual(window[name], self.triple(1, moment, moment))
+                else:
+                    self.assertEqual(window[name], zero)
+
+    def test_multiple_same_window_events_update_count_and_last(self):
+        # 同窗两次 h→u（中间恢复）：count=2、first 留首次、last 随最近事件。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 10},
+            {"op": "probe", "id": "b", "ok": True, "now": 20},
+            {"op": "probe", "id": "b", "ok": False, "now": 50},
+            self.rt("b", 0, 0, 59),
+        ]
+        entry = self.results(ops)[-1]["windows"][0]["health"]
+        self.assertEqual(entry, self.triple(2, 10, 50))
+
+    def test_circuit_reopen_records_each_transition(self):
+        # C→O（10），cg 转 H（11），H 中失败重开 O（12）：两次 circuit。
+        ops = [
+            {"op": "add", "id": "c", "weight": 1},
+            {"op": "cs", "id": "c", "n": 1, "m": 1, "r": 1, "w": 1, "q": 1},
+            {"op": "cr", "id": "c", "ok": False, "now": 10},
+            {"op": "cg", "id": "c", "now": 11},
+            {"op": "cr", "id": "c", "ok": False, "now": 12},
+            self.rt("c", 0, 0, 12),
+        ]
+        entry = self.results(ops)[-1]["windows"][0]["circuit"]
+        self.assertEqual(entry, self.triple(2, 10, 12))
+
+    def test_drain_transitions_only(self):
+        # dr 记一次；D 态再 dr 无转换不记；du 后再 dr 记第二次。
+        ops = [
+            {"op": "add", "id": "d", "weight": 1},
+            {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+            {"op": "ds", "id": "d", "t": 100},
+            {"op": "dr", "id": "d", "now": 10},
+            {"op": "dr", "id": "d", "now": 11},
+            {"op": "du", "id": "d", "now": 12},
+            {"op": "dr", "id": "d", "now": 20},
+            self.rt("d", 0, 0, 59),
+        ]
+        entry = self.results(ops)[-1]["windows"][0]["drain"]
+        self.assertEqual(entry, self.triple(2, 10, 20))
+
+    def test_overload_each_queue_event(self):
+        # cap=1 被占，两次入队 Q 各记一次 overload。
+        ops = [
+            {"op": "add", "id": "o", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+            {"op": "open", "cid": "y", "flow": self.FLOW, "now": 0},
+            {"op": "oa", "cid": "z", "flow": self.FLOW, "c": "k",
+             "s": "k", "key": "k", "now": 1},
+            {"op": "oa", "cid": "w", "flow": self.FLOW, "c": "j",
+             "s": "j", "key": "j", "now": 5},
+            self.rt("o", 0, 0, 5),
+        ]
+        entry = self.results(ops)[-1]["windows"][0]["overload"]
+        self.assertEqual(entry, self.triple(2, 1, 5))
+
+    def test_cross_window_closed_range_ascending(self):
+        # w0 与 w1 各一次 health；区间闭、按 window 升序，空窗补零三元组。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 10},
+            {"op": "probe", "id": "b", "ok": True, "now": 60},
+            {"op": "probe", "id": "b", "ok": False, "now": 70},
+            self.rt("b", 0, 2, 179),
+        ]
+        windows = self.results(ops)[-1]["windows"]
+        self.assertEqual([w["window"] for w in windows], [0, 1, 2])
+        zero = self.triple(0, None, None)
+        self.assertEqual(windows[0]["health"], self.triple(1, 10, 10))
+        self.assertEqual(windows[1]["health"], self.triple(1, 70, 70))
+        self.assertEqual(windows[2]["health"], zero)
+        for window in windows:
+            self.assertEqual(
+                list(window),
+                ["window", "health", "drain", "circuit", "overload"],
+            )
+            for name in ("drain", "circuit", "overload"):
+                self.assertEqual(window[name], zero)
+
+    def test_never_evented_backend_is_zero_null_null(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 0, 0, 0),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        zero = self.triple(0, None, None)
+        for name in ("health", "drain", "circuit", "overload"):
+            self.assertEqual(window[name], zero)
+            self.assertEqual(list(window[name]), ["count", "first", "last"])
+
+    def test_result_key_order(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 0, 0, 0),
+        ]
+        results = self.results(ops)
+        result = results[-1]
+        self.assertEqual(list(result), ["op", "id", "windows"])
+
+    def test_output_byte_layout_and_single_newline(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 0, 0, 0),
+        ])
+        _, out, _ = run_balancer("run", raw)
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+        fragment = (
+            b'{"op":"rt","id":"b","windows":[{"window":0,'
+            b'"health":{"count":0,"first":null,"last":null},'
+            b'"drain":{"count":0,"first":null,"last":null},'
+            b'"circuit":{"count":0,"first":null,"last":null},'
+            b'"overload":{"count":0,"first":null,"last":null}}]}'
+        )
+        self.assertIn(fragment, out)
+
+    def test_rt_count_matches_rh(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 10},
+            {"op": "probe", "id": "b", "ok": True, "now": 20},
+            {"op": "probe", "id": "b", "ok": False, "now": 50},
+            {"op": "rh", "id": "b", "from": 0, "to": 0, "now": 59},
+            self.rt("b", 0, 0, 59),
+        ]
+        results = self.results(ops)
+        rh = next(r for r in results if r["op"] == "rh")
+        rt = next(r for r in results if r["op"] == "rt")
+        for name in ("health", "drain", "circuit", "overload"):
+            self.assertEqual(
+                rt["windows"][0][name]["count"], rh["windows"][0][name]
+            )
+
+    def test_key_order_and_key_set_is_input(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","to":0,"from":0,"now":0}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","from":0,"to":0}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"b","from":0,"to":0,"now":0,"x":1}]}',
+            2, "INPUT",
+        )
+
+    def test_bad_numbers_are_input(self):
+        # 各字段按固定位置插入非法值（bool、负数、超界、小数、串、null）。
+        bad_values = ("true", "-1", "1000000001", "1.5", '"0"', "null")
+        templates = {
+            "from": '{"op":"rt","id":"b","from":%s,"to":0,"now":0}',
+            "to": '{"op":"rt","id":"b","from":0,"to":%s,"now":0}',
+            "now": '{"op":"rt","id":"b","from":0,"to":0,"now":%s}',
+        }
+        for field, template in templates.items():
+            for value in bad_values:
+                raw = ('{"ops":[%s]}' % (template % value)).encode("utf-8")
+                self.assert_failure(raw, 2, "INPUT")
+
+    def test_window_relations_are_input(self):
+        # from>to、to>now//60、to-from=60 均 INPUT。
+        self.assert_failure(
+            encode_ops([{"op": "add", "id": "b", "weight": 1},
+                        self.rt("b", 1, 0, 0)]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "add", "id": "b", "weight": 1},
+                        self.rt("b", 0, 2, 119)]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([{"op": "add", "id": "b", "weight": 1},
+                        self.rt("b", 0, 60, 3600)]),
+            2, "INPUT",
+        )
+
+    def test_window_relation_boundaries_ok(self):
+        # to-from=59 合法；from=to=now//60 合法。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 1, 60, 3600),
+            self.rt("b", 16666666, 16666666, 10 ** 9),
+        ]
+        results = self.results(ops)
+        rts = [r for r in results if r["op"] == "rt"]
+        self.assertEqual(len(rts[0]["windows"]), 60)
+        self.assertEqual(len(rts[1]["windows"]), 1)
+
+    def test_bad_id_is_input(self):
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":"","from":0,"to":0,"now":0}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            b'{"ops":[{"op":"rt","id":7,"from":0,"to":0,"now":0}]}',
+            2, "INPUT",
+        )
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            encode_ops([self.rt("x", 0, 0, 0)]), 3, "BACKEND"
+        )
+
+    def test_unknown_id_with_stale_from_is_backend(self):
+        # 未知 id 优先于 from 过旧：BACKEND。
+        self.assert_failure(
+            encode_ops([self.rt("x", 0, 0, 3600)]), 3, "BACKEND"
+        )
+
+    def test_unknown_id_with_bad_relation_is_input(self):
+        # 数值关系在解析期判定，优先于未知 id：INPUT。
+        self.assert_failure(
+            encode_ops([self.rt("x", 1, 0, 0)]), 2, "INPUT"
+        )
+
+    def test_clock_regression_is_input(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "probe", "id": "b", "ok": True, "now": 5},
+            self.rt("b", 0, 0, 0),
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_stale_window_is_state(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 0, 0, 3600),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+        # 下界 max(0, now//60-59)=1 合法。
+        results = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 1, 1, 3600),
+        ])
+        self.assertEqual(results[-1]["windows"][0]["window"], 1)
+
+    def test_retains_last_60_windows(self):
+        # w1 事件在 now=3600（w60）仍可查，w0 已不可查。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+        ] + self.health_flip("b", 60) + [
+            {"op": "probe", "id": "b", "ok": True, "now": 119},
+            self.rt("b", 1, 60, 3600),
+        ]
+        windows = self.results(ops)[-1]["windows"]
+        self.assertEqual([w["window"] for w in windows], list(range(1, 61)))
+        self.assertEqual(windows[0]["health"], self.triple(1, 60, 60))
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.rt("b", 0, 0, 3600),
+            ]),
+            4, "STATE",
+        )
+
+    def test_remove_readd_clears_timeline(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+        ] + self.health_flip("b", 0) + [
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 0, 0, 0),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        self.assertEqual(window["health"], self.triple(0, None, None))
+
+    @staticmethod
+    def v1_config():
+        return {
+            "version": 1,
+            "backends": [
+                {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                 "circuit": None, "drain": None}
+            ],
+            "vnodes": None,
+            "limits": [],
+            "overload": None,
+        }
+
+    def test_ci_success_clears_timeline(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+        ] + self.health_flip("b", 0) + [
+            {"op": "ci", "config": self.v1_config(), "now": 60},
+            self.rt("b", 1, 1, 60),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        self.assertEqual(window["health"], self.triple(0, None, None))
+
+    def test_cb_success_clears_timeline(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+        ] + self.health_flip("b", 0) + [
+            {"op": "ci", "config": self.v1_config(), "now": 60},
+        ] + self.health_flip("b", 120) + [
+            {"op": "cb", "rev": 1, "now": 180},
+            self.rt("b", 3, 3, 180),
+        ]
+        window = self.results(ops)[-1]["windows"][0]
+        self.assertEqual(window["health"], self.triple(0, None, None))
+
+    def test_rt_is_read_only(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+        ] + self.health_flip("b", 10) + [
+            self.rt("b", 0, 0, 59),
+            self.rt("b", 0, 0, 59),
+            {"op": "rh", "id": "b", "from": 0, "to": 0, "now": 59},
+        ]
+        results = self.results(ops)
+        rts = [r for r in results if r["op"] == "rt"]
+        self.assertEqual(rts[0], rts[1])
+        rh = next(r for r in results if r["op"] == "rh")
+        self.assertEqual(rts[0]["windows"][0]["health"]["count"],
+                         rh["windows"][0]["health"])
+
+    def test_failed_rt_has_no_output(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 0, 0, 3600),
+        ]
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        self.assertEqual(stderr, b'{"error":"STATE"}\n')
+
+    def test_failure_after_rt_rolls_back_batch(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 0, 0, 5),
+            {"op": "probe", "id": "b", "ok": "notabool", "now": 6},
+        ]
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (2, b""))
+        self.assertEqual(stderr, b'{"error":"INPUT"}\n')
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "hset", "id": "b", "fail": 1, "success": 1},
+            {"op": "probe", "id": "b", "ok": False, "now": 3},
+            {"op": "probe", "id": "b", "ok": True, "now": 4},
+            {"op": "probe", "id": "b", "ok": False, "now": 66},
+            self.rt("b", 0, 1, 66),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+    def test_record_replay_covers_failing_rt(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.rt("b", 0, 0, 3600),
+        ])
+        _, rec_stdout, _ = run_balancer("record", raw)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual(record["exit"], 4)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, 4)
+        self.assertEqual(rep_stdout, b"")
+        self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -308,14 +308,30 @@ fault,none 的非负整数计数对象，removed=null 的样本计入 none。mx 
 后端 conns≥os.cap 时该后端 overload 加 1（同次过载与其它原因重叠只记
 overload 一次）。重报（probe/cr 幂等重报、D/X 再 dr）与无状态转换一律
 不记；oa 报 OVERLOAD/7（P 态背压或队满尾拒绝）回滚整批且不记。各计数
-封顶 10^18。rh 精确键序 op,id,from,to,now；from/to/now 为 0..10^9 非
+封顶 10^18；每次计数增加时同步为该后端、分钟窗和原因维护
+count,first,last——count 沿用 10^18 封顶，first 为首次事件的 now（不随
+封顶改变），last 为最近事件的 now，封顶后 last 仍更新（rt 查询此三值）。
+rh 精确键序 op,id,from,to,now；from/to/now 为 0..10^9 非
 bool 整数，now 进入共用非递减时钟，须 from≤to≤now//60 且 to-from<60。
 返回键序 op,id,windows；windows 含 from 至 to 所有窗并按窗升序，项键序
 window,health,drain,circuit,overload，值为非负整数，空窗全 0。键集、
 类型、范围、关系或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，from 早于
 max(0,now//60-59) 报 STATE/4。rh 只读，失败批次天然回滚；remove 后重加
-与 ci 成功清空历史。记账 O(1)，rh 时间 O(R)（R 为窗数）、空间 O(60B)，
+与 ci/cb 成功清空历史。记账 O(1)，rh 时间 O(R)（R 为窗数）、空间 O(60B)，
 record/replay 逐字节覆盖；其他子命令行为不变。
+
+原因事件时刻查询：rt 精确键序 op,id,from,to,now（键须按此序出现），id
+沿用后端标识，from/to/now 为 0..10^9 非 bool 整数，now 进入共用非递减
+时钟，须 from≤to≤now//60 且 to-from<60。结果键序 op,id,windows；
+windows 覆盖闭区间 [from,to] 并升序，项键序
+window,health,drain,circuit,overload，四项均为键序 count,first,last 的
+对象：count 为该窗该原因事件数（封顶 10^18），first/last 为首次/最近
+事件的 now（封顶后 last 仍更新），无事件取 0,null,null。非法键序、id、
+数值关系或时钟倒退报 INPUT/2；未知 id 报 BACKEND/3；from 早于
+max(0,now//60-59) 报 STATE/4。保留最近 60 窗；remove 后同 id 重加及
+ci/cb 成功清空，rt 只读、不推进历史，失败批次天然回滚。rt 时间 O(R)
+（R 为窗数）、空间 O(60B)，仅用标准库；沿用紧凑 UTF-8 固定键序 JSON、
+单末尾换行及 record/replay 逐字节契约，其他操作不变。
 
 全池不可用原因汇总：ra 精确键序 op,from,to,now（键须按此序出现），
 from/to/now 为 0..10^9 非 bool 整数，now 纳入共用非递减时钟，须
@@ -1802,7 +1818,7 @@ def parse_op(raw_op):
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "bp", "bq", "qp", "rp", "rg",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "ra", "ma", "mo", "lp", "pa", "ph",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "ra", "ma", "mo", "lp", "pa", "ph",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -2355,6 +2371,20 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("rh", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "rt":
+        # 原因事件时刻查询：精确键序 op,id,from,to,now（键须按此序出现），
+        # 只读；数值与关系约束同 rh，from 过早的 STATE 留执行期判
+        # （未知 id 先 BACKEND）。
+        if list(raw_op) != ["op", "id", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("rt", parse_backend_id(raw_op["id"]), start, end, now)
 
     if name == "ra":
         # 全池不可用原因汇总：精确键序 op,from,to,now（键须按此序出现），
@@ -3262,20 +3292,33 @@ def run(raw):
     def record_reason(backend_id, reason, now):
         """不可用原因分钟历史记账（O(1)）：reason ∈ health/drain/circuit/
         overload，归属后端 backend_id 的 window=now//60 窗，对应计数加 1 并
-        封顶 10^18。仅在确有状态转换（probe h→u、dr A→D/X、cr C/H→O）或
-        oa 因连接达 cap 入队 Q 时由调用方调用；重报、无转换与 oa 的
-        OVERLOAD 回滚均不调用。每后端只保留最近 60 窗，空窗不预建。"""
+        封顶 10^18；first 为该窗该原因首次事件的 now（封顶不再变），last 为
+        最近事件的 now，计数封顶后 last 仍更新。仅在确有状态转换（probe
+        h→u、dr A→D/X、cr C/H→O）或 oa 因连接达 cap 入队 Q 时由调用方调
+        用；重报、无转换与 oa 的 OVERLOAD 回滚均不调用。每后端只保留最近
+        60 窗，空窗不预建。"""
         history = backends[backend_id]["reason_hist"]
         window = now // 60
         counts = history.get(window)
         if counts is None:
-            # 首次记账该窗：新建四项计数；时钟非递减，顺带丢弃 60 窗前旧窗。
-            counts = {"health": 0, "drain": 0, "circuit": 0, "overload": 0}
+            # 首次记账该窗：新建四项 [count,first,last]；时钟非递减，顺带
+            # 丢弃 60 窗前旧窗。
+            counts = {
+                "health": [0, None, None],
+                "drain": [0, None, None],
+                "circuit": [0, None, None],
+                "overload": [0, None, None],
+            }
             history[window] = counts
             cutoff = window - 59
             for old in [w for w in history if w < cutoff]:
                 del history[old]
-        counts[reason] = min(METRIC_CAP, counts[reason] + 1)
+        entry = counts[reason]
+        entry[0] = min(METRIC_CAP, entry[0] + 1)
+        # first 仅在首次事件时记录；last 每次事件都更新（封顶后亦然）。
+        if entry[1] is None:
+            entry[1] = now
+        entry[2] = now
 
     def overload_window(now):
         """取 now//60 窗的过载分钟历史计数行（惰性建窗，空窗不预建），只保留
@@ -4005,7 +4048,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "oq",
             "mr", "mg", "mh",
-            "ms", "mx", "rh", "ra", "ma", "lp",
+            "ms", "mx", "rh", "rt", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "br",
             "ru", "ea", "eh", "pa", "ph",
@@ -4134,10 +4177,12 @@ def run(raw):
                 # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
                 # ci 成功即清空。
                 "samples": {},
-                # 不可用原因分钟历史（rh）：window -> 固定键序
-                # health,drain,circuit,overload 的计数对象，仅保留最近 60
-                # 窗，空窗不预建；各计数封顶 10^18，仅在状态转换或 oa 因
-                # 连接达 cap 入队时记账。remove 后重加与 ci 成功即清空。
+                # 不可用原因分钟历史（rh/rt）：window -> 固定键序
+                # health,drain,circuit,overload 的对象，每因布局
+                # [count,first,last]，仅保留最近 60 窗，空窗不预建；计数
+                # 封顶 10^18，first/last 为首次/最近事件的 now（封顶后
+                # last 仍更新），仅在状态转换或 oa 因连接达 cap 入队时记账。
+                # remove 后重加与 ci 成功即清空。
                 "reason_hist": {},
             }
             results.append({"op": "add", "ok": True})
@@ -5513,10 +5558,10 @@ def run(raw):
                 if counts is None:
                     health = drain = circuit = overload = 0
                 else:
-                    health = counts["health"]
-                    drain = counts["drain"]
-                    circuit = counts["circuit"]
-                    overload = counts["overload"]
+                    health = counts["health"][0]
+                    drain = counts["drain"][0]
+                    circuit = counts["circuit"][0]
+                    overload = counts["overload"][0]
                 windows.append(
                     {
                         "window": window,
@@ -5527,6 +5572,40 @@ def run(raw):
                     }
                 )
             results.append({"op": "rh", "id": backend_id, "windows": windows})
+
+        elif op[0] == "rt":
+            # 原因事件时刻只读查询：校验次序同 rh——未知 id 报 BACKEND，
+            # from 早于最近 60 窗下界报 STATE；不改任何历史，失败批次天然
+            # 回滚。返回键序 op,id,windows；windows 覆盖 from..to 并升序，
+            # 项键序 window,health,drain,circuit,overload，四因各为键序
+            # count,first,last 的对象：count 为该窗该因事件数（封顶 10^18），
+            # first/last 为首次/最近事件的 now（封顶后 last 仍更新），无事件
+            # 取 0,null,null。逐项拷贝当下值，避免结果被批次内后续记账污染。
+            _, backend_id, start, end, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = record["reason_hist"]
+            windows = []
+            for window in range(start, end + 1):
+                counts = history.get(window)
+                entry = {"window": window}
+                for name in ("health", "drain", "circuit", "overload"):
+                    # 无该窗或该因无事件：0,null,null；first 仅首次事件时
+                    # 记录，last 每次事件更新（计数封顶后亦然）。
+                    if counts is None or counts[name][0] == 0:
+                        entry[name] = {"count": 0, "first": None, "last": None}
+                    else:
+                        count, first, last = counts[name]
+                        entry[name] = {
+                            "count": count, "first": first, "last": last,
+                        }
+                windows.append(entry)
+            results.append({"op": "rt", "id": backend_id, "windows": windows})
 
         elif op[0] == "ra":
             # 全池不可用原因汇总（只读）：from 早于最近 60 窗下界报 STATE
@@ -5551,7 +5630,7 @@ def run(raw):
                     entry = {"id": backend_id}
                     for reason in ("health", "drain", "circuit", "overload"):
                         # 缺窗：该项为 0，求和不受影响。
-                        value = 0 if counts is None else counts[reason]
+                        value = 0 if counts is None else counts[reason][0]
                         entry[reason] = value
                         total[reason] = min(METRIC_CAP, total[reason] + value)
                     entries.append(entry)
