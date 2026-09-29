@@ -416,6 +416,20 @@ max(0,now//60-59) 报 STATE/4，依次判定。remove 后同 id 重加及 ci/cb/
 库；紧凑 UTF-8 固定键序 JSON、单末尾换行及 record/replay 逐字节契约照
 常，xa、xh 不变。
 
+池级重试/重映射告警概览：xp 精确键序 op,from,to,now（键须按此序出现），
+from/to/now 为 0..10^9 非 bool 整数，now 进入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60。返回键序 op,backends,total：backends 仅
+列现存后端并按 id 的 UTF-8 字节升序，项键序 id,R,M，R/M 各按
+state,raised,cleared——state 为该 (id,k) 当前 xa 状态（N/A），未评估取
+N，raised/cleared 为闭区间 [from,to] 内现存历史的 N→A、A→N 次数；total
+键序 R,M，各按 alerting,raised,cleared——alerting 为当前 A 态后端数，
+raised/cleared 为全部后端明细之和，三值封顶 10^18；空池返回空数组与全零
+total。xp 只读：不推进 xa 状态机、不裁剪历史。键序、类型、范围、关系或
+时钟倒退报 INPUT/2；from 早于 max(0,now//60-59) 报 STATE/4，依次判定。
+remove 后同 id 重加及 ci/cb/ca 成功清空告警与历史；失败批回滚。xp 时间
+O(B log B+60B)、额外空间 O(B)，仅标准库；紧凑 UTF-8 固定键序 JSON、单
+末尾换行及 record/replay 逐字节契约照常，xa、xh、xg 不变。
+
 后端采样历史：ms 键集 op,id,now（now 为 [0,10^9] 非 bool 整数，纳入共用
 非递减时钟），id 须现存否则 BACKEND。每次采样记录该后端当时的活动连接数
 与 removed——removed 沿用 mg 的取值与优先级（drain、health、circuit、
@@ -2079,7 +2093,7 @@ def parse_op(raw_op):
         "lh",
         "lt",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -2833,6 +2847,21 @@ def parse_op(raw_op):
             "xg", parse_backend_id(raw_op["id"]),
             kind, start, end, now,
         )
+
+    if name == "xp":
+        # 池级 R/M 告警概览查询：精确键序 op,from,to,now（键须按此序出现），
+        # 只读；from/to/now 为 0..10^9 非 bool 整数；窗关系
+        # from≤to≤now//60 且 to-from<60，非法即 INPUT；now 纳入共用非
+        # 递减时钟（倒退执行期判 INPUT）。from 过早留执行期判 STATE。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("xp", start, end, now)
 
     if name == "ms":
         if keys != {"op", "id", "now"}:
@@ -4881,7 +4910,7 @@ def run(raw):
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
-            "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg",
+            "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "cp", "cq", "ca",
         ):
             now = op[-1]
@@ -8476,6 +8505,65 @@ def run(raw):
                  "state": state, "last": last_window,
                  "total": raised + cleared, "raised": raised,
                  "cleared": cleared}
+            )
+
+        elif op[0] == "xp":
+            # 池级重试/重映射告警概览（只读）：from 早于最近 60 窗下界报
+            # STATE（同 xg）；不推进告警状态机、不裁剪历史，失败批次天然回
+            # 滚。backends 仅列现存后端，按 id 的 UTF-8 字节升序，项键序
+            # id,R,M；R/M 各按 state,raised,cleared——state 取该 (id,k) 当
+            # 前 xa 状态（未首评为 N），raised/cleared 为闭区间 [from,to]
+            # 内现存历史的 N→A、A→N 事件数。total 键序 R,M，各按
+            # alerting,raised,cleared：alerting 为当前 A 态后端数，后二值
+            # 为明细之和；三值封顶 10^18。空池 backends 为空数组、total 全
+            # 零。每后端两键历史各至多 60 项，时间 O(B log B+60B)、额外
+            # 空间 O(B)。
+            _, start, end, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            total = {
+                "R": {"alerting": 0, "raised": 0, "cleared": 0},
+                "M": {"alerting": 0, "raised": 0, "cleared": 0},
+            }
+            entries = []
+            for backend_id in sorted(backends, key=encode_backend_id):
+                item = {"id": backend_id, "R": None, "M": None}
+                for kind_code in ("R", "M"):
+                    entry = retry_alerts.get((backend_id, kind_code))
+                    state = "N" if entry is None else entry["state"]
+                    raised = 0
+                    cleared = 0
+                    history = retry_events.get((backend_id, kind_code))
+                    if history is not None:
+                        for event in history:
+                            if start <= event["window"] <= end:
+                                if event["to"] == "A":
+                                    # N→A。
+                                    raised += 1
+                                else:
+                                    # A→N。
+                                    cleared += 1
+                    kind_total = total[kind_code]
+                    if state == "A":
+                        kind_total["alerting"] = min(
+                            METRIC_CAP, kind_total["alerting"] + 1
+                        )
+                    kind_total["raised"] = min(
+                        METRIC_CAP, kind_total["raised"] + raised
+                    )
+                    kind_total["cleared"] = min(
+                        METRIC_CAP, kind_total["cleared"] + cleared
+                    )
+                    item[kind_code] = {
+                        "state": state,
+                        "raised": raised,
+                        "cleared": cleared,
+                    }
+                entries.append(item)
+            results.append(
+                {"op": "xp", "backends": entries, "total": total}
             )
 
         elif op[0] == "fx":
