@@ -5131,6 +5131,471 @@ class WaitPercentileTest(unittest.TestCase):
         )
 
 
+class WaitAlertTest(unittest.TestCase):
+    """wa 排队等待分位告警：单窗 wp 口径、各 kind 独立 N/A 滞回状态机、
+    同窗缓存、变参/跳窗/窗口与时钟拒绝、ci 清空及 record/replay。"""
+
+    def results(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        if isinstance(ops, (bytes, bytearray)):
+            raw = bytes(ops)
+        else:
+            raw = encode_ops(ops)
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code, raw)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def oa(cid, now, key="k"):
+        return {"op": "oa", "cid": cid, "flow": FLOW,
+                "c": "k", "s": "k", "key": key, "now": now}
+
+    @staticmethod
+    def close(cid, now):
+        return {"op": "close", "cid": cid, "now": now}
+
+    @staticmethod
+    def wa(kind, w, now, p=100, hi=1, lo=0, n=1):
+        return {"op": "wa", "kind": kind, "w": w, "p": p,
+                "hi": hi, "lo": lo, "n": n, "now": now}
+
+    def base_ops(self, cap=1, q=20, ttl=100000):
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": cap, "q": q, "ttl": ttl},
+        ]
+
+    def scenario_start(self):
+        """c1 在 now=0 立即建连为活动连接；返回 (ops, active, 下一序号)。"""
+        ops = self.base_ops() + [self.oa("c1", 0)]
+        return ops, "c1", 2
+
+    def admit_high(self, ops, active, index, w):
+        """在窗 w 制造一个 bucket1（d=1）的 admitted 样本。
+        入队于 60w，于 60w+1 接纳，返回新活动 cid。"""
+        cid = "c%d" % index
+        t = 60 * w
+        ops += [
+            self.oa(cid, t),
+            self.close(active, t + 1),
+            {"op": "ot", "now": t + 1},
+        ]
+        return cid
+
+    def admit_low(self, ops, active, index, w):
+        """在窗 w 制造一个 bucket0（d=0）的 admitted 样本。
+        入队与接纳同在 60w，返回新活动 cid。"""
+        cid = "c%d" % index
+        t = 60 * w
+        ops += [
+            self.oa(cid, t),
+            self.close(active, t),
+            {"op": "ot", "now": t},
+        ]
+        return cid
+
+    def wa_results(self, results):
+        return [r for r in results if r.get("op") == "wa"]
+
+    # ---- 键序、空窗与单窗 wp 口径 ----
+
+    def test_empty_window_is_zero_null_null_from_N(self):
+        out = self.results(
+            self.base_ops() + [self.wa("A", 0, 60)]
+        )[-1]
+        self.assertEqual(
+            list(out),
+            ["op", "kind", "w", "p", "state", "samples", "bucket",
+             "upper", "run", "changed"],
+        )
+        self.assertEqual(out["op"], "wa")
+        self.assertEqual(out["kind"], "A")
+        self.assertEqual(out["w"], 0)
+        self.assertEqual(out["p"], 100)
+        self.assertEqual(out["state"], "N")
+        self.assertEqual(out["samples"], 0)
+        self.assertIsNone(out["bucket"])
+        self.assertIsNone(out["upper"])
+        self.assertEqual(out["run"], 0)
+        self.assertFalse(out["changed"])
+
+    def test_single_window_uses_wp_buckets_and_uppers(self):
+        # c1 活动、c2..c6 排队；接纳延迟 0/1/10 落窗 0，100/101 落窗 1。
+        ops, active, _ = self.scenario_start()
+        ops += [self.oa("c%d" % i, 0) for i in range(2, 7)]
+        leaves = [("c1", 0), ("c2", 1), ("c3", 10),
+                  ("c4", 100), ("c5", 101)]
+        for cid, leave in leaves:
+            ops += [self.close(cid, leave), {"op": "ot", "now": leave}]
+        # 窗 0：桶 0/1/2 各 1；p=100 取最末非空桶 2，upper=10。
+        out = self.results(ops + [self.wa("A", 0, 120)])[-1]
+        self.assertEqual(out["samples"], 3)
+        self.assertEqual(out["bucket"], 2)
+        self.assertEqual(out["upper"], 10)
+        # 窗 1：桶 3/4 各 1；p=100 取桶 4，upper=null。
+        out = self.results(ops + [self.wa("A", 1, 120)])[-1]
+        self.assertEqual(out["samples"], 2)
+        self.assertEqual(out["bucket"], 4)
+        self.assertIsNone(out["upper"])
+
+    def test_percentile_rank_picks_bucket(self):
+        # 窗 0：桶 0 两个样本（d=0）、桶 2 一个（d=10）。
+        def build():
+            ops, active, _ = self.scenario_start()
+            ops += [self.oa("c2", 0), self.oa("c3", 0), self.oa("c4", 0)]
+            ops += [
+                self.close("c1", 0), {"op": "ot", "now": 0},
+                self.close("c2", 0), {"op": "ot", "now": 0},
+                self.close("c3", 10), {"op": "ot", "now": 10},
+            ]
+            return ops
+        ops = build()
+        # 不同 p 须独立批次（同窗异参属变参 STATE）。
+        self.assertEqual(self.results(ops + [self.wa("A", 0, 60, p=1)])[-1]["bucket"], 0)
+        self.assertEqual(self.results(ops + [self.wa("A", 0, 60, p=67)])[-1]["bucket"], 2)
+        self.assertEqual(self.results(ops + [self.wa("A", 0, 60, p=100)])[-1]["bucket"], 2)
+
+    def test_kind_letters_are_independent_state_machines(self):
+        # 窗 0 仅一个 admitted bucket1 样本；E/C/V 无样本。
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        ops += [
+            self.wa("A", 0, 60, hi=1, lo=0),
+            self.wa("E", 0, 60, hi=1, lo=0),
+            self.wa("C", 0, 60, hi=1, lo=0),
+            self.wa("V", 0, 60, hi=1, lo=0),
+        ]
+        out = {r["kind"]: r for r in self.wa_results(self.results(ops))}
+        self.assertTrue(out["A"]["changed"])
+        self.assertEqual(out["A"]["state"], "A")
+        self.assertEqual(out["A"]["bucket"], 1)
+        for kind in ("E", "C", "V"):
+            self.assertEqual(out[kind]["state"], "N")
+            self.assertFalse(out[kind]["changed"])
+            self.assertEqual(out[kind]["samples"], 0)
+            self.assertIsNone(out[kind]["bucket"])
+
+    def test_kind_letters_map_to_wait_histories(self):
+        # A：admitted d=1 -> 桶1。
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        out = self.results(ops + [self.wa("A", 0, 60)])[-1]
+        self.assertEqual((out["samples"], out["bucket"], out["upper"]),
+                         (1, 1, 1))
+        # C：oc 在时钟推进到 5 后取消，d=5 落桶2。
+        ops = self.base_ops() + [self.oa("c1", 0), self.oa("c2", 0),
+                                 {"op": "oq", "now": 5},
+                                 {"op": "oc", "cid": "c2"}]
+        out = self.results(ops + [self.wa("C", 0, 60)])[-1]
+        self.assertEqual((out["samples"], out["bucket"], out["upper"]),
+                         (1, 2, 10))
+        # E：ttl=10 到期，d=10 落桶2。
+        ops = self.base_ops(ttl=10) + [
+            self.oa("c1", 0), self.oa("c2", 0), {"op": "ot", "now": 10},
+        ]
+        out = self.results(ops + [self.wa("E", 0, 60)])[-1]
+        self.assertEqual((out["samples"], out["bucket"], out["upper"]),
+                         (1, 2, 10))
+        # V：H 模式头淘汰 d=5 落桶2。
+        ops = self.base_ops(q=1) + [
+            {"op": "rp", "mode": "H"},
+            self.oa("c0", 0, key="k0"),
+            self.oa("c1", 0, key="k1"),
+            self.oa("c2", 5, key="k2"),
+        ]
+        out = self.results(ops + [self.wa("V", 0, 60)])[-1]
+        self.assertEqual((out["samples"], out["bucket"], out["upper"]),
+                         (1, 2, 10))
+
+    # ---- N/A 滞回状态机 ----
+
+    def test_hi_boundary_inclusive_transitions_to_A(self):
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)  # bucket1>=hi=1
+        out = self.results(ops + [self.wa("A", 0, 60, hi=1, lo=0)])[-1]
+        self.assertEqual(out["state"], "A")
+        self.assertTrue(out["changed"])
+        self.assertEqual(out["run"], 0)
+
+    def test_n_run_accumulates_then_transitions(self):
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        ops.append(self.wa("A", 0, 60, hi=1, lo=0, n=2))      # run=1
+        # 窗 1 空窗：方向不符清 0。
+        ops.append(self.wa("A", 1, 120, hi=1, lo=0, n=2))
+        active = self.admit_high(ops, active, idx + 1, 2)
+        ops.append(self.wa("A", 2, 180, hi=1, lo=0, n=2))      # run=1
+        active = self.admit_high(ops, active, idx + 2, 3)
+        ops.append(self.wa("A", 3, 240, hi=1, lo=0, n=2))      # run=2->A
+        seq = [(r["w"], r["state"], r["run"], r["changed"])
+               for r in self.wa_results(self.results(ops))]
+        self.assertEqual(seq, [
+            (0, "N", 1, False),
+            (1, "N", 0, False),
+            (2, "N", 1, False),
+            (3, "A", 0, True),
+        ])
+
+    def test_empty_window_clears_run_in_A(self):
+        # n=1：窗 0 bucket1 转 A；窗 1 空窗 bucket=null 不满足 <=lo，留 A
+        # run=0；窗 2 bucket0<=lo=0 转回 N。
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        ops.append(self.wa("A", 0, 60, hi=1, lo=0))            # A
+        ops.append(self.wa("A", 1, 120, hi=1, lo=0))           # 空窗留 A
+        active = self.admit_low(ops, active, idx + 1, 2)
+        ops.append(self.wa("A", 2, 180, hi=1, lo=0))           # bucket0->N
+        seq = [(r["w"], r["state"], r["run"], r["changed"], r["bucket"])
+               for r in self.wa_results(self.results(ops))]
+        self.assertEqual(seq, [
+            (0, "A", 0, True, 1),
+            (1, "A", 0, False, None),
+            (2, "N", 0, True, 0),
+        ])
+
+    def test_lo_boundary_inclusive_transitions_to_N(self):
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        ops.append(self.wa("A", 0, 60, hi=1, lo=0))
+        active = self.admit_low(ops, active, idx + 1, 1)
+        ops.append(self.wa("A", 1, 120, hi=1, lo=0))
+        self.assertEqual(
+            [(r["state"], r["changed"])
+             for r in self.wa_results(self.results(ops))],
+            [("A", True), ("N", True)],
+        )
+
+    def test_other_kinds_keep_state_when_one_kind_transitions(self):
+        # A 在窗0转 A；窗1 A 给低样本转回 N，期间 E 始终无样本留 N，二者
+        # 状态互不影响。
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        ops += [self.wa("A", 0, 60), self.wa("E", 0, 60)]
+        active = self.admit_low(ops, active, idx + 1, 1)
+        ops += [self.wa("A", 1, 120), self.wa("E", 1, 120)]
+        out = self.wa_results(self.results(ops))
+        a = [r for r in out if r["kind"] == "A"]
+        e = [r for r in out if r["kind"] == "E"]
+        self.assertEqual([(r["state"], r["changed"]) for r in a],
+                         [("A", True), ("N", True)])
+        self.assertEqual([(r["state"], r["changed"]) for r in e],
+                         [("N", False), ("N", False)])
+
+    # ---- 同窗缓存 ----
+
+    def test_same_window_same_params_returns_cached_result(self):
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        ops += [
+            self.wa("A", 0, 60),
+            self.wa("A", 0, 120),   # 同窗同参，时钟可继续走
+        ]
+        out = self.wa_results(self.results(ops))
+        self.assertEqual(out[0], out[1])
+        self.assertTrue(out[1]["changed"])
+
+    def test_cached_does_not_advance_state_machine(self):
+        # 窗0 转 A；窗0 重报返回缓存 A；窗1 低样本仍从 A 出发（n=1）转 N。
+        # 缓存评估取 now=60，以便随后在 60 入队并于窗1 接纳 bucket0 样本。
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        ops += [self.wa("A", 0, 60), self.wa("A", 0, 60)]
+        active = self.admit_low(ops, active, idx + 1, 1)
+        ops.append(self.wa("A", 1, 120))
+        seq = [(r["w"], r["state"], r["changed"])
+               for r in self.wa_results(self.results(ops))]
+        self.assertEqual(seq, [(0, "A", True), (0, "A", True),
+                               (1, "N", True)])
+
+    def test_same_window_changed_param_is_state(self):
+        base = self.base_ops() + [self.wa("A", 0, 60, p=100, hi=2, lo=1, n=1)]
+        for second in (
+            self.wa("A", 0, 60, p=99, hi=2, lo=1, n=1),
+            self.wa("A", 0, 60, p=100, hi=3, lo=1, n=1),
+            self.wa("A", 0, 60, p=100, hi=2, lo=0, n=1),
+            self.wa("A", 0, 60, p=100, hi=2, lo=1, n=2),
+        ):
+            self.assert_failure(base + [second], 4, "STATE")
+
+    def test_param_change_next_window_is_state(self):
+        base = self.base_ops() + [self.wa("A", 0, 60, p=100, hi=2, lo=1, n=1)]
+        for second in (
+            self.wa("A", 1, 120, p=99, hi=2, lo=1, n=1),
+            self.wa("A", 1, 120, p=100, hi=3, lo=1, n=1),
+            self.wa("A", 1, 120, p=100, hi=2, lo=0, n=1),
+            self.wa("A", 1, 120, p=100, hi=2, lo=1, n=2),
+        ):
+            self.assert_failure(base + [second], 4, "STATE")
+
+    def test_other_kind_same_window_is_independent_first_eval(self):
+        # A 首评后，同窗 E 是其自身首评（非缓存、非变参）。
+        ops = self.base_ops() + [
+            self.wa("A", 0, 60), self.wa("E", 0, 60),
+        ]
+        out = self.wa_results(self.results(ops))
+        self.assertEqual([r["kind"] for r in out], ["A", "E"])
+        self.assertEqual([r["run"] for r in out], [0, 0])
+
+    # ---- 跳窗与窗口关系 ----
+
+    def test_skip_window_is_state(self):
+        base = self.base_ops() + [self.wa("A", 0, 60)]
+        self.assert_failure(base + [self.wa("A", 2, 180)], 4, "STATE")
+
+    def test_window_rollback_is_state(self):
+        # 先评窗1 再评窗0 属回退跳窗。
+        base = self.base_ops() + [self.wa("A", 1, 120)]
+        self.assert_failure(base + [self.wa("A", 0, 120)], 4, "STATE")
+
+    def test_window_not_ended_is_state(self):
+        # now=0 当前窗0，w=0 尚未结束。
+        self.assert_failure(
+            self.base_ops() + [self.wa("A", 0, 0)], 4, "STATE"
+        )
+        # w 等于当前窗同样未结束。
+        self.assert_failure(
+            self.base_ops() + [self.wa("A", 2, 120)], 4, "STATE"
+        )
+
+    def test_window_too_old_is_state(self):
+        # now=3600 当前窗60，下界为 1；w=0 超出最近 60 窗。
+        self.assert_failure(
+            self.base_ops() + [self.wa("A", 0, 3600)], 4, "STATE"
+        )
+
+    def test_retention_boundary_w_accepted(self):
+        # w=current-59=1 恰在保留下界上，合法。
+        out = self.results(
+            self.base_ops() + [self.wa("A", 1, 3600)]
+        )[-1]
+        self.assertEqual(out["w"], 1)
+
+    def test_unconfigured_os_is_state(self):
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1},
+             self.wa("A", 0, 60)],
+            4, "STATE",
+        )
+
+    def test_clock_regression_is_input(self):
+        self.assert_failure(
+            self.base_ops() + [
+                self.wa("A", 0, 120),
+                self.wa("A", 1, 60),
+            ],
+            2, "INPUT",
+        )
+
+    # ---- 输入校验 ----
+
+    def test_input_violations(self):
+        bad_ops = [
+            # 键序不符（须 op,kind,w,p,hi,lo,n,now）。
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"now":60,"n":1}]}',
+            # 缺键、多键。
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"n":1,"now":60,"x":1}]}',
+            # kind：全称、小写、非串。
+            b'{"ops":[{"op":"wa","kind":"admitted","w":0,"p":1,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"a","w":0,"p":1,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"B","w":0,"p":1,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":1,"w":0,"p":1,"hi":1,"lo":0,"n":1,"now":60}]}',
+            # p：bool、越界 0/101、浮点、字符串。
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":true,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":0,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":101,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1.0,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":"1","hi":1,"lo":0,"n":1,"now":60}]}',
+            # hi/lo：bool、越界、浮点。
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":true,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":5,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":-1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":4,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1.0,"lo":0,"n":1,"now":60}]}',
+            # lo<hi 关系：lo==hi。
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":1,"n":1,"now":60}]}',
+            # n：bool、越界 0/61、浮点。
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"n":true,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"n":0,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"n":61,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"n":1.0,"now":60}]}',
+            # w/now：bool、负数、超 10^9。
+            b'{"ops":[{"op":"wa","kind":"A","w":false,"p":1,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":-1,"p":1,"hi":1,"lo":0,"n":1,"now":60}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"n":1,"now":1000000001}]}',
+            b'{"ops":[{"op":"wa","kind":"A","w":0,"p":1,"hi":1,"lo":0,"n":1,"now":true}]}',
+        ]
+        for raw in bad_ops:
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual(code, 2, raw)
+            self.assertEqual(stdout, b"")
+            self.assertEqual(stderr, b'{"error":"INPUT"}\n', raw)
+
+    # ---- 失败批回滚、ci 清空、record/replay ----
+
+    def test_failed_batch_rolls_back(self):
+        # oc 取消成功记账后批内后续操作非法：整批回滚，无 stdout。
+        ops = self.base_ops() + [
+            self.oa("c1", 0), self.oa("c2", 0),
+            {"op": "oq", "now": 5},
+            {"op": "oc", "cid": "c2"},
+            self.wa("C", 0, 60),
+            {"op": "oc", "cid": "ghost"},
+        ]
+        self.assert_failure(ops, 5, "CONNECTION")
+
+    def test_ci_clears_wait_alerts(self):
+        # 窗0 admitted bucket1，wa 首评即转 A。
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)
+        ops += [self.wa("A", 0, 60), {"op": "ce"}]
+        exported = self.results(ops)
+        config = next(r for r in exported if r["op"] == "ce")["config"]
+        # 关闭活动连接后 ci 成功；wa 状态被清空。
+        ops += [
+            self.close(active, 119),
+            {"op": "ci", "now": 3600, "config": config},
+            # 若未清空，w=59 相对旧 w=0 为跳窗报 STATE；清空后为全新首评。
+            self.wa("A", 59, 3600),
+            # 再评 +1 窗也合法（序列已重置）。
+            self.wa("A", 60, 3660),
+        ]
+        out = self.wa_results(self.results(ops))
+        self.assertEqual(out[0]["state"], "A")
+        # ci 后两次评估均为全新首评：空窗 N、run=0、无转换。
+        self.assertEqual((out[1]["w"], out[1]["state"], out[1]["changed"],
+                          out[1]["samples"]), (59, "N", False, 0))
+        self.assertEqual((out[2]["w"], out[2]["state"], out[2]["changed"],
+                          out[2]["samples"]), (60, "N", False, 0))
+
+    def test_record_replay_covers_wa(self):
+        ops, active, idx = self.scenario_start()
+        active = self.admit_high(ops, active, idx, 0)   # 窗0 bucket1
+        ops.append(self.wa("A", 0, 60, hi=1, lo=0))     # -> A
+        ops.append(self.wa("A", 0, 60))                 # 同窗缓存
+        active = self.admit_low(ops, active, idx + 1, 1)
+        ops.append(self.wa("A", 1, 120, hi=1, lo=0))    # bucket0 -> N
+        ops.append(self.wa("E", 0, 120))                # 另一 kind 首评
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 class RecordReplayTest(unittest.TestCase):
     """核心输入经 record、replay 逐字节复现退出码、stdout、stderr。"""
 
