@@ -27,6 +27,15 @@
 - 返回键序 `op,id,w,state,samples,peak,run,changed`；`state` 仅 N/A，`changed` 仅转换时为 true。
 - 键序、id 编码、类型、范围、关系或时钟倒退报 INPUT/2；未知 id 报 BACKEND/3；窗口未结束或过旧、跳窗、变参报 STATE/4。remove 后重加及 ci/cb/ca/cu 成功清状态，失败批次回滚。时间 O(1)、额外空间 O(B)，仅用标准库。
 
+## 限流告警：le
+
+每 (scope,id) 独立的限流滞回告警，窗值取该标识 `lh` 的 `w` 窗 `token`/`quota`（空窗均为 0），`value` 为二者之和并封顶 10^18。
+
+- `le`：精确键序 `op,scope,id,w,hi,lo,n,now`（键须按此序出现）；`scope` 仅 B/C/S，`id` 沿用 `ls` 的非空 UTF-8 串校验（B 未知 id、无桶无配额留执行期判），`w`/`now` ∈ [0,10⁹]、`hi` ∈ [1,10¹⁸]、`lo` ∈ [0,10¹⁸)、`n` ∈ [1,60]，均为非 bool 整数且 `lo<hi`；`now` 纳入共用非递减时钟，须 `max(0,now//60-59)≤w<now//60`。
+- 各标识首评固化 `hi/lo/n` 并自 N 态起评：N 态连续 `n` 窗 `value≥hi` 转 A；A 态连续 `n` 窗 `value≤lo` 转 N；否则连续数清 0，转换后亦为 0。`w` 此后仅同值或 +1；同窗同参返回首评结果、不推进状态机。
+- 返回键序 `op,scope,id,w,state,token,quota,value,run,changed`；`state` 仅 N/A，`changed` 仅转换时为 true。
+- 键序、scope、id 编码、类型、范围、关系或时钟倒退报 INPUT/2；B 未知 id 报 BACKEND/3；无桶且无配额、窗口未结束或过旧、跳窗、变参报 STATE/4。`ls`/`qs` 重配不清；remove 后重加及 ci/cb/ca/cu 成功清状态，失败批次回滚。时间 O(1)、额外空间 O(K)，仅用标准库。
+
 ## 测试
 
     python -m unittest discover
