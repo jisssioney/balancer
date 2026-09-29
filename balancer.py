@@ -2105,6 +2105,7 @@ def parse_op(raw_op):
         "ts", "tm", "te", "tk", "tg", "tx",
         "ep", "fw",
         "ru",
+        "mu",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -2648,6 +2649,14 @@ def parse_op(raw_op):
         if list(raw_op) != ["op", "now"]:
             fail(EXIT_INPUT, "INPUT")
         return ("oq", parse_metric_num(raw_op["now"]))
+
+    if name == "mu":
+        # 池级统一观测：精确键序 op,now（键须按此序出现），只读；now 为
+        # 0..10^9 非 bool 整数，纳入共用非递减时钟（倒退执行期判 INPUT）。
+        # 除推进时钟外不改变任何状态。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("mu", parse_metric_num(raw_op["now"]))
 
     if name == "mr":
         if keys != {"op", "id", "ok", "ms", "retries", "remaps", "now"}:
@@ -4911,6 +4920,7 @@ def run(raw):
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
+            "mu",
             "cp", "cq", "ca",
         ):
             now = op[-1]
@@ -6354,6 +6364,59 @@ def run(raw):
                     }
                 )
             results.append({"op": "mh", "id": backend_id, "windows": windows})
+
+        elif op[0] == "mu":
+            # 池级统一观测（只读）：结果键序 op,window,backends；window=
+            # now//60；backends 列全部现存后端并按 id 的 UTF-8 字节升序，空
+            # 池为 []，项键序
+            # id,requests,qps,concurrency,errors,error_rate,latency,removed,
+            # retries,remaps。requests/errors/retries/remaps 与五整数
+            # latency 取该窗 mh 口径（record["metrics"]），缺窗为零；
+            # concurrency/removed 取同 now 的 mg 口径（活动连接数与
+            # removed_reason，removed ∈ null/drain/health/circuit/fault）。
+            # qps=requests/60、error_rate=100*errors/requests（零请求为 0）
+            # 均向下截为两位小数字符串。除共用时钟（循环开头统一推进）外不
+            # 写任何状态，失败批次天然回滚。排序 O(B log B)，removed 的
+            # fault 判定 bisect 故障时间线 O(log(T+1))，合计时间
+            # O(B log B+B log(T+1))、结果空间 O(B)。
+            _, now = op
+            window = now // 60
+            items = []
+            for backend_id in sorted(backends, key=encode_backend_id):
+                record = backends[backend_id]
+                metrics = record["metrics"].get(window)
+                if metrics is None:
+                    # 查询新窗（含从未 mr）按零计，不写回存储。
+                    requests = errors = retries = remaps = 0
+                    latency = [0, 0, 0, 0, 0]
+                else:
+                    requests = metrics[0]
+                    errors = metrics[1]
+                    retries = metrics[2]
+                    remaps = metrics[3]
+                    latency = list(metrics[4])
+                # qps=requests/60、error_rate=100*errors/requests 均下截两位。
+                qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
+                if requests == 0:
+                    error_rate = "0.00"
+                else:
+                    rate = errors * 10000 // requests
+                    error_rate = "%d.%02d" % divmod(rate, 100)
+                items.append(
+                    {
+                        "id": backend_id,
+                        "requests": requests,
+                        "qps": qps,
+                        "concurrency": record["conns"],
+                        "errors": errors,
+                        "error_rate": error_rate,
+                        "latency": latency,
+                        "removed": removed_reason(record, now),
+                        "retries": retries,
+                        "remaps": remaps,
+                    }
+                )
+            results.append({"op": "mu", "window": window, "backends": items})
 
         elif op[0] == "lp":
             # 后端延迟分位查询（只读）：未知 id 报 BACKEND，from 早于最近
