@@ -761,6 +761,20 @@ backends=[]。键序、now 类型或范围、时钟倒退报 INPUT/2；br 除推
 O(B log(T+1))、空间 O(B)（T 为单后端故障段数），仅用标准库；
 record/replay 逐字节覆盖。
 
+池级统一观测：mu 精确键序 op,now（键须按此序出现），now 为 0..10^9
+非 bool 整数，纳入共用非递减时钟。结果键序 op,window,backends，
+window=now//60；backends 按现存后端 id 的 UTF-8 字节升序，空池为 []，
+项键序 id,requests,qps,concurrency,errors,error_rate,latency,removed,
+retries,remaps。requests、errors、retries、remaps 及五整数 latency 沿用
+该窗 mh 存储（缺窗为 0，查询新窗不写回），concurrency 与 removed 取同
+now 的 mg 口径：concurrency 为活动连接数，removed 为
+null/drain/health/circuit/fault（优先级 drain>health>circuit>fault）。
+qps=requests/60、error_rate=100*errors/requests（零请求为 0）均向下截为
+两位小数字符串。键序、now 类型/范围或时钟倒退报 INPUT/2。mu 除推进时钟
+外只读，失败批回滚；沿用既有 JSON 字节契约，record/replay 逐字节覆盖。
+时间 O(B log B+B log(T+1))、空间 O(B)（T 为单后端故障段数），仅用标准
+库；其他子命令不变。
+
 故障重试：fr 键集 op,cid,flow,key,timeout,max,now，cid/flow/key 同
 fx，timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数，now 纳入
 共用非递减时钟。自 key 哈希点按 fx 顺序遍历不同后端至多 max 个（环同
@@ -2105,6 +2119,7 @@ def parse_op(raw_op):
         "ts", "tm", "te", "tk", "tg", "tx",
         "ep", "fw",
         "ru",
+        "mu",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -3044,6 +3059,14 @@ def parse_op(raw_op):
         if list(raw_op) != ["op", "now"]:
             fail(EXIT_INPUT, "INPUT")
         return ("br", parse_metric_num(raw_op["now"]))
+
+    if name == "mu":
+        # 池级统一观测：精确键序 op,now（键须按此序出现）；now 为
+        # 0..10^9 非 bool 整数，纳入共用非递减时钟；键序/类型/范围在此判
+        # INPUT，时钟倒退由批前通用时钟判定报 INPUT。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("mu", parse_metric_num(raw_op["now"]))
 
     if name == "ru":
         # 不可用时长查询：精确键序 op,id,now（键须按此序出现）；id 为非空
@@ -4912,6 +4935,7 @@ def run(raw):
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "cp", "cq", "ca",
+            "mu",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -7685,6 +7709,58 @@ def run(raw):
                     }
                 )
             results.append({"op": "br", "now": now, "backends": snapshot})
+
+        elif op[0] == "mu":
+            # 池级统一观测：除共用时钟按 now 推进外只读，失败批次天然回滚。
+            # backends 按现存后端 id 的 UTF-8 字节升序；每后端项同 mg 当前
+            # 窗口径：requests/errors/retries/remaps 与五整数 latency 取
+            # window=now//60 的 mh 存储（缺窗为 0），concurrency 取活动连接
+            # 数，removed 取同 now 的 mg 判定（null/drain/health/circuit/
+            # fault），qps/error_rate 下截两位小数字符串。排序 O(B log B)，
+            # 活动段查找每后端 O(log T_b)，整体 O(B log B+B log(T+1))、
+            # 空间 O(B)。
+            _, now = op
+            window = now // 60
+            snapshot = []
+            for backend_id in sorted(
+                backends, key=lambda bid: bid.encode("utf-8")
+            ):
+                record = backends[backend_id]
+                metrics = record["metrics"].get(window)
+                if metrics is None:
+                    # 缺窗（含从未 mr 或已跨入新窗）按零计，不写回存储。
+                    requests = errors = retries = remaps = 0
+                    latency = [0, 0, 0, 0, 0]
+                else:
+                    requests = metrics[0]
+                    errors = metrics[1]
+                    retries = metrics[2]
+                    remaps = metrics[3]
+                    latency = metrics[4]
+                # qps=requests/60、error_rate=100*errors/requests 均下截两位。
+                qps = "%d.%02d" % divmod(requests * 100 // 60, 100)
+                if requests == 0:
+                    error_rate = "0.00"
+                else:
+                    rate = errors * 10000 // requests
+                    error_rate = "%d.%02d" % divmod(rate, 100)
+                snapshot.append(
+                    {
+                        "id": backend_id,
+                        "requests": requests,
+                        "qps": qps,
+                        "concurrency": record["conns"],
+                        "errors": errors,
+                        "error_rate": error_rate,
+                        "latency": list(latency),
+                        "removed": removed_reason(record, now),
+                        "retries": retries,
+                        "remaps": remaps,
+                    }
+                )
+            results.append(
+                {"op": "mu", "window": window, "backends": snapshot}
+            )
 
         elif op[0] == "ru":
             # 不可用时长查询：除共用时钟按 now 推进（批前通用时钟块）外只读，
