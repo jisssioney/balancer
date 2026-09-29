@@ -716,6 +716,21 @@ op,base,target,rev,ok，base/target 为操作前后小写 SHA-256 摘要，rev �
 O(N)，N 为合成配置大小，仅用标准库；紧凑 UTF-8 固定键序 JSON、单换行
 及 record/replay 逐字节契约不变，其他子命令不变。
 
+配置变更审计：al 精确键序仅 op，只读、不推进时钟，返回键序 op,events，
+events 为保留事件快照、按 rev 升序。仅 ci（含带 base 的乐观并发形式）、
+cb、cu 或 ca 成功并分配新 rev 时追加一个事件；失败操作、cp 预约、
+cv/cd/pd/hd 等预览查询以及一切不分配 rev 的登记操作均不记。事件精确键序
+rev,now,kind,section,before,after：rev 为本次新分配的 rev，now 为该操作
+的显式时钟（ci/cu 取各自 now 原值，cb/ca 取其 now），kind 仅 ci/cb/cu/ca，
+section 仅 cu 取被替换的顶层字段、其余为 null，before/after 分别为操作
+前后规范化 version=11 配置按 ct 规则所得的小写 SHA-256；配置未变仍记录，
+两摘要可相同。审计初始为空，独立于 cl 的 16 条提交历史，按 rev 升序仅
+保留最近 64 条，成功配置变更不清空旧事件。重复 al 查询逐字节相同且不
+推进时钟。非法键集报 INPUT/2；批内后项失败天然回滚事件、rev、时钟与
+原状态（事件只在全部校验通过、状态提交后才追加）。追加均摊 O(1)，al
+查询 O(A)、额外空间 O(A)，A≤64，仅用标准库；沿用紧凑 UTF-8 固定键序
+JSON、末尾单换行与 record/replay 逐字节契约，其他子命令行为不变。
+
 H pick 记账：扩展 H 模式 pick，调度与映射行为不变，成功项仅记一次并归属
 返回 id。无旧映射记 first；旧目标合格且本次未判到期记 sticky；三键旧映射
 e 非 null 且 now≥e 记 expired（重选回原 id 也算 expired）；否则按旧目标
@@ -2125,7 +2140,7 @@ def parse_op(raw_op):
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "ce", "ci", "cl", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
-        "cp", "cq", "ca",
+        "cp", "cq", "ca", "al",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
         "br",
@@ -3427,6 +3442,12 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("cl",)
 
+    if name == "al":
+        # 配置变更审计查询：精确键序仅 op，只读、不推进时钟。
+        if list(raw_op) != ["op"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("al",)
+
     if name == "cb":
         # 配置回滚：精确键集 op,rev,now；rev 为 1..10^18 非 bool 整数
         # （是否仍被保留留执行期判 STATE），now 沿用 ci 并进入共用非递减
@@ -3772,6 +3793,19 @@ def run(raw):
     # ca 成功、ci/cb 成功均清除；其余操作不影响预约。额外空间 O(N)，N 为
     # 规范化配置大小。
     reservation = None
+    # 配置变更审计（al）：仅 ci（含带 base 的乐观并发形式）、cb、cu、ca
+    # 成功并分配新 rev 时追加一个事件，失败操作、cp 预约、cv/cd/pd/hd 等
+    # 预览与一切不分配 rev 的登记操作均不记。事件为全新 dict，精确键序
+    # rev,now,kind,section,before,after：rev 为本次新分配的 rev；now 为该
+    # 操作显式时钟（cb/ca 为 op.now，ci 三键与带 base 形式、cu 均为其
+    # now 原值，三键 ci 可能为任意非负非 bool 整数）；kind 仅 ci/cb/cu/ca；
+    # section 仅 cu 取被替换的顶层字段，其余为 None；before/after 分别为
+    # 操作前后规范化 version=11 配置按 ct 规则所得的小写 SHA-256（配置未
+    # 变也记录，两摘要可相同）。审计独立于 commit_history（后者仅留 16
+    # 条），按 rev 升序仅保留最近 64 条，追加与左端淘汰均摊还 O(1)；成功
+    # 配置变更不清空旧事件，初始为空。deque 保序即 rev 升序，额外空间
+    # O(A)，A≤64。
+    audit_events = deque()
     results = []
 
     def backend_routable(record, drain_strict=False):
@@ -4953,6 +4987,24 @@ def run(raw):
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
         mo_cache = None
+
+    def append_audit_event(rev, now, kind, section, before, after):
+        """成功配置变更（ci/cb/cu/ca 且分配新 rev）后追加审计事件。事件为
+        全新 dict、精确键序 rev,now,kind,section,before,after；before/after
+        已由调用方按 ct 规则算好。追加与左端淘汰均摊还 O(1)，仅留最近 64
+        条（按 rev 升序）。"""
+        audit_events.append(
+            {
+                "rev": rev,
+                "now": now,
+                "kind": kind,
+                "section": section,
+                "before": before,
+                "after": after,
+            }
+        )
+        if len(audit_events) > 64:
+            audit_events.popleft()
 
     for raw_op in ops:
         op = parse_op(raw_op)
@@ -7301,15 +7353,24 @@ def run(raw):
             # 配置载入，v1..v8 为默认 F/T；capacities 显式覆盖随配置原子
             # 替换，旧版或 [] 清空；硬时限按 lifetime 载入，null 或 v1..v10
             # 清除）。
+            before_digest = config_digest(export_config())
             apply_config(config, now)
+            after_export = export_config()
             # 成功后把规范化 version=11 配置存为提交：rev 从 1 起递增，
             # 仅保留最近 16 条；失败不分配、不改历史。export_config 产出
             # 全新结构（lifetime 为刚载入的登记值），提交后的 qp/rp/pc/tm
             # 修改不影响已存快照。
-            commit_history.append((next_rev, export_config()))
+            commit_history.append((next_rev, after_export))
+            new_rev = next_rev
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
+            # ci（含带 base 形式）成功并分配新 rev：追加审计事件；配置未变
+            # 也记录（before/after 可相同）。
+            append_audit_event(
+                new_rev, now, "ci", None,
+                before_digest, config_digest(after_export),
+            )
             # ci 成功清除既有配置预约。
             reservation = None
             results.append({"op": "ci", "ok": True})
@@ -7545,6 +7606,19 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "al":
+            # 配置变更审计（只读，不推进时钟）：events 按 rev 升序（deque
+            # 本就按分配序追加、仅留最近 64 条），事件为保留快照（逐项浅
+            # 拷贝，叶值皆 int/str/None，追加后不再变更），项精确键序
+            # rev,now,kind,section,before,after。初始为空；重复查询逐字节
+            # 相同。O(A)，A≤64。
+            results.append(
+                {
+                    "op": "al",
+                    "events": [dict(event) for event in audit_events],
+                }
+            )
+
         elif op[0] == "cb":
             # 配置回滚：按目标快照执行 ci 的原子替换与默认运行态重建，成功
             # 另建新 rev；全部校验先于任何变更，失败天然回滚时钟、配置、
@@ -7570,13 +7644,21 @@ def run(raw):
             # full 随快照恢复，队列清空且淘汰计数、最近淘汰 cid 重置（0、
             # null）；capacities 覆盖随快照恢复；硬时限按快照 lifetime
             # 载入，null 清除。
+            before_digest = config_digest(export_config())
             apply_config(parse_config(snapshot), now)
             # 原历史保留，追加新 rev 后再按 16 条淘汰。
-            commit_history.append((next_rev, export_config()))
+            after_export = export_config()
+            commit_history.append((next_rev, after_export))
             new_rev = next_rev
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
+            # cb 成功并分配新 rev：追加审计事件；before 为回滚前当前配置
+            # 摘要，after 为目标快照应用后的摘要。
+            append_audit_event(
+                new_rev, now, "cb", None,
+                before_digest, config_digest(after_export),
+            )
             # cb 成功清除既有配置预约。
             reservation = None
             results.append(
@@ -7635,6 +7717,12 @@ def run(raw):
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
+            # cu 成功并分配新 rev：追加审计事件，section 取被替换的顶层
+            # 字段；值未变时 before/after 可相同，仍记录。
+            append_audit_event(
+                new_rev, now, "cu", section,
+                before_digest, target_digest,
+            )
             # cu 成功清除既有配置预约。
             reservation = None
             results.append(
@@ -7714,12 +7802,20 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             if next_rev > 10 ** 18:
                 fail(EXIT_STATE, "STATE")
+            before_digest = config_digest(export_config())
             apply_config(parse_config(snapshot), now)
-            commit_history.append((next_rev, export_config()))
+            after_export = export_config()
+            commit_history.append((next_rev, after_export))
             new_rev = next_rev
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
+            # ca 成功并分配新 rev：追加审计事件；before 为生效前当前配置
+            # 摘要，after 为预约快照应用后的摘要。
+            append_audit_event(
+                new_rev, now, "ca", None,
+                before_digest, config_digest(after_export),
+            )
             reservation = None
             results.append(
                 {"op": "ca", "digest": digest, "rev": new_rev, "ok": True}
