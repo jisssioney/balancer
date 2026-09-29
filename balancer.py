@@ -372,6 +372,21 @@ remove 后同 id 重加及 ci/cb 成功清空历史；失败批回滚。ph 时�
 额外空间 O(60B)，仅标准库；紧凑 UTF-8 固定键序 JSON、单末尾换行及
 record/replay 逐字节契约照常；其他操作不变。
 
+每后端重试/重映射告警：xa 精确键序 op,id,k,w,hi,lo,n,now（键须按此序出
+现），id 沿用后端标识（未知 id 报 BACKEND/3），k 仅 R/M（分别取 w 窗 mh
+口径的 retries/remaps 累计值）；w、now 为 0..10^9，hi 为 1..10^18，lo 为
+0..(10^18-1)，n 为 1..60，皆为非 bool 整数且 lo<hi。now 纳入共用非递减
+时钟，须 max(0,now//60-59)≤w<now//60（w 窗已结束且在最近 60 窗保留范围
+内）。各 (id,k) 均从 N 态开始并独立维护，首评固化 hi/lo/n；取 w 窗 value
+（缺窗为 0），N 态连续 n 窗 value≥hi 转 A，A 态连续 n 窗 value≤lo 转 N，
+方向不符清 run，转换后 run=0。后续 w 仅可同前或 +1；同窗同参返回缓存结
+果且不推进状态机。结果键序 op,id,k,w,state,value,run,changed；state 仅
+N/A，value、run 为非负整数，changed 仅转换为 true。键序、id、k、类型、
+范围、关系或时钟非法报 INPUT/2；窗口未结束/过旧、跳窗（含回退）或变参
+报 STATE/4，依次判定。remove 后重加及 ci/cb/ca 成功清告警，失败批回滚。
+xa 时空 O(1)/O(B)，仅标准库；紧凑 UTF-8 固定键序 JSON、单末尾换行及
+record/replay 逐字节契约照常；mr/mh/rr 及其余操作行为不变。
+
 后端采样历史：ms 键集 op,id,now（now 为 [0,10^9] 非 bool 整数，纳入共用
 非递减时钟），id 须现存否则 BACKEND。每次采样记录该后端当时的活动连接数
 与 removed——removed 沿用 mg 的取值与优先级（drain、health、circuit、
@@ -1179,6 +1194,28 @@ def parse_quota_span(value):
         not isinstance(value, int)
         or isinstance(value, bool)
         or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_xa_hi(value):
+    # xa 的 hi ∈ [1,10^18]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 18
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_xa_lo(value):
+    # xa 的 lo ∈ [0,10^18)，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value < 10 ** 18
     ):
         fail(EXIT_INPUT, "INPUT")
     return value
@@ -2013,7 +2050,7 @@ def parse_op(raw_op):
         "lh",
         "lt",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -2691,6 +2728,37 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("ph", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "xa":
+        # 每后端重试/重映射告警：精确键序 op,id,k,w,hi,lo,n,now（键须按此
+        # 序出现）；id 沿用非空字符串校验（未知 id 留执行期判 BACKEND），
+        # k 仅 R/M（分别取 w 窗 mh 口径的 retries/remaps 累计值），w/now
+        # 为 0..10^9、hi 为 1..10^18、lo 为 0..(10^18-1)、n 为 1..60，皆为
+        # 非 bool 整数且 lo<hi；now 纳入共用非递减时钟（倒退执行期判
+        # INPUT）。键序/k/类型/范围/lo<hi 在此判 INPUT；窗关系
+        # max(0,now//60-59)≤w<now//60、跳窗与变参留执行期判 STATE。
+        if list(raw_op) != ["op", "id", "k", "w", "hi", "lo", "n", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        kind = raw_op["k"]
+        if not isinstance(kind, str) or kind not in ("R", "M"):
+            fail(EXIT_INPUT, "INPUT")
+        w = parse_metric_num(raw_op["w"])
+        hi = parse_xa_hi(raw_op["hi"])
+        lo = parse_xa_lo(raw_op["lo"])
+        if not lo < hi:
+            fail(EXIT_INPUT, "INPUT")
+        n = raw_op["n"]
+        if (
+            not isinstance(n, int)
+            or isinstance(n, bool)
+            or not 1 <= n <= 60
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_metric_num(raw_op["now"])
+        return (
+            "xa", parse_backend_id(raw_op["id"]),
+            kind, w, hi, lo, n, now,
+        )
 
     if name == "ms":
         if keys != {"op", "id", "now"}:
@@ -3513,6 +3581,15 @@ def run(raw):
     # 加删除其历史，ci/cb 成功整体清空；ph 只读，不推进告警也不清理历史。
     # 额外空间 O(60B)。
     percent_events = {}
+    # 每后端重试/重映射告警（xa）：以 (id, k) 为键（k ∈ R/M，分别取该后端
+    # w 窗 mh 口径的 retries/remaps 累计值），各 (id,k) 独立、未首评为缺键，
+    # 否则为 {"hi","lo","n","state","run","w","result"}——(hi,lo,n) 为首评
+    # 固化的阈值（hi 1..10^18、lo 0..(10^18-1)、lo<hi、n 1..60），state ∈
+    # N/A，run 为当前连续计数，w 为最近已评窗，result 为该窗结果（同窗同
+    # 参原样返回，不推进状态机）。无转换历史。remove 删除该后端全部键，同
+    # id 重加回到未首评，ci/cb/ca 成功整体清空。dict 查找/写入 O(1)，每后端
+    # 至多两键，额外空间 O(B)。
+    retry_alerts = {}
     # 配置提交历史（cl/cb）：(rev, 规范化 version=11 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
@@ -4522,7 +4599,7 @@ def run(raw):
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal hard_ttl_cfg
         nonlocal sticky_map, alert, alert_events, overload_hist, wait_hist, err_alerts
-        nonlocal err_events, percent_alerts, percent_events, wait_alerts
+        nonlocal err_events, percent_alerts, percent_events, wait_alerts, retry_alerts
         nonlocal mo_seq, mo_cache, queue_mode, dequeue_policy
         nonlocal full_mode, evict_count, evict_last, cap_overrides
         nonlocal limit_hist, aging_cfg
@@ -4700,6 +4777,9 @@ def run(raw):
         percent_alerts = {}
         # ci/cb 成功同时清空全部后端 pa 告警转换历史。
         percent_events = {}
+        # ci/cb/ca 成功清空全部后端重试/重映射告警（xa 各 (id,k) 均回到
+        # 未首评）。
+        retry_alerts = {}
         # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
@@ -4716,7 +4796,7 @@ def run(raw):
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
-            "ru", "ea", "eh", "pa", "ph",
+            "ru", "ea", "eh", "pa", "ph", "xa",
             "cp", "cq", "ca",
         ):
             now = op[-1]
@@ -4884,6 +4964,10 @@ def run(raw):
             percent_alerts.pop(backend_id, None)
             # remove 同时删除该后端的 pa 告警转换历史；同 id 重加不继承。
             percent_events.pop(backend_id, None)
+            # remove 删除该后端重试/重映射告警的 R/M 两键；同 id 重加各自
+            # 回到未首评。
+            retry_alerts.pop((backend_id, "R"), None)
+            retry_alerts.pop((backend_id, "M"), None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -8110,6 +8194,95 @@ def run(raw):
             results.append(
                 {"op": "ph", "id": backend_id, "events": events}
             )
+
+        elif op[0] == "xa":
+            # 每后端重试/重映射告警（每 (id,k) 独立状态机）：首评固化
+            # (hi,lo,n) 并自 N 态起评；此后阈值须相同且 w 仅同前（同窗同
+            # 参原样返回首评结果，不推进时钟外的状态机）或 +1，变参或跳窗
+            # （含回退）报 STATE。窗口越界（w 未结束或超出最近 60 窗保留
+            # 下界）同样 STATE；窗口判定先于阈值/缓存，与 pa/ea 同序。k=R
+            # 取该后端 w 窗 mh 口径 retries 累计，k=M 取 remaps 累计（缺窗
+            # value=0），皆为非负整数。N 态连续 n 窗 value>=hi 转 A，A 态
+            # 连续 n 窗 value<=lo 转 N；方向不符与转换后连续数清 0；转换时
+            # changed=true。返回键序 op,id,k,w,state,value,run,changed。xa
+            # 记账时间 O(1)、额外空间 O(B)（每后端至多 R/M 两键）。
+            _, backend_id, kind_code, w, hi, lo, n, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                # 未知 id 先于一切状态机判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if w >= current or w < max(0, current - 59):
+                # 窗未结束（含未来窗），或已超出最近 60 窗的保留下界。
+                fail(EXIT_STATE, "STATE")
+            alert_key = (backend_id, kind_code)
+            entry = retry_alerts.get(alert_key)
+            if entry is not None:
+                if (hi, lo, n) != (entry["hi"], entry["lo"], entry["n"]):
+                    # 变参。
+                    fail(EXIT_STATE, "STATE")
+                if w == entry["w"]:
+                    # 同窗同参重报：原样返回首评结果，不推进状态机。
+                    results.append(dict(entry["result"]))
+                    continue
+                if w != entry["w"] + 1:
+                    # 跳窗（含回退）。
+                    fail(EXIT_STATE, "STATE")
+            metrics = record["metrics"].get(w)
+            if metrics is None:
+                # 缺窗：该窗 retries/remaps 累计均为 0。
+                value = 0
+            else:
+                # metrics 布局 [requests,errors,retries,remaps,latency]；
+                # R 取 retries（下标 2），M 取 remaps（下标 3）。
+                value = metrics[2] if kind_code == "R" else metrics[3]
+            if entry is None:
+                state = "N"
+                run_count = 0
+            else:
+                state = entry["state"]
+                run_count = entry["run"]
+            changed = False
+            if state == "N":
+                if value >= hi:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "A"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符：连续数清 0。
+                    run_count = 0
+            else:
+                if value <= lo:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "N"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符：连续数清 0。
+                    run_count = 0
+            result = {
+                "op": "xa",
+                "id": backend_id,
+                "k": kind_code,
+                "w": w,
+                "state": state,
+                "value": value,
+                "run": run_count,
+                "changed": changed,
+            }
+            retry_alerts[alert_key] = {
+                "hi": hi,
+                "lo": lo,
+                "n": n,
+                "state": state,
+                "run": run_count,
+                "w": w,
+                "result": dict(result),
+            }
+            results.append(result)
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
