@@ -1980,7 +1980,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "bp", "bq", "qp", "rp", "rg",
+        "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "wp", "bp", "bq", "qp", "rp", "rg",
         "qa",
         "lh",
         "lt",
@@ -2349,6 +2349,32 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("wh", start, end, now)
+
+    if name == "wp":
+        # 排队等待分位查询：精确键序 op,kind,from,to,p,now（键须按此序出现），
+        # 只读；kind 仅 A/E/C/V（admitted/expired/cancelled/evicted），
+        # from/to/now 为 0..10^9、p 为 1..100 的非 bool 整数；now 纳入共用
+        # 非递减时钟（倒退执行期判 INPUT）。窗关系同 wh（from≤to≤now//60
+        # 且 to-from<60），未 os 与 from 过早的 STATE 留执行期判。
+        if list(raw_op) != ["op", "kind", "from", "to", "p", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        kind = raw_op["kind"]
+        if kind not in ("A", "E", "C", "V"):
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        percentile = raw_op["p"]
+        if (
+            not isinstance(percentile, int)
+            or isinstance(percentile, bool)
+            or not 1 <= percentile <= 100
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("wp", kind, start, end, percentile, now)
 
     if name == "lh":
         # 多维限流历史：精确键序 op,scope,id,from,to,now（键须按此序出现），
@@ -4600,7 +4626,7 @@ def run(raw):
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
-            "fa", "fe", "ah", "oh", "wh", "br",
+            "fa", "fe", "ah", "oh", "wh", "wp", "br",
             "ru", "ea", "eh", "pa", "ph",
             "cp", "cq", "ca",
         ):
@@ -6437,6 +6463,67 @@ def run(raw):
                     }
                 )
             results.append({"op": "wh", "windows": windows})
+
+        elif op[0] == "wp":
+            # 排队等待分位查询（只读）：未 os 报 STATE；from 早于最近 60 窗
+            # 下界报 STATE（同 wh）；除推进共用时钟外不改任何状态，失败批次
+            # 天然回滚。汇总闭区间 [from,to] 各窗该 kind（A/E/C/V 对应
+            # admitted/expired/cancelled/evicted）的五等待时长桶，逐桶求和
+            # 并封顶 10^18；samples 为五桶和再封顶 10^18。samples>0 时
+            # rank=ceil(p*samples/100)，按桶 0..4 累计（截至 samples）取首个
+            # 累计≥rank 者，桶上界依次为 0、1、10、100、null；无样本则
+            # rank=0，bucket/upper 为 null。时间 O(to-from+1)、额外空间 O(1)。
+            _, kind, start, end, percentile, now = op
+            if queue_cfg is None:
+                # 未配置 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            kind_name = {
+                "A": "admitted",
+                "E": "expired",
+                "C": "cancelled",
+                "V": "evicted",
+            }[kind]
+            buckets = [0, 0, 0, 0, 0]
+            for window in range(start, end + 1):
+                row = wait_hist.get(window)
+                if row is not None:
+                    counts = row[kind_name]
+                    for i in range(5):
+                        buckets[i] = min(METRIC_CAP, buckets[i] + counts[i])
+            # samples 为五桶和再封顶 10^18。
+            samples = min(METRIC_CAP, sum(buckets))
+            if samples == 0:
+                rank = 0
+                chosen = None
+            else:
+                # rank=ceil(p*samples/100)，按桶累计（截至 samples）取首个
+                # 累计≥rank 者；p≤100 故 rank≤samples，必然落在某桶。
+                rank = (percentile * samples + 99) // 100
+                cumulative = 0
+                chosen = None
+                for i in range(5):
+                    cumulative = min(samples, cumulative + buckets[i])
+                    if cumulative >= rank:
+                        chosen = i
+                        break
+            results.append(
+                {
+                    "op": "wp",
+                    "kind": kind,
+                    "from": start,
+                    "to": end,
+                    "p": percentile,
+                    "samples": samples,
+                    "buckets": buckets,
+                    "rank": rank,
+                    "bucket": chosen,
+                    "upper": None if chosen is None else (0, 1, 10, 100, None)[chosen],
+                }
+            )
 
         elif op[0] == "lh":
             # 多维限流历史（只读）：B 的未知 id 报 BACKEND（先于状态检查）；
