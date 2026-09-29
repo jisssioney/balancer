@@ -222,6 +222,20 @@ def config_v10(weight, faults=(), quotas=(), dequeue="F", full="T",
     return config
 
 
+def config_v11(weight, faults=(), quotas=(), dequeue="F", full="T",
+               capacities=(), lifetime=None, **overrides):
+    """最小 version=11 配置：十三键同 v10 且末置 lifetime（null 或
+    {"ttl":整数}）。"""
+    config = config_v10(
+        weight, faults, quotas, dequeue, full, capacities, **overrides
+    )
+    config["version"] = 11
+    config["lifetime"] = (
+        None if lifetime is None else {"ttl": lifetime}
+    )
+    return config
+
+
 def config_v9_input(weight, faults=(), quotas=(), dequeue="F", full="T",
                     **overrides):
     """最小 version=9 输入：十一键同 v8 且末置 queue（dequeue,full）。"""
@@ -246,9 +260,10 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(list(result), ["op", "current", "commits"])
         self.assertEqual(result, {"op": "cl", "current": None, "commits": []})
 
-    def test_ci_commits_normalized_v10(self):
-        # version=1 旧结构成功加载后，提交为规范化 version=10 配置
-        # （faults 空计划、quotas 空数组、queue 默认 F/T、capacities 空）。
+    def test_ci_commits_normalized_v11(self):
+        # version=1 旧结构成功加载后，提交为规范化 version=11 配置
+        # （faults 空计划、quotas 空数组、queue 默认 F/T、capacities 空、
+        # lifetime=null）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -278,7 +293,7 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(commit["rev"], 1)
         self.assertEqual(
             commit["config"],
-            config_v10(2),
+            config_v11(2),
         )
 
     def test_failed_ci_does_not_commit(self):
@@ -325,9 +340,9 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(
             results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
         )
-        # 回滚后当前配置即 rev=1 的规范化 v10 快照（faults、quotas 均空，
-        # queue 默认 F/T、capacities 空）。
-        self.assertEqual(results[3]["config"], config_v10(1))
+        # 回滚后当前配置即 rev=1 的规范化 v11 快照（faults、quotas 均空，
+        # queue 默认 F/T、capacities 空、lifetime=null）。
+        self.assertEqual(results[3]["config"], config_v11(1))
 
     def test_cb_restores_runtime_state(self):
         # 回滚按目标快照重建默认运行态：调度策略、限流桶、预热自 cb.now 起算。
@@ -412,6 +427,7 @@ class ConfigPrecheckTest(unittest.TestCase):
         return code, out
 
     def test_cv_empty_state_applicable(self):
+        # v10 候选仍合法，预检回显规范化 v11（追加末置 lifetime=null）。
         code, out = self.run_ops(
             [{"op": "cv", "config": config_v10(2), "now": 5}]
         )
@@ -424,10 +440,10 @@ class ConfigPrecheckTest(unittest.TestCase):
         self.assertEqual(result["applicable"], True)
         self.assertEqual(result["connections"], 0)
         self.assertEqual(result["queued"], 0)
-        self.assertEqual(result["config"], config_v10(2))
+        self.assertEqual(result["config"], config_v11(2))
 
-    def test_cv_normalizes_v1_to_v9(self):
-        # version=1 旧结构回显为规范化 version=10（同 ci 提交格式）。
+    def test_cv_normalizes_v1_to_v11(self):
+        # version=1 旧结构回显为规范化 version=11（同 ci 提交格式）。
         config_v1 = {
             "version": 1,
             "backends": [
@@ -450,7 +466,7 @@ class ConfigPrecheckTest(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         result = json.loads(out)["results"][0]
-        self.assertEqual(result["config"], config_v10(2))
+        self.assertEqual(result["config"], config_v11(2))
 
     def test_cv_config_matches_ci_export(self):
         # 富 v10 配置：cv 回显与 ci 成功后 ce 导出逐字节同构。
@@ -675,7 +691,7 @@ class ConfigDigestTest(unittest.TestCase):
         result = results[0]
         # 结果精确键序 op,digest。
         self.assertEqual(list(result), ["op", "digest"])
-        empty_config = config_v10(1)
+        empty_config = config_v11(1)
         empty_config["backends"] = []
         self.assertEqual(result["digest"], digest_of(empty_config))
 
@@ -933,8 +949,8 @@ class ConfigDiffTest(unittest.TestCase):
         }
 
     def make_config(self, backends, **overrides):
-        # 以最小 v10 配置为底，整体替换 backends。
-        config = config_v10(1, **overrides)
+        # 以最小 v11 配置为底，整体替换 backends。
+        config = config_v11(1, **overrides)
         config["backends"] = list(backends)
         return config
 
@@ -953,7 +969,7 @@ class ConfigDiffTest(unittest.TestCase):
         self.assertEqual(result["op"], "cd")
         # base 即同批 ct 对空配置的指纹；target 为候选规范化配置的指纹。
         self.assertEqual(result["base"], results[0]["digest"])
-        empty = config_v10(1)
+        empty = config_v11(1)
         empty["backends"] = []
         self.assertEqual(result["base"], digest_of(empty))
         self.assertEqual(result["target"], digest_of(self.make_config(
@@ -1133,8 +1149,9 @@ class ConfigDiffTest(unittest.TestCase):
         }
         results = self.run_ops([{"op": "cd", "config": config_v1, "now": 0}])
         result = results[0]
-        # target 为规范化 v10 配置（endpoint=null、queue 默认 F/T）的指纹。
-        normalized = config_v10(2)
+        # target 为规范化 v11 配置（endpoint=null、queue 默认 F/T、
+        # lifetime=null）的指纹。
+        normalized = config_v11(2)
         self.assertEqual(result["target"], digest_of(normalized))
         self.assertEqual(result["added"], ["a"])
 
@@ -1280,17 +1297,17 @@ class PolicyDiffTest(unittest.TestCase):
         return {"op": "pd", "config": config, "now": now}
 
     def test_pd_result_shape_and_digests(self):
-        results = self.run_ops([{"op": "ct"}, self.pd(config_v10(1))])
+        results = self.run_ops([{"op": "ct"}, self.pd(config_v11(1))])
         result = results[1]
         # 精确结果键序 op,base,target,changes。
         self.assertEqual(list(result), ["op", "base", "target", "changes"])
         self.assertEqual(result["op"], "pd")
         # base 即同批 ct 对当前（空）配置的指纹；target 为候选规范化指纹。
         self.assertEqual(result["base"], results[0]["digest"])
-        empty = config_v10(1)
+        empty = config_v11(1)
         empty["backends"] = []
         self.assertEqual(result["base"], digest_of(empty))
-        self.assertEqual(result["target"], digest_of(config_v10(1)))
+        self.assertEqual(result["target"], digest_of(config_v11(1)))
         self.assertRegex(result["target"], r"^[0-9a-f]{64}$")
         # 仅 backends 不同：changes 为空。
         self.assertEqual(result["changes"], [])
@@ -1392,8 +1409,8 @@ class PolicyDiffTest(unittest.TestCase):
     def test_pd_backends_only_change_is_empty_changes(self):
         # 仅 backends 变化（含增删与字段变更）：changes 为空，base/target
         # 仍为两份完整配置的指纹。
-        current = config_v10(1)
-        candidate = config_v10(9)
+        current = config_v11(1)
+        candidate = config_v11(9)
         candidate["backends"].append(
             {"id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
              "circuit": None, "drain": None, "endpoint": None}
@@ -1463,7 +1480,8 @@ class PolicyDiffTest(unittest.TestCase):
         )
 
     def test_pd_accepts_v1_and_normalizes(self):
-        # v1 候选规范化为 v9：target 为规范化指纹，queue 默认 F/T 不差异。
+        # v1 候选规范化为 v11：target 为规范化指纹，queue 默认 F/T、
+        # lifetime=null 不差异。
         config_v1 = {
             "version": 1,
             "backends": [{
@@ -1476,7 +1494,7 @@ class PolicyDiffTest(unittest.TestCase):
         }
         results = self.run_ops([self.pd(config_v1)])
         result = results[0]
-        self.assertEqual(result["target"], digest_of(config_v10(2)))
+        self.assertEqual(result["target"], digest_of(config_v11(2)))
         self.assertEqual(result["changes"], [])
 
     def test_pd_unknown_backend_references_are_backend(self):
@@ -1607,7 +1625,7 @@ class PolicyDiffTest(unittest.TestCase):
     def seg(self, backend="a", k="D", a=0, z=10, v=0):
         return {"id": backend, "k": k, "a": a, "z": z, "v": v}
 
-    def test_ce_exports_v10_with_faults_quotas_queue_and_capacities_last(self):
+    def test_ce_exports_v11_with_lifetime_last(self):
         results = self.run_ops([{"op": "add", "id": "a", "weight": 1},
                                 {"op": "ce"}])
         config = results[-1]["config"]
@@ -1615,17 +1633,19 @@ class PolicyDiffTest(unittest.TestCase):
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue", "capacities"],
+             "queue", "capacities", "lifetime"],
         )
-        self.assertEqual(config["version"], 10)
+        self.assertEqual(config["version"], 11)
         self.assertEqual(config["faults"], [])
         self.assertEqual(config["quotas"], [])
         # queue 精确键序 dequeue,full，默认 F/T；不含 evicted、last。
         self.assertEqual(list(config["queue"]), ["dequeue", "full"])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
-        # capacities 末置、默认为空 []（无 pc 覆盖）。
-        self.assertEqual(list(config)[-1], "capacities")
+        # capacities 无 pc 覆盖为空 []。
         self.assertEqual(config["capacities"], [])
+        # lifetime 末置、默认 null（未 tm 且无 v11 快照）。
+        self.assertEqual(list(config)[-1], "lifetime")
+        self.assertIsNone(config["lifetime"])
 
     def test_ci_loads_faults_observed_by_fq(self):
         # 乱序提交（段与后端），ce/fq 按后端加入序、段 a 升序规范化。
@@ -1879,7 +1899,7 @@ class PolicyDiffTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
         # ce 输出逐字节固定键序、紧凑、单换行。
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":10', run_stdout)
+        self.assertIn(b'"version":11', run_stdout)
 
 
 class FaultTimelineTest(unittest.TestCase):
@@ -2611,20 +2631,22 @@ class QuotaWindowTest(unittest.TestCase):
             {"op": "ce"},
         ]
         results = self.run_ops(ops)
-        # ce 导出 version=10：精确十三键，capacities 末置；v1..v7 热加载视
-        # quotas=[]、queue 为默认 F/T、capacities 为空，故 quotas 为空。
+        # ce 导出 version=11：精确十四键，lifetime 末置；v1..v7 热加载视
+        # quotas=[]、queue 为默认 F/T、capacities 为空、lifetime=null，故
+        # quotas 为空。
         self.assertEqual(
             list(results[4]["config"]),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue", "capacities"],
+             "queue", "capacities", "lifetime"],
         )
-        self.assertEqual(results[4]["config"]["version"], 10)
+        self.assertEqual(results[4]["config"]["version"], 11)
         self.assertEqual(results[4]["config"]["quotas"], [])
         self.assertEqual(
             results[4]["config"]["queue"], {"dequeue": "F", "full": "T"}
         )
         self.assertEqual(results[4]["config"]["capacities"], [])
+        self.assertIsNone(results[4]["config"]["lifetime"])
         # ci（v7）成功后配额已清空。
         self.assert_failure(
             self.base_ops() + [
@@ -2703,15 +2725,16 @@ class QuotaHotReloadTest(unittest.TestCase):
             {"op": "ce"},
         ])
         config = results[-1]["config"]
-        self.assertEqual(config["version"], 10)
-        # capacities 末置、键序 id,cap，默认空 []。
+        self.assertEqual(config["version"], 11)
+        # capacities 后为末置 lifetime，默认 null。
         self.assertEqual(list(config), [
             "version", "backends", "vnodes", "limits", "overload", "sticky",
             "idle", "backpressure", "scheduler", "faults", "quotas", "queue",
-            "capacities",
+            "capacities", "lifetime",
         ])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
         self.assertEqual(config["capacities"], [])
+        self.assertIsNone(config["lifetime"])
         # 按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；项键序
         # scope,id,limit,span，不含 window、used。
         self.assertEqual(
@@ -2887,10 +2910,10 @@ class QuotaHotReloadTest(unittest.TestCase):
         self.assertEqual(
             commits[2]["config"]["quotas"], [self.quota("C", "c", 5, 10)]
         )
-        self.assertEqual(commits[2]["config"]["version"], 10)
-        # cl/cb 快照一律规范化为 version=10，queue 默认 F/T、capacities 空。
+        self.assertEqual(commits[2]["config"]["version"], 11)
+        # cl/cb 快照一律规范化为 version=11（末置 lifetime=null），queue 默认 F/T、capacities 空。
         for commit in commits:
-            self.assertEqual(commit["config"]["version"], 10)
+            self.assertEqual(commit["config"]["version"], 11)
             self.assertEqual(
                 commit["config"]["queue"], {"dequeue": "F", "full": "T"}
             )
@@ -2915,7 +2938,7 @@ class QuotaHotReloadTest(unittest.TestCase):
             (run_code, run_stdout, run_stderr),
         )
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":10', run_stdout)
+        self.assertIn(b'"version":11', run_stdout)
         self.assertIn(b'"quotas":[{', run_stdout)
 
     @staticmethod
@@ -2974,7 +2997,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
 
     # ---- 导出与默认 ----
 
-    def test_ce_thirteen_keys_capacities_last_with_default_ft(self):
+    def test_ce_fourteen_keys_lifetime_last_with_default_ft(self):
         results = self.run_ops([
             {"op": "ci", "config": config_v8(1), "now": 0},
             {"op": "ce"},
@@ -2984,12 +3007,13 @@ class V9QueueHotReloadTest(unittest.TestCase):
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue", "capacities"],
+             "queue", "capacities", "lifetime"],
         )
-        self.assertEqual(config["version"], 10)
+        self.assertEqual(config["version"], 11)
         self.assertEqual(list(config["queue"]), ["dequeue", "full"])
         self.assertEqual(config["queue"], {"dequeue": "F", "full": "T"})
         self.assertEqual(config["capacities"], [])
+        self.assertIsNone(config["lifetime"])
 
     def test_v1_through_v8_default_to_ft(self):
         be7 = [{
@@ -2997,7 +3021,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
             "success": 2, "circuit": None, "drain": None,
         }]
         be8 = [dict(be7[0], endpoint=None)]
-        for version in (1, 2, 3, 4, 5, 6, 7, 8):
+        for version in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
             if version == 1:
                 cfg = {
                     "version": 1, "backends": be7, "vnodes": None,
@@ -3013,6 +3037,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
                 helper = {
                     3: config_v6, 4: config_v6, 5: config_v6,
                     6: config_v6, 7: config_v7, 8: config_v8,
+                    9: config_v9_input, 10: config_v10, 11: config_v11,
                 }[version](1)
                 cfg = helper
                 cfg["version"] = version
@@ -3029,7 +3054,9 @@ class V9QueueHotReloadTest(unittest.TestCase):
                 {"dequeue": "F", "full": "T"},
                 version,
             )
-            self.assertEqual(results[1]["config"]["version"], 10)
+            # 各版本均规范化导出为当前版本 11，lifetime=null。
+            self.assertEqual(results[1]["config"]["version"], 11)
+            self.assertIsNone(results[1]["config"]["lifetime"])
 
     def test_v9_loads_and_exports_sh(self):
         cfg = self.config(dequeue="S", full="H")
@@ -3082,7 +3109,8 @@ class V9QueueHotReloadTest(unittest.TestCase):
             encode_ops([{"op": "ci", "config": extra, "now": 0}]),
             2, "INPUT",
         )
-        # version 字段非法（字符串、越界、bool）；10 现为合法版本号。
+        # version 字段非法（字符串、0、bool）；v10 键形上的 11 为版本不符；
+        # 10/11 均为合法版本号。
         for bad_version in ("10", 0, 11, True):
             cfg = config_v10(1)
             cfg["version"] = bad_version
@@ -3090,6 +3118,27 @@ class V9QueueHotReloadTest(unittest.TestCase):
                 encode_ops([{"op": "ci", "config": cfg, "now": 0}]),
                 2, "INPUT",
             )
+        # 12 越界：v10/v11 两种键形均判 INPUT。
+        for cfg in (config_v10(1), config_v11(1)):
+            cfg["version"] = 12
+            self.assert_failure(
+                encode_ops([{"op": "ci", "config": cfg, "now": 0}]),
+                2, "INPUT",
+            )
+        # version=11 但缺末置 lifetime（十三键）：键形为 v10，版本不符。
+        missing_lifetime = config_v10(1)
+        missing_lifetime["version"] = 11
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": missing_lifetime, "now": 0}]),
+            2, "INPUT",
+        )
+        # version=10 但含 lifetime（十四键）：键形为 v11，版本不符。
+        with_lifetime = config_v11(1)
+        with_lifetime["version"] = 10
+        self.assert_failure(
+            encode_ops([{"op": "ci", "config": with_lifetime, "now": 0}]),
+            2, "INPUT",
+        )
 
     def test_top_level_queue_before_quotas_is_input(self):
         raw = (
@@ -3201,13 +3250,13 @@ class V9QueueHotReloadTest(unittest.TestCase):
 
     # ---- cl/cb 规范化与回滚 ----
 
-    def test_cl_normalizes_to_v9_with_loaded_queue(self):
+    def test_cl_normalizes_to_v11_with_loaded_queue(self):
         cfg = self.config(dequeue="S", full="H")
         results = self.run_ops([
             {"op": "ci", "config": cfg, "now": 0}, {"op": "cl"},
         ])
         commit = results[1]["commits"][0]["config"]
-        self.assertEqual(commit["version"], 10)
+        self.assertEqual(commit["version"], 11)
         self.assertEqual(commit["queue"], {"dequeue": "S", "full": "H"})
 
     def test_post_commit_qp_rp_change_does_not_mutate_commit(self):
@@ -3269,10 +3318,10 @@ class V9QueueHotReloadTest(unittest.TestCase):
             results[3], {"op": "cb", "target": 1, "rev": 2, "ok": True}
         )
         commits = results[4]["commits"]
-        # 两个快照均规范化为 v9 且均携带恢复后的 S/H。
+        # 两个快照均规范化为 v11 且均携带恢复后的 S/H。
         self.assertEqual(len(commits), 2)
         for commit in commits:
-            self.assertEqual(commit["config"]["version"], 10)
+            self.assertEqual(commit["config"]["version"], 11)
             self.assertEqual(
                 commit["config"]["queue"], {"dequeue": "S", "full": "H"}
             )
@@ -3347,7 +3396,7 @@ class V9QueueHotReloadTest(unittest.TestCase):
         )
         # 单换行、紧凑、固定键序。
         self.assertEqual(run_stdout.count(b"\n"), 1)
-        self.assertIn(b'"version":10', run_stdout)
+        self.assertIn(b'"version":11', run_stdout)
         self.assertIn(b'"queue":{"dequeue":"S","full":"H"}', run_stdout)
 
 
@@ -3386,13 +3435,15 @@ class V10CapacitiesHotReloadTest(unittest.TestCase):
 
     # ---- 导出与规范化 ----
 
-    def test_ce_exports_capacities_last_empty_by_default(self):
-        # 初始空配置：capacities 末置为空 []。
+    def test_ce_exports_lifetime_last_empty_by_default(self):
+        # 初始空配置：lifetime 末置为 null，capacities 为空 []。
         results = self.run_ops([{"op": "ce"}])
         config = results[0]["config"]
-        self.assertEqual(config["version"], 10)
-        self.assertEqual(list(config)[-1], "capacities")
+        self.assertEqual(config["version"], 11)
+        self.assertEqual(list(config)[-2], "capacities")
         self.assertEqual(config["capacities"], [])
+        self.assertEqual(list(config)[-1], "lifetime")
+        self.assertIsNone(config["lifetime"])
 
     def test_ci_loads_and_ce_exports_capacities_in_backend_order(self):
         # 输入顺序不限：乱序提交按后端加入序（a 在 b 前）输出，仅列显式项。
@@ -3407,7 +3458,7 @@ class V10CapacitiesHotReloadTest(unittest.TestCase):
             list(config),
             ["version", "backends", "vnodes", "limits", "overload", "sticky",
              "idle", "backpressure", "scheduler", "faults", "quotas",
-             "queue", "capacities"],
+             "queue", "capacities", "lifetime"],
         )
         self.assertEqual(
             config["capacities"],
@@ -3458,7 +3509,7 @@ class V10CapacitiesHotReloadTest(unittest.TestCase):
             result["config"]["capacities"],
             [{"id": "a", "cap": 3}, {"id": "b", "cap": 9}],
         )
-        self.assertEqual(result["config"]["version"], 10)
+        self.assertEqual(result["config"]["version"], 11)
         # cv 不应用：ce 仍为空。
         results = self.run_ops([{"op": "cv", "config": cfg, "now": 0},
                                 {"op": "ce"}])
@@ -3563,8 +3614,8 @@ class V10CapacitiesHotReloadTest(unittest.TestCase):
             encode_ops([{"op": "ci", "config": extra, "now": 0}]),
             2, "INPUT",
         )
-        # version 字段非法：字符串、越界 11、bool。
-        for bad in ("10", 11, False):
+        # version 字段非法：字符串、越界 12、bool。
+        for bad in ("10", 12, False):
             cfg = config_v10(1)
             cfg["version"] = bad
             self.assert_failure(
@@ -3717,7 +3768,7 @@ class V10CapacitiesHotReloadTest(unittest.TestCase):
         ]
         self.assert_failure(encode_ops(ops), 4, "STATE")
 
-    def test_cb_restores_overrides_and_new_snapshot_is_v10(self):
+    def test_cb_restores_overrides_and_new_snapshot_is_v11(self):
         first = self.two_backend_config(
             capacities=[{"id": "a", "cap": 2}, {"id": "b", "cap": 7}]
         )
@@ -3743,7 +3794,7 @@ class V10CapacitiesHotReloadTest(unittest.TestCase):
         self.assertEqual(commits[2]["config"]["capacities"],
                          [{"id": "a", "cap": 2}, {"id": "b", "cap": 7}])
         for commit in commits:
-            self.assertEqual(commit["config"]["version"], 10)
+            self.assertEqual(commit["config"]["version"], 11)
         self.assertEqual(
             results[6]["config"]["capacities"],
             [{"id": "a", "cap": 2}, {"id": "b", "cap": 7}],
@@ -3904,6 +3955,403 @@ class V10CapacitiesHotReloadTest(unittest.TestCase):
             b'"capacities":[{"id":"a","cap":2},{"id":"b","cap":5}]',
             run_stdout,
         )
+
+
+class V11LifetimeHotReloadTest(unittest.TestCase):
+    """version=11 末置 lifetime：tm 硬时限纳入配置与 ce/ci/cl/cb/cp/ca。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def te(self, cid, now):
+        return {"op": "te", "cid": cid, "now": now}
+
+    # ---- 结构与校验 ----
+
+    def test_v11_requires_exact_trailing_lifetime_and_order(self):
+        # version=11 缺末置 lifetime（十三键）：INPUT。
+        missing = config_v10(1)
+        missing["version"] = 11
+        self.assert_failure(
+            [{"op": "ci", "config": missing, "now": 0}], 2, "INPUT"
+        )
+        # version=10 含 lifetime（十四键）：INPUT。
+        extra = config_v11(1)
+        extra["version"] = 10
+        self.assert_failure(
+            [{"op": "ci", "config": extra, "now": 0}], 2, "INPUT"
+        )
+        # 越界版本 12（两种键形）：INPUT。
+        for cfg in (config_v10(1), config_v11(1)):
+            cfg["version"] = 12
+            self.assert_failure(
+                [{"op": "ci", "config": cfg, "now": 0}], 2, "INPUT"
+            )
+
+    def test_lifetime_key_order_is_input(self):
+        # lifetime 不在末置（与 capacities 交换）：INPUT。
+        ordered = config_v11(1, lifetime=5)
+        items = list(ordered.items())
+        items[-1], items[-2] = items[-2], items[-1]
+        self.assert_failure(
+            [{"op": "ci", "config": dict(items), "now": 0}], 2, "INPUT"
+        )
+
+    def test_invalid_lifetime_is_input_for_all_config_ops(self):
+        for opname in ("ci", "cv", "cd", "pd"):
+            for bad in (
+                0, -1, 10 ** 9 + 1, True, False, 1.0, "5", [], {},
+                {"x": 1}, {"ttl": 0}, {"ttl": True}, {"ttl": "5"},
+                {"ttl": None}, {"ttl": 5, "x": 1},
+            ):
+                cfg = config_v11(1)
+                cfg["lifetime"] = bad
+                with self.subTest(op=opname, bad=bad):
+                    self.assert_failure(
+                        [{"op": opname, "config": cfg, "now": 0}],
+                        2, "INPUT",
+                    )
+
+    def test_lifetime_boundaries_ok(self):
+        for ttl in (1, 10 ** 9):
+            results = self.run_ops([
+                {"op": "cv", "config": config_v11(1, lifetime=ttl), "now": 0},
+            ])
+            self.assertEqual(
+                results[0]["config"]["lifetime"], {"ttl": ttl}
+            )
+
+    def test_legacy_versions_1_to_10_normalize_lifetime_null(self):
+        # 各版本候选均合法，cv 回显 v11 且 lifetime=null。
+        candidates = [
+            {
+                "version": 1,
+                "backends": [{
+                    "id": "a", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                    "circuit": None, "drain": None,
+                }],
+                "vnodes": None, "limits": [], "overload": None,
+            },
+            config_v6(1), config_v7(1), config_v8(1),
+            config_v9_input(1), config_v10(1),
+        ]
+        for cfg in candidates:
+            with self.subTest(version=cfg["version"]):
+                results = self.run_ops([
+                    {"op": "cv", "config": cfg, "now": 0},
+                ])
+                normalized = results[0]["config"]
+                self.assertEqual(normalized["version"], 11)
+                self.assertEqual(list(normalized)[-1], "lifetime")
+                self.assertIsNone(normalized["lifetime"])
+
+    # ---- ce/ct/cl 导出 ----
+
+    def test_ce_ct_export_loaded_lifetime(self):
+        cfg = config_v11(1, lifetime=5)
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "ce"},
+            {"op": "ct"},
+        ])
+        config = results[1]["config"]
+        self.assertEqual(list(config)[-1], "lifetime")
+        self.assertEqual(config["version"], 11)
+        self.assertEqual(config["lifetime"], {"ttl": 5})
+        self.assertEqual(results[2]["digest"], digest_of(config))
+
+    def test_ct_changes_when_tm_changes_current_config(self):
+        cfg = config_v11(1, lifetime=5)
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "ct"},
+            {"op": "tm", "ttl": 9},
+            {"op": "ce"},
+            {"op": "ct"},
+        ])
+        self.assertNotEqual(results[1]["digest"], results[4]["digest"])
+        self.assertEqual(results[3]["config"]["lifetime"], {"ttl": 9})
+
+    # ---- ci 载入与清除 ----
+
+    def test_ci_loads_lifetime_applied_to_new_connections(self):
+        cfg = config_v11(1, lifetime=5)
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "open", "cid": "c", "flow": self.FLOW, "now": 0},
+            self.te("c", 4),
+            self.te("c", 5),
+        ])
+        self.assertEqual(
+            {k: results[2][k] for k in
+             ("idle", "lifetime", "deadline", "state", "reason")},
+            {"idle": None, "lifetime": 5, "deadline": 5,
+             "state": "A", "reason": None},
+        )
+        self.assertEqual(
+            {k: results[3][k] for k in
+             ("lifetime", "deadline", "state", "reason")},
+            {"lifetime": 5, "deadline": 5, "state": "E", "reason": "L"},
+        )
+
+    def test_loaded_lifetime_combined_with_idle_hard_deadline_wins(self):
+        # idle=3（ts 登记）且 lifetime=5：tk 刷新 last 后空闲截止推迟到 5，
+        # 硬截止仍为 opened_at+5；二者同时到期取 L。
+        cfg = config_v11(1, idle={"ttl": 3}, lifetime=5)
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "open", "cid": "c", "flow": self.FLOW, "now": 0},
+            {"op": "tk", "cid": "c", "now": 2},
+            self.te("c", 5),
+        ])
+        self.assertEqual(results[2]["ok"], True)
+        self.assertEqual(
+            {k: results[3][k] for k in
+             ("idle", "lifetime", "state", "reason")},
+            {"idle": 5, "lifetime": 5, "state": "E", "reason": "L"},
+        )
+
+    def test_loaded_lifetime_drives_tk_and_tx(self):
+        cfg = config_v11(1, lifetime=5)
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "open", "cid": "c", "flow": self.FLOW, "now": 0},
+            {"op": "tx", "now": 5},
+        ])
+        self.assertEqual(results[2], {"op": "tx", "expired": ["c"]})
+        # tk 还要求已 ts：配 idle=100 使 tk 可用，命中硬到期（opened_at+5）
+        # 同样报 CONNECTION/5 且不刷新 last。
+        cfg_both = config_v11(1, idle={"ttl": 100}, lifetime=5)
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg_both, "now": 0},
+                {"op": "open", "cid": "c", "flow": self.FLOW, "now": 0},
+                {"op": "tk", "cid": "c", "now": 5},
+            ],
+            5, "CONNECTION",
+        )
+        # 硬到期前 tk 正常刷新 last。
+        results = self.run_ops([
+            {"op": "ci", "config": cfg_both, "now": 0},
+            {"op": "open", "cid": "c", "flow": self.FLOW, "now": 0},
+            {"op": "tk", "cid": "c", "now": 4},
+        ])
+        self.assertEqual(results[2]["ok"], True)
+
+    def test_ci_null_lifetime_clears_current_tm(self):
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1, lifetime=5), "now": 0},
+            {"op": "tm", "ttl": 99},
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            {"op": "ce"},
+        ])
+        self.assertIsNone(results[3]["config"]["lifetime"])
+
+    def test_ci_v10_candidate_clears_current_tm(self):
+        # v1..v10 候选规范化 lifetime=null：成功热加载清除既有 tm 登记。
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1, lifetime=5), "now": 0},
+            {"op": "tm", "ttl": 99},
+            {"op": "ci", "config": config_v10(1), "now": 1},
+            {"op": "ce"},
+        ])
+        self.assertEqual(results[3]["config"]["version"], 11)
+        self.assertIsNone(results[3]["config"]["lifetime"])
+
+    # ---- tm 只影响当前 ce/ct ----
+
+    def test_tm_after_commit_does_not_change_stored_snapshot(self):
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1, lifetime=5), "now": 0},
+            {"op": "tm", "ttl": 99},
+            {"op": "cl"},
+            {"op": "ce"},
+            {"op": "ct"},
+        ])
+        commit = results[2]["commits"][0]["config"]
+        self.assertEqual(commit["version"], 11)
+        self.assertEqual(commit["lifetime"], {"ttl": 5})
+        self.assertEqual(results[3]["config"]["lifetime"], {"ttl": 99})
+        # 当前 ct 反映 tm，提交快照指纹不随之变化。
+        self.assertEqual(results[4]["digest"], digest_of(results[3]["config"]))
+        self.assertNotEqual(
+            results[4]["digest"], digest_of(commit)
+        )
+
+    # ---- cb 回滚 ----
+
+    def test_cb_restores_snapshot_lifetime(self):
+        flow = self.FLOW
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1, lifetime=5), "now": 0},
+            {"op": "open", "cid": "c", "flow": flow, "now": 0},
+            {"op": "close", "cid": "c", "now": 0},
+            {"op": "tm", "ttl": 99},
+            {"op": "cb", "rev": 1, "now": 1},
+            {"op": "open", "cid": "d", "flow": flow, "now": 1},
+            self.te("d", 6),
+            {"op": "ce"},
+        ])
+        self.assertEqual(
+            results[4], {"op": "cb", "target": 1, "rev": 2, "ok": True}
+        )
+        # 恢复 rev1 的 ttl=5：opened_at=1，lifetime=6，now=6 硬到期。
+        self.assertEqual(
+            {k: results[6][k] for k in
+             ("lifetime", "deadline", "state", "reason")},
+            {"lifetime": 6, "deadline": 6, "state": "E", "reason": "L"},
+        )
+        self.assertEqual(results[7]["config"]["lifetime"], {"ttl": 5})
+
+    def test_cb_to_null_lifetime_clears_tm(self):
+        flow = self.FLOW
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            {"op": "ci", "config": config_v11(1, lifetime=5), "now": 1},
+            {"op": "open", "cid": "c", "flow": flow, "now": 1},
+            {"op": "close", "cid": "c", "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},
+            {"op": "ce"},
+        ])
+        self.assertEqual(results[4]["rev"], 3)
+        self.assertIsNone(results[5]["config"]["lifetime"])
+
+    # ---- cp/cq/ca 预约 ----
+
+    def test_cp_stores_lifetime_and_ca_loads_it(self):
+        flow = self.FLOW
+        results = self.run_ops([
+            {"op": "cp", "config": config_v11(1, lifetime=5),
+             "at": 5, "now": 0},
+            {"op": "tm", "ttl": 99},
+            {"op": "cq", "now": 1},
+            {"op": "ca", "now": 5},
+            {"op": "open", "cid": "c", "flow": flow, "now": 5},
+            self.te("c", 10),
+            {"op": "ce"},
+        ])
+        self.assertTrue(results[2]["pending"])
+        # 预约生效按快照 ttl=5（非 tm 的 99）：opened_at=5，lifetime=10。
+        self.assertEqual(
+            results[3],
+            {"op": "ca", "digest": results[2]["digest"],
+             "rev": 1, "ok": True},
+        )
+        self.assertEqual(
+            {k: results[5][k] for k in
+             ("lifetime", "deadline", "state", "reason")},
+            {"lifetime": 10, "deadline": 10, "state": "E", "reason": "L"},
+        )
+        self.assertEqual(results[6]["config"]["lifetime"], {"ttl": 5})
+
+    def test_cp_snapshot_digest_is_v11_normalization(self):
+        results = self.run_ops([
+            {"op": "cp", "config": config_v11(1, lifetime=7),
+             "at": 1, "now": 0},
+            {"op": "ct"},
+            {"op": "cv", "config": config_v11(1, lifetime=7), "now": 0},
+        ])
+        self.assertEqual(
+            results[0]["digest"],
+            digest_of(results[2]["config"]),
+        )
+        self.assertNotEqual(results[0]["digest"], results[1]["digest"])
+
+    # ---- pd.changes：lifetime 在 capacities 之后 ----
+
+    def test_pd_lifetime_change_listed_after_capacities(self):
+        current = config_v11(1)
+        candidate = config_v11(
+            1, capacities=[{"id": "a", "cap": 4}], lifetime=7
+        )
+        results = self.run_ops([
+            {"op": "ci", "config": current, "now": 0},
+            {"op": "pd", "config": candidate, "now": 1},
+        ])
+        sections = [item["section"] for item in results[1]["changes"]]
+        self.assertEqual(sections, ["capacities", "lifetime"])
+        self.assertEqual(
+            results[1]["changes"][1],
+            {"section": "lifetime",
+             "before": None, "after": {"ttl": 7}},
+        )
+
+    def test_pd_lifetime_reflects_current_tm(self):
+        # 当前 ce 的 lifetime 含 tm 后续修改；候选仅 lifetime 差异时列出。
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1, lifetime=5), "now": 0},
+            {"op": "tm", "ttl": 9},
+            {"op": "pd", "config": config_v11(1, lifetime=5), "now": 1},
+        ])
+        self.assertEqual(
+            results[2]["changes"],
+            [{"section": "lifetime",
+              "before": {"ttl": 9}, "after": {"ttl": 5}}],
+        )
+
+    # ---- 错误优先级 ----
+
+    def test_v11_unknown_backend_references_are_backend(self):
+        for field in (
+            {"limits": [{"scope": "B", "id": "ghost", "r": 1, "b": 1}]},
+            {"quotas": [{"scope": "B", "id": "ghost",
+                         "limit": 1, "span": 1}]},
+            {"faults": [{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}]},
+            {"capacities": [{"id": "ghost", "cap": 1}]},
+        ):
+            cfg = config_v11(1, lifetime=5)
+            cfg.update(field)
+            with self.subTest(field=field):
+                self.assert_failure(
+                    [{"op": "ci", "config": cfg, "now": 0}],
+                    3, "BACKEND",
+                )
+
+    def test_v11_ci_active_connection_and_queue_are_state(self):
+        cfg = config_v11(1, lifetime=5)
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                {"op": "open", "cid": "c", "flow": self.FLOW, "now": 1},
+                {"op": "ci", "config": cfg, "now": 2},
+            ],
+            4, "STATE",
+        )
+
+    # ---- record/replay 逐字节 ----
+
+    def test_record_replay_byte_identical(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1, lifetime=5), "now": 0},
+            {"op": "open", "cid": "c", "flow": self.FLOW, "now": 0},
+            self.te("c", 5),
+            {"op": "cl"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+        self.assertEqual(run_stdout.count(b"\n"), 1)
+        self.assertIn(b'"lifetime":{"ttl":5}', run_stdout)
 
 
 class V7FaultNormalizationTest(unittest.TestCase):
@@ -6623,7 +7071,7 @@ class HashDryRunTest(unittest.TestCase):
         return item
 
     def make_config(self, ids, vnodes, backends=None, **overrides):
-        config = config_v10(1, **overrides)
+        config = config_v11(1, **overrides)
         config["backends"] = (
             list(backends)
             if backends is not None

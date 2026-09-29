@@ -149,7 +149,7 @@ F/S/P：登记 ot
 规则扣减并建连，阻塞项移至队尾并保持相对次序、继续检查后项；expired、
 admitted 按原 FIFO 顺序，各项使用同一 ot.now，前项扣减对后项可见，失败批
 回滚运行态。ci/cb 按 queue.dequeue 原子载入（v1..v8 规范化为 F）；登记
-值随 ce 经 version=10 的 queue.dequeue 导出；rp/qp 提交（ci/cb）后的后续
+值随 ce 经 version=11 的 queue.dequeue 导出；rp/qp 提交（ci/cb）后的后续
 修改仅影响当前 ce，不改已存提交快照；record/replay 逐字节覆盖。
 S 模式 ot 时间 O(qBV log(BV))、额外空间 O(q)。
 
@@ -184,7 +184,7 @@ id，evicted 仅头淘汰时为旧 cid，立即接纳或普通入队为 null；T
 原四键（Q 的 backend 为 null）。rp/rg 键序、类型或值非法报 INPUT/2。ci/cb
 按 queue.full 原子载入（v1..v8 规范化为 T）并清空队列、置 evicted=0、
 last=null，失败批回滚队列、指标、粘性、策略与计数；登记策略随 ce 经
-version=10 的 queue.full 导出（evicted、last 不导出），提交后的 rp 修改
+version=11 的 queue.full 导出（evicted、last 不导出），提交后的 rp 修改
 仅影响当前 ce，不改已存提交快照。rp、rg 及新增判定均 O(1)，额外空间
 O(1)，仅用标准库。
 
@@ -453,8 +453,8 @@ record/replay 逐字节契约，其余子命令与既有操作行为不变。
 
 配置导出与热加载：ce 键集仅 op，返回键序 op,config；config 精确键序
 {version,backends,vnodes,limits,overload,sticky,idle,backpressure,
-scheduler,faults,quotas,queue,capacities}：
-version=10；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
+scheduler,faults,quotas,queue,capacities,lifetime}：
+version=11；backends 按加入序，项 {id,weight,d,fail,success,circuit,drain,
 endpoint}，circuit=null 或 {n,m,r,w,q}，drain=null 或登记的 t，endpoint
 为 null 或键序 {host,port} 的登记端点，均只含登记值不含运行态；
 vnodes=null 或整数；limits 项 {scope,id,r,b}，按 scope 的 B/C/S 序、id 的
@@ -470,18 +470,20 @@ F/S 须 v>0），同 id 各段 [a,z) 不重叠（相邻端点可接），按后�
 段 a 升序输出，空计划为 []，不含 effect 或运行态；quotas 为数组，项
 键序 scope,id,limit,span（scope 仅 B/C/S，id 为非空 UTF-8 串，limit
 ∈ [1,10^18]、span ∈ [1,10^9] 非 bool 整数），按 scope 的 B/C/S 序、
-id 的 UTF-8 字节升序输出，只含登记值，不含 window、used；queue 末置，
+id 的 UTF-8 字节升序输出，只含登记值，不含 window、used；queue 为
 精确键序 {dequeue,full}：dequeue 为 "F"/"S"（ot 遇阻即停/跳过阻塞），
 full 为 "T"/"H"（队满尾拒绝/头淘汰），只含登记策略，不含等待项、
-evicted 或 last；capacities 末置，为数组，项精确键序 {id,cap}（id
-引用本配置后端，cap ∈ [1,10^6] 非 bool 整数），按后端加入序仅列显式
-接纳容量覆盖，空为 []（[] 表示各后端使用 overload.cap）。ci 精确键集
+evicted 或 last；capacities 为数组（其后为 lifetime），项精确键序
+{id,cap}（id 引用本配置后端，cap ∈ [1,10^6] 非 bool 整数），按后端加入序仅列显式
+接纳容量覆盖，空为 []（[] 表示各后端使用 overload.cap）；lifetime
+末置，为 null 或精确 {"ttl":整数}（ttl ∈ [1,10^9] 非 bool 整数），
+为当前 tm 硬时限登记的纯登记值、不含运行态。ci 精确键集
 op,config,now（原形式，键序不限），另接受精确键序 op,config,base,now
 的乐观并发形式：base 为小写 64 位十六进制串（ct 输出的配置指纹），
 格式非法判 INPUT/2；候选完成既有校验后比较 base 与操作前指纹，不等
 判 STATE/4 且先于活动连接或排队检查，相等则沿用 ci 全部成功语义。
 ct 精确键序仅 op，返回键序 op,digest：digest 为 ce.config 规范化
-version=10 对象按逐层键序序列化为 UTF-8 紧凑 JSON（非 ASCII 不转义、
+version=11 对象按逐层键序序列化为 UTF-8 紧凑 JSON（非 ASCII 不转义、
 无末尾换行）后的 SHA-256 小写 64 位十六进制；ct 只读且不推进时钟，
 时空 O(N)（N 为规范化配置大小）。cv 精确键序 op,config,now（键须按
 此序出现）：config 校验与规范化同 ci，now ∈ [0,10^9] 非 bool 整数并
@@ -489,7 +491,7 @@ version=10 对象按逐层键序序列化为 UTF-8 紧凑 JSON（非 ASCII 不�
 BACKEND/3，
 其余配置错误与 ci 同型同优先级；不应用配置，活动连接或排队项仅令
 applicable=false，返回键序 op,applicable,connections,queued,config
-（config 为规范化 version=10 回显）。cd 精确键序 op,config,now（键须
+（config 为规范化 version=11 回显）。cd 精确键序 op,config,now（键须
 按此序出现）：config 校验、规范化与错误优先级同 cv，now 同上并进入
 共用非递减时钟；比较当前 ce.config 与候选规范化配置的 backends，不
 应用候选，活动连接或排队项不报错。结果键序
@@ -508,7 +510,7 @@ config 校验与规范化同 cv/cd/pd，now ∈ [0,10^9] 非 bool 整数并进�
 （SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，按摘要、加入序、i 排序；
 key 哈希取首个不小于它的令牌、越界回绕），按 keys 原序各自独立映射。
 结果键序 op,base,target,cases,summary：base/target 为当前/候选规范化
-version=10 配置的 ct 摘要字符串；cases 按 keys 原序，项键序
+version=11 配置的 ct 摘要字符串；cases 按 keys 原序，项键序
 key,before,after,changed，before/after 为当前/候选环选中的后端 id
 字符串，changed 为 bool；summary 键序 total,stable,remapped，均为非负
 整数，total 等于 keys 长度，stable 为前后相同的项数、remapped 为变化
@@ -534,13 +536,16 @@ quotas=[]），backends 项同 v6；version=9 在既有十一键末追加 queue 
 v6；version=10 在既有十二键末追加 capacities 且须精确含末置该键，为
 数组，项精确键序 id,cap（cap ∈ [1,10^6] 非 bool 整数，id 重复报
 INPUT/2），输入顺序不限、按后端加入序仅列显式覆盖导出（v1..v9 一律视
-capacities=[]，成功即清空覆盖），queue 与 backends 项同 v9。
+capacities=[]，成功即清空覆盖），queue 与 backends 项同 v9；
+version=11 在既有十三键末追加 lifetime 且须精确含末置该键，为 null 或
+精确 {"ttl":整数} 单键对象（ttl ∈ [1,10^9] 非 bool 整数），v1..v10
+一律规范化 lifetime=null。
 各值沿用 add/hset/ws/chash/cs/ds/ls/os/ss/ts/bp 与 fs/fp 的类型与范围。
 scheduler
 缺失（v1/v2）合法，v3 多键、类型错误或 pick 非 W/R，v4 的 pick 非 W/R/L，
-v5..v10 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
+v5..v11 的 pick 非 W/R/L/H 或选 H 而 vnodes 为 null，
 连同其余非法结构、键集、键序、版本、queue 结构/类型或枚举值、capacities
-容器/项键序/类型/范围/编码或 id 重复、范围、
+容器/项键序/类型/范围/编码或 id 重复、lifetime 结构/键集/ttl 类型或范围、
 重复后端/限流项/故障段/
 配额项、编码、
 交叉约束（含同 id 段重叠）或时钟倒退判
@@ -561,8 +566,10 @@ sticky/idle 以登记值作用于新连接（idle
 dequeue/full 策略按 queue 原子载入（v1..v8 默认 F/T），清空队列并置
 evicted=0、last=null；每后端接纳容量覆盖按 capacities 原子替换（v10 显式
 覆盖按后端加入序恢复，旧版或 [] 清空；ci 后的 pc 只改当前 ce，不改已存
-提交）；失败回滚
-不变更。R 模式 pick 按既有健康、熔断闭合、排空 A 条件取得按加入序排列
+提交）；硬时限按 lifetime 原子载入（v11 携带 ttl 即按快照登记，null 与
+v1..v10 清除回到未配，作用于此后新建连接；载入后的 tm 修改只改当前
+ce/ct，不改已存提交与预约）；失败回滚
+时钟、配置、运行态、rev、历史和预约均不变更。R 模式 pick 按既有健康、熔断闭合、排空 A 条件取得按加入序排列
 的可选列表 E，E 空报 STATE/4，否则返回 E[ticket%len(E)] 并将 ticket 加
 一；R 忽略权重且不改平滑 current，结果仍键序 op,id。add/remove 或健康、
 熔断、排空状态迁移均不重置 ticket；W 及其余旧操作不变。L 模式 pick 仅
@@ -581,23 +588,25 @@ op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配�
 时间、O(1) 额外
 空间，H 的 pick 为 O(BV log(BV)) 时间、O(BV+S) 空间。
 
-配置提交与回滚：ci 成功后把规范化 version=10 配置存为提交，rev 从 1 起
+配置提交与回滚：ci 成功后把规范化 version=11 配置存为提交，rev 从 1 起
 递增，仅保留最近 16 条；失败不分配、不改历史，初始无提交。cl 精确键集
 仅 op，返回键序 op,current,commits：current 为最新 rev 或 null，
 commits 按 rev 升序，项键序 rev,config，config 复用 ce 的逐层键序与
-值格式（含 faults、quotas、queue 与 capacities）。cb 精确键集
+值格式（含 faults、quotas、queue、capacities 与末置 lifetime）。cb 精确键集
 op,rev,now：rev 为 1..10^18
 非 bool
 整数且须仍被保留，now 沿用 ci 并进入共用非递减时钟；按目标快照执行 ci
 的原子替换与默认运行态重建（恢复目标 faults 时间线并重置故障运行态，
 恢复目标 quotas 并以 cb.now 重置各配额 window=now//span、used=0，
 恢复目标 queue 的 dequeue/full 策略、清空队列并置 evicted=0、last=null，
-恢复目标 capacities 的每后端接纳容量覆盖），
+恢复目标 capacities 的每后端接纳容量覆盖，按目标 lifetime 载入硬时限、
+null 清除），
 成功另建新 rev，返回键序 op,target,rev,ok（ok=true），
 原历史保留后再按 16 条淘汰。目标不存在或 rev 耗尽（下一个 rev 将超过
 10^18）报 STATE/4；键集、rev 类型/范围或时钟非法报 INPUT/2；有活动
-连接或排队项报 STATE/4。失败回滚时钟、配置、运行态、rev 与历史。
-record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16(B+M+T+Q))；其余
+连接或排队项报 STATE/4。失败回滚时钟、配置、运行态、rev、历史与预约。
+record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16N)（N 为规范化
+配置大小）；其余
 子命令与既有操作行为不变。
 
 H pick 记账：扩展 H 模式 pick，调度与映射行为不变，成功项仅记一次并归属
@@ -821,8 +830,9 @@ reason=L，二者同时到期取 L；ts、tm 均未配报 STATE/4，未知 cid �
 CONNECTION/5。tx 在已配 ts 或 tm 时可用，依建连序删除全部
 now≥deadline（空闲或硬截止到期）的连接，删除联动（端点快照、后端
 并发与排空 D→X）不变，结果仍为 op,expired。tm/te 的非法键序、类型、
-范围或时钟倒退报 INPUT/2；失败批次原子回滚。硬时限为运行态登记，不
-随 ce/ci 导出，ci/cb/ca 成功随运行态重建回到未配。tm/te 为 O(1)，
+范围或时钟倒退报 INPUT/2；失败批次原子回滚。硬时限登记自 v11 起经末置
+lifetime 随 ce/ci 导出导入：ci/cb/ca 成功按快照载入（null 清除），tm
+后续修改只影响当前 ce/ct，不改已有提交与预约。tm/te 为 O(1)，
 tx 为 O(C)；紧凑 JSON 键序、单末尾换行及 record/replay 逐字节契约不变，
 仅用标准库。
 
@@ -844,8 +854,8 @@ str(ipaddress.ip_address(host))==host，port 为 1..65535 非 bool 整数；
 endpoint（未配置仍建连、无快照）。fw 键集 op,cid，返回键序
 op,cid,backend,host,port，取建连时的快照、不受后续 ep 变更影响；无快
 照报 STATE/4，未知 cid 报 CONNECTION/5；删除连接（close/dg/tx）同步
-删除快照。ce 统一导出当前规范化 version=10（九键末为 faults，其后为
-quotas、queue 与末置 capacities），
+删除快照。ce 统一导出当前规范化 version=11（九键末为 faults，其后为
+quotas、queue、capacities 与末置 lifetime），
 backends 项保持在既有七键后追加 endpoint（null 或键序 host,port）；ci
 兼容 version1..5 并视 endpoint=null，version6 须含 endpoint 但结构无
 faults，version7 在九键后追加 faults 且项按 fp 同款校验，成功原子重建并
@@ -1461,8 +1471,13 @@ def parse_config(value):
     INPUT，未知 id 留执行期判 BACKEND；输入顺序不限），十三键结构只可能
     为 v10 且十三键须严格按声明顺序出现（capacities 末置，任何乱序报
     INPUT）；v1..v9 结构不含 capacities，一律视为空（[]，即全部使用
-    overload.cap）。返回的规范化结构额外含 "queue": (dequeue, full) 与
-    "capacities": [(id, cap), ...]（按后端加入序，仅显式覆盖）。"""
+    overload.cap）。version=11 在既有十三键末追加 lifetime（null 或精确
+    {"ttl":整数} 单键对象，ttl ∈ [1,10^9] 非 bool 整数，同 tm.ttl；不含
+    运行态），十四键结构只可能为 v11 且十四键须严格按声明顺序出现
+    （lifetime 末置，任何乱序报 INPUT）；v1..v10 结构不含 lifetime，一律
+    规范化为 null。返回的规范化结构额外含 "queue": (dequeue, full)、
+    "capacities": [(id, cap), ...]（按后端加入序，仅显式覆盖）与
+    "lifetime": None/ttl 整数。"""
     if not isinstance(value, dict):
         fail(EXIT_INPUT, "INPUT")
     config_keys = set(value)
@@ -1477,6 +1492,8 @@ def parse_config(value):
     v9_keys = v8_keys | {"queue"}
     # v10 在既有十二键末追加 capacities；十三键结构只可能为 v10。
     v10_keys = v9_keys | {"capacities"}
+    # v11 在既有十三键末追加 lifetime；十四键结构只可能为 v11。
+    v11_keys = v10_keys | {"lifetime"}
     if config_keys == v1_keys:
         version = 1
     elif config_keys == v2_keys:
@@ -1515,6 +1532,16 @@ def parse_config(value):
         ]:
             fail(EXIT_INPUT, "INPUT")
         version = 10
+    elif config_keys == v11_keys:
+        # v11 十四键须严格按声明顺序出现，lifetime 末置：任何乱序均报
+        # INPUT。
+        if list(value) != [
+            "version", "backends", "vnodes", "limits", "overload",
+            "sticky", "idle", "backpressure", "scheduler", "faults",
+            "quotas", "queue", "capacities", "lifetime",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        version = 11
     else:
         fail(EXIT_INPUT, "INPUT")
     raw_version = value["version"]
@@ -1680,7 +1707,7 @@ def parse_config(value):
     if version >= 3:
         # scheduler 精确为 {"pick":...} 单键对象：缺失（v1/v2 键集不含该
         # 键，已在上文分流）不会出现；多键、非对象、键名错误或 pick 非
-        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5..v10 收
+        # 字符串均报 INPUT；v3 仅收 W/R，v4 收 W/R/L，v5..v11 收
         # W/R/L/H。
         raw_scheduler = value["scheduler"]
         if (
@@ -1696,7 +1723,7 @@ def parse_config(value):
         if raw_scheduler["pick"] not in allowed:
             fail(EXIT_INPUT, "INPUT")
         scheduler = raw_scheduler["pick"]
-        # v5..v10 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
+        # v5..v11 选 H 时 vnodes 须非 null（一致性哈希环必须已配置）。
         if scheduler == "H" and vnodes is None:
             fail(EXIT_INPUT, "INPUT")
     else:
@@ -1744,7 +1771,7 @@ def parse_config(value):
         # queue 精确为两键对象且键须按 dequeue,full 顺序出现：dequeue 仅
         # F/S（遇阻即停/跳过阻塞），full 仅 T/H（尾拒绝/头淘汰）；不含
         # 等待项、evicted 或 last 等运行态。结构、键序、类型或枚举值非法
-        # 判 INPUT。v9/v10 结构含该键；v1..v8 走缺省 F/T。
+        # 判 INPUT。v9/v10/v11 结构含该键；v1..v8 走缺省 F/T。
         raw_queue = value["queue"]
         if not isinstance(raw_queue, dict) or list(raw_queue) != [
             "dequeue", "full",
@@ -1764,7 +1791,7 @@ def parse_config(value):
         # v1..v8 结构不含 queue：dequeue 默认 F，full 默认 T。
         queue_policy = ("F", "T")
 
-    if version == 10:
+    if version >= 10:
         # capacities 精确为数组，项精确键序 id,cap（键须按此序出现）：
         # id 为非空 UTF-8 串且引用本配置后端（未知 id 留执行期判 BACKEND，
         # 同 B 限流/配额与 faults），cap ∈ [1,10^6] 非 bool 整数；输入顺序
@@ -1788,6 +1815,25 @@ def parse_config(value):
         # 成功热加载时清空已有覆盖。
         normalized_capacities = {}
 
+    if version == 11:
+        # lifetime 精确为 null 或 {"ttl":整数} 单键对象（键集精确为 ttl，
+        # 键序仅影响输出）：ttl ∈ [1,10^9] 非 bool 整数（同 tm.ttl）。
+        # 结构、类型或范围非法判 INPUT；不含任何运行态。null 表示未登记
+        # 硬时限，成功热加载时清除既有运行态登记。
+        raw_lifetime = value["lifetime"]
+        if raw_lifetime is None:
+            lifetime_ttl = None
+        else:
+            if not isinstance(raw_lifetime, dict) or set(raw_lifetime) != {
+                "ttl",
+            }:
+                fail(EXIT_INPUT, "INPUT")
+            lifetime_ttl = parse_idle_ttl(raw_lifetime["ttl"])
+    else:
+        # v1..v10 结构不含 lifetime：一律规范化为 null（成功热加载即清除
+        # 既有 tm 硬时限登记）。
+        lifetime_ttl = None
+
     return {
         "backends": normalized_backends,
         "vnodes": vnodes,
@@ -1801,16 +1847,18 @@ def parse_config(value):
         "quotas": normalized_quotas,
         "queue": queue_policy,
         "capacities": normalized_capacities,
+        "lifetime": lifetime_ttl,
     }
 
 
 def export_normalized_config(config):
-    """把 parse_config 的规范化结构导出为 version=10 配置对象：逐层键序、
+    """把 parse_config 的规范化结构导出为 version=11 配置对象：逐层键序、
     值格式与数组排序同 ce.config（backends 按配置出现序，项 id,weight,d,
     fail,success,circuit,drain,endpoint；limits/quotas 已由 parse_config
     强制按 scope 的 B/C/S 序、id 的 UTF-8 字节升序；faults 按后端出现序、
     段 a 升序，项键序 id,k,a,z,v；queue 键序 dequeue,full；capacities
-    末置，按后端加入序仅列显式覆盖，项键序 id,cap）。纯登记值、不含任何
+    末置（其后为 lifetime），按后端加入序仅列显式覆盖，项键序 id,cap；
+    lifetime 末置，为 null 或 {"ttl":整数}）。纯登记值、不含任何
     运行态；返回全新结构。O(N)，N 为 config 元素数。"""
     exported_backends = []
     for (backend_id, weight, d, fail_threshold, success_threshold,
@@ -1863,6 +1911,7 @@ def export_normalized_config(config):
     idle_ttl = config["idle"]
     backpressure = config["backpressure"]
     capacities = config["capacities"]
+    lifetime = config["lifetime"]
     # 按后端加入序仅列显式覆盖；未知 id 已在执行期判 BACKEND，导出路径上
     # 不会出现，但仍按已知后端过滤以保持纯函数。
     exported_capacities = [
@@ -1871,7 +1920,7 @@ def export_normalized_config(config):
         if backend_entry[0] in capacities
     ]
     return {
-        "version": 10,
+        "version": 11,
         "backends": exported_backends,
         "vnodes": config["vnodes"],
         "limits": exported_limits,
@@ -1892,11 +1941,12 @@ def export_normalized_config(config):
         "quotas": exported_quotas,
         "queue": {"dequeue": config["queue"][0], "full": config["queue"][1]},
         "capacities": exported_capacities,
+        "lifetime": None if lifetime is None else {"ttl": lifetime},
     }
 
 
 def config_digest(exported):
-    """ce.config 规范化 version=10 对象的指纹：按逐层键序序列化为 UTF-8
+    """ce.config 规范化 version=11 对象的指纹：按逐层键序序列化为 UTF-8
     紧凑 JSON（非 ASCII 不转义、无末尾换行）后取 SHA-256，返回小写 64 位
     十六进制。exported 为 export_config 产出的结构。O(N)，N 为规范化
     配置大小。"""
@@ -3023,7 +3073,7 @@ def parse_op(raw_op):
         # faults 与 capacities 引用未知后端留执行期判 BACKEND）；at、now
         # 均为 0..10^9 非 bool 整数，now 进入共用非递减时钟（倒退在执行
         # 期与其余操作同序判 INPUT），at 仅表示触发时刻、不推进时钟，
-        # at<cp.now 留执行期判 INPUT。成功保存 v10 快照但不应用。
+        # at<cp.now 留执行期判 INPUT。成功保存 v11 快照但不应用。
         if list(raw_op) != ["op", "config", "at", "now"]:
             fail(EXIT_INPUT, "INPUT")
         at = raw_op["at"]
@@ -3283,10 +3333,11 @@ def run(raw):
     # 连接空闲超时：ttl_cfg 未 ts 时为 None，否则为登记的全局空闲时限；
     # 异值重配报 STATE，登记值随 ce/ci 导出导入（ci 后作用于新连接）。
     ttl_cfg = None
-    # 连接硬时限：hard_ttl_cfg 未 tm 时为 None，否则为登记的全局硬时限；
-    # 同值幂等、异值覆盖（覆盖立即作用于既有与后续连接，硬截止恒为
-    # opened_at+当前登记值，tk 不延长）。运行态登记，不随 ce/ci 导出：
-    # ci/cb/ca 成功随运行态重建即回到未配。
+    # 连接硬时限：hard_ttl_cfg 未 tm 且当前配置 lifetime=null 时为 None，
+    # 否则为登记的全局硬时限；同值幂等、异值覆盖（覆盖立即作用于既有与
+    # 后续连接，硬截止恒为 opened_at+当前登记值，tk 不延长）。v11 起随
+    # ce/ci 经末置 lifetime 导出导入：ci/cb/ca 成功按快照载入，null 清除；
+    # 载入后的 tm 后续修改只影响当前 ce/ct，不改已有提交与预约快照。
     hard_ttl_cfg = None
     # pick 调度策略：W 为既有平滑加权（默认），R 为轮询，L 为最少连接；
     # 登记值随 ce/ci 导出导入（v1/v2 等价于 W，v3 仅 W/R，v4 收 W/R/L）。
@@ -3349,7 +3400,7 @@ def run(raw):
     # 加删除其历史，ci/cb 成功整体清空；ph 只读，不推进告警也不清理历史。
     # 额外空间 O(60B)。
     percent_events = {}
-    # 配置提交历史（cl/cb）：(rev, 规范化 version=10 配置快照) 按 rev 升序，
+    # 配置提交历史（cl/cb）：(rev, 规范化 version=11 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
     # export_config 产出的全新结构（含 faults 登记时间线与 queue 策略），
@@ -3358,7 +3409,7 @@ def run(raw):
     commit_history = []
     next_rev = 1
     # 配置预约（cp/cq/ca）：无预约为 None，否则为
-    # (snapshot, at, digest)——snapshot 为 cp 当时规范化 version=10 配置的
+    # (snapshot, at, digest)——snapshot 为 cp 当时规范化 version=11 配置的
     # 全新导出结构（不随后续运行态变化），at 为触发时刻（只表示时刻、不推进
     # 时钟），digest 为快照的 ct 摘要。cp 成功即整体替换，cq 只读 O(1)，
     # ca 成功、ci/cb 成功均清除；其余操作不影响预约。额外空间 O(N)，N 为
@@ -3551,7 +3602,8 @@ def run(raw):
 
     def conn_deadlines(connection):
         """返回连接的 (idle, hard, deadline)：idle 为 last+ts.ttl（未 ts 为
-        None），hard 为 opened_at+tm.ttl（未 tm 为 None），deadline 为非
+        None），hard 为 opened_at+硬时限（硬时限经 tm 或 ci/cb/ca 的 v11
+        lifetime 载入，二者均无为 None），deadline 为非
         None 二者最小值（均未配为 None）。硬截止只认 opened_at 与当前登记
         值，tk 刷新 last 不影响它。均 O(1)。"""
         idle = None if ttl_cfg is None else connection[3] + ttl_cfg
@@ -4216,7 +4268,7 @@ def run(raw):
 
     def export_config():
         """ce 与提交快照共用的配置导出：纯登记值、不含任何运行态，逐层键序
-        固定（version=10；backends 按加入序，项 id,weight,d,fail,success,
+        固定（version=11；backends 按加入序，项 id,weight,d,fail,success,
         circuit,drain,endpoint；limits 按 scope 的 B/C/S 序、id 的 UTF-8
         字节升序；overload/sticky/idle/backpressure 为 null 或登记值；
         scheduler 精确为 {"pick":...}；faults 按后端加入序、段 a 升序，
@@ -4224,9 +4276,10 @@ def run(raw):
         项键序 scope,id,limit,span，按 scope 的 B/C/S 序、id 的 UTF-8
         字节升序，不含 window、used；queue 键序 dequeue,full，仅登记
         出队与满载策略（F/S、T/H），不含等待项、evicted 或 last；
-        capacities 末置，按后端加入序仅列显式接纳容量覆盖，项键序
-        id,cap，空为 []）。返回全新结构，调用方可安全存为快照（不随后续
-        运行态变化）。"""
+        capacities 按后端加入序仅列显式接纳容量覆盖，项键序 id,cap，空
+        为 []；lifetime 末置，为 null 或 {"ttl":当前硬时限登记值}）。
+        返回全新结构，调用方可安全存为快照（不随后续运行态变化；ci/cb/ca
+        后的 tm 修改只改当前导出，不影响已存提交与预约快照）。"""
         exported_backends = []
         for backend_id, record in backends.items():
             circuit = record["circuit"]
@@ -4302,7 +4355,7 @@ def run(raw):
                 ),
             )
         ]
-        # capacities 末置：当前配置的每后端接纳容量覆盖，按后端加入序仅列
+        # capacities：当前配置的每后端接纳容量覆盖，按后端加入序仅列
         # 显式项，项键序 id,cap，空为 []。ci/cb 时随配置原子替换，此后 pc
         # 只改当前 ce（此处实时反映），不改已存提交快照（快照为全新结构）。
         exported_capacities = [
@@ -4310,8 +4363,10 @@ def run(raw):
             for backend_id in backends
             if backend_id in cap_overrides
         ]
+        # lifetime 末置：导出当前硬时限登记（ci/cb/ca 按快照载入，tm 后续
+        # 修改只改当前 ce/ct）；未 tm 且快照未携带（规范化 null）时为 null。
         return {
-            "version": 10,
+            "version": 11,
             "backends": exported_backends,
             "vnodes": ring_vnodes,
             "limits": exported_limits,
@@ -4331,17 +4386,22 @@ def run(raw):
             # 态。P 不持久化：queue_mode 为 P 时导出进入 P 前保留的 F/S。
             "queue": {"dequeue": dequeue_policy, "full": full_mode},
             "capacities": exported_capacities,
+            "lifetime": (
+                None if hard_ttl_cfg is None else {"ttl": hard_ttl_cfg}
+            ),
         }
 
     def apply_config(config, now):
-        """ci/cb 共用的原子替换：以 now 重建默认运行态（全部 healthy、d>0
+        """ci/cb/ca 共用的原子替换：以 now 重建默认运行态（全部 healthy、d>0
         自 now 起算预热、熔断 C 空窗、排空 A、桶满、配额按 quotas 重建
         （window=now//span、used=0，v1..v7 为空即清空）、队空、粘性清空、
         度量归零、平滑 current 与轮询 ticket=0；sticky/idle 取登记值作用于新
         连接，backpressure 携带时置 N、未携带时取消；队列策略按配置 queue
         载入（v1..v8 规范化为 F/T，v9+ 为登记的 dequeue/full），队空且
         FIFO 满载淘汰计数与最近淘汰 cid 清零；每后端接纳容量覆盖按
-        capacities 原子替换（v10 显式覆盖，旧版或 [] 清空）；fe/ah 告警
+        capacities 原子替换（v10+ 显式覆盖，旧版或 [] 清空）；硬时限按
+        lifetime 原子载入（v11 携带 ttl 即登记，v1..v10 或 null 清除回到
+        未配，作用于此后新建连接）；fe/ah 告警
         状态与历史清除；故障统计、分钟历史与恢复基线重置），并按 v7+
         faults 载入各后端登记时间线（v1..v6 为空计划）。调用方须已完成
         全部校验，本函数自身不再失败。"""
@@ -4492,9 +4552,11 @@ def run(raw):
         # 此后新建连接）；backpressure 携带时置 N，未携带（含 v1）即取消。
         sticky_ttl = config["sticky"]
         ttl_cfg = config["idle"]
-        # 硬时限为运行态登记（不随 ce/ci 导出导入）：热加载/回滚/预约提交
-        # 成功即回到未配；活动连接已被 ci 前置清空，无既有连接受影响。
-        hard_ttl_cfg = None
+        # 硬时限随配置快照原子载入（ci/cb/ca 与 v11 导出导入语义一致）：
+        # config["lifetime"] 为 None（v1..v10 或 v11 null）即清除登记回到
+        # 未配，否则为登记的 ttl 整数，作用于此后新建连接；活动连接已被
+        # ci/cb/ca 前置清空，无既有连接受影响。
+        hard_ttl_cfg = config["lifetime"]
         bp_cfg = config["backpressure"]
         bp_state = "N"
         # 队列策略按配置 queue 原子载入：dequeue 仅 F/S（v1..v8 规范化为
@@ -6589,7 +6651,7 @@ def run(raw):
 
         elif op[0] == "ct":
             # 配置指纹（只读，不推进时钟）：当前 ce.config 规范化
-            # version=10 对象的 SHA-256，键序 op,digest。
+            # version=11 对象的 SHA-256，键序 op,digest。
             results.append(
                 {"op": "ct", "digest": config_digest(export_config())}
             )
@@ -6624,11 +6686,13 @@ def run(raw):
             # 校验全部通过，原子替换配置并以 now 重建默认运行态（v7+ 同步
             # 载入 faults 时间线，故障运行态统计/基线仍重置；queue 策略随
             # 配置载入，v1..v8 为默认 F/T；capacities 显式覆盖随配置原子
-            # 替换，旧版或 [] 清空）。
+            # 替换，旧版或 [] 清空；硬时限按 lifetime 载入，null 或 v1..v10
+            # 清除）。
             apply_config(config, now)
-            # 成功后把规范化 version=10 配置存为提交：rev 从 1 起递增，
+            # 成功后把规范化 version=11 配置存为提交：rev 从 1 起递增，
             # 仅保留最近 16 条；失败不分配、不改历史。export_config 产出
-            # 全新结构，提交后的 qp/rp/pc 修改不影响已存快照。
+            # 全新结构（lifetime 为刚载入的登记值），提交后的 qp/rp/pc/tm
+            # 修改不影响已存快照。
             commit_history.append((next_rev, export_config()))
             next_rev += 1
             if len(commit_history) > 16:
@@ -6685,7 +6749,7 @@ def run(raw):
                 if override_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
             # 预览不应用候选：比较当前 ce.config 与候选规范化配置的
-            # backends。base/target 为 ct 摘要（规范化 version=10 对象的
+            # backends。base/target 为 ct 摘要（规范化 version=11 对象的
             # SHA-256）；added/removed 为 id 数组，分别按候选/当前加入序；
             # changed 按候选序列出共有且变化者，fields 按
             # weight,d,fail,success,circuit,drain,endpoint 列差异；order
@@ -6749,22 +6813,23 @@ def run(raw):
             for override_id in config["capacities"]:
                 if override_id not in config_backend_ids:
                     fail(EXIT_BACKEND, "BACKEND")
-            # 预览不应用候选：比较当前 ce.config 与候选规范化 version=10
+            # 预览不应用候选：比较当前 ce.config 与候选规范化 version=11
             # 配置的非 backends 部分。base/target 为两份完整规范化配置的 ct
             # 摘要；changes 按 vnodes,limits,overload,sticky,idle,
-            # backpressure,scheduler,faults,quotas,queue,capacities 列差异项
-            # （capacities 在 queue 后），项键序 section,before,after，
-            # before/after 复用对应 ce 字段的导出值（类型、键序、数组排序与
-            # 值格式一致；capacities 的 before 含当前 pc 显式覆盖）；仅
-            # backends 变化时 changes 为空。成功仅推进时钟（已在共用时钟块
-            # 完成），其余状态不变。O(N)，N 为规范化配置大小。
+            # backpressure,scheduler,faults,quotas,queue,capacities,lifetime
+            # 列差异项（lifetime 在 capacities 后、末置），项键序
+            # section,before,after，before/after 复用对应 ce 字段的导出值
+            # （类型、键序、数组排序与值格式一致；capacities 的 before 含
+            # 当前 pc 显式覆盖；lifetime 的 before 含当前 tm 硬时限登记）；
+            # 仅 backends 变化时 changes 为空。成功仅推进时钟（已在共用时钟
+            # 块完成），其余状态不变。O(N)，N 为规范化配置大小。
             current_export = export_config()
             candidate_export = export_normalized_config(config)
             changes = []
             for section in (
                 "vnodes", "limits", "overload", "sticky", "idle",
                 "backpressure", "scheduler", "faults", "quotas", "queue",
-                "capacities",
+                "capacities", "lifetime",
             ):
                 before = current_export[section]
                 after = candidate_export[section]
@@ -6886,11 +6951,12 @@ def run(raw):
             # 有活动连接或排队项时拒绝回滚：STATE。
             if connections or wait_queue:
                 fail(EXIT_STATE, "STATE")
-            # 快照即规范化 version=10 配置（含 queue 策略与 capacities
-            # 覆盖），重解析后沿用 ci 的替换语义；快照来自 export_config，
-            # 必然合法，不会抛 INPUT。queue.dequeue/full 随快照恢复，队列
-            # 清空且淘汰计数、最近淘汰 cid 重置（0、null）；capacities
-            # 覆盖随快照恢复。
+            # 快照即规范化 version=11 配置（含 queue 策略、capacities
+            # 覆盖与 lifetime 硬时限），重解析后沿用 ci 的替换语义；快照
+            # 来自 export_config，必然合法，不会抛 INPUT。queue.dequeue/
+            # full 随快照恢复，队列清空且淘汰计数、最近淘汰 cid 重置（0、
+            # null）；capacities 覆盖随快照恢复；硬时限按快照 lifetime
+            # 载入，null 清除。
             apply_config(parse_config(snapshot), now)
             # 原历史保留，追加新 rev 后再按 16 条淘汰。
             commit_history.append((next_rev, export_config()))
@@ -6907,7 +6973,7 @@ def run(raw):
         elif op[0] == "cp":
             # 配置预约：at>=now 为时间字段判定（先于 BACKEND）；B 限流、
             # B 配额、faults 与 capacities 引用未知后端报 BACKEND，优先级同
-            # cv。成功把候选规范化为 version=10 快照保存但不应用、不建 rev、
+            # cv。成功把候选规范化为 version=11 快照保存但不应用、不建 rev、
             # 不改任何运行态；同 digest、at 重报幂等（原样返回且不重存快
             # 照）。快照为 export_normalized_config 产出的全新结构，额外
             # 时间 O(N)、空间 O(N)，N 为规范化配置大小。
@@ -6957,7 +7023,7 @@ def run(raw):
 
         elif op[0] == "ca":
             # 预约生效：无预约、now<at、有活动连接或排队项报 STATE；rev 耗尽
-            # 同 ci 报 STATE。全部校验先于任何变更。通过后按保存的 v10 快照
+            # 同 ci 报 STATE。全部校验先于任何变更。通过后按保存的 v11 快照
             # 执行 ci 的原子替换、以 now 重建默认运行态并新建 rev（快照来自
             # export_normalized_config，重解析必然合法），成功清除预约；
             # 失败天然原子回滚（预约、时钟、配置、rev 均不变）。
