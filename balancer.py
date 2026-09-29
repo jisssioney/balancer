@@ -986,6 +986,27 @@ since=a+2*v*((now-a)//(2*v))，F 上线相位与 S 段不列入。同参重报
 O(log(T+1))、空间 O(1)（T 为故障段数），仅用标准库；沿用紧凑 UTF-8
 固定键序 JSON、单换行及 record/replay 逐字节契约，其他子命令不变且不
 属本题范围。
+
+配置变更审计：成功配置变更（ci/cb/cu/ca）每分配一个新 rev 追加一条审计
+事件，按 rev 升序仅保留最近 64 条，初始为空；rev 从 1 起递增只增不复
+用，已分配最大 rev 初值 0。事件项键序
+rev,now,kind,section,before,after：now 为该操作显式时钟，kind ∈
+ci/cb/cu/ca，section 仅 cu 为被替换顶层字段、其余 null，before/after
+为操作前后规范化 version=11 配置的 ct 摘要（值未变两摘要相同仍记录）。
+al 精确键序仅 op，返回键序 op,events：events 为保留事件（至多 64 条，
+按 rev 升序）的逐项全新快照；只读、不推进时钟，重复查询逐字节相同，
+O(A)，A≤64。ai 精确键序 op,after,limit（键须按此序出现）：after 为
+0..10^18、limit 为 1..64 的非 bool 整数，只读且不推进时钟；after>已分
+配最大 rev 报 STATE/4，键序、类型或范围非法报 INPUT/2。复用 al 按 rev
+升序保留的最近 64 条事件：历史非空且 after<最旧 rev-1 时，游标之前事件
+已淘汰不可再读，置 truncated=true 并自最旧事件读取；否则取 rev>after
+的事件；至多 limit 条。结果键序 op,after,next,truncated,more,events：
+next 为末条事件 rev、无条目等于 after；truncated、more 为 bool，more
+表示保留事件中本页之后是否尚有可读事件；events 项键序与值义沿用 al。
+空历史的 after=0 查询返回 next=0、truncated=false、more=false、空数组。
+ai 时间 O(A)、额外空间 O(limit)，A≤64。两查询均只读、不改任何状态，
+失败批回滚；紧凑 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节
+契约不变，仅用标准库，其他子命令不变。
 """
 
 import base64
@@ -2124,7 +2145,7 @@ def parse_op(raw_op):
         "lt",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
-        "ce", "ci", "cl", "al", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
+        "ce", "ci", "cl", "al", "ai", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -3433,6 +3454,28 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("al",)
 
+    if name == "ai":
+        # 审计游标查询：精确键序 op,after,limit（键须按此序出现），after 为
+        # 0..10^18、limit 为 1..64 的非 bool 整数；只读、不推进时钟。
+        # after 超过已分配最大 rev 的 STATE 留执行期判。
+        if list(raw_op) != ["op", "after", "limit"]:
+            fail(EXIT_INPUT, "INPUT")
+        after = raw_op["after"]
+        limit = raw_op["limit"]
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or not 0 <= after <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 64
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("ai", after, limit)
+
     if name == "cb":
         # 配置回滚：精确键集 op,rev,now；rev 为 1..10^18 非 bool 整数
         # （是否仍被保留留执行期判 STATE），now 沿用 ci 并进入共用非递减
@@ -3778,13 +3821,14 @@ def run(raw):
     # ca 成功、ci/cb 成功均清除；其余操作不影响预约。额外空间 O(N)，N 为
     # 规范化配置大小。
     reservation = None
-    # 配置变更审计（al）：deque(maxlen=64) 按 rev 升序保留最近 64 条，追加
-    # O(1) 且超额自动淘汰最旧项；初始为空，独立于 commit_history 的 16 条
-    # 提交，成功配置变更（ci/cb/cu/ca 分配新 rev 时）不清空旧事件。每事件
-    # 为全新 dict，精确键序 rev,now,kind,section,before,after：rev 为本次
-    # 新 rev，now 为该操作显式时钟，kind ∈ ci/cb/cu/ca，section 仅 cu 取被
-    # 替换顶层字段、其余 None，before/after 为操作前后规范化 version=11 配
-    # 置的 ct 摘要（值未变两摘要相同仍记录）。额外空间 O(A)，A≤64。
+    # 配置变更审计（al/ai）：deque(maxlen=64) 按 rev 升序保留最近 64 条，
+    # 追加 O(1) 且超额自动淘汰最旧项；初始为空，独立于 commit_history 的
+    # 16 条提交，成功配置变更（ci/cb/cu/ca 分配新 rev 时）不清空旧事件。
+    # 已分配最大 rev 即 next_rev-1（初始 0）。每事件为全新 dict，精确键序
+    # rev,now,kind,section,before,after：rev 为本次新 rev，now 为该操作
+    # 显式时钟，kind ∈ ci/cb/cu/ca，section 仅 cu 取被替换顶层字段、其余
+    # None，before/after 为操作前后规范化 version=11 配置的 ct 摘要（值未
+    # 变两摘要相同仍记录）。额外空间 O(A)，A≤64。
     audit_events = deque(maxlen=64)
     results = []
 
@@ -7595,6 +7639,60 @@ def run(raw):
                         }
                         for event in audit_events
                     ],
+                }
+            )
+
+        elif op[0] == "ai":
+            # 审计游标查询（只读，不推进时钟）：latest 为已分配最大 rev
+            # （next_rev-1，初始 0），after>latest 报 STATE（空历史仅
+            # after=0 合法）。复用 al 按 rev 升序保留的最近 64 条事件：
+            # 历史非空且 after<最旧rev-1 时，游标之前的事件已按 64 条淘汰、
+            # 不可再读，置 truncated=true 并自最旧事件读取；否则取
+            # rev>after 的事件；至多返回 limit 条。响应键序
+            # op,after,next,truncated,more,events：next 为末条 rev，无条目
+            # 等于 after；more 为保留事件中本页之后是否尚有可读事件；
+            # events 项键序与值义沿用 al。事件逐项复制为全新结构，重复
+            # 查询逐字节相同。单次升序扫描，O(A) 时间、O(limit) 额外空间，
+            # A≤64。
+            _, after, limit = op
+            latest = next_rev - 1
+            if after > latest:
+                fail(EXIT_STATE, "STATE")
+            truncated = bool(
+                audit_events and after < audit_events[0]["rev"] - 1
+            )
+            events = []
+            more = False
+            for event in audit_events:
+                if not truncated and event["rev"] <= after:
+                    # 非截断路径跳过游标本身及之前事件；截断路径下全部
+                    # 保留事件 rev 均大于 after，自最旧事件起全部可读。
+                    continue
+                if len(events) < limit:
+                    events.append(
+                        {
+                            "rev": event["rev"],
+                            "now": event["now"],
+                            "kind": event["kind"],
+                            "section": event["section"],
+                            "before": event["before"],
+                            "after": event["after"],
+                        }
+                    )
+                else:
+                    # deque 按 rev 升序：命中第 limit+1 条即知尚有可读
+                    # 事件，其后无须再扫。
+                    more = True
+                    break
+            cursor_next = events[-1]["rev"] if events else after
+            results.append(
+                {
+                    "op": "ai",
+                    "after": after,
+                    "next": cursor_next,
+                    "truncated": truncated,
+                    "more": more,
+                    "events": events,
                 }
             )
 
