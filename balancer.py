@@ -402,6 +402,20 @@ remove 后同 id 重加及 ci/cb/ca 成功清空历史；失败批回滚。xh �
 额外空间 O(60B)，仅标准库；紧凑 UTF-8 固定键序 JSON、单末尾换行及
 record/replay 逐字节契约照常，其他子命令不变。
 
+每后端重试/重映射告警汇总：xg 精确键序 op,id,k,from,to,now（键须按此序
+出现），id 沿用后端标识，k 仅 R/M，from/to/now 为 0..10^9 非 bool 整数，
+now 进入共用非递减时钟，须 from≤to≤now//60 且 to-from<60。结果键序
+op,id,k,state,last,total,raised,cleared：state 取该 (id,k) 当前 xa 状态
+N/A，从未评估时为 N；last 取现存 60 窗历史中最近的转换窗且不限查询区
+间，无事件为 null；raised、cleared 分别统计闭区间 [from,to] 内的 N→A、
+A→N 事件，total 为两者之和，三者皆为非负整数，无历史时为 0。xg 只读：
+不推进 xa 状态机、不裁剪历史。键序、id、k、类型、范围、关系或时钟倒退
+报 INPUT/2；未知 id 报 BACKEND/3；from 早于 max(0,now//60-59) 报
+STATE/4，依次判定。remove 后同 id 重加及 ci/cb/ca 成功仍清告警与历史；
+失败批回滚。xg 时间 O(60)、额外空间 O(1)，仅标准库；紧凑 UTF-8 固定键
+序 JSON、单末尾换行及 record/replay 逐字节契约照常，xa、xh 及其余子命令
+不变。
+
 后端采样历史：ms 键集 op,id,now（now 为 [0,10^9] 非 bool 整数，纳入共用
 非递减时钟），id 须现存否则 BACKEND。每次采样记录该后端当时的活动连接数
 与 removed——removed 沿用 mg 的取值与优先级（drain、health、circuit、
@@ -2065,7 +2079,7 @@ def parse_op(raw_op):
         "lh",
         "lt",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -2795,6 +2809,29 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return (
             "xh", parse_backend_id(raw_op["id"]),
+            kind, start, end, now,
+        )
+
+    if name == "xg":
+        # 每后端重试/重映射告警汇总（只读）：精确键序
+        # op,id,k,from,to,now（键须按此序出现）；id 沿用非空字符串校验
+        # （未知 id 留执行期判 BACKEND），k 仅 R/M，from/to/now 为
+        # 0..10^9 非 bool 整数；窗关系 from≤to≤now//60 且 to-from<60，
+        # 非法即 INPUT；now 纳入共用非递减时钟（倒退执行期判 INPUT）。
+        # from 过早与未知 id 留执行期判。
+        if list(raw_op) != ["op", "id", "k", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        kind = raw_op["k"]
+        if not isinstance(kind, str) or kind not in ("R", "M"):
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "xg", parse_backend_id(raw_op["id"]),
             kind, start, end, now,
         )
 
@@ -4845,7 +4882,7 @@ def run(raw):
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
-            "ru", "ea", "eh", "pa", "ph", "xa", "xh",
+            "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg",
             "cp", "cq", "ca",
         ):
             now = op[-1]
@@ -8396,6 +8433,57 @@ def run(raw):
             results.append(
                 {"op": "xh", "id": backend_id, "k": kind_code,
                  "events": events}
+            )
+
+        elif op[0] == "xg":
+            # 每后端重试/重映射告警汇总（只读）：未知 id 判 BACKEND，先于窗
+            # 状态；from 早于最近 60 窗下界报 STATE（同 xh/ph/eh）。不推进
+            # xa 状态机、不清理历史，失败批次天然回滚。state 取该 (id,k) 当
+            # 前 xa 状态（未首评为 N）；last 取现存 60 窗历史中最近的转换
+            # 窗，与查询区间无关，无事件为 null；raised/cleared 分别统计现存
+            # 历史中落在闭区间 [from,to] 的 N→A、A→N 事件数，total 为二者
+            # 之和，无历史三者皆 0。历史每键至多 60 项，单次遍历即得全部汇
+            # 总，时间 O(60)、额外空间 O(1)（不拷贝事件）。
+            _, backend_id, kind_code, start, end, now = op
+            if backend_id not in backends:
+                # 未知 id 先于窗口状态判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            alert_key = (backend_id, kind_code)
+            entry = retry_alerts.get(alert_key)
+            # 从未评估（含 remove 后同 id 重加、ci/cb/ca 清空）时 state=N。
+            state = "N" if entry is None else entry["state"]
+            raised = 0
+            cleared = 0
+            last = None
+            history = retry_events.get(alert_key)
+            if history is not None:
+                for event in history:
+                    window = event["window"]
+                    # 闭区间 [from,to] 内才计入 raised/cleared；事件仅
+                    # N→A/A→N 两种。
+                    if start <= window <= end:
+                        if event["from"] == "N" and event["to"] == "A":
+                            raised += 1
+                        else:
+                            cleared += 1
+                    # last 不限查询区间：现存历史中的最近转换窗。
+                    if last is None or window > last:
+                        last = window
+            results.append(
+                {
+                    "op": "xg",
+                    "id": backend_id,
+                    "k": kind_code,
+                    "state": state,
+                    "last": last,
+                    "total": raised + cleared,
+                    "raised": raised,
+                    "cleared": cleared,
+                }
             )
 
         elif op[0] == "fx":
