@@ -11089,6 +11089,456 @@ class RetryRemapAlertTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b'{"error":"BACKEND"}\n')
 
 
+class ConcurrencyAlertTest(unittest.TestCase):
+    """na 每后端并发告警：mx 窗 samples/peak、N/A 滞回、缓存与拒绝。"""
+
+    def results(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def na(w, now, hi=1, lo=0, n=1, backend="b"):
+        return {"op": "na", "id": backend, "w": w,
+                "hi": hi, "lo": lo, "n": n, "now": now}
+
+    @staticmethod
+    def open(cid, now=0):
+        return {"op": "open", "cid": cid, "flow": FLOW, "now": now}
+
+    @staticmethod
+    def close(cid, now=0):
+        return {"op": "close", "cid": cid, "now": now}
+
+    @staticmethod
+    def ms(now, backend="b"):
+        return {"op": "ms", "id": backend, "now": now}
+
+    def na_results(self, ops):
+        return [r for r in self.results(ops) if r["op"] == "na"]
+
+    def test_result_key_order_and_value_source(self):
+        out = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.open("y", 0),
+            self.ms(1),                      # 并发 2
+            self.close("y", 2),
+            self.ms(3),                      # 并发 1
+            self.na(0, 60, hi=2),
+        ])[-1]
+        self.assertEqual(
+            list(out),
+            ["op", "id", "w", "state", "samples", "peak", "run", "changed"],
+        )
+        # samples 为窗内采样点数，peak 为窗内并发峰值。
+        self.assertEqual(out["samples"], 2)
+        self.assertEqual(out["peak"], 2)
+        self.assertEqual(out["state"], "A")
+        self.assertEqual(out["run"], 0)
+        self.assertIs(out["changed"], True)
+
+    def test_empty_window_zero_starts_N(self):
+        out = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(0, 60),
+        ])[-1]
+        self.assertEqual(
+            (out["state"], out["samples"], out["peak"],
+             out["run"], out["changed"]),
+            ("N", 0, 0, 0, False),
+        )
+
+    def test_empty_window_does_not_count_in_A(self):
+        # 空窗 samples=0：即使 peak=0<=lo 也不计入 A→N 连续数。
+        seq = self.na_results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60),                  # A
+            self.na(1, 120),                 # 空窗：留 A，run=0
+            self.na(2, 180),                 # 空窗：仍留 A
+        ])
+        self.assertEqual(
+            [(r["state"], r["samples"], r["run"], r["changed"]) for r in seq],
+            [("A", 1, 0, True), ("A", 0, 0, False), ("A", 0, 0, False)],
+        )
+
+    def test_n_accumulates_then_transitions_and_returns(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60, n=2),             # run=1
+            self.ms(60),
+            self.na(1, 120, n=2),            # N→A
+            self.close("x", 120),
+            self.ms(121),                    # 并发 0：samples>0 且 peak<=lo
+            self.na(2, 180, n=2),            # A 态 run=1
+            self.ms(180),
+            self.na(3, 240, n=2),            # 连续 2 窗 → A→N
+        ]
+        seq = [(r["state"], r["run"], r["changed"], r["peak"])
+               for r in self.na_results(ops)]
+        self.assertEqual(seq, [
+            ("N", 1, False, 1),
+            ("A", 0, True, 1),
+            ("A", 1, False, 0),
+            ("N", 0, True, 0),
+        ])
+
+    def test_direction_mismatch_clears_run_in_N(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60, n=2),             # run=1
+            self.close("x", 60),
+            self.ms(61),
+            self.na(1, 120, n=2),            # peak<hi 清 0
+            self.open("y", 120),
+            self.ms(121),
+            self.na(2, 180, n=2),            # run=1
+            self.ms(180),
+            self.na(3, 240, n=2),            # run=2→A
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.na_results(ops)]
+        self.assertEqual(seq, [
+            ("N", 1, False), ("N", 0, False),
+            ("N", 1, False), ("A", 0, True),
+        ])
+
+    def test_direction_mismatch_clears_run_in_A(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60, n=2),             # run=1
+            self.ms(60),
+            self.na(1, 120, n=2),            # N→A
+            self.ms(120),
+            self.na(2, 180, n=2),            # peak>lo 清 0 留 A
+            self.close("x", 180),
+            self.ms(181),
+            self.na(3, 240, n=2),            # peak<=lo：A 态 run=1
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.na_results(ops)]
+        self.assertEqual(seq, [
+            ("N", 1, False), ("A", 0, True),
+            ("A", 0, False), ("A", 1, False),
+        ])
+
+    def test_hi_lo_boundaries_inclusive(self):
+        # peak==hi 满足 >=hi；peak==lo 满足 <=lo。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.open("y", 0),
+            self.ms(1),                      # peak 2
+            self.na(0, 60, hi=2, lo=1),      # 2==hi → N→A
+            self.close("y", 60),
+            self.ms(61),                     # peak 1
+            self.na(1, 120, hi=2, lo=1),     # 1==lo → A→N
+        ]
+        seq = [(r["state"], r["changed"]) for r in self.na_results(ops)]
+        self.assertEqual(seq, [("A", True), ("N", True)])
+
+    def test_per_backend_independent(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            self.open("x", 0),               # 等权首选取最早加入的 b
+            self.ms(1, backend="b"),
+            self.ms(1, backend="c"),
+            self.na(0, 60, backend="b"),     # b 并发 1 → A
+            self.na(0, 61, backend="c"),     # c 并发 0 → 留 N
+        ]
+        seq = self.na_results(ops)
+        self.assertEqual([r["state"] for r in seq], ["A", "N"])
+        self.assertEqual(seq[1]["peak"], 0)
+
+    def test_same_window_same_params_returns_cached(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60, n=2),
+            self.na(0, 61, n=2),
+            self.na(0, 62, n=2),
+        ]
+        seq = self.na_results(ops)
+        self.assertEqual(seq[0], seq[1])
+        self.assertEqual(seq[1], seq[2])
+        self.assertEqual([r["run"] for r in seq], [1, 1, 1])
+
+    def test_same_window_changed_param_is_state(self):
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(0, 60, n=2),
+            self.na(0, 61, n=3),
+        ]), 4, "STATE")
+
+    def test_param_change_next_window_is_state(self):
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(0, 60, hi=2),
+            self.na(1, 120, hi=3),
+        ]), 4, "STATE")
+
+    def test_skipped_window_is_state(self):
+        # 前跳一窗 w=2（最近已评 w=0）→ STATE。
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(0, 60),
+            self.na(2, 180),
+        ]), 4, "STATE")
+        # 回退：w=1 后再评 w=0（即使 w=0 仍在保留窗范围内）→ STATE。
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(1, 120),
+            self.na(0, 180),
+        ]), 4, "STATE")
+
+    def test_window_not_ended_is_state(self):
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(1, 119),
+        ]), 4, "STATE")
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(0, 59),
+        ]), 4, "STATE")
+
+    def test_window_too_old_is_state(self):
+        # now=3600 当前窗 60、下界 1，w=0 过旧。
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(0, 3600),
+        ]), 4, "STATE")
+
+    def test_window_lower_bound_is_inclusive(self):
+        for now, w in ((3600, 1), (3599, 0)):
+            out = self.results([
+                {"op": "add", "id": "b", "weight": 1},
+                self.na(w, now),
+            ])[-1]
+            self.assertEqual(out["w"], w)
+
+    def test_clock_regression_is_input(self):
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.ms(120),
+            self.na(0, 60),
+        ]), 2, "INPUT")
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(encode_ops([self.na(0, 60, backend="z")]),
+                            3, "BACKEND")
+
+    def test_unknown_id_precedes_window_state(self):
+        self.assert_failure(encode_ops([self.na(5, 60, backend="z")]),
+                            3, "BACKEND")
+
+    def test_key_order_rejections(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        tail = b"]}"
+        cases = [
+            # hi/lo 乱序。
+            b'{"op":"na","id":"b","w":0,"lo":0,"hi":1,"n":1,"now":60}',
+            # w 与 hi 乱序。
+            b'{"op":"na","id":"b","hi":1,"w":0,"lo":0,"n":1,"now":60}',
+            # 缺 w。
+            b'{"op":"na","id":"b","hi":1,"lo":0,"n":1,"now":60}',
+            # 多键。
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":0,"n":1,"now":60,"x":1}',
+        ]
+        for body in cases:
+            self.assert_failure(head + body + tail, 2, "INPUT")
+
+    def test_type_range_relation_rejections(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        tail = b"]}"
+        cases = [
+            b'{"op":"na","id":"b","w":0,"hi":0,"lo":0,"n":1,"now":60}',   # hi 下界
+            b'{"op":"na","id":"b","w":0,"hi":1000000001,"lo":0,"n":1,"now":60}',  # hi 超界
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":-1,"n":1,"now":60}',  # lo 下界
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":1000000000,"n":1,"now":60}',  # lo 上界
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":1,"n":1,"now":60}',   # lo==hi
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":2,"n":1,"now":60}',   # lo>hi
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":0,"n":0,"now":60}',   # n 下界
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":0,"n":61,"now":60}',  # n 上界
+            b'{"op":"na","id":"b","w":-1,"hi":1,"lo":0,"n":1,"now":60}',  # w 下界
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":0,"n":1,"now":-1}',   # now 下界
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":0,"n":1,"now":1000000001}',  # now 上界
+            b'{"op":"na","id":"b","w":true,"hi":1,"lo":0,"n":1,"now":60}',   # w bool
+            b'{"op":"na","id":"b","w":0,"hi":true,"lo":0,"n":1,"now":60}',  # hi bool
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":false,"n":1,"now":60}', # lo bool
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":0,"n":true,"now":60}',  # n bool
+            b'{"op":"na","id":"b","w":0,"hi":1,"lo":0,"n":1,"now":true}',   # now bool
+            b'{"op":"na","id":"b","w":0,"hi":1.0,"lo":0,"n":1,"now":60}',   # hi 浮点
+            b'{"op":"na","id":"b","w":"0","hi":1,"lo":0,"n":1,"now":60}',   # w 字符串
+            b'{"op":"na","id":123,"w":0,"hi":1,"lo":0,"n":1,"now":60}',    # id 非字符串
+        ]
+        for body in cases:
+            self.assert_failure(head + body + tail, 2, "INPUT")
+
+    def test_threshold_bounds_accepted(self):
+        out = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(0, 60, hi=10 ** 9, lo=10 ** 9 - 1),
+        ])[-1]
+        self.assertEqual(
+            (out["state"], out["peak"], out["run"]), ("N", 0, 0)
+        )
+
+    def test_remove_and_readd_clears(self):
+        # remove 后直接 na → BACKEND。
+        self.assert_failure(encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(0, 60),
+            {"op": "remove", "id": "b"},
+            self.na(1, 120),
+        ]), 3, "BACKEND")
+        # 重加后回到未首评。
+        seq = self.na_results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60),                  # A
+            self.close("x", 60),
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            self.na(1, 120),                 # 未首评：N
+        ])
+        self.assertEqual(
+            [(r["state"], r["run"], r["changed"]) for r in seq],
+            [("A", 0, True), ("N", 0, False)],
+        )
+
+    def test_ci_cb_ca_cu_clear_alarm(self):
+        exported = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ce"},
+        ])[-1]["config"]
+        digest = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ct"},
+        ])[-1]["digest"]
+        raise_ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60),                  # A
+            self.close("x", 61),
+        ]
+        # ci 成功清告警。
+        seq = self.na_results(
+            raise_ops
+            + [{"op": "ci", "config": exported, "now": 120},
+               self.na(1, 120)]              # 未首评：N
+        )
+        self.assertEqual([(r["state"], r["changed"]) for r in seq],
+                         [("A", True), ("N", False)])
+        # cb 回滚成功同样清告警（先 ci 产生 rev 1）。
+        seq = self.na_results(
+            [{"op": "ci", "config": exported, "now": 0}]
+            + [self.open("x", 0), self.ms(1), self.na(0, 60),
+               self.close("x", 61)]
+            + [{"op": "cb", "rev": 1, "now": 120},
+               self.na(1, 120)]              # 未首评：N
+        )
+        self.assertEqual([(r["state"], r["changed"]) for r in seq],
+                         [("A", True), ("N", False)])
+        # cp 预约、ca 生效成功清告警。
+        seq = self.na_results(
+            [{"op": "ci", "config": exported, "now": 0}]
+            + [self.open("x", 0), self.ms(1), self.na(0, 60),
+               self.close("x", 61)]
+            + [{"op": "cp", "config": exported, "at": 180, "now": 62},
+               {"op": "ca", "now": 180},
+               self.na(1, 240)]              # 未首评：N
+        )
+        self.assertEqual([(r["state"], r["changed"]) for r in seq],
+                         [("A", True), ("N", False)])
+        # cu 热加载成功同样清告警。
+        seq = self.na_results(
+            raise_ops
+            + [{"op": "cu", "base": digest, "section": "vnodes",
+                "value": None, "now": 62},
+               self.na(0, 120)]              # 未首评：N
+        )
+        self.assertEqual([(r["state"], r["changed"]) for r in seq],
+                         [("A", True), ("N", False)])
+
+    def test_failed_batch_is_atomic(self):
+        # 合法 na 之后跳窗触发 STATE：整批无 stdout。
+        code, stdout, stderr = run_balancer("run", encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60),
+            self.na(9, 600),
+        ]))
+        self.assertEqual((code, stdout), (4, b""))
+        self.assertEqual(stderr, b'{"error":"STATE"}\n')
+
+    def test_output_single_newline(self):
+        _, out, _ = run_balancer("run", encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60),
+        ]))
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.ms(1),
+            self.na(0, 60, n=2),
+            self.ms(60),
+            self.na(0, 61, n=2),
+            self.na(1, 120, n=2),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+    def test_record_replay_covers_failure(self):
+        raw = encode_ops([self.na(0, 60, backend="z")])
+        _, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, 3)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+        self.assertEqual(rep_stderr, b'{"error":"BACKEND"}\n')
+
+
 class RetryRemapAlertHistoryTest(unittest.TestCase):
     """xh 重试/重映射告警转换历史：事件追加、区间、只读、裁剪与清除。"""
 
