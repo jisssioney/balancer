@@ -447,6 +447,20 @@ fault,none 的非负整数计数对象，removed=null 的样本计入 none。mx 
 清空采样历史。ms 为 O(1)，mx 为 O(R+S)（R 为窗数、S 为区间内样本数），
 仅用标准库，其余子命令与既有操作行为不变。
 
+后端并发告警：na 精确键序 op,id,w,hi,lo,n,now（键须按此序出现），id 沿
+用后端标识（未知 id 报 BACKEND/3），w/now 为 0..10^9、hi 为 1..10^9、lo
+为 0..(10^9-1)、n 为 1..60，皆为非 bool 整数且 lo<hi。now 纳入共用非
+递减时钟，须 max(0,now//60-59)≤w<now//60（w 窗已结束且在最近 60 窗保留
+范围内）。取 mx 中 w 窗的 samples、peak（空窗皆为 0）。各 id 初始 N 并
+在首评固化 hi/lo/n；N 连续 n 窗满足 samples>0 且 peak≥hi 转 A，A 连续
+n 窗满足 samples>0 且 peak≤lo 转 N，否则 run 清 0，转换后 run=0。w 此
+后仅可同前或 +1；同窗同参返回首次缓存结果且不推进状态机。结果键序
+op,id,w,state,samples,peak,run,changed；state 仅 N/A，changed 仅转换时
+true。键序、id 编码、类型、范围、关系或时钟倒退报 INPUT/2；窗口未结束/
+过旧、跳窗（含回退）或变参报 STATE/4。remove 后重加及 ci/cb/ca/cu 成功
+清告警，失败批回滚。na 时空 O(1)、空间 O(B)，仅标准库；紧凑 UTF-8 固定
+键序 JSON、单换行及 record/replay 逐字节契约照常，其他子命令不变。
+
 不可用原因分钟历史：按 window=now//60 记账，各后端只保留最近 60 窗，
 空窗不预建。probe 使 healthy 转 unhealthy 时该后端 health 加 1；dr 使 A
 转 D/X 时 drain 加 1；cr 使 C/H 转 O 时 circuit 加 1；oa 返回 Q 且所选
@@ -2123,7 +2137,7 @@ def parse_op(raw_op):
         "lh",
         "lt",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
+        "mr", "mg", "mh", "ms", "mx", "na", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "ce", "ci", "cl", "al", "ai", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -2918,6 +2932,46 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("mx", parse_backend_id(raw_op["id"]), start, end, now)
+
+    if name == "na":
+        # 后端并发告警：精确键序 op,id,w,hi,lo,n,now（键须按此序出现）；
+        # id 沿用非空字符串校验（未知 id 留执行期判 BACKEND），w/now 为
+        # 0..10^9、hi 为 1..10^9、lo 为 0..(10^9-1)、n 为 1..60，皆为非
+        # bool 整数且 lo<hi；now 纳入共用非递减时钟（倒退执行期判 INPUT）。
+        # 键序/类型/范围/lo<hi 在此判 INPUT；窗关系
+        # max(0,now//60-59)≤w<now//60、跳窗与变参留执行期判 STATE。
+        if list(raw_op) != ["op", "id", "w", "hi", "lo", "n", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        w = parse_metric_num(raw_op["w"])
+        hi = raw_op["hi"]
+        # bool 是 int 的子类，必须显式排除。
+        if (
+            not isinstance(hi, int)
+            or isinstance(hi, bool)
+            or not 1 <= hi <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        lo = raw_op["lo"]
+        if (
+            not isinstance(lo, int)
+            or isinstance(lo, bool)
+            or not 0 <= lo < 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if not lo < hi:
+            fail(EXIT_INPUT, "INPUT")
+        n = raw_op["n"]
+        if (
+            not isinstance(n, int)
+            or isinstance(n, bool)
+            or not 1 <= n <= 60
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_metric_num(raw_op["now"])
+        return (
+            "na", parse_backend_id(raw_op["id"]),
+            w, hi, lo, n, now,
+        )
 
     if name == "rh":
         # 不可用原因分钟历史：精确键序 op,id,from,to,now（键须按此序出现），
@@ -3786,6 +3840,14 @@ def run(raw):
     # 删除该后端 R/M 两键历史，ci/cb/ca 成功整体清空；xh 只读，不推进告
     # 警也不清理历史。额外空间 O(60B)。
     retry_events = {}
+    # 后端并发告警（na）：以后端 id 为键，未首评为缺键，否则为
+    # {"hi","lo","n","state","run","w","result"}——(hi,lo,n) 为首评固化的
+    # 阈值（hi 1..10^9、lo 0..(10^9-1)、lo<hi、n 1..60），state ∈ N/A，run
+    # 为当前连续计数，w 为最近已评窗，result 为该窗结果（同窗同参原样返回，
+    # 不推进状态机）。窗值取该后端 mx 口径 w 窗的 samples、peak（空窗皆
+    # 0）。每后端独立；remove 删除其告警，同 id 重加回到未首评，
+    # ci/cb/ca/cu 成功整体清空。dict 查找/写入 O(1)，额外空间 O(B)。
+    conc_alerts = {}
     # 配置提交历史（cl/cb）：(rev, 规范化 version=11 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
@@ -4803,7 +4865,7 @@ def run(raw):
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal hard_ttl_cfg
         nonlocal sticky_map, alert, alert_events, overload_hist, wait_hist, err_alerts
-        nonlocal err_events, percent_alerts, percent_events, wait_alerts, retry_alerts, retry_events
+        nonlocal err_events, percent_alerts, percent_events, wait_alerts, retry_alerts, retry_events, conc_alerts
         nonlocal mo_seq, mo_cache, queue_mode, dequeue_policy
         nonlocal full_mode, evict_count, evict_last, cap_overrides
         nonlocal limit_hist, aging_cfg
@@ -4986,6 +5048,8 @@ def run(raw):
         retry_alerts = {}
         # ci/cb/ca 成功同时清空全部后端 xa 告警转换历史。
         retry_events = {}
+        # ci/cb/ca/cu 成功清空全部后端并发告警（na 各 id 均回到未首评）。
+        conc_alerts = {}
         # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
@@ -4999,7 +5063,7 @@ def run(raw):
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "oq", "lh", "lt",
             "mr", "mg", "mh",
-            "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
+            "ms", "mx", "na", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
@@ -5179,6 +5243,8 @@ def run(raw):
             # 不继承。
             retry_events.pop((backend_id, "R"), None)
             retry_events.pop((backend_id, "M"), None)
+            # remove 删除该后端并发告警；同 id 重加回到未首评。
+            conc_alerts.pop(backend_id, None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -6636,6 +6702,98 @@ def run(raw):
                     }
                 )
             results.append({"op": "mx", "id": backend_id, "windows": windows})
+
+        elif op[0] == "na":
+            # 后端并发告警（每后端独立状态机）：首评固化 (hi,lo,n) 并自 N
+            # 态起评；此后参数须相同且 w 仅同前（同窗同参原样返回首评结果，
+            # 不推进时钟外的状态机）或 +1，变参或跳窗（含回退）报 STATE。
+            # 窗口越界（w 未结束或超出最近 60 窗保留下界）同样 STATE；窗口
+            # 判定先于参数/缓存，与 pa/xa 同序。窗值取该后端 mx 口径 w 窗的
+            # samples、peak（空窗皆 0）。N 态连续 n 窗满足 samples>0 且
+            # peak>=hi 转 A，A 态连续 n 窗满足 samples>0 且 peak<=lo 转 N；
+            # 否则（含空窗）连续数清 0，转换后 run=0；转换时 changed=true。
+            # 返回键序 op,id,w,state,samples,peak,run,changed。na 记账时间
+            # O(1)、额外空间 O(B)。
+            _, backend_id, w, hi, lo, n, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                # 未知 id 先于一切状态机判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if w >= current or w < max(0, current - 59):
+                # 窗未结束（含未来窗），或已超出最近 60 窗的保留下界。
+                fail(EXIT_STATE, "STATE")
+            entry = conc_alerts.get(backend_id)
+            if entry is not None:
+                if (hi, lo, n) != (entry["hi"], entry["lo"], entry["n"]):
+                    # 变参。
+                    fail(EXIT_STATE, "STATE")
+                if w == entry["w"]:
+                    # 同窗同参重报：原样返回首评结果，不推进状态机。
+                    results.append(dict(entry["result"]))
+                    continue
+                if w != entry["w"] + 1:
+                    # 跳窗（含回退）。
+                    fail(EXIT_STATE, "STATE")
+            snapshot = record["samples"].get(w)
+            if not snapshot:
+                # 空窗：samples/peak 皆为 0（沿 mx 口径）。
+                samples = 0
+                peak = 0
+            else:
+                # samples 为窗内采样数，peak 为窗内并发峰值（同 mx）。
+                samples = len(snapshot)
+                peak = 0
+                for _, (conns, _reason) in snapshot.items():
+                    if conns > peak:
+                        peak = conns
+            if entry is None:
+                state = "N"
+                run_count = 0
+            else:
+                state = entry["state"]
+                run_count = entry["run"]
+            changed = False
+            if state == "N":
+                if samples > 0 and peak >= hi:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "A"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符（含空窗 samples=0）：连续数清 0。
+                    run_count = 0
+            else:
+                if samples > 0 and peak <= lo:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "N"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符（含空窗 samples=0）：连续数清 0。
+                    run_count = 0
+            result = {
+                "op": "na",
+                "id": backend_id,
+                "w": w,
+                "state": state,
+                "samples": samples,
+                "peak": peak,
+                "run": run_count,
+                "changed": changed,
+            }
+            conc_alerts[backend_id] = {
+                "hi": hi,
+                "lo": lo,
+                "n": n,
+                "state": state,
+                "run": run_count,
+                "w": w,
+                "result": dict(result),
+            }
+            results.append(result)
 
         elif op[0] == "rh":
             # 不可用原因分钟历史只读查询：未知 id 报 BACKEND，from 早于最近
