@@ -695,6 +695,27 @@ record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16N)（N 为�
 配置大小）；其余
 子命令与既有操作行为不变。
 
+单字段配置热加载：cu 精确键序 op,base,section,value,now（键须按此序
+出现）：base 格式同 ct.digest（小写 64 位十六进制串）；section 须为
+version=11 的 ce.config 除 version 外任一顶层键
+（backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler,
+faults,quotas,queue,capacities,lifetime）；value 沿用该字段既有结构、
+键序、类型、范围与排序（limits/quotas 项键序与按 scope 的 B/C/S 序、
+id 的 UTF-8 字节升序约束同 ci，v11 十四键键序约束同 ci），now 为
+0..10^9 非 bool 整数并进入共用非递减时钟。以当前 ce.config 规范化 v11
+导出为底稿仅替换 section，再按 ci 整体校验交叉约束（含 scheduler=H 须
+vnodes 非 null、非 null backpressure 须 overload 非 null 且
+low<high≤overload.q）；B 限流/配额、faults 或 capacities 引用未知候选
+后端报 BACKEND/3；键序、base 格式、section、value 的结构/键序/类型/
+范围/排序/交叉约束、now 或时钟倒退报 INPUT/2；校验后 base 与操作前指纹
+不匹配、有活动连接或排队项、rev 耗尽报 STATE/4，依次判错（BACKEND 先于
+base，base 先于活动连接与排队检查）。成功原子应用并沿用 ci 的运行态
+重建、清除预约、分配新 rev（值未变也新建）并按 16 条历史淘汰；结果键序
+op,base,target,rev,ok，base/target 为操作前后小写 SHA-256 摘要，rev 为
+新 rev，ok=true。失败回滚时钟、配置、运行态、rev、历史与预约。时空
+O(N)，N 为合成配置大小，仅用标准库；紧凑 UTF-8 固定键序 JSON、单换行
+及 record/replay 逐字节契约不变，其他子命令不变。
+
 H pick 记账：扩展 H 模式 pick，调度与映射行为不变，成功项仅记一次并归属
 返回 id。无旧映射记 first；旧目标合格且本次未判到期记 sticky；三键旧映射
 e 非 null 且 now≥e 记 expired（重选回原 id 也算 expired）；否则按旧目标
@@ -2076,6 +2097,15 @@ def parse_base(value):
     return value
 
 
+# cu 单字段配置热加载允许替换的顶层段：ce.config 逐层键序中除 version 外
+# 的任一键（version 恒规范化为 11，不可替换）。
+CU_SECTIONS = (
+    "backends", "vnodes", "limits", "overload", "sticky", "idle",
+    "backpressure", "scheduler", "faults", "quotas", "queue",
+    "capacities", "lifetime",
+)
+
+
 def parse_op(raw_op):
     """校验单个操作的形状，返回规范化元组；不合格式直接 INPUT 退出。"""
     if not isinstance(raw_op, dict):
@@ -2094,7 +2124,7 @@ def parse_op(raw_op):
         "lt",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
-        "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
+        "ce", "ci", "cl", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -3411,6 +3441,22 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("cb", rev, parse_now(raw_op["now"]))
+
+    if name == "cu":
+        # 单字段配置热加载：精确键序 op,base,section,value,now（键须按此序
+        # 出现，乱序报 INPUT）。base 格式同 ct.digest（小写 64 位十六进制
+        # 串）；section 须为 version=11 的 ce.config 除 version 外任一顶层
+        # 键；value 沿用该字段既有结构、键序、类型、范围与排序，执行期以
+        # 当前配置为底稿仅替换该段后按 ci 整体校验（含交叉约束）；now 为
+        # 0..10^9 非 bool 整数并进入共用非递减时钟。
+        if list(raw_op) != ["op", "base", "section", "value", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        base = parse_base(raw_op["base"])
+        section = raw_op["section"]
+        if not isinstance(section, str) or section not in CU_SECTIONS:
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_warm_now(raw_op["now"])
+        return ("cu", base, section, raw_op["value"], now)
 
     if name == "ts":
         if keys != {"op", "ttl"}:
@@ -4917,7 +4963,7 @@ def run(raw):
             "oq", "lh", "lt",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
-            "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "mu",
@@ -7535,6 +7581,70 @@ def run(raw):
             reservation = None
             results.append(
                 {"op": "cb", "target": target_rev, "rev": new_rev, "ok": True}
+            )
+
+        elif op[0] == "cu":
+            # 单字段配置热加载：以当前 ce.config 规范化 version=11 导出为
+            # 底稿，仅替换 section 一段，再按 ci 整体校验（结构、键序、类型、
+            # 范围、排序与交叉约束）。校验通过前不改任何配置或运行态；时钟
+            # 已由共用时钟块推进，失败随整批丢弃即回滚。
+            _, base, section, value, now = op
+            before_export = export_config()
+            before_digest = config_digest(before_export)
+            # 复制顶层映射后在原键位替换该段：替换不改变顶层键序，其余段
+            # 与操作前完全一致；候选的 version 恒为 11。
+            candidate = dict(before_export)
+            candidate[section] = value
+            # 按 ci 同型校验整份候选：键序、结构、类型、范围、排序或交叉
+            # 约束（如 scheduler=H 须 vnodes 非 null、backpressure 须
+            # overload 非 null 且 low<high≤q）非法均 INPUT。
+            config = parse_config(candidate)
+            # B 限流、B 配额、faults 与 capacities 引用未知候选后端：
+            # BACKEND，先于 base 与活动状态判定（同 ci 的错误优先级）。
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for override_id in config["capacities"]:
+                if override_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 校验后 base 与操作前指纹不等：STATE，先于活动连接或排队检查。
+            if base != before_digest:
+                fail(EXIT_STATE, "STATE")
+            # 有活动连接或排队项时拒绝热加载：STATE。
+            if connections or wait_queue:
+                fail(EXIT_STATE, "STATE")
+            if next_rev > 10 ** 18:
+                # rev 耗尽：不分配、不改历史。
+                fail(EXIT_STATE, "STATE")
+            # 沿用 ci 的原子替换与默认运行态重建（桶满、配额按 quotas 以
+            # now 重置、队空、粘性清空、度量归零、faults 时间线载入、queue
+            # 策略与 capacities 覆盖替换、lifetime 载入、告警与历史清空）。
+            apply_config(config, now)
+            target_export = export_config()
+            target_digest = config_digest(target_export)
+            # 值未变也新建 rev；成功后提交并按最近 16 条淘汰（同 ci/cb）。
+            commit_history.append((next_rev, target_export))
+            new_rev = next_rev
+            next_rev += 1
+            if len(commit_history) > 16:
+                commit_history.pop(0)
+            # cu 成功清除既有配置预约。
+            reservation = None
+            results.append(
+                {
+                    "op": "cu",
+                    "base": before_digest,
+                    "target": target_digest,
+                    "rev": new_rev,
+                    "ok": True,
+                }
             )
 
         elif op[0] == "cp":

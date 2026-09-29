@@ -916,6 +916,440 @@ class ConfigDigestTest(unittest.TestCase):
         self.assertEqual(results[0], {"op": "ci", "ok": True})
 
 
+class ConfigSectionHotReloadTest(unittest.TestCase):
+    """单字段配置热加载 cu：以当前配置为底稿仅替换一个顶层段。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def cu(self, base, section, value, now):
+        return {
+            "op": "cu", "base": base, "section": section,
+            "value": value, "now": now,
+        }
+
+    def test_replace_vnodes_output_and_commit(self):
+        base = digest_of(config_v11(1))
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": config_v11(1), "now": 0},
+                self.cu(base, "vnodes", 4, 1),
+                {"op": "ce"},
+                {"op": "cl"},
+            ]
+        )
+        result = results[1]
+        # 结果精确键序 op,base,target,rev,ok。
+        self.assertEqual(
+            list(result), ["op", "base", "target", "rev", "ok"]
+        )
+        self.assertEqual(result["op"], "cu")
+        self.assertEqual(result["base"], base)
+        expected = config_v11(1, vnodes=4)
+        self.assertEqual(result["target"], digest_of(expected))
+        self.assertEqual(result["rev"], 2)
+        self.assertIs(result["ok"], True)
+        # 当前配置只替换 vnodes，其余段不变。
+        self.assertEqual(results[2]["config"], expected)
+        # 成功另建提交 rev=2，快照即替换后配置。
+        self.assertEqual(results[3]["current"], 2)
+        self.assertEqual(len(results[3]["commits"]), 2)
+        self.assertEqual(results[3]["commits"][1]["rev"], 2)
+        self.assertEqual(results[3]["commits"][1]["config"], expected)
+
+    def test_works_from_initial_empty_state(self):
+        # 初始空配置即可作为底稿：ct 取指纹后用 backends 段整体载入。
+        results = self.run_ops([{"op": "ct"}])
+        base = results[0]["digest"]
+        backends = config_v11(1)["backends"]
+        results = self.run_ops(
+            [self.cu(base, "backends", backends, 0), {"op": "ce"}]
+        )
+        self.assertEqual(results[0]["rev"], 1)
+        self.assertEqual(results[1]["config"], config_v11(1))
+
+    def test_unchanged_value_still_creates_rev(self):
+        base = digest_of(config_v11(1))
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": config_v11(1), "now": 0},
+                self.cu(base, "vnodes", None, 1),
+                {"op": "cl"},
+            ]
+        )
+        # 值未变：base 与 target 相同，但仍新建 rev。
+        self.assertEqual(results[1]["base"], results[1]["target"])
+        self.assertEqual(results[1]["rev"], 2)
+        self.assertEqual(results[2]["current"], 2)
+
+    def test_chained_cu_uses_fresh_digest(self):
+        # 段替换逐条生效：后一条 cu 的 base 为前一条的 target。
+        base1 = digest_of(config_v11(1))
+        mid = config_v11(1, vnodes=4)
+        base2 = digest_of(mid)
+        final = config_v11(1, vnodes=4, sticky={"ttl": 9})
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": config_v11(1), "now": 0},
+                self.cu(base1, "vnodes", 4, 1),
+                self.cu(base2, "sticky", {"ttl": 9}, 2),
+                {"op": "ce"},
+            ]
+        )
+        self.assertEqual(results[1]["target"], base2)
+        self.assertEqual(results[2]["target"], digest_of(final))
+        self.assertEqual((results[1]["rev"], results[2]["rev"]), (2, 3))
+        self.assertEqual(results[3]["config"], final)
+
+    def test_replace_backends_drops_old_backend(self):
+        # backends 段整体替换：旧 id a 消失，新 id b 生效，其余段保持。
+        base = digest_of(config_v11(1))
+        new_backends = [
+            {
+                "id": "b", "weight": 2, "d": 0, "fail": 1, "success": 1,
+                "circuit": None, "drain": None, "endpoint": None,
+            }
+        ]
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": config_v11(1), "now": 0},
+                self.cu(base, "backends", new_backends, 1),
+                {"op": "hget", "id": "b"},
+            ]
+        )
+        target = config_v11(1)
+        target["backends"] = new_backends
+        self.assertEqual(results[1]["target"], digest_of(target))
+        self.assertEqual(results[2]["id"], "b")
+
+    def test_runtime_rebuilt_after_section_replace(self):
+        # limits 段被替换为空：旧 B 桶消失（lg 报 STATE），默认运行态重建。
+        with_limits = config_v11(
+            1, limits=[{"scope": "B", "id": "a", "r": 3, "b": 9}]
+        )
+        base = digest_of(with_limits)
+        self.assert_failure(
+            encode_ops(
+                [
+                    {"op": "ci", "config": with_limits, "now": 0},
+                    self.cu(base, "limits", [], 1),
+                    {"op": "lg", "scope": "B", "id": "a", "now": 1},
+                ]
+            ),
+            4, "STATE",
+        )
+        # 替换前同配置桶存在且满令牌。
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": with_limits, "now": 0},
+                {"op": "lg", "scope": "B", "id": "a", "now": 0},
+            ]
+        )
+        self.assertEqual((results[1]["r"], results[1]["b"], results[1]["t"]),
+                         (3, 9, 9))
+
+    def test_cu_clears_reservation(self):
+        candidate = config_v11(1, vnodes=4)
+        base = digest_of(config_v11(1))
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": config_v11(1), "now": 0},
+                {"op": "cp", "config": candidate, "at": 10, "now": 1},
+                self.cu(base, "sticky", {"ttl": 5}, 2),
+                {"op": "cq", "now": 2},
+            ]
+        )
+        # cu 成功清除既有配置预约。
+        self.assertEqual(results[3]["pending"], False)
+        self.assertIsNone(results[3]["digest"])
+
+    def test_eviction_keeps_recent_16(self):
+        # 16 次 ci 占 rev 1..16，再 cu 建 rev 17：历史仅留 2..17。
+        ops = [
+            {"op": "ci", "config": config_v11(i), "now": i}
+            for i in range(1, 17)
+        ]
+        ops.append(self.cu(digest_of(config_v11(16)), "vnodes", 7, 16))
+        ops.append({"op": "cl"})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["current"], 17)
+        self.assertEqual(
+            [commit["rev"] for commit in results[-1]["commits"]],
+            list(range(2, 18)),
+        )
+        self.assertEqual(results[-2]["target"],
+                         digest_of(config_v11(16, vnodes=7)))
+
+    def test_stale_base_is_state(self):
+        base = digest_of(config_v11(1))
+        self.assert_failure(
+            encode_ops(
+                [
+                    {"op": "ci", "config": config_v11(1), "now": 0},
+                    self.cu(base, "vnodes", 4, 1),
+                    self.cu(base, "vnodes", 5, 2),
+                ]
+            ),
+            4, "STATE",
+        )
+
+    def test_base_check_precedes_connection_check(self):
+        # base 不匹配先于活动连接检查报 STATE。
+        self.assert_failure(
+            encode_ops(
+                [
+                    {"op": "ci", "config": config_v11(1), "now": 0},
+                    {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                    self.cu("0" * 64, "vnodes", 4, 2),
+                ]
+            ),
+            4, "STATE",
+        )
+
+    def test_active_connection_is_state(self):
+        base = digest_of(config_v11(1))
+        self.assert_failure(
+            encode_ops(
+                [
+                    {"op": "ci", "config": config_v11(1), "now": 0},
+                    {"op": "open", "cid": "x", "flow": self.FLOW, "now": 1},
+                    self.cu(base, "vnodes", 4, 2),
+                ]
+            ),
+            4, "STATE",
+        )
+
+    def test_queued_item_is_state(self):
+        cfg = config_v11(1, vnodes=1,
+                         overload={"cap": 1, "q": 2, "ttl": 10})
+        base = digest_of(cfg)
+        self.assert_failure(
+            encode_ops(
+                [
+                    {"op": "ci", "config": cfg, "now": 0},
+                    {"op": "open", "cid": "y", "flow": self.FLOW, "now": 1},
+                    {"op": "oa", "cid": "z", "flow": self.FLOW,
+                     "c": "k", "s": "k", "key": "k", "now": 1},
+                    self.cu(base, "vnodes", 2, 2),
+                ]
+            ),
+            4, "STATE",
+        )
+
+    def test_unknown_backend_references_are_backend(self):
+        base = digest_of(config_v11(1))
+        # B 限流、B 配额、faults、capacities 引用未知候选后端均 BACKEND。
+        cases = [
+            ("limits", [{"scope": "B", "id": "ghost", "r": 1, "b": 1}]),
+            ("quotas", [{"scope": "B", "id": "ghost",
+                         "limit": 1, "span": 1}]),
+            ("faults", [{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}]),
+            ("capacities", [{"id": "ghost", "cap": 1}]),
+        ]
+        for section, value in cases:
+            self.assert_failure(
+                encode_ops(
+                    [
+                        {"op": "ci", "config": config_v11(1), "now": 0},
+                        self.cu(base, section, value, 1),
+                    ]
+                ),
+                3, "BACKEND",
+            )
+
+    def test_backend_precedes_base_check(self):
+        # 未知后端引用（BACKEND）先于 base 不匹配（STATE）判定。
+        self.assert_failure(
+            encode_ops(
+                [
+                    {"op": "ci", "config": config_v11(1), "now": 0},
+                    self.cu(
+                        "0" * 64, "faults",
+                        [{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}],
+                        1,
+                    ),
+                ]
+            ),
+            3, "BACKEND",
+        )
+
+    def test_exact_key_order_required(self):
+        base = digest_of(config_v11(1))
+        # 乱序键序一律 INPUT（键集相同）。
+        for raw in (
+            b'{"ops":[{"op":"cu","section":"vnodes","base":"' + base.encode()
+            + b'","value":4,"now":1}]}',
+            b'{"ops":[{"op":"cu","base":"' + base.encode()
+            + b'","now":1,"section":"vnodes","value":4}]}',
+            b'{"ops":[{"op":"cu","base":"' + base.encode()
+            + b'","section":"vnodes","value":4,"now":1,"x":1}]}',
+        ):
+            self.assert_failure(raw, 2, "INPUT")
+
+    def test_bad_section_is_input(self):
+        base = digest_of(config_v11(1))
+        for section in ("version", "Vnodes", "nope", 1, None, True):
+            self.assert_failure(
+                encode_ops(
+                    [self.cu(base, section, None, 0)]
+                ),
+                2, "INPUT",
+            )
+
+    def test_bad_base_format_is_input(self):
+        for bad in ("0" * 63, "g" * 64, "A" * 64, "0" * 64 + "0", 1, True):
+            self.assert_failure(
+                encode_ops([self.cu(bad, "vnodes", 4, 0)]),
+                2, "INPUT",
+            )
+
+    def test_bad_now_is_input(self):
+        base = digest_of(config_v11(1))
+        for now in (-1, 10 ** 9 + 1, True, "1", 1.5, None):
+            self.assert_failure(
+                encode_ops([self.cu(base, "vnodes", 4, now)]),
+                2, "INPUT",
+            )
+
+    def test_clock_regression_is_input(self):
+        base = digest_of(config_v11(1))
+        self.assert_failure(
+            encode_ops(
+                [
+                    {"op": "ci", "config": config_v11(1), "now": 10},
+                    self.cu(base, "vnodes", 4, 5),
+                ]
+            ),
+            2, "INPUT",
+        )
+
+    def test_bad_value_structure_is_input(self):
+        base = digest_of(config_v11(1))
+        cfg_ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+        ]
+        cases = [
+            # vnodes：bool 不是整数、超范围。
+            ("vnodes", True),
+            ("vnodes", 1025),
+            # scheduler：非法 pick；H 而 vnodes 为 null 的交叉约束。
+            ("scheduler", {"pick": "X"}),
+            ("scheduler", {"pick": "H"}),
+            # queue：键序乱、枚举非法。
+            ("queue", {"full": "T", "dequeue": "F"}),
+            ("queue", {"dequeue": "P", "full": "T"}),
+            # lifetime：ttl 越界与错误包装。
+            ("lifetime", {"ttl": 0}),
+            ("lifetime", 7),
+            # backpressure 交叉约束：overload 为 null 时不可登记。
+            ("backpressure", {"low": 1, "high": 2}),
+            # sticky/idle ttl 范围。
+            ("sticky", {"ttl": 0}),
+            ("idle", {"ttl": -1}),
+            # backends：重复 id 与缺 endpoint 键。
+            ("backends", [
+                {"id": "a", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                 "circuit": None, "drain": None, "endpoint": None},
+                {"id": "a", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                 "circuit": None, "drain": None, "endpoint": None},
+            ]),
+            ("backends", [
+                {"id": "a", "weight": 1, "d": 0, "fail": 3, "success": 2,
+                 "circuit": None, "drain": None},
+            ]),
+            # faults：同 id 段重叠。
+            ("faults", [
+                {"id": "a", "k": "D", "a": 0, "z": 5, "v": 0},
+                {"id": "a", "k": "D", "a": 4, "z": 8, "v": 0},
+            ]),
+            # quotas：未按 scope/id 排序。
+            ("quotas", [
+                {"scope": "S", "id": "x", "limit": 1, "span": 1},
+                {"scope": "B", "id": "a", "limit": 1, "span": 1},
+            ]),
+            # capacities：id 重复。
+            ("capacities", [{"id": "a", "cap": 1}, {"id": "a", "cap": 2}]),
+        ]
+        for section, value in cases:
+            self.assert_failure(
+                encode_ops(cfg_ops + [self.cu(base, section, value, 1)]),
+                2, "INPUT",
+            )
+
+    def test_backpressure_section_requires_overload(self):
+        # overload 非 null 且 low<high≤q 时 backpressure 段可替换成功。
+        cfg = config_v11(1, overload={"cap": 1, "q": 4, "ttl": 10})
+        base = digest_of(cfg)
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                self.cu(base, "backpressure", {"low": 1, "high": 3}, 1),
+                {"op": "ce"},
+            ]
+        )
+        self.assertEqual(results[2]["config"]["backpressure"],
+                         {"low": 1, "high": 3})
+
+    def test_failed_cu_rolls_back_everything(self):
+        # cu 失败整批回滚：此前成功结果也不产生 stdout，时钟/配置/提交不变。
+        raw = encode_ops(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "probe", "id": "a", "ok": True, "now": 0},
+                {"op": "cu", "base": "0" * 64, "section": "vnodes",
+                 "value": 4, "now": 1},
+            ]
+        )
+        self.assert_failure(raw, 4, "STATE")
+        # 同一成功前缀下 ce/cl 保持原样，证明无部分应用。
+        results = self.run_ops(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "probe", "id": "a", "ok": True, "now": 0},
+                {"op": "cl"},
+                {"op": "ce"},
+            ]
+        )
+        self.assertEqual(results[2]["commits"], [])
+        self.assertEqual(results[3]["config"]["vnodes"], None)
+
+    def test_record_replay_covers_cu(self):
+        base = digest_of(config_v11(1))
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.cu(base, "vnodes", 4, 1),
+            self.cu(digest_of(config_v11(1, vnodes=4)),
+                    "queue", {"dequeue": "S", "full": "H"}, 2),
+            {"op": "cl"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+
 class ConfigDiffTest(unittest.TestCase):
     """后端配置变更预览 cd：比较当前与候选规范化配置的 backends，不应用。"""
 
