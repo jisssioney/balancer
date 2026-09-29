@@ -14,6 +14,14 @@
 - 返回键序 `op,key,now,cases`；`cases` 按 `times` 排列，项键序 `at,state,backend,attempts,retries,remaps,latency`，其中 `state`/`backend`/`attempts`/`latency` 同 `fi`，`retries=remaps=max(attempts-1,0)`。
 - 键序、字段类型/范围/编码、`times` 容器/项数/次序或时钟倒退报 INPUT/2；未配置环或无合格候选报 STATE/4。仅 `now` 推进时钟，不改连接、粘性、指标、告警或故障状态，失败批回滚。时间 O(PBV)、空间 O(P+BV)（P 为 `times` 项数）。
 
+## 故障差异预演：fd
+
+按 `times` 外层、`keys` 内层，对每个 (时刻, 键) 分别用当前故障时间线与候选计划独立模拟 `fr` 的候选资格、哈希环与 D/F/S 规则，只读比较前后结果。
+
+- `fd`：精确键序 `op,items,keys,times,timeout,max,now`。`items` 为 `fp` 同款全量候选计划（列入 id 的时间线原子替换、未列入的保持原样）；`keys` 为 1..64 项 `route` 键数组，可重复；`times` 为 1..60 项严格递增数组，项为 `now`..10⁹ 非 bool 整数；`timeout`/`max`/`now` 沿用 `fr`（`now` 纳入共用非递减时钟）。
+- 返回键序 `op,now,cases,summary`；`cases` 项键序 `at,key,before,after,changed`，`before`/`after` 键序均为 `state,backend,attempts,retries,remaps,latency` 且值义同 `ft`，不同则 `changed=true`。`summary` 键序 `total,stable,changed`，三值为非负整数：cases 数、未变数、变化数。
+- 键序、字段类型/范围/编码、容器/项数/次序或时钟倒退报 INPUT/2；候选引用未知后端报 BACKEND/3；未配置环或无合格候选报 STATE/4。仅 `now` 推进时钟，不改状态，失败批回滚。时间 O(T+PKBV)、空间 O(T+PK+BV)（T/P/K 对应 `items`/`times`/`keys` 项数），仅用标准库。
+
 ## 配置变更审计：al / ai
 
 配置变更（`ci`/`cb`/`cu`/`ca`）成功并分配新 rev 时追加一条审计事件；`rev` 从 1 起递增，事件按 rev 升序仅保留最近 64 条，超额淘汰最旧项。两查询均只读、不推进时钟，失败批次回滚。

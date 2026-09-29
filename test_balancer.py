@@ -2764,6 +2764,335 @@ class FtTimelineDryRunTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
 
 
+class FdDiffDryRunTest(unittest.TestCase):
+    """故障差异预演 fd：times 外层、keys 内层，当前与候选计划各模拟 fr。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if err:
+            self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self):
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "chash", "vnodes": 8},
+        ]
+
+    def fd_op(self, items, keys, times, now=0, timeout=9, max_attempts=3):
+        return {
+            "op": "fd", "items": items, "keys": keys, "times": times,
+            "timeout": timeout, "max": max_attempts, "now": now,
+        }
+
+    def test_result_shape_and_key_order(self):
+        results = self.run_ops(
+            self.base_ops()
+            + [self.fd_op([], ["k", "k2"], [0, 3, 9])]
+        )
+        result = results[-1]
+        self.assertEqual(list(result), ["op", "now", "cases", "summary"])
+        self.assertEqual(result["op"], "fd")
+        self.assertEqual(result["now"], 0)
+        self.assertEqual(len(result["cases"]), 6)
+        for case in result["cases"]:
+            self.assertEqual(
+                list(case), ["at", "key", "before", "after", "changed"]
+            )
+            for side in ("before", "after"):
+                self.assertEqual(
+                    list(case[side]),
+                    ["state", "backend", "attempts",
+                     "retries", "remaps", "latency"],
+                )
+                self.assertIn(case[side]["state"], ("A", "R"))
+                self.assertEqual(
+                    case[side]["retries"],
+                    max(case[side]["attempts"] - 1, 0),
+                )
+                self.assertEqual(
+                    case[side]["remaps"], case[side]["retries"]
+                )
+            self.assertEqual(
+                case["changed"], case["before"] != case["after"]
+            )
+        self.assertEqual(list(result["summary"]), ["total", "stable", "changed"])
+        self.assertEqual(result["summary"]["total"], 6)
+        # 空候选计划即当前时间线：全部稳定。
+        self.assertEqual(
+            (result["summary"]["stable"], result["summary"]["changed"]),
+            (6, 0),
+        )
+
+    def test_cases_ordered_times_outer_keys_inner(self):
+        results = self.run_ops(
+            self.base_ops()
+            + [self.fd_op([], ["x", "y"], [2, 5, 9])]
+        )
+        self.assertEqual(
+            [(case["at"], case["key"]) for case in results[-1]["cases"]],
+            [(2, "x"), (2, "y"), (5, "x"), (5, "y"), (9, "x"), (9, "y")],
+        )
+
+    def test_diff_tracks_candidate_plan(self):
+        # 当前 a 在 [0,10) 为 D；候选把 a 的窗口收窄到 [5,10)。
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "D", "a": 0, "z": 10, "v": 0}]
+            + [self.fd_op(
+                [{"id": "a", "k": "D", "a": 5, "z": 10, "v": 0}],
+                ["k"], [0, 7, 12],
+            )]
+        )
+        result = results[-1]
+        triples = [
+            (
+                case["at"],
+                (case["before"]["state"], case["before"]["backend"],
+                 case["before"]["attempts"]),
+                (case["after"]["state"], case["after"]["backend"],
+                 case["after"]["attempts"]),
+                case["changed"],
+            )
+            for case in result["cases"]
+        ]
+        self.assertEqual(
+            triples,
+            [
+                (0, ("A", "b", 2), ("A", "a", 1), True),
+                (7, ("A", "b", 2), ("A", "b", 2), False),
+                (12, ("A", "a", 1), ("A", "a", 1), False),
+            ],
+        )
+        self.assertEqual(
+            result["summary"], {"total": 3, "stable": 2, "changed": 1}
+        )
+
+    def test_candidate_can_add_fault_to_clean_backend(self):
+        # 当前无故障；候选让 a 在 [0,100) 为 D：after 绕过 a 落到 b。
+        results = self.run_ops(
+            self.base_ops()
+            + [self.fd_op(
+                [{"id": "a", "k": "D", "a": 0, "z": 100, "v": 0}],
+                ["k"], [0],
+            )]
+        )
+        case = results[-1]["cases"][0]
+        self.assertEqual(
+            (case["before"]["state"], case["before"]["backend"],
+             case["before"]["attempts"]),
+            ("A", "a", 1),
+        )
+        self.assertEqual(
+            (case["after"]["state"], case["after"]["backend"],
+             case["after"]["attempts"]),
+            ("A", "b", 2),
+        )
+        self.assertTrue(case["changed"])
+        self.assertEqual(
+            results[-1]["summary"], {"total": 1, "stable": 0, "changed": 1}
+        )
+
+    def test_unlisted_backend_keeps_current_timeline(self):
+        # 候选只列入 b：a 的当前时间线在 after 中保持原样。
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "D", "a": 0, "z": 10, "v": 0}]
+            + [self.fd_op(
+                [{"id": "b", "k": "S", "a": 0, "z": 10, "v": 5}],
+                ["k"], [0],
+            )]
+        )
+        case = results[-1]["cases"][0]
+        # before：a 为 D 落到 b（b 当前无故障，1 次成功之外的尝试为 a）。
+        self.assertEqual(
+            (case["before"]["backend"], case["before"]["attempts"]), ("b", 2)
+        )
+        # after：a 仍为 D，b 变慢但 v<=timeout 仍成功，耗时按 v 计。
+        self.assertEqual(
+            (case["after"]["backend"], case["after"]["attempts"],
+             case["after"]["latency"]),
+            ("b", 2, 5),
+        )
+        self.assertTrue(case["changed"])
+
+    def test_read_only_preserves_runtime_state(self):
+        # fd 不建连、不记 mr/fm、不改故障时间线；fq/fm/br 均保持原样。
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "D", "a": 0, "z": 100, "v": 0}]
+            + [self.fd_op(
+                [{"id": "a", "k": "S", "a": 0, "z": 100, "v": 5}],
+                ["k"], [0, 50],
+            )]
+            + [{"op": "fq", "now": 1}]
+            + [{"op": "fm", "id": "a"}]
+            + [{"op": "br", "now": 1}]
+        )
+        fq, fm, br = results[-3], results[-2], results[-1]
+        self.assertEqual(
+            fq["faults"],
+            [{"id": "a", "k": "D", "a": 0, "z": 100, "v": 0,
+              "effect": "D"}],
+        )
+        for kind in ("D", "F", "S"):
+            self.assertEqual(
+                fm[kind],
+                {"affected": 0, "rejected": 0, "retries": 0,
+                 "remaps": 0, "recovered": 0},
+            )
+        self.assertTrue(
+            all(b["connections"] == 0 for b in br["backends"])
+        )
+
+    def test_clock_advances_by_now_only(self):
+        # times 项不推进共用时钟：后续 now 只需 ≥ fd.now。
+        results = self.run_ops(
+            self.base_ops()
+            + [self.fd_op([], ["k"], [100, 200], now=5)]
+            + [self.fd_op([], ["k"], [5, 6], now=5)]
+        )
+        self.assertEqual(results[-1]["now"], 5)
+
+    def test_input_violations(self):
+        # 键序乱序。
+        self.assert_failure(
+            self.base_ops()
+            + [{"op": "fd", "items": [], "times": [0], "keys": ["k"],
+                "timeout": 1, "max": 1, "now": 0}],
+            2, "INPUT",
+        )
+        # keys 非数组 / 空 / 超 64 项 / 项为空串 / 项为 bool。
+        for bad_keys in (5, [], ["k"] * 65, [""], [True]):
+            self.assert_failure(
+                self.base_ops()
+                + [self.fd_op([], bad_keys, [0], timeout=1, max_attempts=1)],
+                2, "INPUT",
+            )
+        # times 非数组 / 空 / 超 60 项。
+        for bad_times in (5, [], list(range(61))):
+            self.assert_failure(
+                self.base_ops()
+                + [self.fd_op([], ["k"], bad_times,
+                              timeout=1, max_attempts=1)],
+                2, "INPUT",
+            )
+        # 项非严格递增、项早于 now、项为 bool、项越界。
+        for bad_times, now in (
+            ([3, 3], 0), ([5, 4], 0), ([2, 9], 3),
+            ([True, 1], 0), ([0, 10 ** 9 + 1], 0),
+        ):
+            self.assert_failure(
+                self.base_ops()
+                + [self.fd_op([], ["k"], bad_times, now=now,
+                              timeout=1, max_attempts=1)],
+                2, "INPUT",
+            )
+        # items 非数组 / 超 4096 项 / 项键序乱序 / 同 id 段重叠 / 字段非法。
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op({"id": "a"}, ["k"], [0])],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op(
+                [{"id": "a", "k": "D", "a": 0, "z": 1, "v": 0}] * 4097,
+                ["k"], [0],
+            )],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op(
+                [{"id": "a", "a": 0, "k": "D", "z": 1, "v": 0}],
+                ["k"], [0],
+            )],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op(
+                [{"id": "a", "k": "D", "a": 0, "z": 5, "v": 0},
+                 {"id": "a", "k": "D", "a": 4, "z": 9, "v": 0}],
+                ["k"], [0],
+            )],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op(
+                [{"id": "a", "k": "D", "a": 0, "z": 5, "v": 1}],
+                ["k"], [0],
+            )],
+            2, "INPUT",
+        )
+        # timeout/max/now 类型或范围非法。
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op([], ["k"], [0], timeout=1, max_attempts=0)],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op([], ["k"], [0], now=-1)],
+            2, "INPUT",
+        )
+
+    def test_backend_state_and_clock_errors(self):
+        # 候选引用未知后端报 BACKEND。
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op(
+                [{"id": "zz", "k": "D", "a": 0, "z": 1, "v": 0}],
+                ["k"], [0],
+            )],
+            3, "BACKEND",
+        )
+        # 未配环报 STATE。
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1},
+             {"op": "fd", "items": [], "keys": ["k"], "times": [0],
+              "timeout": 1, "max": 1, "now": 0}],
+            4, "STATE",
+        )
+        # 时钟倒退报 INPUT（整批回滚）。
+        self.assert_failure(
+            self.base_ops()
+            + [self.fd_op([], ["k"], [5], now=5)]
+            + [self.fd_op([], ["k"], [4], now=4)],
+            2, "INPUT",
+        )
+
+    def test_record_replay_covers_fd(self):
+        ops = (
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "F", "a": 0, "z": 100, "v": 2}]
+            + [self.fd_op(
+                [{"id": "a", "k": "S", "a": 0, "z": 50, "v": 7}],
+                ["日本語", "k"], [0, 1, 2, 3, 50],
+            )]
+        )
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual(rec_code, 0)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+
+
 class MoSnapshotTest(unittest.TestCase):
     """全池增量快照 mo：游标、缓存、基线、跨窗与重置契约。"""
 

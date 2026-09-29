@@ -1452,6 +1452,42 @@ def parse_fault_segment(fields):
     return k, a, z, v
 
 
+def parse_fault_plan(raw_items):
+    """fp/fd 共用的全量计划校验：items 为 0..4096 项数组（bool 不是数组），
+    项精确键序 id,k,a,z,v（键须按此序出现），字段约束沿用 fs；同一 id
+    多段须按 a 升序且 [a,z) 互不重叠（相邻端点可接）。返回
+    {id: [segment, ...]}，各 id 段已按 a 规范化排序。"""
+    if (
+        not isinstance(raw_items, list)
+        or isinstance(raw_items, bool)
+        or not 0 <= len(raw_items) <= 4096
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    # 按 id 分组并保序收集段；全部校验先于任何状态变更，失败批回滚。
+    grouped = OrderedDict()
+    for item in raw_items:
+        if (
+            not isinstance(item, dict)
+            or list(item) != ["id", "k", "a", "z", "v"]
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        item_id = parse_backend_id(item["id"])
+        grouped.setdefault(item_id, []).append(
+            parse_fault_segment(item)
+        )
+    plan = {}
+    for item_id, segments in grouped.items():
+        # 规范化：同 id 段先按 a 升序排序，再校验半开区间互不重叠
+        # （z_i<=a_{i+1}，相等为相邻可接）。乱序但可排成不重叠序列的
+        # 计划合法；同 a 或任何相交在此被拒。
+        segments.sort(key=lambda segment: segment[1])
+        for idx in range(len(segments) - 1):
+            if segments[idx][2] > segments[idx + 1][1]:
+                fail(EXIT_INPUT, "INPUT")
+        plan[item_id] = segments
+    return plan
+
+
 def parse_key(value):
     # key 为 UTF-8 可编码的非空字符串；JSON 可能解码出孤立代理项。
     if not isinstance(value, str) or value == "":
@@ -2209,7 +2245,7 @@ def parse_op(raw_op):
         "ce", "ci", "cl", "al", "ai", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "ft", "oi", "od",
-        "fb", "fp", "fq",
+        "fb", "fp", "fq", "fd",
         "br",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
@@ -3173,43 +3209,13 @@ def parse_op(raw_op):
         return ("fb", plan)
 
     if name == "fp":
-        # 故障时间线原子替换：精确键序 op,items（键须按此序出现）；items 为
-        # 0..4096 项数组（bool 不是数组），项精确键序 id,k,a,z,v（键须按此
-        # 序出现），字段约束沿用 fs；同一 id 多段须按 a 升序且 [a,z) 互不
-        # 重叠（相邻端点可接）。键序/容器/项数/字段/重叠判 INPUT，未知 id
-        # 留执行期判 BACKEND。
+        # 故障时间线原子替换：精确键序 op,items（键须按此序出现）；items
+        # 为 fp/fd 同款全量计划（parse_fault_plan：0..4096 项、项键序
+        # id,k,a,z,v、同 id 段按 a 升序且不重叠）。键序/容器/项数/字段/
+        # 重叠判 INPUT，未知 id 留执行期判 BACKEND。
         if list(raw_op) != ["op", "items"]:
             fail(EXIT_INPUT, "INPUT")
-        raw_items = raw_op["items"]
-        if (
-            not isinstance(raw_items, list)
-            or isinstance(raw_items, bool)
-            or not 0 <= len(raw_items) <= 4096
-        ):
-            fail(EXIT_INPUT, "INPUT")
-        # 按 id 分组并保序收集段；全部校验先于任何状态变更，失败批回滚。
-        grouped = OrderedDict()
-        for item in raw_items:
-            if (
-                not isinstance(item, dict)
-                or list(item) != ["id", "k", "a", "z", "v"]
-            ):
-                fail(EXIT_INPUT, "INPUT")
-            item_id = parse_backend_id(item["id"])
-            grouped.setdefault(item_id, []).append(
-                parse_fault_segment(item)
-            )
-        plan = {}
-        for item_id, segments in grouped.items():
-            # 规范化：同 id 段先按 a 升序排序，再校验半开区间互不重叠
-            # （z_i<=a_{i+1}，相等为相邻可接）。乱序但可排成不重叠序列的
-            # 计划合法；同 a 或任何相交在此被拒。
-            segments.sort(key=lambda segment: segment[1])
-            for idx in range(len(segments) - 1):
-                if segments[idx][2] > segments[idx + 1][1]:
-                    fail(EXIT_INPUT, "INPUT")
-            plan[item_id] = segments
-        return ("fp", plan)
+        return ("fp", parse_fault_plan(raw_op["items"]))
 
     if name == "fq":
         if keys != {"op", "now"}:
@@ -3462,6 +3468,43 @@ def parse_op(raw_op):
         return (
             "ft",
             parse_key(raw_op["key"]),
+            times,
+            parse_fault_num(raw_op["timeout"]),
+            parse_attempt_max(raw_op["max"]),
+            now,
+        )
+
+    if name == "fd":
+        # 故障差异预演：精确键序 op,items,keys,times,timeout,max,now（键须
+        # 按此序出现）；items 为 fp 同款全量候选计划（parse_fault_plan），
+        # keys 为 1..64 项数组、元素沿用 route 的 key 校验（可重复），
+        # times 为 1..60 项严格递增数组、项为 now..10^9 非 bool 整数，
+        # timeout/max/now 沿用 fr（now 纳入共用非递减时钟）。候选引用未知
+        # id 留执行期判 BACKEND；未配环或无合格候选的 STATE 留执行期判
+        # （ft 同款）。
+        if list(raw_op) != [
+            "op", "items", "keys", "times", "timeout", "max", "now",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        plan = parse_fault_plan(raw_op["items"])
+        now = parse_fault_num(raw_op["now"])
+        raw_keys = raw_op["keys"]
+        if not isinstance(raw_keys, list) or not 1 <= len(raw_keys) <= 64:
+            fail(EXIT_INPUT, "INPUT")
+        raw_times = raw_op["times"]
+        if not isinstance(raw_times, list) or not 1 <= len(raw_times) <= 60:
+            fail(EXIT_INPUT, "INPUT")
+        times = []
+        for raw_at in raw_times:
+            at = parse_fault_num(raw_at)
+            if at < now or (times and at <= times[-1]):
+                # 项须落在 now..10^9 且严格递增。
+                fail(EXIT_INPUT, "INPUT")
+            times.append(at)
+        return (
+            "fd",
+            plan,
+            [parse_key(raw_key) for raw_key in raw_keys],
             times,
             parse_fault_num(raw_op["timeout"]),
             parse_attempt_max(raw_op["max"]),
@@ -4437,20 +4480,24 @@ def run(raw):
         counts = row[kind]
         counts[bucket] = min(METRIC_CAP, counts[bucket] + 1)
 
-    def active_fault(record, now):
-        """按 now 在故障时间线中取唯一活动段：段按 a 升序且 [a,z) 互不
-        重叠，故至多一段满足 a<=now<z（O(log T_b)，fault_a 为与 faults
-        平行的 a 列表，随替换原子更新）；未登记或处于段间隙时返回 None。"""
-        a_values = record["fault_a"]
+    def active_segment(faults, a_values, now):
+        """在段列表（a 升序且 [a,z) 互不重叠）与其平行 a 列表中取唯一活动
+        段（O(log T_b)）；未登记或处于段间隙时返回 None。"""
         if not a_values:
             return None
         idx = bisect.bisect_right(a_values, now) - 1
         if idx < 0:
             return None
-        segment = record["faults"][idx]
+        segment = faults[idx]
         if now < segment[2]:
             return segment
         return None
+
+    def active_fault(record, now):
+        """按 now 在故障时间线中取唯一活动段：段按 a 升序且 [a,z) 互不
+        重叠，故至多一段满足 a<=now<z（O(log T_b)，fault_a 为与 faults
+        平行的 a 列表，随替换原子更新）；未登记或处于段间隙时返回 None。"""
+        return active_segment(record["faults"], record["fault_a"], now)
 
     def fault_active(record, now):
         """mg 的 removed=fault 判定：活动段且 now ∈ [a,z) 窗口内时，D 恒为
@@ -4491,12 +4538,15 @@ def run(raw):
             return "D" if ((now - a) // v) % 2 == 0 else "N"
         return "S"
 
-    def simulate_fr(tokens, digests, key, timeout, max_attempts, now):
+    def simulate_fr(tokens, digests, key, timeout, max_attempts, now,
+                    fault_view=None):
         """只读模拟一次 fr 的哈希遍历与 D/F/S 规则，返回
         (state, backend, attempts, latency)：自 key 哈希点按 fx 顺序遍历
         不同后端至多 max_attempts 个，D/故障相位 F 失败耗时 0、S 的
         v>timeout 失败耗时 timeout，否则成功耗时 v 或 0 并终止；不建连、
-        不记度量与故障统计。tokens 非空（空环由调用方先报 STATE）。"""
+        不记度量与故障统计。tokens 非空（空环由调用方先报 STATE）。
+        fault_view 非 None 时为 {backend_id: (faults, fault_a)} 的只读
+        候选视图（fd 差异预演），活动段改自视图查找、不触碰运行态。"""
         key_hash = int.from_bytes(
             hashlib.sha256(key.encode("utf-8")).digest(), "big"
         )
@@ -4515,8 +4565,11 @@ def run(raw):
             if backend_id in seen:
                 continue
             seen.add(backend_id)
-            record = backends[backend_id]
-            segment = active_fault(record, now)
+            if fault_view is None:
+                segment = active_fault(backends[backend_id], now)
+            else:
+                view_faults, view_a = fault_view[backend_id]
+                segment = active_segment(view_faults, view_a, now)
             effect = fault_effect(segment, now)
             attempts += 1
             if effect == "D":
@@ -5192,6 +5245,7 @@ def run(raw):
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
+            "fd",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "na",
@@ -9556,6 +9610,100 @@ def run(raw):
                     "key": key,
                     "now": now,
                     "cases": cases,
+                }
+            )
+
+        elif op[0] == "fd":
+            # 故障差异预演（只读）：按 times 外层、keys 内层，对每个
+            # (at, key) 分别用当前故障时间线与候选计划（fp 同款语义：列入
+            # id 的时间线原子替换、未列入的保持原样）独立模拟 fr，逐项比较
+            # 前后结果；除共用时钟按 now 推进外不改任何运行态（不读写粘性
+            # 映射、不建连、不记 mr/fm/fh、不动告警），失败批次天然回滚。
+            # 环与候选视图各只建一次，时间 O(T+PKBV)、额外空间 O(T+PK+BV)，
+            # T/P/K 为 items/times/keys 项数。
+            _, plan, keys, times, timeout, max_attempts, now = op
+            for item_id in plan:
+                if item_id not in backends:
+                    # 候选引用未知后端报 BACKEND，先于环状态判定。
+                    fail(EXIT_BACKEND, "BACKEND")
+            if ring_vnodes is None:
+                # 未配环报 STATE，同 fr/fi/ft。
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                # 环内无合格候选同样报 STATE（同 fr/fi/ft）。
+                fail(EXIT_STATE, "STATE")
+            digests = [token[0] for token in tokens]
+            # 候选视图：列入 id 用计划段（解析期已按 a 规范化），未列入
+            # 沿用当前时间线；全部 (at, key) 复用同一份只读视图。
+            after_view = {}
+            for backend_id, record in backends.items():
+                new_faults = plan.get(backend_id)
+                if new_faults is None:
+                    after_view[backend_id] = (
+                        record["faults"],
+                        record["fault_a"],
+                    )
+                else:
+                    after_view[backend_id] = (
+                        new_faults,
+                        [segment[1] for segment in new_faults],
+                    )
+            cases = []
+            changed_count = 0
+            for at in times:
+                for key in keys:
+                    before_state, before_id, before_attempts, before_latency = (
+                        simulate_fr(
+                            tokens, digests, key, timeout, max_attempts, at
+                        )
+                    )
+                    after_state, after_id, after_attempts, after_latency = (
+                        simulate_fr(
+                            tokens, digests, key, timeout, max_attempts, at,
+                            after_view,
+                        )
+                    )
+                    before_retries = max(before_attempts - 1, 0)
+                    after_retries = max(after_attempts - 1, 0)
+                    before = {
+                        "state": before_state,
+                        "backend": before_id,
+                        "attempts": before_attempts,
+                        "retries": before_retries,
+                        "remaps": before_retries,
+                        "latency": before_latency,
+                    }
+                    after = {
+                        "state": after_state,
+                        "backend": after_id,
+                        "attempts": after_attempts,
+                        "retries": after_retries,
+                        "remaps": after_retries,
+                        "latency": after_latency,
+                    }
+                    changed = before != after
+                    if changed:
+                        changed_count += 1
+                    cases.append(
+                        {
+                            "at": at,
+                            "key": key,
+                            "before": before,
+                            "after": after,
+                            "changed": changed,
+                        }
+                    )
+            results.append(
+                {
+                    "op": "fd",
+                    "now": now,
+                    "cases": cases,
+                    "summary": {
+                        "total": len(cases),
+                        "stable": len(cases) - changed_count,
+                        "changed": changed_count,
+                    },
                 }
             )
 
