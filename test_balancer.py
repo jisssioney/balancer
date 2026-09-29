@@ -4893,6 +4893,244 @@ class WaitHistoryTest(unittest.TestCase):
         )
 
 
+class WaitPercentileTest(unittest.TestCase):
+    """wp 排队等待分位查询：kind 映射、五桶汇总、rank/bucket/upper 与校验。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self, ttl=10, cap=1, q=10):
+        # 环上唯一后端 a，cap=1 便于制造入队。
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": cap, "q": q, "ttl": ttl},
+        ]
+
+    def oa(self, cid, now, key="k"):
+        return {"op": "oa", "cid": cid, "flow": FLOW,
+                "c": "k", "s": "k", "key": key, "now": now}
+
+    ZERO = [0, 0, 0, 0, 0]
+
+    def admitted_ops(self, ttl=100000):
+        # c2..c6 接纳延迟 0/1/10/100/101，分别落桶 0/1/2/3/4；前三在窗 0、
+        # 后二在窗 1。
+        return self.base_ops(ttl=ttl) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0), self.oa("c3", 0), self.oa("c4", 0),
+            self.oa("c5", 0), self.oa("c6", 0),
+            {"op": "close", "cid": "c1", "now": 0},
+            {"op": "ot", "now": 0},
+            {"op": "close", "cid": "c2", "now": 1},
+            {"op": "ot", "now": 1},
+            {"op": "close", "cid": "c3", "now": 10},
+            {"op": "ot", "now": 10},
+            {"op": "close", "cid": "c4", "now": 100},
+            {"op": "ot", "now": 100},
+            {"op": "close", "cid": "c5", "now": 101},
+            {"op": "ot", "now": 101},
+        ]
+
+    def wp(self, kind, start, end, p, now):
+        return {"op": "wp", "kind": kind, "from": start,
+                "to": end, "p": p, "now": now}
+
+    def test_wp_no_samples_key_order_and_nulls(self):
+        ops = self.base_ops() + [self.wp("A", 0, 0, 50, 0)]
+        result = self.run_ops(ops)[3]
+        self.assertEqual(
+            list(result),
+            ["op", "kind", "from", "to", "p", "samples", "buckets",
+             "rank", "bucket", "upper"],
+        )
+        self.assertEqual(result["op"], "wp")
+        self.assertEqual(result["kind"], "A")
+        self.assertEqual(result["from"], 0)
+        self.assertEqual(result["to"], 0)
+        self.assertEqual(result["p"], 50)
+        self.assertEqual(result["samples"], 0)
+        self.assertEqual(result["buckets"], self.ZERO)
+        self.assertEqual(result["rank"], 0)
+        self.assertIsNone(result["bucket"])
+        self.assertIsNone(result["upper"])
+
+    def test_wp_aggregates_buckets_and_percentiles(self):
+        ops = self.admitted_ops()
+        # 闭区间两窗汇总：五桶各 1。
+        result = self.run_ops(ops + [self.wp("A", 0, 1, 100, 101)])[-1]
+        self.assertEqual(result["buckets"], [1, 1, 1, 1, 1])
+        self.assertEqual(result["samples"], 5)
+        # rank=ceil(p*5/100) 与累计首次不小于 rank 的桶及上界。
+        cases = [
+            (1, 1, 0, 0),
+            (40, 2, 1, 1),
+            (60, 3, 2, 10),
+            (80, 4, 3, 100),
+            (100, 5, 4, None),
+        ]
+        for p, want_rank, want_bucket, want_upper in cases:
+            result = self.run_ops(ops + [self.wp("A", 0, 1, p, 101)])[-1]
+            self.assertEqual(result["rank"], want_rank, p)
+            self.assertEqual(result["bucket"], want_bucket, p)
+            self.assertEqual(result["upper"], want_upper, p)
+
+    def test_wp_single_window_is_within_range(self):
+        ops = self.admitted_ops()
+        # 仅查窗 0：桶 0/1/2 各 1。
+        result = self.run_ops(ops + [self.wp("A", 0, 0, 100, 101)])[-1]
+        self.assertEqual(result["buckets"], [1, 1, 1, 0, 0])
+        self.assertEqual(result["samples"], 3)
+        # p=100：累计到桶 2 才达 rank=3，upper=10。
+        self.assertEqual(result["rank"], 3)
+        self.assertEqual(result["bucket"], 2)
+        self.assertEqual(result["upper"], 10)
+
+    def test_wp_kind_letters_map_to_histories(self):
+        # C：取消（逻辑时钟 5，d=5 落 ≤10 桶）。
+        ops = self.base_ops() + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "oq", "now": 5},
+            {"op": "oc", "cid": "c2"},
+            self.wp("C", 0, 0, 50, 5),
+        ]
+        result = self.run_ops(ops)[-1]
+        self.assertEqual(result["buckets"], [0, 0, 1, 0, 0])
+        self.assertEqual(result["samples"], 1)
+        self.assertEqual((result["rank"], result["bucket"], result["upper"]),
+                         (1, 2, 10))
+        # E：过期（d=10 落 ≤10 桶）。
+        ops = self.base_ops(ttl=10) + [
+            self.oa("c1", 0),
+            self.oa("c2", 0),
+            {"op": "ot", "now": 10},
+            self.wp("E", 0, 0, 1, 10),
+        ]
+        result = self.run_ops(ops)[-1]
+        self.assertEqual(result["buckets"], [0, 0, 1, 0, 0])
+        self.assertEqual((result["rank"], result["bucket"], result["upper"]),
+                         (1, 2, 10))
+        # V：H 头淘汰（d=5 落 ≤10 桶）。
+        ops = self.base_ops(q=1) + [
+            {"op": "rp", "mode": "H"},
+            self.oa("c0", 0, key="k0"),
+            self.oa("c1", 0, key="k1"),
+            self.oa("c2", 5, key="k2"),
+            self.wp("V", 0, 0, 100, 5),
+        ]
+        result = self.run_ops(ops)[-1]
+        self.assertEqual(result["buckets"], [0, 0, 1, 0, 0])
+        self.assertEqual((result["rank"], result["bucket"], result["upper"]),
+                         (1, 2, 10))
+
+    def test_wp_empty_kind_has_zero_samples(self):
+        # 只有 admitted 事件，查 E 无样本。
+        ops = self.admitted_ops() + [self.wp("E", 0, 1, 100, 101)]
+        result = self.run_ops(ops)[-1]
+        self.assertEqual(result["samples"], 0)
+        self.assertEqual(result["buckets"], self.ZERO)
+        self.assertEqual(result["rank"], 0)
+        self.assertIsNone(result["bucket"])
+        self.assertIsNone(result["upper"])
+
+    def test_wp_advances_clock(self):
+        # wp 推进共用时钟：其后更早 now 的操作报时钟倒退。
+        self.assert_failure(
+            self.base_ops() + [
+                self.wp("A", 0, 1, 50, 120),
+                self.wp("A", 0, 1, 50, 60),
+            ],
+            2, "INPUT",
+        )
+
+    def test_wp_unconfigured_os_is_state(self):
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1},
+             self.wp("A", 0, 0, 50, 0)],
+            4, "STATE",
+        )
+
+    def test_wp_premature_from_is_state(self):
+        # now=3600 时当前窗为 60，from 早于下界 1 报 STATE。
+        self.assert_failure(
+            self.base_ops() + [self.wp("A", 0, 0, 50, 3600)],
+            4, "STATE",
+        )
+
+    def test_wp_failed_batch_rolls_back(self):
+        # oc 取消成功记账后批内后续操作失败：整批回滚，wp 不落输出。
+        self.assert_failure(
+            self.base_ops() + [
+                self.oa("c1", 0),
+                self.oa("c2", 0),
+                {"op": "oc", "cid": "c2"},
+                self.wp("C", 0, 0, 50, 0),
+                {"op": "oc", "cid": "ghost"},
+            ],
+            5, "CONNECTION",
+        )
+
+    def test_wp_input_violations(self):
+        bad_ops = [
+            # 键序不符（须 op,kind,from,to,p,now）。
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"now":0,"p":1}]}',
+            # 缺键、多键。
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":1}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":1,"now":0,"x":1}]}',
+            # kind 非法：全称、小写、非串。
+            b'{"ops":[{"op":"wp","kind":"admitted","from":0,"to":0,"p":1,"now":0}]}',
+            b'{"ops":[{"op":"wp","kind":"a","from":0,"to":0,"p":1,"now":0}]}',
+            b'{"ops":[{"op":"wp","kind":1,"from":0,"to":0,"p":1,"now":0}]}',
+            # p：bool、越界 0/101、浮点、字符串。
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":true,"now":0}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":0,"now":0}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":101,"now":0}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":1.0,"now":0}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":"1","now":0}]}',
+            # from/to/now：bool、负数、超 10^9。
+            b'{"ops":[{"op":"wp","kind":"A","from":false,"to":0,"p":1,"now":0}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":1,"now":true}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":-1,"to":0,"p":1,"now":0}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":0,"p":1,"now":1000000001}]}',
+            # 关系：from>to、to-from>=60、to>now//60。
+            b'{"ops":[{"op":"wp","kind":"A","from":2,"to":1,"p":1,"now":180}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":60,"p":1,"now":3600}]}',
+            b'{"ops":[{"op":"wp","kind":"A","from":0,"to":2,"p":1,"now":60}]}',
+        ]
+        for raw in bad_ops:
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual(code, 2, raw)
+            self.assertEqual(stdout, b"")
+            self.assertEqual(stderr, b'{"error":"INPUT"}\n')
+
+    def test_record_replay_covers_wp(self):
+        ops = self.admitted_ops(ttl=100000) + [
+            self.wp("A", 0, 1, 90, 101),
+            self.wp("C", 0, 0, 50, 101),
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 class RecordReplayTest(unittest.TestCase):
     """核心输入经 record、replay 逐字节复现退出码、stdout、stderr。"""
 
