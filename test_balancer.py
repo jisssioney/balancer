@@ -12746,5 +12746,473 @@ class RetryTimelineTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
 
 
+class ConfigFieldHotReloadTest(unittest.TestCase):
+    """单字段配置热加载 cu：精确键序 op,base,section,value,now。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def cu(self, base, section, value, now):
+        return {
+            "op": "cu", "base": base, "section": section,
+            "value": value, "now": now,
+        }
+
+    # ---- 基础路径 -----------------------------------------------------
+
+    def test_replaces_single_section_and_commits(self):
+        # 以当前配置为底稿仅替换 backends：结果键序 op,base,target,rev,ok，
+        # base/target 为前后 ct 摘要，rev 自 ci 的 1 递增到 2，ce/cl 均反映。
+        before = config_v11(1)
+        after = config_v11(5)
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": before, "now": 0},
+                self.cu(digest_of(before), "backends",
+                        after["backends"], 1),
+                {"op": "ce"},
+                {"op": "cl"},
+            ]
+        )
+        cu_result = results[1]
+        self.assertEqual(
+            list(cu_result),
+            ["op", "base", "target", "rev", "ok"],
+        )
+        self.assertEqual(cu_result["op"], "cu")
+        self.assertEqual(cu_result["base"], digest_of(before))
+        self.assertEqual(cu_result["target"], digest_of(after))
+        self.assertEqual(cu_result["rev"], 2)
+        self.assertIs(cu_result["ok"], True)
+        self.assertEqual(results[2]["config"], after)
+        self.assertEqual(results[3]["current"], 2)
+        self.assertEqual(
+            [commit["rev"] for commit in results[3]["commits"]], [1, 2]
+        )
+        self.assertEqual(results[3]["commits"][1]["config"], after)
+
+    def test_unchanged_value_still_creates_rev(self):
+        # 值未变（vnodes 仍为 null）也新建 rev，base==target。
+        cfg = config_v11(1)
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                self.cu(digest_of(cfg), "vnodes", None, 1),
+            ]
+        )
+        cu_result = results[1]
+        self.assertEqual(cu_result["rev"], 2)
+        self.assertEqual(cu_result["base"], cu_result["target"])
+        self.assertIs(cu_result["ok"], True)
+
+    def test_each_section_uses_existing_shape(self):
+        # 各 section 按 version=11 既有结构替换：vnodes、sticky、idle、
+        # queue、lifetime、limits/quotas（C 维，非后端引用）、faults、
+        # capacities（本配置后端）均可热加载。
+        cfg = config_v11(
+            1,
+            vnodes=1,
+            overload={"cap": 1, "q": 10, "ttl": 10},
+        )
+        c1 = dict(cfg)
+        c1["sticky"] = {"ttl": 30}
+        c2 = dict(c1)
+        c2["idle"] = {"ttl": 40}
+        c3 = dict(c2)
+        c3["queue"] = {"dequeue": "S", "full": "H"}
+        c4 = dict(c3)
+        c4["lifetime"] = {"ttl": 50}
+        c5 = dict(c4)
+        c5["limits"] = [{"scope": "C", "id": "cli", "r": 2, "b": 8}]
+        c6 = dict(c5)
+        c6["quotas"] = [
+            {"scope": "S", "id": "svc", "limit": 7, "span": 3}
+        ]
+        c7 = dict(c6)
+        c7["faults"] = [{"id": "a", "k": "D", "a": 0, "z": 1, "v": 0}]
+        c8 = dict(c7)
+        c8["capacities"] = [{"id": "a", "cap": 4}]
+        chain = [
+            (cfg, c1, "sticky", c1["sticky"]),
+            (c1, c2, "idle", c2["idle"]),
+            (c2, c3, "queue", c3["queue"]),
+            (c3, c4, "lifetime", c4["lifetime"]),
+            (c4, c5, "limits", c5["limits"]),
+            (c5, c6, "quotas", c6["quotas"]),
+            (c6, c7, "faults", c7["faults"]),
+            (c7, c8, "capacities", c8["capacities"]),
+        ]
+        ops = [{"op": "ci", "config": cfg, "now": 0}]
+        for idx, (old, new, section, value) in enumerate(chain, start=1):
+            ops.append(self.cu(digest_of(old), section, value, idx))
+        ops.append({"op": "ce"})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["config"], c8)
+        # 每次成功 rev 递增，共 8 次 cu，最终 rev=9。
+        self.assertEqual([r["rev"] for r in results[1:-1]], list(range(2, 10)))
+
+    def test_cross_constraint_backpressure_with_overload(self):
+        # 同一批次内先登记 overload 再登记 backpressure，第二次 cu 的 base
+        # 为第一次成功后的摘要；交叉约束通过。
+        cfg = config_v11(1)
+        with_overload = dict(cfg)
+        with_overload["overload"] = {"cap": 1, "q": 10, "ttl": 10}
+        with_bp = dict(with_overload)
+        with_bp["backpressure"] = {"low": 1, "high": 2}
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                self.cu(digest_of(cfg), "overload",
+                        with_overload["overload"], 1),
+                self.cu(digest_of(with_overload), "backpressure",
+                        with_bp["backpressure"], 2),
+                {"op": "ce"},
+            ]
+        )
+        self.assertEqual(results[-1]["config"], with_bp)
+
+    def test_works_from_initial_empty_state(self):
+        # 未 ci 时当前配置即初始 version=11 空配置；cu 直接建首个 rev。
+        initial = self.initial_config()
+        results = self.run_ops(
+            [self.cu(digest_of(initial), "vnodes", 3, 0), {"op": "cl"}]
+        )
+        self.assertEqual(results[0]["rev"], 1)
+        self.assertEqual(results[1]["current"], 1)
+
+    # ---- 运行态重建、预约与历史淘汰 ------------------------------------
+
+    def test_success_rebuilds_runtime_like_ci(self):
+        # 后端已转 unhealthy；cu 替换 backends 后按 ci 语义重建默认运行态，
+        # 后端重新 healthy、预热自 cu.now 起算。hset 会改登记阈值，故操作前
+        # 摘要以含 fail=success=1 的配置计算。
+        cfg = config_v11(1)
+        cfg["backends"][0]["fail"] = 1
+        cfg["backends"][0]["success"] = 1
+        changed = config_v11(1)
+        changed["backends"][0]["d"] = 100
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                {"op": "hset", "id": "a", "fail": 1, "success": 1},
+                {"op": "probe", "id": "a", "ok": False, "now": 1},
+                self.cu(digest_of(cfg), "backends",
+                        changed["backends"], 50),
+                {"op": "br", "now": 50},
+                {"op": "wg", "id": "a", "now": 50},
+            ]
+        )
+        self.assertEqual(results[4]["backends"][0]["health"], "healthy")
+        self.assertEqual(results[5]["stage"], "warm")
+        self.assertEqual(
+            (results[5]["start"], results[5]["end"]), (50, 150)
+        )
+
+    def test_success_clears_reservation(self):
+        cfg = config_v11(1)
+        results = self.run_ops(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                {"op": "cp", "config": cfg, "at": 10, "now": 0},
+                self.cu(digest_of(cfg), "vnodes", None, 1),
+                {"op": "cq", "now": 1},
+            ]
+        )
+        self.assertEqual(
+            results[-1],
+            {"op": "cq", "pending": False, "digest": None, "at": None},
+        )
+
+    def test_history_eviction_keeps_recent_16(self):
+        # 1 次 ci 加 17 次 cu 共 18 条提交，仅保留最近 16（rev 3..18）。
+        cfg = config_v11(1)
+        ops = [{"op": "ci", "config": cfg, "now": 0}]
+        current = cfg
+        for i in range(1, 18):
+            nxt = dict(current)
+            nxt["lifetime"] = None if i % 2 == 0 else {"ttl": i}
+            ops.append(
+                self.cu(
+                    digest_of(current), "lifetime", nxt["lifetime"], i
+                )
+            )
+            current = nxt
+        ops.append({"op": "cl"})
+        results = self.run_ops(ops)
+        history = results[-1]
+        self.assertEqual(history["current"], 18)
+        self.assertEqual(
+            [commit["rev"] for commit in history["commits"]],
+            list(range(3, 19)),
+        )
+        self.assertEqual(len(history["commits"]), 16)
+
+    # ---- INPUT：键序、base、section、value、now -----------------------
+
+    def test_exact_key_order_required(self):
+        cfg = config_v11(1)
+        base = digest_of(cfg)
+        # 乱序、缺键、多键均报 INPUT。
+        bad_ops = [
+            {"op": "cu", "now": 1, "base": base,
+             "section": "vnodes", "value": None},
+            {"op": "cu", "base": base, "section": "vnodes", "value": None},
+            {"op": "cu", "base": base, "section": "vnodes",
+             "value": None, "now": 1, "extra": 1},
+        ]
+        for raw_op in bad_ops:
+            self.assert_failure(
+                [{"op": "ci", "config": cfg, "now": 0}, raw_op], 2, "INPUT"
+            )
+
+    def test_base_format_is_input(self):
+        for bad_base in (
+            64 * "g", 64 * "A", 63 * "0", 65 * "0", 123, None, ["x"],
+        ):
+            self.assert_failure(
+                [self.cu(bad_base, "vnodes", None, 0)], 2, "INPUT"
+            )
+
+    def test_section_is_input(self):
+        base = digest_of(config_v11(1))
+        for section in ("version", "rev", "", 7, None, ["vnodes"]):
+            self.assert_failure(
+                [self.cu(base, section, None, 0)], 2, "INPUT"
+            )
+
+    def test_value_shape_is_input(self):
+        # value 沿用该字段既有结构、键序、类型、范围与排序。
+        cfg = config_v11(1)
+        base = digest_of(cfg)
+        cases = [
+            ("vnodes", 0),
+            ("vnodes", True),
+            ("scheduler", {"pick": "X"}),
+            ("scheduler", {"pick": "W", "x": 1}),
+            ("queue", {"dequeue": "X", "full": "T"}),
+            ("queue", {"full": "T", "dequeue": "F"}),
+            ("lifetime", {"ttl": 0}),
+            ("lifetime", {"ttl": "1"}),
+            ("sticky", {"x": 1}),
+            ("idle", {"ttl": 10 ** 9 + 1}),
+            ("backends", {}),
+            ("backends", None),
+            ("backends", [{"id": "a"}]),
+            ("limits", [{"scope": "X", "id": "c", "r": 1, "b": 1}]),
+            ("limits", [{"scope": "C", "id": "b", "r": 1, "b": 1},
+                        {"scope": "C", "id": "a", "r": 1, "b": 1}]),
+            ("quotas", [{"scope": "C", "id": "c", "limit": 0, "span": 1}]),
+            ("quotas", [{"scope": "C", "id": "c", "limit": 1, "span": 0}]),
+            ("faults", [{"id": "a", "k": "D", "a": 0, "z": 0, "v": 0}]),
+            ("faults", [{"id": "a", "k": "F", "a": 0, "z": 2, "v": 0}]),
+            ("faults", [{"id": "a", "k": "D", "a": 0, "z": 1, "v": 0},
+                        {"id": "a", "k": "D", "a": 0, "z": 2, "v": 0}]),
+            ("capacities", [{"id": "a", "cap": 0}]),
+            ("capacities", [{"cap": 1, "id": "a"}]),
+            ("capacities", [{"id": "a", "cap": 1},
+                            {"id": "a", "cap": 2}]),
+        ]
+        for section, value in cases:
+            self.assert_failure(
+                [
+                    {"op": "ci", "config": cfg, "now": 0},
+                    self.cu(base, section, value, 1),
+                ],
+                2,
+                "INPUT",
+            )
+
+    def test_cross_constraints_are_input(self):
+        cfg = config_v11(1)
+        base = digest_of(cfg)
+        # backpressure 非 null 但 overload 为 null；scheduler 选 H 而
+        # vnodes 为 null：均按 ci 交叉约束判 INPUT。
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                self.cu(base, "backpressure", {"low": 1, "high": 2}, 1),
+            ],
+            2,
+            "INPUT",
+        )
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                self.cu(base, "scheduler", {"pick": "H"}, 1),
+            ],
+            2,
+            "INPUT",
+        )
+
+    def test_now_is_input(self):
+        base = digest_of(config_v11(1))
+        for now in (True, False, -1, 10 ** 9 + 1, "1", 1.5, None):
+            self.assert_failure(
+                [self.cu(base, "vnodes", None, now)], 2, "INPUT"
+            )
+
+    def test_clock_regression_is_input(self):
+        cfg = config_v11(1)
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg, "now": 10},
+                self.cu(digest_of(cfg), "vnodes", None, 5),
+            ],
+            2,
+            "INPUT",
+        )
+
+    # ---- BACKEND ------------------------------------------------------
+
+    def test_unknown_backend_references_are_backend(self):
+        cfg = config_v11(1)
+        base = digest_of(cfg)
+        cases = [
+            ("limits", [{"scope": "B", "id": "ghost", "r": 1, "b": 1}]),
+            ("quotas", [{"scope": "B", "id": "ghost",
+                         "limit": 1, "span": 1}]),
+            ("faults", [{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}]),
+            ("capacities", [{"id": "ghost", "cap": 1}]),
+        ]
+        for section, value in cases:
+            self.assert_failure(
+                [
+                    {"op": "ci", "config": cfg, "now": 0},
+                    self.cu(base, section, value, 1),
+                ],
+                3,
+                "BACKEND",
+            )
+
+    # ---- STATE --------------------------------------------------------
+
+    def test_base_mismatch_is_state(self):
+        cfg = config_v11(1)
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                self.cu("0" * 64, "vnodes", None, 1),
+            ],
+            4,
+            "STATE",
+        )
+
+    def test_active_connection_is_state(self):
+        cfg = config_v11(1)
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+                self.cu(digest_of(cfg), "vnodes", None, 1),
+            ],
+            4,
+            "STATE",
+        )
+
+    def test_queued_item_is_state(self):
+        cfg = config_v11(
+            1, vnodes=1, overload={"cap": 1, "q": 2, "ttl": 10}
+        )
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                {"op": "open", "cid": "x", "flow": self.FLOW, "now": 0},
+                {"op": "oa", "cid": "z", "flow": self.FLOW,
+                 "c": "c", "s": "s", "key": "k", "now": 0},
+                self.cu(digest_of(cfg), "vnodes", None, 1),
+            ],
+            4,
+            "STATE",
+        )
+
+    def test_failure_rolls_back_batch(self):
+        # cu 成功后批内后续操作失败：整批无 stdout，cu 的配置、rev 与时钟
+        # 均不落盘（新一批 ct 仍为操作前摘要、cl 仍为空）。
+        cfg = config_v11(1)
+        changed = config_v11(5)
+        self.assert_failure(
+            [
+                {"op": "ci", "config": cfg, "now": 0},
+                self.cu(digest_of(cfg), "backends",
+                        changed["backends"], 1),
+                {"op": "probe", "id": "ghost", "ok": True, "now": 2},
+            ],
+            3,
+            "BACKEND",
+        )
+        # 回滚校验在全新进程：失败批次不落任何状态，新进程 ct 仍为初始
+        # 空配置摘要、cl 仍为空。
+        results = self.run_ops([{"op": "ct"}, {"op": "cl"}])
+        self.assertEqual(results[0]["digest"], digest_of(self.initial_config()))
+        self.assertIsNone(results[1]["current"])
+
+    @staticmethod
+    def initial_config():
+        return {
+            "version": 11, "backends": [], "vnodes": None, "limits": [],
+            "overload": None, "sticky": None, "idle": None,
+            "backpressure": None, "scheduler": {"pick": "W"},
+            "faults": [], "quotas": [],
+            "queue": {"dequeue": "F", "full": "T"},
+            "capacities": [], "lifetime": None,
+        }
+
+    # ---- record/replay ------------------------------------------------
+
+    def test_record_replay_covers_cu(self):
+        cfg = config_v11(1)
+        changed = config_v11(5)
+        ops = [
+            {"op": "ci", "config": cfg, "now": 0},
+            self.cu(digest_of(cfg), "backends", changed["backends"], 1),
+            {"op": "ce"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        self.assertEqual((run_code, run_stderr), (0, b""))
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+    def test_record_replay_covers_failing_cu(self):
+        raw = encode_ops(
+            [self.cu("0" * 64, "vnodes", None, 0)]
+        )
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        self.assertEqual(run_code, 4)
+        self.assertEqual(run_stdout, b"")
+        self.assertEqual(run_stderr, b'{"error":"STATE"}\n')
+        _, rec_stdout, _ = run_balancer("record", raw)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual(record["exit"], 4)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, 4)
+        self.assertEqual(rep_stdout, b"")
+        self.assertEqual(rep_stderr, run_stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

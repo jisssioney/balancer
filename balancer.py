@@ -695,6 +695,29 @@ record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16N)（N 为�
 配置大小）；其余
 子命令与既有操作行为不变。
 
+单字段配置热加载：cu 精确键序 op,base,section,value,now（键须按此序
+出现）；base 格式同 ct.digest（小写 64 位十六进制串）；section 须是
+version=11 的 ce.config 除 version 外任一顶层键（backends,vnodes,
+limits,overload,sticky,idle,backpressure,scheduler,faults,quotas,
+queue,capacities,lifetime）；value 沿用该字段在 version=11 配置中的
+既有结构、键序、类型、范围与排序（backends 项含 endpoint，limits/
+quotas 须按 scope 的 B/C/S 序、id 的 UTF-8 字节升序，queue 键序
+dequeue,full，faults 项键序 id,k,a,z,v，capacities 项键序 id,cap，
+lifetime 为 null 或 {"ttl":整数}）；now 为 0..10^9 非 bool 整数并进入
+共用非递减时钟。以当前配置为底稿仅替换 section 合成 version=11 候选，
+再按 ci 校验结构与交叉约束（如 scheduler 选 H 须 vnodes 非 null、
+backpressure 非 null 须 overload 非 null 且 low<high≤overload.q）。
+候选的 B 限流/配额、faults 或 capacities 引用未知候选后端判 BACKEND/3；
+校验后 base 与操作前 ct 指纹不匹配、有活动连接或排队项、rev 耗尽（下
+一个 rev 将超过 10^18）判 STATE/4，依次判错。成功原子应用：沿用 ci 的
+运行态重建、清除既有配置预约、rev 从 1 起递增分配（值未变也新建 rev）、
+提交历史仅保留最近 16 条。结果键序 op,base,target,rev,ok：base/target
+为操作前/后配置的小写 SHA-256 摘要，rev 为新 rev，ok=true。键序、base
+格式、section、value 或 now/时钟非法报 INPUT/2；失败回滚时钟、配置、
+运行态、rev、历史与预约。时空 O(N)，N 为合成配置大小，仅用标准库；
+紧凑 UTF-8 固定键序 JSON、单末尾换行及 record/replay 逐字节契约照常，
+其他子命令不变。
+
 H pick 记账：扩展 H 模式 pick，调度与映射行为不变，成功项仅记一次并归属
 返回 id。无旧映射记 first；旧目标合格且本次未判到期记 sticky；三键旧映射
 e 非 null 且 now≥e 记 expired（重选回原 id 也算 expired）；否则按旧目标
@@ -2094,7 +2117,7 @@ def parse_op(raw_op):
         "lt",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
-        "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
+        "ce", "ci", "cl", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -3411,6 +3434,28 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("cb", rev, parse_now(raw_op["now"]))
+
+    if name == "cu":
+        # 单字段配置热加载：精确键序 op,base,section,value,now（键须按此序
+        # 出现，乱序报 INPUT）；base 格式同 ct.digest（小写 64 位十六进制
+        # 串）；section 须是 version=11 的 ce.config 除 version 外任一顶层
+        # 键，value 沿用该字段在配置中的既有结构、键序、类型、范围与排序；
+        # now ∈ [0,10^9] 非 bool 整数并进入共用非递减时钟（倒退在执行期与
+        # 其余操作同序判 INPUT）。以当前配置为底稿仅替换 section 合成 version
+        # =11 候选，再按 ci 校验，故字段内部结构直接复用 parse_config，未知
+        # 后端引用留执行期判 BACKEND。
+        if list(raw_op) != ["op", "base", "section", "value", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        base = parse_base(raw_op["base"])
+        section = raw_op["section"]
+        if not isinstance(section, str) or section not in (
+            "backends", "vnodes", "limits", "overload",
+            "sticky", "idle", "backpressure", "scheduler",
+            "faults", "quotas", "queue", "capacities", "lifetime",
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        parse_warm_now(raw_op["now"])
+        return ("cu", base, section, raw_op["value"], raw_op["now"])
 
     if name == "ts":
         if keys != {"op", "ttl"}:
@@ -4917,7 +4962,7 @@ def run(raw):
             "oq", "lh", "lt",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
-            "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "mu",
@@ -7535,6 +7580,63 @@ def run(raw):
             reservation = None
             results.append(
                 {"op": "cb", "target": target_rev, "rev": new_rev, "ok": True}
+            )
+
+        elif op[0] == "cu":
+            # 单字段配置热加载：以当前 ce.config（规范化 version=11）为底稿，
+            # 仅替换 section 后合成候选，再按 ci 同型校验（含交叉约束）。
+            # INPUT 已在解析期（键序、base 格式、section、value 结构/类型/
+            # 范围/排序、now）与共用时钟块（时钟倒退）判完；合成候选的 B
+            # 限流/配额、faults、capacities 引用未知后端判 BACKEND，先于
+            # base 比对与活动状态判定（同 ci 乐观并发形式）。全部校验先于
+            # 任何变更，失败天然回滚时钟、配置、运行态、rev、历史与预约。
+            _, base, section, raw_value, now = op
+            before_export = export_config()
+            before_digest = config_digest(before_export)
+            # 顶层键赋值保持该键位置：合成对象仍严格按 version=11 十四键
+            # 声明顺序，version=11 不被替换。parse_config 只读输入。
+            before_export[section] = raw_value
+            config = parse_config(before_export)
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for override_id in config["capacities"]:
+                if override_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            # 校验后 base 不匹配：STATE，先于活动连接或排队检查（同 ci）。
+            if base != before_digest:
+                fail(EXIT_STATE, "STATE")
+            if connections or wait_queue:
+                fail(EXIT_STATE, "STATE")
+            if next_rev > 10 ** 18:
+                # rev 耗尽：不分配、不改历史。
+                fail(EXIT_STATE, "STATE")
+            # 沿用 ci 的原子替换与默认运行态重建；value 与现值相同也新建 rev。
+            apply_config(config, now)
+            new_export = export_config()
+            target_digest = config_digest(new_export)
+            commit_history.append((next_rev, new_export))
+            new_rev = next_rev
+            next_rev += 1
+            if len(commit_history) > 16:
+                commit_history.pop(0)
+            # cu 成功同 ci 清除既有配置预约。
+            reservation = None
+            results.append(
+                {
+                    "op": "cu",
+                    "base": before_digest,
+                    "target": target_digest,
+                    "rev": new_rev,
+                    "ok": True,
+                }
             )
 
         elif op[0] == "cp":
