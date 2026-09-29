@@ -9871,6 +9871,474 @@ class PercentileAlertTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class RetryAlertTest(unittest.TestCase):
+    """xa 每后端重试/重映射告警：mh 窗值、N/A 滞回状态机、(id,k) 独立、
+    缓存/跳窗/变参与各类清除。"""
+
+    def results(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def mr(retries=0, remaps=0, now=0, ok=True, backend="b"):
+        return {"op": "mr", "id": backend, "ok": ok, "ms": 1,
+                "retries": retries, "remaps": remaps, "now": now}
+
+    @staticmethod
+    def xa(k, w, now, hi=5, lo=1, n=1, backend="b"):
+        return {"op": "xa", "id": backend, "k": k, "w": w,
+                "hi": hi, "lo": lo, "n": n, "now": now}
+
+    def test_value_takes_retries_for_R_and_remaps_for_M(self):
+        # 一条 mr：retries=3、remaps=2；同窗 R 取 3、M 取 2（同窗评估互不
+        # 推进对方状态机，用独立批次与同窗混合各验一次）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(3, 2, 0),
+            self.xa("R", 0, 60, hi=10, lo=0),
+            self.xa("M", 0, 60, hi=10, lo=0),
+        ]
+        xa_results = [r for r in self.results(ops) if r["op"] == "xa"]
+        self.assertEqual(
+            [(r["k"], r["value"]) for r in xa_results],
+            [("R", 3), ("M", 2)],
+        )
+
+    def test_value_sums_mr_within_window(self):
+        # 同窗两条 mr：retries 按 mh 口径累加。
+        out = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(3, 2, 0),
+            self.mr(4, 5, 59),
+            self.xa("R", 0, 60, hi=10, lo=0),
+            self.xa("M", 0, 60, hi=10, lo=0),
+        ])
+        xa_results = {r["k"]: r for r in out if r["op"] == "xa"}
+        self.assertEqual(xa_results["R"]["value"], 7)
+        self.assertEqual(xa_results["M"]["value"], 7)
+
+    def test_empty_window_value_is_zero(self):
+        out = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.xa("R", 0, 60),
+        ])[-1]
+        self.assertEqual(out["value"], 0)
+        self.assertEqual(out["state"], "N")
+        self.assertEqual(out["run"], 0)
+        self.assertFalse(out["changed"])
+
+    def test_hi_boundary_inclusive_triggers_alarm(self):
+        # value==hi 即满足 value>=hi：retries=5、hi=5、n=1 当窗转 A。
+        result = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 0, 0),
+            self.xa("R", 0, 60, hi=5, lo=1),
+        ])[-1]
+        self.assertEqual(result["state"], "A")
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["run"], 0)
+
+    def test_lo_boundary_inclusive_clears_alarm(self):
+        # A 态 value==lo 即满足 value<=lo：w0 remaps=5 转 A，w1 remaps=1
+        # （==lo）转回 N。
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results([
+                   {"op": "add", "id": "b", "weight": 1},
+                   self.mr(0, 5, 0), self.xa("M", 0, 60, hi=5, lo=1),
+                   self.mr(0, 1, 60), self.xa("M", 1, 120, hi=5, lo=1),
+               ]) if r["op"] == "xa"]
+        self.assertEqual(seq, [("A", 0, True), ("N", 0, True)])
+
+    def test_n_run_accumulates_and_resets_on_mismatch(self):
+        # n=2：N 态需连续两窗 value>=hi；方向不符窗把连续数清 0。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 0, 0), self.xa("R", 0, 60, hi=5, lo=1, n=2),   # run=1
+            self.xa("R", 1, 120, hi=5, lo=1, n=2),                    # 0 清 0
+            self.mr(5, 0, 120), self.xa("R", 2, 180, hi=5, lo=1, n=2),  # 1
+            self.mr(5, 0, 180), self.xa("R", 3, 240, hi=5, lo=1, n=2),  # 转 A
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "xa"]
+        self.assertEqual(seq, [
+            ("N", 1, False),
+            ("N", 0, False),
+            ("N", 1, False),
+            ("A", 0, True),
+        ])
+
+    def test_A_run_accumulates_then_resets_on_mismatch(self):
+        # n=2 双向：w0 转 A；A 态需连续两窗 value<=lo，中间一窗超 lo 清 0。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 0, 0), self.xa("R", 0, 60, hi=5, lo=1, n=2),
+            self.mr(5, 0, 60), self.xa("R", 1, 120, hi=5, lo=1, n=2),  # A
+            self.mr(1, 0, 120), self.xa("R", 2, 180, hi=5, lo=1, n=2),  # run=1
+            self.mr(5, 0, 180), self.xa("R", 3, 240, hi=5, lo=1, n=2),  # 清 0
+            self.mr(1, 0, 240), self.xa("R", 4, 300, hi=5, lo=1, n=2),  # 1
+            self.mr(1, 0, 300), self.xa("R", 5, 360, hi=5, lo=1, n=2),  # 转 N
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "xa"]
+        self.assertEqual(seq, [
+            ("N", 1, False),
+            ("A", 0, True),
+            ("A", 1, False),
+            ("A", 0, False),
+            ("A", 1, False),
+            ("N", 0, True),
+        ])
+
+    def test_R_and_M_are_independent_state_machines(self):
+        # 同窗 w0：retries=5 使 R 转 A，remaps=0 使 M 留 N；随后两机各走
+        # 各的连续计数，互不影响。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 0, 0),
+            self.xa("R", 0, 60, hi=5, lo=1),
+            self.xa("M", 0, 60, hi=5, lo=1),
+            self.mr(1, 0, 60),
+            self.xa("R", 1, 120, hi=5, lo=1),   # R：value=1<=lo 回 N
+            self.xa("M", 1, 120, hi=5, lo=1),   # M：value=0，仍 N
+        ]
+        seq = [(r["k"], r["state"], r["changed"])
+               for r in self.results(ops) if r["op"] == "xa"]
+        self.assertEqual(seq, [
+            ("R", "A", True),
+            ("M", "N", False),
+            ("R", "N", True),
+            ("M", "N", False),
+        ])
+
+    def test_same_window_same_params_cache_no_advance(self):
+        # 同窗同参重报原样返回首评结果（含 changed），不推进状态机；随后
+        # w+1 正常推进。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 0, 0),
+            self.xa("R", 0, 60, hi=5, lo=1),
+            self.xa("R", 0, 120, hi=5, lo=1),   # 时钟可继续走，仍返缓存
+            self.xa("R", 1, 120, hi=5, lo=1),   # 空窗 value=0，A→N
+        ]
+        xa_results = [r for r in self.results(ops) if r["op"] == "xa"]
+        self.assertEqual(xa_results[0], xa_results[1])
+        self.assertTrue(xa_results[1]["changed"])
+        self.assertEqual(xa_results[2]["w"], 1)
+        self.assertEqual(xa_results[2]["state"], "N")
+        self.assertTrue(xa_results[2]["changed"])
+
+    def test_same_window_changed_params_is_state(self):
+        for override in (
+            {"hi": 6}, {"lo": 0}, {"n": 2},
+        ):
+            params = dict(hi=5, lo=1, n=1)
+            params.update(override)
+            ops = [
+                {"op": "add", "id": "b", "weight": 1},
+                self.xa("R", 0, 60, **params),
+                self.xa("R", 0, 60, hi=5, lo=1, n=1),
+            ]
+            self.assert_failure(encode_ops(ops), 4, "STATE")
+        # 同窗改 k 是另一条独立状态机的首评，合法（互不视为变参）。
+        out = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.xa("R", 0, 60),
+            self.xa("M", 0, 60),
+        ])
+        self.assertEqual([r["k"] for r in out if r["op"] == "xa"],
+                         ["R", "M"])
+
+    def test_skip_and_regression_window_are_state(self):
+        base = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.xa("R", 0, 60),
+        ]
+        # 跳窗 w=2。
+        self.assert_failure(
+            encode_ops(base + [self.xa("R", 2, 180)]), 4, "STATE"
+        )
+        # 已逐窗到 w1 后回退评 w0。
+        self.assert_failure(
+            encode_ops(base + [
+                self.xa("R", 1, 120),
+                self.xa("R", 0, 120),
+            ]),
+            4, "STATE",
+        )
+
+    def test_param_change_next_window_is_state(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.xa("R", 0, 60, hi=5),
+            self.xa("R", 1, 120, hi=6),
+        ]
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_per_backend_independent(self):
+        # b 转 A、c 留 N，且各 id 可固化不同阈值。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            self.mr(5, 0, 0, backend="b"),
+            self.mr(1, 0, 0, backend="c"),
+            self.xa("R", 0, 60, hi=5, lo=1, n=1, backend="b"),
+            self.xa("R", 0, 60, hi=10, lo=9, n=1, backend="c"),
+        ]
+        by_id = {r["id"]: r for r in self.results(ops) if r["op"] == "xa"}
+        self.assertEqual(by_id["b"]["state"], "A")
+        self.assertTrue(by_id["b"]["changed"])
+        self.assertEqual(by_id["c"]["state"], "N")
+        self.assertFalse(by_id["c"]["changed"])
+
+    def test_readd_clears_alarm(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 5, 0),
+            self.xa("R", 0, 60, hi=5, lo=1),
+            self.xa("M", 0, 60, hi=5, lo=1),
+            {"op": "remove", "id": "b"},
+            {"op": "add", "id": "b", "weight": 1},
+            # R/M 均回到未首评：空窗 N、changed=false、run=0。
+            self.xa("R", 1, 120, hi=5, lo=1),
+            self.xa("M", 1, 120, hi=5, lo=1),
+        ]
+        for result in self.results(ops)[-2:]:
+            self.assertEqual(result["state"], "N")
+            self.assertEqual(result["run"], 0)
+            self.assertFalse(result["changed"])
+            self.assertEqual(result["value"], 0)
+
+    def test_ci_clears_alarm(self):
+        # ce 导出当前规范化配置，ci 成功后 xa 回到未首评。
+        exported = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ce"},
+        ])[-1]["config"]
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 0, 0),
+            self.xa("R", 0, 60, hi=5, lo=1),
+            {"op": "ci", "config": exported, "now": 120},
+            self.xa("R", 1, 120, hi=5, lo=1),
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "xa"]
+        self.assertEqual(seq[0], ("A", 0, True))
+        self.assertEqual(seq[1], ("N", 0, False))
+
+    def test_cb_clears_alarm(self):
+        # ci 建立 rev1；其后 xa 转 A，cb 回滚成功同样清空告警。
+        exported = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ce"},
+        ])[-1]["config"]
+        ops = [
+            {"op": "ci", "config": exported, "now": 0},
+            self.mr(5, 0, 60),
+            self.xa("R", 1, 120, hi=5, lo=1),                 # A
+            {"op": "cb", "rev": 1, "now": 120},
+            self.xa("R", 1, 120, hi=5, lo=1),                 # 未首评 N
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "xa"]
+        self.assertEqual(seq[0], ("A", 0, True))
+        self.assertEqual(seq[1], ("N", 0, False))
+
+    def test_ca_clears_alarm(self):
+        # cp 预约、ca 生效成功清空告警（同 ci 路径）。
+        exported = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ce"},
+        ])[-1]["config"]
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 0, 0),
+            self.xa("R", 0, 60, hi=5, lo=1),                  # A
+            {"op": "cp", "config": exported, "at": 120, "now": 120},
+            {"op": "ca", "now": 120},
+            self.xa("R", 1, 120, hi=5, lo=1),                 # 未首评 N
+        ]
+        seq = [(r["state"], r["run"], r["changed"])
+               for r in self.results(ops) if r["op"] == "xa"]
+        self.assertEqual(seq[0], ("A", 0, True))
+        self.assertEqual(seq[1], ("N", 0, False))
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            encode_ops([self.xa("R", 0, 60, backend="z")]), 3, "BACKEND"
+        )
+
+    def test_unknown_id_precedes_window_state(self):
+        # 即使 w 窗未结束（本应 STATE），未知 id 也先判 BACKEND。
+        self.assert_failure(
+            encode_ops([self.xa("R", 1, 60, backend="z")]), 3, "BACKEND"
+        )
+
+    def test_k_only_R_or_M(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        tail = b']}'
+        cases = [
+            b'{"op":"xa","id":"b","k":"X","w":0,"hi":1,"lo":0,'
+            b'"n":1,"now":60}',
+            b'{"op":"xa","id":"b","k":"r","w":0,"hi":1,"lo":0,'
+            b'"n":1,"now":60}',
+            b'{"op":"xa","id":"b","k":null,"w":0,"hi":1,"lo":0,'
+            b'"n":1,"now":60}',
+            b'{"op":"xa","id":"b","k":true,"w":0,"hi":1,"lo":0,'
+            b'"n":1,"now":60}',
+        ]
+        for body in cases:
+            self.assert_failure(head + body + tail, 2, "INPUT")
+
+    def test_key_order_and_shape_rejections(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        # k 与 w 乱序。
+        self.assert_failure(
+            head + b'{"op":"xa","id":"b","w":0,"k":"R","hi":1,'
+                   b'"lo":0,"n":1,"now":60}]}',
+            2, "INPUT",
+        )
+        # 缺 k。
+        self.assert_failure(
+            head + b'{"op":"xa","id":"b","w":0,"hi":1,"lo":0,'
+                   b'"n":1,"now":60}]}',
+            2, "INPUT",
+        )
+        # 多键。
+        self.assert_failure(
+            head + b'{"op":"xa","id":"b","k":"R","w":0,"hi":1,'
+                   b'"lo":0,"n":1,"now":60,"x":1}]}',
+            2, "INPUT",
+        )
+
+    def test_type_range_and_relation_rejections(self):
+        head = b'{"ops":[{"op":"add","id":"b","weight":1},'
+        tail = b']}'
+        cases = [
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":0,"lo":0,'
+            b'"n":1,"now":60}',                               # hi 下界
+            b'{"op":"xa","id":"b","k":"R","w":0,'
+            b'"hi":1000000000000000001,"lo":0,"n":1,"now":60}',  # hi 超界
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":1,"lo":-1,'
+            b'"n":1,"now":60}',                               # lo 下界
+            b'{"op":"xa","id":"b","k":"R","w":0,'
+            b'"hi":1000000000000000000,'
+            b'"lo":1000000000000000000,"n":1,"now":60}',      # lo 上界
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":1,"lo":1,'
+            b'"n":1,"now":60}',                               # lo==hi
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":2,"lo":1,'
+            b'"n":0,"now":60}',                               # n 下界
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":2,"lo":1,'
+            b'"n":61,"now":60}',                              # n 上界
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":true,'
+            b'"lo":0,"n":1,"now":60}',                        # hi bool
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":2.0,'
+            b'"lo":1,"n":1,"now":60}',                        # hi 浮点
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":"2",'
+            b'"lo":1,"n":1,"now":60}',                        # hi 字符串
+            b'{"op":"xa","id":"b","k":"R","w":-1,"hi":2,'
+            b'"lo":1,"n":1,"now":60}',                        # w 下界
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":2,'
+            b'"lo":1,"n":1,"now":-1}',                        # now 下界
+            b'{"op":"xa","id":"b","k":"R","w":0,"hi":2,'
+            b'"lo":1,"n":1,"now":1000000001}',                # now 上界
+        ]
+        for body in cases:
+            self.assert_failure(head + body + tail, 2, "INPUT")
+
+    def test_hi_lo_boundary_values_accepted(self):
+        # hi=10^18、lo=10^18-1、lo<hi 合法；空窗 value=0<=lo 不触发。
+        out = self.results([
+            {"op": "add", "id": "b", "weight": 1},
+            self.xa("R", 0, 60, hi=10 ** 18, lo=10 ** 18 - 1),
+        ])[-1]
+        self.assertEqual(out["state"], "N")
+        self.assertEqual(out["value"], 0)
+
+    def test_window_out_of_range_is_state(self):
+        # w==now//60（窗未结束）。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.xa("R", 1, 60),
+            ]),
+            4, "STATE",
+        )
+        # now=3600：当前窗 60、下界 1，w=0 越界。
+        self.assert_failure(
+            encode_ops([
+                {"op": "add", "id": "b", "weight": 1},
+                self.xa("R", 0, 3600),
+            ]),
+            4, "STATE",
+        )
+
+    def test_clock_regression_is_input(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "mg", "id": "b", "now": 120},
+            self.xa("R", 0, 60),
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_failed_batch_is_atomic(self):
+        # 合法 xa 之后跳窗触发 STATE：整批无 stdout（不产生部分结果）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.xa("R", 0, 60),
+            self.xa("R", 2, 180),
+        ]
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        self.assertEqual(stderr, b'{"error":"STATE"}\n')
+
+    def test_output_key_order_and_single_newline(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 2, 0),
+            self.xa("M", 0, 60, hi=5, lo=1),
+        ])
+        _, out, _ = run_balancer("run", raw)
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+        result = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(
+            list(result),
+            ["op", "id", "k", "w", "state", "value", "run", "changed"],
+        )
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            self.mr(5, 2, 0),
+            self.xa("R", 0, 60, hi=5, lo=1, n=2),
+            self.xa("R", 0, 60, hi=5, lo=1, n=2),
+            self.xa("M", 0, 60, hi=5, lo=1),
+            self.mr(5, 2, 60),
+            self.xa("R", 1, 120, hi=5, lo=1, n=2),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+
 class PercentileAlertHistoryTest(unittest.TestCase):
     """ph 后端延迟分位告警转换历史：pa 转换记账、闭区间查询、优先级与清除。"""
 
