@@ -434,18 +434,20 @@ O(B log B+60B)、额外空间 O(B)，仅标准库；紧凑 UTF-8 固定键序 JS
 非递减时钟），id 须现存否则 BACKEND。每次采样记录该后端当时的活动连接数
 与 removed——removed 沿用 mg 的取值与优先级（drain、health、circuit、
 fault 或 null）。按 window=now//60 分窗保留最近 60 窗，每窗至多 60 个
-不同 now（每后端至多 3600 样本）。同 (id, now) 重报：采样值（连接数与
-removed）一致幂等，不一致属冲突重报报 STATE/4。ms 返回键序 op,ok，
-ok=true。mx 精确键集 op,id,from,to,now，数值与关系约束同 mh（非法键集、
-类型、范围、关系或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，from 早于
-max(0,now//60-59) 报 STATE/4）。结果键序 op,id,windows，windows 含 from
-至 to 所有窗并按窗升序，项键序 window,samples,peak,last,removed：
-samples 为窗内采样数、peak 为窗内并发峰值、last 为末次采样的并发；空窗
-samples/peak 为 0 且 last=null；removed 为键序 drain,health,circuit,
-fault,none 的非负整数计数对象，removed=null 的样本计入 none。mx 不改变
-采样，失败原子回滚；record/replay 逐字节覆盖。remove 后重加、ci 成功均
-清空采样历史。ms 为 O(1)，mx 为 O(R+S)（R 为窗数、S 为区间内样本数），
-仅用标准库，其余子命令与既有操作行为不变。
+不同 now（每后端至多 3600 样本）。ms 成功时按后端与 window=now//60 同步
+维护该窗 samples（窗内采样数）与 peak（窗内并发峰值）聚合：同 (id, now)
+同值重报幂等、不重复计数，值变化属冲突重报报 STATE/4（在改聚合前判定，
+失败批次天然回滚）；聚合供 na 单次 O(1) 取窗值。ms 返回键序
+op,ok，ok=true。mx 精确键集 op,id,from,to,now，数值与关系约束同 mh（非
+法键集、类型、范围、关系或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，
+from 早于 max(0,now//60-59) 报 STATE/4）。结果键序 op,id,windows，
+windows 含 from 至 to 所有窗并按窗升序，项键序
+window,samples,peak,last,removed：samples/peak 取上述窗聚合、last 为末
+次采样的并发；空窗 samples/peak 为 0 且 last=null；removed 为键序
+drain,health,circuit,fault,none 的非负整数计数对象，removed=null 的样本
+计入 none。mx 不改变采样，失败原子回滚；record/replay 逐字节覆盖。remove
+后重加、ci 成功均清空采样历史。ms 为 O(1)，mx 为 O(R+S)（R 为窗数、S
+为区间内样本数），仅用标准库，其余子命令与既有操作行为不变。
 
 不可用原因分钟历史：按 window=now//60 记账，各后端只保留最近 60 窗，
 空窗不预建。probe 使 healthy 转 unhealthy 时该后端 health 加 1；dr 使 A
@@ -5187,10 +5189,11 @@ def run(raw):
                     "total": 0, "first": 0, "sticky": 0, "expired": 0,
                     "removed": 0, "health": 0, "circuit": 0, "drain": 0,
                 },
-                # 后端采样历史（ms/mx）：window -> {now: (活动连接数,
-                # removed)}，内层按采样先后（now 升序）保序；按 now//60
-                # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
-                # ci 成功即清空。
+                # 后端采样历史（ms/mx）：window -> {"points": {now: (活动
+                # 连接数, removed)}, "samples": 窗内采样数, "peak": 窗内并发
+                # 峰值}；points 按采样先后（now 升序）保序，samples/peak 由
+                # ms 同步维护供 na O(1) 取窗值。按 now//60 仅保留最近 60 窗，
+                # 每窗至多 60 个不同 now。remove 后重加、ci 成功即清空。
                 "samples": {},
                 # 不可用原因分钟历史（rh/rt）：window -> 固定键序
                 # health,drain,circuit,overload 的对象，每因布局
@@ -6633,21 +6636,29 @@ def run(raw):
             if snapshot is None:
                 # 首次采样该窗：新建该窗快照；时钟非递减，顺带丢弃 60 窗前
                 # 的旧窗（每后端至多 60 窗、每窗至多 60 个不同 now，即
-                # 3600 样本）。
-                snapshot = {}
+                # 3600 样本）。窗聚合 samples/peak 与快照同步维护，供 na
+                # O(1) 取窗值，初值 0/0。
+                snapshot = {"points": {}, "samples": 0, "peak": 0}
                 history[window] = snapshot
                 cutoff = window - 59
                 for old in [w for w in history if w < cutoff]:
                     del history[old]
             # 采样值为当时的 (活动连接数, removed)，removed 沿用 mg 优先级。
             current = (record["conns"], removed_reason(record, now))
-            previous = snapshot.get(now)
+            points = snapshot["points"]
+            previous = points.get(now)
             if previous is not None:
                 # 同 (id, now)：采样值相同幂等，不同即冲突重报，报 STATE。
+                # 幂等重报不重复计数，故 samples/peak 不变（在改聚合前判定，
+                # 失败批次天然回滚）。
                 if previous != current:
                     fail(EXIT_STATE, "STATE")
             else:
-                snapshot[now] = current
+                points[now] = current
+                # 新样本：samples 加 1、peak 取窗内并发峰值（均摊 O(1)）。
+                snapshot["samples"] += 1
+                if current[0] > snapshot["peak"]:
+                    snapshot["peak"] = current[0]
             results.append({"op": "ms", "ok": True})
 
         elif op[0] == "mx":
@@ -6681,20 +6692,18 @@ def run(raw):
                         }
                     )
                     continue
-                peak = 0
+                # samples/peak 取 ms 同步维护的窗聚合；last 与 removed 仍逐
+                # 样本统计（mx 时间 O(R+S) 不变）。内层 dict 按采样先后
+                # （共用时钟非递减）保序，末次并发即末项。
                 last = 0
-                # 内层 dict 按采样先后（共用时钟非递减）保序，末次并发即
-                # 末项；遍历同时求窗内峰值与 removed 分类计数。
-                for _, (conns, reason) in snapshot.items():
-                    if conns > peak:
-                        peak = conns
+                for _, (conns, reason) in snapshot["points"].items():
                     last = conns
                     counts[reason if reason is not None else "none"] += 1
                 windows.append(
                     {
                         "window": window,
-                        "samples": len(snapshot),
-                        "peak": peak,
+                        "samples": snapshot["samples"],
+                        "peak": snapshot["peak"],
                         "last": last,
                         "removed": counts,
                     }
@@ -9013,11 +9022,9 @@ def run(raw):
                 samples = 0
                 peak = 0
             else:
-                samples = len(snapshot)
-                peak = 0
-                for conns, _ in snapshot.values():
-                    if conns > peak:
-                        peak = conns
+                # 取 ms 同步维护的窗聚合，O(1)，不逐样本扫描。
+                samples = snapshot["samples"]
+                peak = snapshot["peak"]
             if entry is None:
                 state = "N"
                 run_count = 0

@@ -11282,6 +11282,41 @@ class ConcurrencyAlertTest(unittest.TestCase):
         self.assertEqual(seq[1], seq[2])
         self.assertEqual([r["run"] for r in seq], [1, 1, 1])
 
+    def test_cross_window_uses_maintained_aggregate(self):
+        # 填满一个已结束窗（59 个不同 now 采样），跨窗 na 仍须按 ms 同步
+        # 维护的 samples/peak 聚合 O(1) 评估，合法跨窗不得失败。
+        ops = [{"op": "add", "id": "b", "weight": 1}, self.open("x", 0)]
+        ops += [self.ms(t) for t in range(1, 60)]   # 59 样本，峰值并发 1
+        ops.append(self.na(0, 60, hi=1))            # N→A
+        ops += [self.ms(60), self.na(1, 120, hi=1)]  # 下一连续窗正常评估
+        seq = self.na_results(ops)
+        self.assertEqual(
+            [(r["w"], r["samples"], r["peak"], r["state"], r["changed"])
+             for r in seq],
+            [(0, 59, 1, "A", True), (1, 1, 1, "A", False)],
+        )
+
+    def test_same_now_rereport_not_double_counted(self):
+        # 同 (id,now) 同值重报幂等：samples/peak 不重复计数，mx 与 na 一致。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            self.open("x", 0),
+            self.open("y", 0),
+            self.ms(1),
+            self.ms(1),                       # 同值重报，不重复计数
+            self.na(0, 60, hi=2),
+        ]
+        na_out = self.na_results(ops)[0]
+        self.assertEqual(
+            (na_out["samples"], na_out["peak"]), (1, 2)
+        )
+        mx_out = self.results(ops + [
+            {"op": "mx", "id": "b", "from": 0, "to": 0, "now": 60}
+        ])[-1]["windows"][0]
+        self.assertEqual(
+            (mx_out["samples"], mx_out["peak"], mx_out["last"]), (1, 2, 2)
+        )
+
     def test_same_window_changed_param_is_state(self):
         self.assert_failure(encode_ops([
             {"op": "add", "id": "b", "weight": 1},
