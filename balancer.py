@@ -2124,7 +2124,7 @@ def parse_op(raw_op):
         "lt",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
-        "ce", "ci", "cl", "al", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
+        "ce", "ci", "cl", "al", "ai", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -3432,6 +3432,29 @@ def parse_op(raw_op):
         if list(raw_op) != ["op"]:
             fail(EXIT_INPUT, "INPUT")
         return ("al",)
+
+    if name == "ai":
+        # 审计游标查询：精确键序 op,after,limit（键须按此序出现），只读、
+        # 不推进时钟。after 为 0..10^18、limit 为 1..64 的非 bool 整数；
+        # 键序、类型或范围非法报 INPUT，after 大于已分配最大 rev 留执行期
+        # 判 STATE。
+        if list(raw_op) != ["op", "after", "limit"]:
+            fail(EXIT_INPUT, "INPUT")
+        after = raw_op["after"]
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or not 0 <= after <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        limit = raw_op["limit"]
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 64
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("ai", after, limit)
 
     if name == "cb":
         # 配置回滚：精确键集 op,rev,now；rev 为 1..10^18 非 bool 整数
@@ -7594,6 +7617,59 @@ def run(raw):
                             "after": event["after"],
                         }
                         for event in audit_events
+                    ],
+                }
+            )
+
+        elif op[0] == "ai":
+            # 审计游标查询（只读，不推进时钟）：复用 al 按 rev 升序保留的
+            # 最近 64 条事件。latest 为已分配最大 rev（next_rev-1，初始 0），
+            # after>latest（游标越过最新事件、指向尚未分配的 rev）报 STATE。
+            # 历史非空且 after 小于最旧 rev 减 1 时，after 与最旧事件之间
+            # 必有已按 64 条淘汰的事件，置 truncated=true 并自最旧事件读取；
+            # after 等于最旧 rev 减 1（缺口恰为淘汰区、不漏可读事件）或更大
+            # 时不截断，仅取 rev>after 的事件。至多取 limit 条并逐项全新复
+            # 制（键序沿用 al）；next 为末条 rev、无条目等于 after；more 为
+            # 该窗口之后是否仍有可读事件。响应键序
+            # op,after,next,truncated,more,events。O(A)，额外空间 O(limit)，
+            # A≤64；不推进时钟、失败批次回滚。
+            _, after, limit = op
+            latest = next_rev - 1
+            if after > latest:
+                fail(EXIT_STATE, "STATE")
+            truncated = False
+            if audit_events and after < audit_events[0]["rev"] - 1:
+                truncated = True
+                candidates = audit_events
+            else:
+                candidates = (
+                    event for event in audit_events if event["rev"] > after
+                )
+            picked = []
+            more = False
+            for event in candidates:
+                if len(picked) < limit:
+                    picked.append(event)
+                else:
+                    more = True
+                    break
+            results.append(
+                {
+                    "op": "ai",
+                    "after": after,
+                    "next": picked[-1]["rev"] if picked else after,
+                    "truncated": truncated,
+                    "more": more,
+                    "events": [
+                        {
+                            "rev": event["rev"],
+                            "now": event["now"],
+                            "kind": event["kind"],
+                            "section": event["section"],
+                            "before": event["before"],
+                            "after": event["after"],
+                        }
+                        for event in picked
                     ],
                 }
             )

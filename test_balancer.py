@@ -13180,5 +13180,193 @@ class RetryTimelineTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
 
 
+class AuditCursorTest(unittest.TestCase):
+    """审计游标查询 ai：分页、truncated、STATE/INPUT 与只读契约。"""
+
+    def ai(self, after, limit):
+        return {"op": "ai", "after": after, "limit": limit}
+
+    def commits(self, count, start=1):
+        # 每次 ci 成功分配一个新 rev 并追加一条 ci 审计事件。
+        return [
+            {"op": "ci", "config": config_v6(i), "now": i}
+            for i in range(start, start + count)
+        ]
+
+    def run_ops(self, ops):
+        return run_balancer("run", encode_ops(ops))
+
+    def result(self, ops):
+        code, stdout, stderr = self.run_ops(ops)
+        self.assertEqual((code, stderr), (0, b""))
+        return json.loads(stdout.decode("utf-8"))["results"][-1]
+
+    def test_empty_history_after_zero(self):
+        # 空历史的 after=0 查询返回 0,false,false,[]，键序固定。
+        r = self.result([self.ai(0, 64)])
+        self.assertEqual(
+            list(r),
+            ["op", "after", "next", "truncated", "more", "events"],
+        )
+        self.assertEqual(
+            r,
+            {
+                "op": "ai",
+                "after": 0,
+                "next": 0,
+                "truncated": False,
+                "more": False,
+                "events": [],
+            },
+        )
+
+    def test_empty_history_after_positive_is_state(self):
+        # latest 初始为 0；任何 after>0 都指向尚未分配的 rev。
+        code, stdout, stderr = self.run_ops([self.ai(1, 1)])
+        self.assertEqual((code, stdout, stderr), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_pages_events_after_cursor_with_limit(self):
+        ops = self.commits(5)
+        r = self.result(ops + [self.ai(0, 2)])
+        self.assertEqual([e["rev"] for e in r["events"]], [1, 2])
+        self.assertEqual((r["after"], r["next"], r["more"], r["truncated"]),
+                         (0, 2, True, False))
+        # 事件项键序与值义沿用 al。
+        event = r["events"][0]
+        self.assertEqual(
+            list(event),
+            ["rev", "now", "kind", "section", "before", "after"],
+        )
+        self.assertEqual(
+            (event["now"], event["kind"], event["section"]),
+            (1, "ci", None),
+        )
+        # 以 next 续页，末页不足 limit 时 more=false；after=latest 返回空。
+        r = self.result(ops + [self.ai(2, 2)])
+        self.assertEqual([e["rev"] for e in r["events"]], [3, 4])
+        self.assertEqual((r["next"], r["more"]), (4, True))
+        r = self.result(ops + [self.ai(4, 2)])
+        self.assertEqual([e["rev"] for e in r["events"]], [5])
+        self.assertEqual((r["next"], r["more"]), (5, False))
+        r = self.result(ops + [self.ai(5, 2)])
+        self.assertEqual((r["events"], r["next"], r["more"]), ([], 5, False))
+
+    def test_after_equal_latest_ok_beyond_is_state(self):
+        ops = self.commits(5)
+        self.assertEqual(self.result(ops + [self.ai(5, 1)])["events"], [])
+        code, stdout, stderr = self.run_ops(ops + [self.ai(6, 1)])
+        self.assertEqual((code, stdout, stderr), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_truncated_window_starts_at_oldest_retained(self):
+        # 70 次变更后仅保留 rev 7..70（maxlen 64）。after=0 < 7-1：截断。
+        ops = self.commits(70)
+        r = self.result(ops + [self.ai(0, 64)])
+        self.assertTrue(r["truncated"])
+        self.assertEqual([e["rev"] for e in r["events"]], list(range(7, 71)))
+        self.assertEqual((r["next"], r["more"]), (70, False))
+        # after=最旧 rev-1=6 时缺口恰为淘汰区，不截断；after=5 才截断。
+        r = self.result(ops + [self.ai(6, 64)])
+        self.assertFalse(r["truncated"])
+        self.assertEqual([e["rev"] for e in r["events"]], list(range(7, 71)))
+        r = self.result(ops + [self.ai(5, 64)])
+        self.assertTrue(r["truncated"])
+        self.assertEqual([e["rev"] for e in r["events"]][0], 7)
+        # 截断窗口同样分页：truncated 恒为 true，more 随页后是否有事件。
+        r = self.result(ops + [self.ai(0, 10)])
+        self.assertEqual([e["rev"] for e in r["events"]], list(range(7, 17)))
+        self.assertEqual((r["next"], r["more"], r["truncated"]),
+                         (16, True, True))
+
+    def test_untruncated_paging_inside_window(self):
+        ops = self.commits(70)
+        r = self.result(ops + [self.ai(30, 5)])
+        self.assertFalse(r["truncated"])
+        self.assertEqual([e["rev"] for e in r["events"]], [31, 32, 33, 34, 35])
+        self.assertEqual((r["next"], r["more"]), (35, True))
+        # 恰好取满末页：more=false。
+        r = self.result(ops + [self.ai(65, 5)])
+        self.assertEqual([e["rev"] for e in r["events"]], [66, 67, 68, 69, 70])
+        self.assertFalse(r["more"])
+
+    def test_cb_and_cu_events_share_cursor(self):
+        ops = self.commits(2)
+        ops.append({"op": "cb", "rev": 1, "now": 2})
+        r = self.result(ops + [self.ai(0, 64)])
+        self.assertEqual(
+            [(e["rev"], e["kind"], e["section"]) for e in r["events"]],
+            [(1, "ci", None), (2, "ci", None), (3, "cb", None)],
+        )
+
+    def test_al_unchanged_and_matches_ai_events(self):
+        ops = self.commits(3)
+        code, stdout, stderr = self.run_ops(ops + [{"op": "al"}])
+        self.assertEqual((code, stderr), (0, b""))
+        al = json.loads(stdout.decode("utf-8"))["results"][-1]
+        self.assertEqual(list(al), ["op", "events"])
+        ai_events = self.result(ops + [self.ai(0, 64)])["events"]
+        self.assertEqual(al["events"], ai_events)
+
+    def test_read_only_does_not_observe_or_move_clock(self):
+        # 同一批中 ai 只反映此前已提交的 rev；重复查询逐字节相同。
+        ops = self.commits(2)
+        code, stdout, stderr = self.run_ops(
+            ops + [self.ai(0, 64), self.ai(0, 64)]
+        )
+        self.assertEqual((code, stderr), (0, b""))
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        self.assertEqual(results[-2], results[-1])
+        self.assertEqual([e["rev"] for e in results[-1]["events"]], [1, 2])
+
+    def test_invalid_shapes_are_input(self):
+        bad_raw = [
+            b'{"ops":[{"op":"ai"}]}',
+            b'{"ops":[{"op":"ai","after":0}]}',
+            b'{"ops":[{"op":"ai","limit":1}]}',
+            b'{"ops":[{"op":"ai","after":0,"limit":1,"x":1}]}',
+            b'{"ops":[{"op":"ai","limit":1,"after":0}]}',
+            b'{"ops":[{"op":"ai","after":-1,"limit":1}]}',
+            b'{"ops":[{"op":"ai","after":1000000000000000001,"limit":1}]}',
+            b'{"ops":[{"op":"ai","after":true,"limit":1}]}',
+            b'{"ops":[{"op":"ai","after":0,"limit":0}]}',
+            b'{"ops":[{"op":"ai","after":0,"limit":65}]}',
+            b'{"ops":[{"op":"ai","after":0,"limit":false}]}',
+            b'{"ops":[{"op":"ai","after":0.0,"limit":1}]}',
+            b'{"ops":[{"op":"ai","after":"0","limit":1}]}',
+            b'{"ops":[{"op":"ai","after":0,"after":0,"limit":1}]}',
+        ]
+        for raw in bad_raw:
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual(
+                (code, stdout, stderr),
+                (2, b"", b'{"error":"INPUT"}\n'),
+                raw,
+            )
+
+    def test_boundary_after_values(self):
+        # after=10^18 在空历史上越 latest 报 STATE；after=0 边界合法。
+        code, _, _ = self.run_ops([self.ai(10 ** 18, 1)])
+        self.assertEqual(code, 4)
+        code, _, _ = self.run_ops([self.ai(0, 1)])
+        self.assertEqual(code, 0)
+
+    def test_failure_rolls_back_whole_batch(self):
+        ops = self.commits(2)
+        code, stdout, stderr = self.run_ops(ops + [self.ai(100, 1)])
+        self.assertEqual((code, stdout, stderr), (4, b"", b'{"error":"STATE"}\n'))
+        code, stdout, stderr = self.run_ops(
+            ops + [{"op": "ai", "after": 0, "limit": 0}]
+        )
+        self.assertEqual((code, stdout, stderr), (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops(self.commits(70) + [self.ai(0, 10)])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        _, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_stderr, b"")
+        self.assertEqual((run_code, rec_stderr), (0, b""))
+        self.assertEqual((rep_code, rep_stdout), (run_code, run_stdout))
+
+
 if __name__ == "__main__":
     unittest.main()
