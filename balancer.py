@@ -402,6 +402,20 @@ remove 后同 id 重加及 ci/cb/ca 成功清空历史；失败批回滚。xh �
 额外空间 O(60B)，仅标准库；紧凑 UTF-8 固定键序 JSON、单末尾换行及
 record/replay 逐字节契约照常，其他子命令不变。
 
+每后端重试/重映射告警汇总：xg 精确键序 op,id,k,from,to,now（键须按此序
+出现），id 沿用后端标识，k 仅 R/M，from/to/now 为 0..10^9 非 bool 整数，
+now 进入共用非递减时钟，须 from≤to≤now//60 且 to-from<60。返回键序
+op,id,k,state,last,total,raised,cleared：state 取该 (id,k) 当前 xa 状态
+（N/A），从未评估为 N；last 取现存 60 窗历史中最近转换窗（不限查询区
+间），无事件为 null；raised/cleared 分别统计闭区间 [from,to] 内 N→A、
+A→N 事件数，total 为两者之和，三者皆为非负整数，无历史时为 0。xg 只
+读：不推进 xa 状态机、不裁剪历史。键序、id、k、类型、范围、关系或时钟
+倒退报 INPUT/2；未知 id 报 BACKEND/3；from 早于
+max(0,now//60-59) 报 STATE/4，依次判定。remove 后同 id 重加及 ci/cb/ca
+成功清空告警与历史；失败批回滚。xg 时间 O(60)、额外空间 O(1)，仅标准
+库；紧凑 UTF-8 固定键序 JSON、单末尾换行及 record/replay 逐字节契约照
+常，xa、xh 不变。
+
 后端采样历史：ms 键集 op,id,now（now 为 [0,10^9] 非 bool 整数，纳入共用
 非递减时钟），id 须现存否则 BACKEND。每次采样记录该后端当时的活动连接数
 与 removed——removed 沿用 mg 的取值与优先级（drain、health、circuit、
@@ -2065,7 +2079,7 @@ def parse_op(raw_op):
         "lh",
         "lt",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -2795,6 +2809,28 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return (
             "xh", parse_backend_id(raw_op["id"]),
+            kind, start, end, now,
+        )
+
+    if name == "xg":
+        # 每后端重试/重映射告警汇总查询：精确键序 op,id,k,from,to,now（键
+        # 须按此序出现），只读；id 沿用非空字符串校验（未知 id 留执行期
+        # 判 BACKEND），k 仅 R/M，from/to/now 为 0..10^9 非 bool 整数；窗
+        # 关系 from≤to≤now//60 且 to-from<60，非法即 INPUT；now 纳入共用
+        # 非递减时钟（倒退执行期判 INPUT）。from 过早与未知 id 留执行期判。
+        if list(raw_op) != ["op", "id", "k", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        kind = raw_op["k"]
+        if not isinstance(kind, str) or kind not in ("R", "M"):
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "xg", parse_backend_id(raw_op["id"]),
             kind, start, end, now,
         )
 
@@ -4845,7 +4881,7 @@ def run(raw):
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
-            "ru", "ea", "eh", "pa", "ph", "xa", "xh",
+            "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg",
             "cp", "cq", "ca",
         ):
             now = op[-1]
@@ -8396,6 +8432,50 @@ def run(raw):
             results.append(
                 {"op": "xh", "id": backend_id, "k": kind_code,
                  "events": events}
+            )
+
+        elif op[0] == "xg":
+            # 每后端重试/重映射告警汇总（只读）：未知 id 判 BACKEND，先于
+            # 窗状态；from 早于最近 60 窗下界报 STATE（同 xh）。不推进告警
+            # 状态机、不裁剪历史，失败批次天然回滚。state 取该 (id,k) 当前
+            # xa 状态，从未评估为 N；last 取现存历史中最近转换窗（队列按
+            # window 升序，即末项之窗），不限查询区间，无事件为 null；
+            # raised/cleared 分别统计闭区间 [from,to] 内 N→A、A→N 事件，
+            # total 为两者之和。返回键序
+            # op,id,k,state,last,total,raised,cleared。事件至多 60 项，单次
+            # 遍历完成统计，时间 O(60)、额外空间 O(1)。
+            _, backend_id, kind_code, start, end, now = op
+            if backend_id not in backends:
+                # 未知 id 先于窗口状态判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            entry = retry_alerts.get((backend_id, kind_code))
+            state = "N" if entry is None else entry["state"]
+            history = retry_events.get((backend_id, kind_code))
+            last_window = None
+            raised = 0
+            cleared = 0
+            if history is not None:
+                for event in history:
+                    window = event["window"]
+                    # last 不限查询区间：现存 60 窗历史中的最近转换窗。
+                    if last_window is None or window > last_window:
+                        last_window = window
+                    if start <= window <= end:
+                        if event["to"] == "A":
+                            # N→A。
+                            raised += 1
+                        else:
+                            # A→N。
+                            cleared += 1
+            results.append(
+                {"op": "xg", "id": backend_id, "k": kind_code,
+                 "state": state, "last": last_window,
+                 "total": raised + cleared, "raised": raised,
+                 "cleared": cleared}
             )
 
         elif op[0] == "fx":
