@@ -383,9 +383,27 @@ record/replay 逐字节契约照常；其他操作不变。
 果且不推进状态机。结果键序 op,id,k,w,state,value,run,changed；state 仅
 N/A，value、run 为非负整数，changed 仅转换为 true。键序、id、k、类型、
 范围、关系或时钟非法报 INPUT/2；窗口未结束/过旧、跳窗（含回退）或变参
-报 STATE/4，依次判定。remove 后重加及 ci/cb/ca 成功清告警，失败批回滚。
-xa 时空 O(1)/O(B)，仅标准库；紧凑 UTF-8 固定键序 JSON、单末尾换行及
-record/replay 逐字节契约照常；mr/mh/rr 及其余操作行为不变。
+报 STATE/4，依次判定。转换（N→A 或 A→N）时为该 (id,k) 追加一个历史事件
+（键序 window,from,to,value,hi,lo,n：window 为触发评估窗，from/to 仅
+N/A，value 取触发转换的评估值，hi/lo/n 为固化阈值，五个数值字段均为整
+数）；同窗重报与未转换不追加；每次 xa 成功后删除 window<w-59 的事件，
+w 严格递增故每 (id,k) 至多 60 项、队列按 window 升序，追加与前端裁剪均摊
+还 O(1)。remove 后重加及 ci/cb/ca 成功清告警与历史，失败批回滚。
+xa 评估 O(1)、额外空间 O(B)，仅标准库；紧凑 UTF-8 固定键序 JSON、单末尾
+换行及 record/replay 逐字节契约照常；mr/mh/rr 及其余操作行为不变，xa 的
+返回输出保持不变。
+
+每后端重试/重映射告警转换历史：xh 精确键序 op,id,k,from,to,now（键须按
+此序出现），id 沿用后端标识（未知 id 报 BACKEND/3），k 仅 R/M；
+from/to/now 为 0..10^9 非 bool 整数，now 纳入共用非递减时钟，须
+from≤to≤now//60 且 to-from<60。返回键序 op,id,k,events；events 仅含该
+(id,k) 区间 [from,to]（闭区间）内的转换事件并按 window 升序，无事件为
+[]，项键序 window,from,to,value,hi,lo,n。xh 只读：不推进 xa 告警状态机、
+不清理历史。键序、id、k、数值、关系或时钟非法报 INPUT/2；未知 id 报
+BACKEND/3；from 早于 max(0,now//60-59) 报 STATE/4。remove 后同 id 重加
+及 ci/cb/ca 成功清空历史；失败批回滚。xh 时间 O(60)、额外空间 O(60B)，
+仅标准库；紧凑 UTF-8 固定键序 JSON、单末尾换行及 record/replay 逐字节
+契约照常，其他操作不变。
 
 后端采样历史：ms 键集 op,id,now（now 为 [0,10^9] 非 bool 整数，纳入共用
 非递减时钟），id 须现存否则 BACKEND。每次采样记录该后端当时的活动连接数
@@ -2050,7 +2068,7 @@ def parse_op(raw_op):
         "lh",
         "lt",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -2758,6 +2776,27 @@ def parse_op(raw_op):
         return (
             "xa", parse_backend_id(raw_op["id"]),
             kind, w, hi, lo, n, now,
+        )
+
+    if name == "xh":
+        # 重试/重映射告警转换历史查询：精确键序 op,id,k,from,to,now（键须
+        # 按此序出现），只读；id 沿用非空字符串校验（未知 id 留执行期判
+        # BACKEND），k 仅 R/M；from/to/now 为 0..10^9 非 bool 整数；窗关系
+        # from≤to≤now//60 且 to-from<60，非法即 INPUT；now 纳入共用非
+        # 递减时钟（倒退执行期判 INPUT）。from 过早留执行期判 STATE。
+        if list(raw_op) != ["op", "id", "k", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        kind = raw_op["k"]
+        if not isinstance(kind, str) or kind not in ("R", "M"):
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "xh", parse_backend_id(raw_op["id"]), kind, start, end, now,
         )
 
     if name == "ms":
@@ -3586,10 +3625,19 @@ def run(raw):
     # 否则为 {"hi","lo","n","state","run","w","result"}——(hi,lo,n) 为首评
     # 固化的阈值（hi 1..10^18、lo 0..(10^18-1)、lo<hi、n 1..60），state ∈
     # N/A，run 为当前连续计数，w 为最近已评窗，result 为该窗结果（同窗同
-    # 参原样返回，不推进状态机）。无转换历史。remove 删除该后端全部键，同
-    # id 重加回到未首评，ci/cb/ca 成功整体清空。dict 查找/写入 O(1)，每后端
-    # 至多两键，额外空间 O(B)。
+    # 参原样返回，不推进状态机）。remove 删除该后端全部键，同 id 重加回到
+    # 未首评，ci/cb/ca 成功整体清空。dict 查找/写入 O(1)，每后端至多两键，
+    # 额外空间 O(B)。
     retry_alerts = {}
+    # xa 告警转换历史：以 (id, k) 为键的 deque，仅在该 (id,k) 首次发生
+    # N/A 转换时惰性创建；每个事件键序 window,from,to,value,hi,lo,n
+    # （window 为触发评估窗，from/to 仅 N/A，value 取触发转换的评估值，
+    # hi/lo/n 为固化阈值，五个数值字段均为整数）。同窗重报与未转换不追加；
+    # 每次推进状态机的 xa 成功后删除 window<w-59 的事件，w 严格递增故每
+    # (id,k) 至多 60 项、队列按 window 升序，追加与前端裁剪均摊还 O(1)。
+    # remove 及同 id 重加删除该后端 R/M 两键历史，ci/cb/ca 成功整体清空；
+    # xh 只读，不推进告警也不清理历史。额外空间 O(60B)。
+    retry_events = {}
     # 配置提交历史（cl/cb）：(rev, 规范化 version=11 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
@@ -4600,6 +4648,7 @@ def run(raw):
         nonlocal hard_ttl_cfg
         nonlocal sticky_map, alert, alert_events, overload_hist, wait_hist, err_alerts
         nonlocal err_events, percent_alerts, percent_events, wait_alerts, retry_alerts
+        nonlocal retry_events
         nonlocal mo_seq, mo_cache, queue_mode, dequeue_policy
         nonlocal full_mode, evict_count, evict_last, cap_overrides
         nonlocal limit_hist, aging_cfg
@@ -4780,6 +4829,8 @@ def run(raw):
         # ci/cb/ca 成功清空全部后端重试/重映射告警（xa 各 (id,k) 均回到
         # 未首评）。
         retry_alerts = {}
+        # ci/cb/ca 成功同时清空全部后端 xa 告警转换历史。
+        retry_events = {}
         # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
@@ -4796,7 +4847,7 @@ def run(raw):
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
-            "ru", "ea", "eh", "pa", "ph", "xa",
+            "ru", "ea", "eh", "pa", "ph", "xa", "xh",
             "cp", "cq", "ca",
         ):
             now = op[-1]
@@ -4968,6 +5019,10 @@ def run(raw):
             # 回到未首评。
             retry_alerts.pop((backend_id, "R"), None)
             retry_alerts.pop((backend_id, "M"), None)
+            # remove 同时删除该后端 R/M 两键的 xa 告警转换历史；同 id 重加
+            # 不继承。
+            retry_events.pop((backend_id, "R"), None)
+            retry_events.pop((backend_id, "M"), None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -8204,8 +8259,11 @@ def run(raw):
             # 取该后端 w 窗 mh 口径 retries 累计，k=M 取 remaps 累计（缺窗
             # value=0），皆为非负整数。N 态连续 n 窗 value>=hi 转 A，A 态
             # 连续 n 窗 value<=lo 转 N；方向不符与转换后连续数清 0；转换时
-            # changed=true。返回键序 op,id,k,w,state,value,run,changed。xa
-            # 记账时间 O(1)、额外空间 O(B)（每后端至多 R/M 两键）。
+            # changed=true。转换（N→A 或 A→N）时为该 (id,k) 追加一个历史
+            # 事件，同窗重报（上方 continue）与未转换不追加；每次评估成功后
+            # 删除该 (id,k) window<w-59 的事件。返回键序
+            # op,id,k,w,state,value,run,changed。xa 评估 O(1)、每 (id,k)
+            # 追加与前端裁剪均摊还 O(1)，额外空间 O(B)（历史 O(60B)）。
             _, backend_id, kind_code, w, hi, lo, n, now = op
             record = backends.get(backend_id)
             if record is None:
@@ -8243,6 +8301,7 @@ def run(raw):
                 state = entry["state"]
                 run_count = entry["run"]
             changed = False
+            prev_state = state
             if state == "N":
                 if value >= hi:
                     run_count += 1
@@ -8282,7 +8341,69 @@ def run(raw):
                 "w": w,
                 "result": dict(result),
             }
+            if changed:
+                # 状态转换：为该 (id,k) 追加事件（键序
+                # window,from,to,value,hi,lo,n），记录触发窗、转换前后状态
+                # （仅 N/A）、该次评估值 value 与固化阈值；五个数值字段
+                # window/value/hi/lo/n 均为整数，未转换不记录。同窗重报在
+                # 上方已 continue，不会走到这里，故不重复。
+                history = retry_events.get(alert_key)
+                if history is None:
+                    history = deque()
+                    retry_events[alert_key] = history
+                history.append(
+                    {
+                        "window": w,
+                        "from": prev_state,
+                        "to": state,
+                        "value": value,
+                        "hi": hi,
+                        "lo": lo,
+                        "n": n,
+                    }
+                )
+            # 评估后删除该 (id,k) 早于 w-59 的事件；w 严格递增，前端裁剪
+            # 摊还 O(1)，每 (id,k) 至多 60 项。未转换且无队列时直接跳过。
+            history = retry_events.get(alert_key)
+            if history is not None:
+                cutoff = w - 59
+                while history and history[0]["window"] < cutoff:
+                    history.popleft()
             results.append(result)
+
+        elif op[0] == "xh":
+            # 重试/重映射告警转换历史（只读）：未知 id 判 BACKEND，先于窗
+            # 状态；from 早于最近 60 窗下界报 STATE（同 eh/ph）。不推进 xa
+            # 告警状态机、不清理历史，失败批次天然回滚。返回键序
+            # op,id,k,events；events 仅含该 (id,k) 区间 [from,to] 内的事件，
+            # 按 window 升序（事件本就按评估窗递增入队），项键序
+            # window,from,to,value,hi,lo,n；无事件返回空数组。逐项拷贝，
+            # 避免结果被批次内后续评估污染。事件至多 60 项，时间 O(60)。
+            _, backend_id, kind_code, start, end, now = op
+            if backend_id not in backends:
+                # 未知 id 先于窗口状态判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            history = retry_events.get((backend_id, kind_code))
+            if history is None:
+                events = []
+            else:
+                events = [
+                    dict(event)
+                    for event in history
+                    if start <= event["window"] <= end
+                ]
+            results.append(
+                {
+                    "op": "xh",
+                    "id": backend_id,
+                    "k": kind_code,
+                    "events": events,
+                }
+            )
 
         elif op[0] == "fx":
             _, cid, flow, key, timeout, now = op
