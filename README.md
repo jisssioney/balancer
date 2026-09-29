@@ -6,6 +6,14 @@
 - 所有超时与健康探测必须由显式时钟驱动；相同请求序列必须产生逐字节相同的调度与连接决策。
 - 调度、连接与统计结果统一写成 JSON，浮点数按固定小数位格式化。
 
+## 故障时间线预演：ft
+
+对同一 `key` 在 `times` 各时刻独立模拟 `fr` 的候选资格、哈希环与 D/F/S 规则，只读预演各时刻的重试结果。
+
+- `ft`：精确键序 `op,key,times,timeout,max,now`。`key` 沿用 `route` 校验，`timeout`/`max`/`now` 沿用 `fr`（`now` 为 0..10⁹ 非 bool 整数，纳入共用非递减时钟）；`times` 为 1..60 项严格递增数组，项为 `now`..10⁹ 非 bool 整数。
+- 返回键序 `op,key,now,cases`；`cases` 按 `times` 排列，项键序 `at,state,backend,attempts,retries,remaps,latency`，其中 `state`/`backend`/`attempts`/`latency` 同 `fi`，`retries=remaps=max(attempts-1,0)`。
+- 键序、字段类型/范围/编码、`times` 容器/项数/次序或时钟倒退报 INPUT/2；未配置环或无合格候选报 STATE/4。仅 `now` 推进时钟，不改连接、粘性、指标、告警或故障状态，失败批回滚。时间 O(PBV)、空间 O(P+BV)（P 为 `times` 项数）。
+
 ## 配置变更审计：al / ai
 
 配置变更（`ci`/`cb`/`cu`/`ca`）成功并分配新 rev 时追加一条审计事件；`rev` 从 1 起递增，事件按 rev 升序仅保留最近 64 条，超额淘汰最旧项。两查询均只读、不推进时钟，失败批次回滚。

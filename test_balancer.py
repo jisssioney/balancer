@@ -2557,6 +2557,213 @@ class FaultTimelineTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
 
 
+class FtTimelineDryRunTest(unittest.TestCase):
+    """故障时间线预演 ft：同一 key 在 times 各时刻独立模拟 fr，只读。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if err:
+            self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self):
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "chash", "vnodes": 8},
+        ]
+
+    def test_result_shape_and_key_order(self):
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "ft", "key": "k", "times": [0, 3, 9],
+                "timeout": 9, "max": 2, "now": 0}]
+        )
+        result = results[-1]
+        self.assertEqual(list(result), ["op", "key", "now", "cases"])
+        self.assertEqual(result["op"], "ft")
+        self.assertEqual(result["key"], "k")
+        self.assertEqual(result["now"], 0)
+        self.assertEqual([case["at"] for case in result["cases"]], [0, 3, 9])
+        for case in result["cases"]:
+            self.assertEqual(
+                list(case),
+                ["at", "state", "backend", "attempts",
+                 "retries", "remaps", "latency"],
+            )
+            self.assertIn(case["state"], ("A", "R"))
+            self.assertEqual(case["retries"], max(case["attempts"] - 1, 0))
+            self.assertEqual(case["remaps"], case["retries"])
+            if case["state"] == "A":
+                self.assertIn(case["backend"], ("a", "b"))
+            else:
+                self.assertIsNone(case["backend"])
+
+    def test_cases_track_fault_window_per_time(self):
+        # a 在 [0,10) 为 D：窗口内 ft 应绕过 a 落到 b，窗口外直接命中 a。
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "D", "a": 0, "z": 10, "v": 0}]
+            + [{"op": "ft", "key": "k", "times": [0, 5, 10, 20],
+                "timeout": 9, "max": 3, "now": 0}]
+        )
+        cases = results[-1]["cases"]
+        self.assertEqual(
+            [(c["at"], c["state"], c["backend"], c["attempts"])
+             for c in cases],
+            [(0, "A", "b", 2), (5, "A", "b", 2),
+             (10, "A", "a", 1), (20, "A", "a", 1)],
+        )
+        self.assertEqual(
+            [(c["retries"], c["remaps"]) for c in cases],
+            [(1, 1), (1, 1), (0, 0), (0, 0)],
+        )
+
+    def test_matches_fr_at_same_moment(self):
+        # 单时刻 ft 与同刻 fr 的 state/backend/attempts/latency 一致。
+        ops = (
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "S", "a": 0, "z": 100, "v": 5}]
+            + [{"op": "fr", "cid": "c1", "flow": self.FLOW, "key": "k",
+                "timeout": 3, "max": 2, "now": 7}]
+            + [{"op": "ft", "key": "k", "times": [7],
+                "timeout": 3, "max": 2, "now": 7}]
+        )
+        results = self.run_ops(ops)
+        fr, ft = results[-2], results[-1]["cases"][0]
+        self.assertEqual(
+            (fr["state"], fr["backend"], fr["attempts"], fr["latency"]),
+            (ft["state"], ft["backend"], ft["attempts"], ft["latency"]),
+        )
+        # S 且 v>timeout：a 失败耗时 timeout，落到 b。
+        self.assertEqual((fr["state"], fr["backend"]), ("A", "b"))
+        self.assertEqual(ft["latency"], 3)
+
+    def test_read_only_preserves_runtime_state(self):
+        # ft 不建连、不记 mr/fm、不动粘性；fm 全零、br 无连接。
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "D", "a": 0, "z": 100, "v": 0}]
+            + [{"op": "ft", "key": "k", "times": [0, 50],
+                "timeout": 9, "max": 2, "now": 0}]
+            + [{"op": "fm", "id": "a"}]
+            + [{"op": "br", "now": 1}]
+        )
+        fm = results[-2]
+        for kind in ("D", "F", "S"):
+            self.assertEqual(
+                fm[kind],
+                {"affected": 0, "rejected": 0, "retries": 0,
+                 "remaps": 0, "recovered": 0},
+            )
+        self.assertTrue(
+            all(b["connections"] == 0 for b in results[-1]["backends"])
+        )
+
+    def test_clock_advances_by_now_only(self):
+        # times 项不推进共用时钟：后续 now 只需 ≥ ft.now。
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "ft", "key": "k", "times": [100, 200],
+                "timeout": 9, "max": 2, "now": 5}]
+            + [{"op": "ft", "key": "k", "times": [5, 6],
+                "timeout": 9, "max": 2, "now": 5}]
+        )
+        self.assertEqual(results[-1]["now"], 5)
+
+    def test_input_violations(self):
+        # 键序乱序。
+        self.assert_failure(
+            self.base_ops()
+            + [{"op": "ft", "key": "k", "timeout": 1, "times": [0],
+                "max": 1, "now": 0}],
+            2, "INPUT",
+        )
+        # times 非数组 / 空 / 超 60 项。
+        for bad_times in (5, [], list(range(61))):
+            self.assert_failure(
+                self.base_ops()
+                + [{"op": "ft", "key": "k", "times": bad_times,
+                    "timeout": 1, "max": 1, "now": 0}],
+                2, "INPUT",
+            )
+        # 项非严格递增、项早于 now、项为 bool、项越界。
+        for bad_times, now in (
+            ([3, 3], 0), ([5, 4], 0), ([2, 9], 3),
+            ([True, 1], 0), ([0, 10 ** 9 + 1], 0),
+        ):
+            self.assert_failure(
+                self.base_ops()
+                + [{"op": "ft", "key": "k", "times": bad_times,
+                    "timeout": 1, "max": 1, "now": now}],
+                2, "INPUT",
+            )
+        # key 空串、timeout/max/now 类型或范围非法。
+        self.assert_failure(
+            self.base_ops()
+            + [{"op": "ft", "key": "", "times": [0],
+                "timeout": 1, "max": 1, "now": 0}],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            self.base_ops()
+            + [{"op": "ft", "key": "k", "times": [0],
+                "timeout": 1, "max": 0, "now": 0}],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            self.base_ops()
+            + [{"op": "ft", "key": "k", "times": [0],
+                "timeout": 1, "max": 1, "now": -1}],
+            2, "INPUT",
+        )
+
+    def test_state_and_clock_errors(self):
+        # 未配环报 STATE。
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1},
+             {"op": "ft", "key": "k", "times": [0],
+              "timeout": 1, "max": 1, "now": 0}],
+            4, "STATE",
+        )
+        # 时钟倒退报 INPUT（整批回滚）。
+        self.assert_failure(
+            self.base_ops()
+            + [{"op": "ft", "key": "k", "times": [5],
+                "timeout": 1, "max": 1, "now": 5}]
+            + [{"op": "ft", "key": "k", "times": [4],
+                "timeout": 1, "max": 1, "now": 4}],
+            2, "INPUT",
+        )
+
+    def test_record_replay_covers_ft(self):
+        ops = (
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "F", "a": 0, "z": 100, "v": 2}]
+            + [{"op": "ft", "key": "日本語", "times": [0, 1, 2, 3, 50],
+                "timeout": 9, "max": 2, "now": 0}]
+        )
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual(rec_code, 0)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+
+
 class MoSnapshotTest(unittest.TestCase):
     """全池增量快照 mo：游标、缓存、基线、跨窗与重置契约。"""
 
