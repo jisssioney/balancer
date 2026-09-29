@@ -435,8 +435,10 @@ O(B log B+60B)、额外空间 O(B)，仅标准库；紧凑 UTF-8 固定键序 JS
 与 removed——removed 沿用 mg 的取值与优先级（drain、health、circuit、
 fault 或 null）。按 window=now//60 分窗保留最近 60 窗，每窗至多 60 个
 不同 now（每后端至多 3600 样本）。同 (id, now) 重报：采样值（连接数与
-removed）一致幂等，不一致属冲突重报报 STATE/4。ms 返回键序 op,ok，
-ok=true。mx 精确键集 op,id,from,to,now，数值与关系约束同 mh（非法键集、
+removed）一致幂等，不一致属冲突重报报 STATE/4。ms 成功时按后端与
+window=now//60 同步维护 na 并发告警的 samples/peak 窗聚合（同值重报不
+重复计数，与采样历史同窗裁剪、同步清理），na 单次评估 O(1)。ms 返回键
+序 op,ok，ok=true。mx 精确键集 op,id,from,to,now，数值与关系约束同 mh（非法键集、
 类型、范围、关系或时钟倒退报 INPUT/2，未知 id 报 BACKEND/3，from 早于
 max(0,now//60-59) 报 STATE/4）。结果键序 op,id,windows，windows 含 from
 至 to 所有窗并按窗升序，项键序 window,samples,peak,last,removed：
@@ -4934,6 +4936,9 @@ def run(raw):
                 },
                 # ci 成功清空采样历史，默认运行态为空。
                 "samples": {},
+                # na 并发告警的窗聚合：window -> [samples, peak]，由 ms
+                # 与采样历史同步维护（同窗裁剪），ci 成功随新记录清空。
+                "conc_agg": {},
                 # 故障时间线：ci version=7 载入登记段（按 a 升序、互不
                 # 重叠），v1..v6 为空计划；fault_a 为平行的段起点 a 列表，
                 # 供 bisect O(log T_b) 取唯一活动段。
@@ -5192,6 +5197,11 @@ def run(raw):
                 # 仅保留最近 60 窗，每窗至多 60 个不同 now。remove 后重加、
                 # ci 成功即清空。
                 "samples": {},
+                # na 并发告警的窗聚合：window -> [samples, peak]，由 ms
+                # 与采样历史同步维护（同 (id,now) 同值重报不计、异值报
+                # STATE 不记；同窗裁剪），remove 后重加、ci 成功随新记录
+                # 清空。
+                "conc_agg": {},
                 # 不可用原因分钟历史（rh/rt）：window -> 固定键序
                 # health,drain,circuit,overload 的对象，每因布局
                 # [count,first,last]，仅保留最近 60 窗，空窗不预建；计数
@@ -6631,23 +6641,33 @@ def run(raw):
             history = record["samples"]
             snapshot = history.get(window)
             if snapshot is None:
-                # 首次采样该窗：新建该窗快照；时钟非递减，顺带丢弃 60 窗前
-                # 的旧窗（每后端至多 60 窗、每窗至多 60 个不同 now，即
-                # 3600 样本）。
+                # 首次采样该窗：新建该窗快照与 na 窗聚合；时钟非递减，顺带
+                # 丢弃 60 窗前的旧窗（每后端至多 60 窗、每窗至多 60 个不同
+                # now，即 3600 样本）。聚合与快照同窗裁剪、同步清理。
                 snapshot = {}
                 history[window] = snapshot
                 cutoff = window - 59
                 for old in [w for w in history if w < cutoff]:
                     del history[old]
+                aggregates = record["conc_agg"]
+                aggregates[window] = [0, 0]
+                for old in [w for w in aggregates if w < cutoff]:
+                    del aggregates[old]
             # 采样值为当时的 (活动连接数, removed)，removed 沿用 mg 优先级。
             current = (record["conns"], removed_reason(record, now))
             previous = snapshot.get(now)
             if previous is not None:
-                # 同 (id, now)：采样值相同幂等，不同即冲突重报，报 STATE。
+                # 同 (id, now)：采样值相同幂等（聚合不重复计数），不同即
+                # 冲突重报，报 STATE。
                 if previous != current:
                     fail(EXIT_STATE, "STATE")
             else:
                 snapshot[now] = current
+                # na 窗聚合同步记账：采样数 +1、峰值取 max，单次 O(1)。
+                aggregate = record["conc_agg"][window]
+                aggregate[0] += 1
+                if current[0] > aggregate[1]:
+                    aggregate[1] = current[0]
             results.append({"op": "ms", "ok": True})
 
         elif op[0] == "mx":
@@ -8981,7 +9001,8 @@ def run(raw):
             # 不推进状态机）或 +1，变参或跳窗（含回退）报 STATE。窗口越界
             # （w 未结束或超出最近 60 窗保留下界）同样 STATE；窗口判定先于
             # 阈值/缓存，与 xa 同序。窗值取该后端 w 窗 mx 口径的 samples/
-            # peak（空窗均为 0），皆为非负整数。N 态连续 n 窗 samples>0 且
+            # peak（空窗均为 0），皆为非负整数，直接读 ms 同步维护的
+            # conc_agg 窗聚合。N 态连续 n 窗 samples>0 且
             # peak>=hi 转 A，A 态连续 n 窗 samples>0 且 peak<=lo 转 N；方向
             # 不符与转换后连续数清 0；转换时 changed=true。返回键序
             # op,id,w,state,samples,peak,run,changed。na 记账均摊 O(1)、
@@ -9007,17 +9028,14 @@ def run(raw):
                 if w != entry["w"] + 1:
                     # 跳窗（含回退）。
                     fail(EXIT_STATE, "STATE")
-            snapshot = record["samples"].get(w)
-            if not snapshot:
+            snapshot = record["conc_agg"].get(w)
+            if snapshot is None:
                 # 空窗：samples/peak 均为 0。
                 samples = 0
                 peak = 0
             else:
-                samples = len(snapshot)
-                peak = 0
-                for conns, _ in snapshot.values():
-                    if conns > peak:
-                        peak = conns
+                # ms 同步维护的窗聚合，单次评估 O(1)。
+                samples, peak = snapshot
             if entry is None:
                 state = "N"
                 run_count = 0
