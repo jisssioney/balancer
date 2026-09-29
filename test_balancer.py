@@ -6751,6 +6751,313 @@ class OdTraceTest(unittest.TestCase):
         )
 
 
+class FtTimelineTest(unittest.TestCase):
+    """ft 故障时间线预演：同一 key 在 times 各时刻独立模拟 fr，只读。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if err:
+            self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def setup(self, ids=("a", "b", "c"), vnodes=8):
+        ops = [{"op": "add", "id": backend_id, "weight": 1}
+               for backend_id in ids]
+        ops.append({"op": "chash", "vnodes": vnodes})
+        return ops
+
+    def ft(self, **overrides):
+        op = {
+            "op": "ft", "key": "k1", "times": [0],
+            "timeout": 5, "max": 3, "now": 0,
+        }
+        op.update(overrides)
+        return op
+
+    def ring_order(self, ids, vnodes, key):
+        """复刻 build_ring 自 key 哈希点的去重后端遍历序。"""
+        tokens = []
+        for join_index, backend_id in enumerate(ids):
+            encoded = backend_id.encode("utf-8")
+            for i in range(vnodes):
+                digest = hashlib.sha256(
+                    encoded + b"\x00" + str(i).encode("ascii")
+                ).digest()
+                tokens.append(
+                    (int.from_bytes(digest, "big"), join_index, i, backend_id)
+                )
+        tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+        digests = [token[0] for token in tokens]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash) % len(tokens)
+        order = []
+        for offset in range(len(tokens)):
+            backend_id = tokens[(index + offset) % len(tokens)][3]
+            if backend_id not in order:
+                order.append(backend_id)
+        return order
+
+    def result(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def test_result_and_case_key_order(self):
+        result = self.result(self.setup() + [self.ft(times=[0, 1])])
+        self.assertEqual(list(result), ["op", "key", "now", "cases"])
+        self.assertEqual(result["op"], "ft")
+        self.assertEqual(result["key"], "k1")
+        self.assertEqual(result["now"], 0)
+        self.assertEqual(len(result["cases"]), 2)
+        for case, at in zip(result["cases"], [0, 1]):
+            self.assertEqual(
+                list(case),
+                ["at", "state", "backend", "attempts",
+                 "retries", "remaps", "latency"],
+            )
+            self.assertEqual(case["at"], at)
+            self.assertEqual(case["state"], "A")
+            self.assertEqual(case["attempts"], 1)
+            self.assertEqual(case["retries"], 0)
+            self.assertEqual(case["remaps"], 0)
+            self.assertEqual(case["latency"], 0)
+
+    def test_timeline_tracks_fault_phases(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        # order[0] 在 [10,50) 不可用，order[1] 在 [20,40) 慢（v=9>timeout）。
+        ops.append({"op": "fs", "id": order[0], "k": "D",
+                    "a": 10, "z": 50, "v": 0})
+        ops.append({"op": "fs", "id": order[1], "k": "S",
+                    "a": 20, "z": 40, "v": 9})
+        ops.append(self.ft(times=[0, 15, 25, 60], now=0))
+        result = self.result(ops)
+        cases = result["cases"]
+        # t=0：无故障，首候选直接成功。
+        self.assertEqual(
+            cases[0],
+            {"at": 0, "state": "A", "backend": order[0], "attempts": 1,
+             "retries": 0, "remaps": 0, "latency": 0},
+        )
+        # t=15：order[0] D 失败（耗时 0），order[1] 无故障成功。
+        self.assertEqual(
+            cases[1],
+            {"at": 15, "state": "A", "backend": order[1], "attempts": 2,
+             "retries": 1, "remaps": 1, "latency": 0},
+        )
+        # t=25：order[0] D 失败，order[1] S 且 v>timeout 失败（耗时
+        # timeout），order[2] 成功；latency=0+5+0。
+        self.assertEqual(
+            cases[2],
+            {"at": 25, "state": "A", "backend": order[2], "attempts": 3,
+             "retries": 2, "remaps": 2, "latency": 5},
+        )
+        # t=60：故障均结束，首候选成功。
+        self.assertEqual(
+            cases[3],
+            {"at": 60, "state": "A", "backend": order[0], "attempts": 1,
+             "retries": 0, "remaps": 0, "latency": 0},
+        )
+
+    def test_exhausted_attempts_reject(self):
+        ops = self.setup()
+        for backend_id in ("a", "b", "c"):
+            ops.append({"op": "fs", "id": backend_id, "k": "D",
+                        "a": 0, "z": 100, "v": 0})
+        ops.append(self.ft(times=[0], max=2, now=0))
+        case = self.result(ops)["cases"][0]
+        self.assertEqual(case["state"], "R")
+        self.assertIsNone(case["backend"])
+        self.assertEqual(case["attempts"], 2)
+        self.assertEqual(case["retries"], 1)
+        self.assertEqual(case["remaps"], 1)
+        self.assertEqual(case["latency"], 0)
+
+    def test_f_phase_counts_as_fault_failure(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        # F 段 a=0,v=5：t=0 处 ((0-0)//5)%2=0 故障相位，同 D 失败、耗时
+        # 0；t=5 处相位为 1，非故障相位、首候选直接成功。
+        ops.append({"op": "fs", "id": order[0], "k": "F",
+                    "a": 0, "z": 100, "v": 5})
+        ops.append(self.ft(times=[0, 5], now=0))
+        cases = self.result(ops)["cases"]
+        self.assertEqual(
+            cases[0],
+            {"at": 0, "state": "A", "backend": order[1], "attempts": 2,
+             "retries": 1, "remaps": 1, "latency": 0},
+        )
+        self.assertEqual(
+            cases[1],
+            {"at": 5, "state": "A", "backend": order[0], "attempts": 1,
+             "retries": 0, "remaps": 0, "latency": 0},
+        )
+
+    def test_cases_follow_times_order(self):
+        result = self.result(
+            self.setup() + [self.ft(times=[3, 7, 9, 10], now=2)]
+        )
+        self.assertEqual(
+            [case["at"] for case in result["cases"]], [3, 7, 9, 10]
+        )
+
+    def test_max_times_and_upper_bound(self):
+        result = self.result(
+            self.setup()
+            + [self.ft(times=list(range(60)), now=0)]
+        )
+        self.assertEqual(len(result["cases"]), 60)
+        result = self.result(
+            self.setup() + [self.ft(times=[10 ** 9], now=10 ** 9)]
+        )
+        self.assertEqual(result["cases"][0]["at"], 10 ** 9)
+
+    def test_exact_key_order(self):
+        raw = (
+            b'{"ops":[{"op":"add","id":"a","weight":1},'
+            b'{"op":"chash","vnodes":4},'
+            b'{"op":"ft","times":[0],"key":"k","timeout":1,'
+            b'"max":1,"now":0}]}'
+        )
+        self.assert_failure(raw, 2, "INPUT")
+        raw = (
+            b'{"ops":[{"op":"add","id":"a","weight":1},'
+            b'{"op":"chash","vnodes":4},'
+            b'{"op":"ft","key":"k","times":[0],"timeout":1,'
+            b'"max":1,"now":0,"x":1}]}'
+        )
+        self.assert_failure(raw, 2, "INPUT")
+
+    def test_times_container_and_items(self):
+        bad_times = [
+            5,              # 非数组
+            [],             # 空
+            list(range(61)),  # 超 60 项
+            [1, 1],         # 非严格递增
+            [2, 1],         # 递减
+            [True],         # bool 项
+            ["0"],          # 非整数项
+            [10 ** 9 + 1],  # 项越上界
+        ]
+        for times in bad_times:
+            self.assert_failure(
+                encode_ops(self.setup() + [self.ft(times=times)]),
+                2, "INPUT",
+            )
+        # 项须 ≥ now。
+        self.assert_failure(
+            encode_ops(self.setup() + [self.ft(times=[0], now=1)]),
+            2, "INPUT",
+        )
+
+    def test_field_validation(self):
+        bad_ops = [
+            self.ft(key=""),                 # 空 key
+            self.ft(key=1),                  # 非串 key
+            self.ft(timeout=-1),             # timeout 越界
+            self.ft(timeout=True),           # timeout bool
+            self.ft(max=0),                  # max 越界
+            self.ft(max=1025),
+            self.ft(max=False),              # max bool
+            self.ft(now=-1),                 # now 越界
+            self.ft(now=10 ** 9 + 1),
+            self.ft(now=True),               # now bool
+        ]
+        for op in bad_ops:
+            self.assert_failure(
+                encode_ops(self.setup() + [op]), 2, "INPUT"
+            )
+
+    def test_clock_regression_is_input(self):
+        ops = self.setup()
+        ops.append(self.ft(times=[5], now=5))
+        ops.append(self.ft(times=[4], now=4))
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_times_do_not_advance_clock(self):
+        # times 项不推进共用时钟：后续 now 只需 ≥ ft.now。
+        ops = self.setup()
+        ops.append(self.ft(times=[10, 20, 30], now=5))
+        ops.append({"op": "fq", "now": 6})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["op"], "fq")
+
+    def test_missing_ring_is_state(self):
+        self.assert_failure(
+            encode_ops([self.ft()]), 4, "STATE"
+        )
+
+    def test_no_eligible_candidate_is_state(self):
+        ops = [{"op": "add", "id": "a", "weight": 1},
+               {"op": "chash", "vnodes": 4},
+               {"op": "hset", "id": "a", "fail": 1, "success": 1},
+               {"op": "probe", "id": "a", "ok": False, "now": 0}]
+        ops.append(self.ft(now=0))
+        self.assert_failure(encode_ops(ops), 4, "STATE")
+
+    def test_read_only_no_runtime_mutation(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "fs", "id": order[0], "k": "D",
+                    "a": 0, "z": 100, "v": 0})
+        ops.append(self.ft(times=[0, 1, 2], now=0))
+        # 故障统计、度量与连接数均不受 ft 影响。
+        ops.append({"op": "fm", "id": order[0]})
+        ops.append({"op": "mg", "id": order[1], "now": 1})
+        results = self.run_ops(ops)
+        fm = results[-2]
+        for kind in ("D", "F", "S"):
+            self.assertEqual(
+                fm[kind],
+                {"affected": 0, "rejected": 0, "retries": 0,
+                 "remaps": 0, "recovered": 0},
+            )
+        mg = results[-1]
+        self.assertEqual(mg["requests"], 0)
+        self.assertEqual(mg["concurrency"], 0)
+        # 不建连：同 cid 的 fr 随后仍可成功建连。
+        ops = self.setup()
+        ops.append(self.ft(times=[0], now=0))
+        ops.append({"op": "fr", "cid": "x", "flow": ["s", 1, "t", 2, "tcp"],
+                    "key": "k1", "timeout": 5, "max": 1, "now": 1})
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1]["state"], "A")
+
+    def test_failure_rolls_back_batch(self):
+        ops = self.setup()
+        ops.append(self.ft(times=[0], now=5))
+        # 时钟倒退：整批失败，此前结果一律不输出。
+        ops.append(self.ft(times=[6], now=4))
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_record_replay_round_trip(self):
+        order = self.ring_order(("a", "b", "c"), 8, "k1")
+        ops = self.setup()
+        ops.append({"op": "fs", "id": order[0], "k": "S",
+                    "a": 0, "z": 100, "v": 9})
+        ops.append(self.ft(times=[0, 50, 150], now=0))
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code), (0, 0))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 class OaQuotaAdmissionTest(unittest.TestCase):
     """固定窗口配额参与 oa/ot 接纳：qs/qg/la/oi/od 行为不变。"""
 

@@ -834,6 +834,22 @@ A/R 的 case 数，attempts 为各 case attempts 求和，retries 与 remaps 均
 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节行为照常，仅用标准库，
 其他子命令行为不变且不属本题范围。
 
+故障时间线预演：ft 精确键序 op,key,times,timeout,max,now（键须按此序
+出现）；key 沿用 route 校验（非空、UTF-8 可编码），timeout/max/now 沿用
+fr（timeout、now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数），now 纳入
+共用非递减时钟；times 为 1..60 项严格递增数组，项为 now..10^9 非 bool
+整数。按 times 顺序对同一 key 在各时刻独立模拟 fr 的哈希遍历与 D/F/S
+规则（环同 route，仅健康、熔断 C、排空 A 后端），每时刻至多尝试 max 个
+不同后端；仅 now 推进共用时钟，不改连接、粘性、指标、告警或故障状态，
+失败批次天然回滚。结果键序 op,key,now,cases；cases 按 times 顺序，项键
+序 at,state,backend,attempts,retries,remaps,latency，值义同 fi：state
+仅 A/R，backend 成功为 id 否则 null，retries=remaps=max(attempts-1,0)，
+latency 为各次耗时之和。非法键序、字段类型/范围/编码、times 容器/项数/
+次序或时钟倒退报 INPUT/2；未配置环或环内无合格候选报 STATE/4。ft 时间
+O(PBV)（P 为 times 项数）、额外空间 O(P+BV)；紧凑 UTF-8 固定键序 JSON、
+单换行及 record/replay 逐字节行为照常，仅用标准库，其他子命令行为不变
+且不属本题范围。
+
 只读接纳预演：oi 精确键序 op,key,c,s,bc,cc,sc,timeout,max,now（键须
 按此序出现），key/c/s 与三项成本沿用 la 新键集校验（bc/cc/sc 不全为
 0），timeout/now ∈ [0,10^9]、max ∈ [1,1024] 均非 bool 整数、now 纳入
@@ -2192,7 +2208,7 @@ def parse_op(raw_op):
         "na",
         "ce", "ci", "cl", "al", "ai", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
-        "fs", "fx", "fr", "fi", "oi", "od",
+        "fs", "fx", "fr", "fi", "ft", "oi", "od",
         "fb", "fp", "fq",
         "br",
         "hm", "fm", "fh",
@@ -3423,6 +3439,29 @@ def parse_op(raw_op):
             parse_attempt_max(raw_op["max"]),
             parse_fault_num(raw_op["now"]),
         )
+
+    if name == "ft":
+        # 故障时间线预演：精确键序 op,key,times,timeout,max,now（键须按此
+        # 序出现）；key 沿用 route 校验，timeout/max/now 沿用 fr；times 为
+        # 1..60 项严格递增数组，项为 now..10^9 非 bool 整数；未配环或无
+        # 合格候选的 STATE 留执行期判（同 fi，先于时钟）。
+        if list(raw_op) != ["op", "key", "times", "timeout", "max", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        key = parse_key(raw_op["key"])
+        timeout = parse_fault_num(raw_op["timeout"])
+        max_attempts = parse_attempt_max(raw_op["max"])
+        now = parse_fault_num(raw_op["now"])
+        raw_times = raw_op["times"]
+        if not isinstance(raw_times, list) or not 1 <= len(raw_times) <= 60:
+            fail(EXIT_INPUT, "INPUT")
+        times = []
+        for raw_at in raw_times:
+            at = parse_fault_num(raw_at)
+            if at < now or (times and at <= times[-1]):
+                # 项须落在 now..10^9 且严格递增。
+                fail(EXIT_INPUT, "INPUT")
+            times.append(at)
+        return ("ft", key, times, timeout, max_attempts, now)
 
     if name in ("ce", "ci"):
         if name == "ce":
@@ -5147,7 +5186,7 @@ def run(raw):
             "oq", "lh", "lt", "le",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
-            "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "na",
@@ -9471,6 +9510,47 @@ def run(raw):
                         "retries": total_retries,
                         "remaps": total_retries,
                     },
+                }
+            )
+
+        elif op[0] == "ft":
+            # 故障时间线预演（只读）：对同一 key 在 times 各时刻独立模拟
+            # fr 的哈希遍历与 D/F/S 规则，每时刻至多尝试 max 个不同后端；
+            # 仅 now 推进共用时钟，不改连接、粘性、指标、告警或故障状态，
+            # 失败批次天然回滚。环只建一次（digests 与之同序），时间
+            # O(PBV)、额外空间 O(P+BV)（P 为 times 项数）。
+            _, key, times, timeout, max_attempts, now = op
+            if ring_vnodes is None:
+                # 未配环报 STATE，同 fr/fi。
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                # 环内无合格候选同样报 STATE（同 fr/fi）。
+                fail(EXIT_STATE, "STATE")
+            digests = [token[0] for token in tokens]
+            cases = []
+            for at in times:
+                state, chosen_id, attempts, latency = simulate_fr(
+                    tokens, digests, key, timeout, max_attempts, at
+                )
+                retries = max(attempts - 1, 0)
+                cases.append(
+                    {
+                        "at": at,
+                        "state": state,
+                        "backend": chosen_id,
+                        "attempts": attempts,
+                        "retries": retries,
+                        "remaps": retries,
+                        "latency": latency,
+                    }
+                )
+            results.append(
+                {
+                    "op": "ft",
+                    "key": key,
+                    "now": now,
+                    "cases": cases,
                 }
             )
 
