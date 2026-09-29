@@ -2124,7 +2124,7 @@ def parse_op(raw_op):
         "lt",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
-        "ce", "ci", "cl", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
+        "ce", "ci", "cl", "al", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
         "fb", "fp", "fq",
@@ -3427,6 +3427,12 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("cl",)
 
+    if name == "al":
+        # 配置变更审计查询：精确键序仅 op，只读、不推进时钟。
+        if list(raw_op) != ["op"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("al",)
+
     if name == "cb":
         # 配置回滚：精确键集 op,rev,now；rev 为 1..10^18 非 bool 整数
         # （是否仍被保留留执行期判 STATE），now 沿用 ci 并进入共用非递减
@@ -3772,6 +3778,14 @@ def run(raw):
     # ca 成功、ci/cb 成功均清除；其余操作不影响预约。额外空间 O(N)，N 为
     # 规范化配置大小。
     reservation = None
+    # 配置变更审计（al）：deque(maxlen=64) 按 rev 升序保留最近 64 条，追加
+    # O(1) 且超额自动淘汰最旧项；初始为空，独立于 commit_history 的 16 条
+    # 提交，成功配置变更（ci/cb/cu/ca 分配新 rev 时）不清空旧事件。每事件
+    # 为全新 dict，精确键序 rev,now,kind,section,before,after：rev 为本次
+    # 新 rev，now 为该操作显式时钟，kind ∈ ci/cb/cu/ca，section 仅 cu 取被
+    # 替换顶层字段、其余 None，before/after 为操作前后规范化 version=11 配
+    # 置的 ct 摘要（值未变两摘要相同仍记录）。额外空间 O(A)，A≤64。
+    audit_events = deque(maxlen=64)
     results = []
 
     def backend_routable(record, drain_strict=False):
@@ -7301,17 +7315,33 @@ def run(raw):
             # 配置载入，v1..v8 为默认 F/T；capacities 显式覆盖随配置原子
             # 替换，旧版或 [] 清空；硬时限按 lifetime 载入，null 或 v1..v10
             # 清除）。
+            before_digest = config_digest(export_config())
             apply_config(config, now)
             # 成功后把规范化 version=11 配置存为提交：rev 从 1 起递增，
             # 仅保留最近 16 条；失败不分配、不改历史。export_config 产出
             # 全新结构（lifetime 为刚载入的登记值），提交后的 qp/rp/pc/tm
             # 修改不影响已存快照。
-            commit_history.append((next_rev, export_config()))
+            new_snapshot = export_config()
+            commit_history.append((next_rev, new_snapshot))
+            after_digest = config_digest(new_snapshot)
+            new_rev = next_rev
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
             # ci 成功清除既有配置预约。
             reservation = None
+            # 审计：成功并分配新 rev 时按 rev 升序追加（仅留最近 64 条），
+            # section 恒 null；before 为操作前指纹，after 为新提交指纹。
+            audit_events.append(
+                {
+                    "rev": new_rev,
+                    "now": now,
+                    "kind": "ci",
+                    "section": None,
+                    "before": before_digest,
+                    "after": after_digest,
+                }
+            )
             results.append({"op": "ci", "ok": True})
 
         elif op[0] == "cv":
@@ -7545,6 +7575,29 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "al":
+            # 配置变更审计（只读，不推进时钟）：events 为保留事件（按 rev
+            # 升序，至多 64 条）的快照，逐项键序
+            # rev,now,kind,section,before,after，响应键序 op,events。重复
+            # 查询逐字节相同；事件追加后不就地修改，逐项复制成全新结构。
+            # O(A)，A≤64。
+            results.append(
+                {
+                    "op": "al",
+                    "events": [
+                        {
+                            "rev": event["rev"],
+                            "now": event["now"],
+                            "kind": event["kind"],
+                            "section": event["section"],
+                            "before": event["before"],
+                            "after": event["after"],
+                        }
+                        for event in audit_events
+                    ],
+                }
+            )
+
         elif op[0] == "cb":
             # 配置回滚：按目标快照执行 ci 的原子替换与默认运行态重建，成功
             # 另建新 rev；全部校验先于任何变更，失败天然回滚时钟、配置、
@@ -7570,15 +7623,30 @@ def run(raw):
             # full 随快照恢复，队列清空且淘汰计数、最近淘汰 cid 重置（0、
             # null）；capacities 覆盖随快照恢复；硬时限按快照 lifetime
             # 载入，null 清除。
+            before_digest = config_digest(export_config())
             apply_config(parse_config(snapshot), now)
             # 原历史保留，追加新 rev 后再按 16 条淘汰。
-            commit_history.append((next_rev, export_config()))
+            new_snapshot = export_config()
+            commit_history.append((next_rev, new_snapshot))
+            after_digest = config_digest(new_snapshot)
             new_rev = next_rev
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
             # cb 成功清除既有配置预约。
             reservation = None
+            # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
+            # null；before 为回滚前指纹，after 为目标快照指纹。
+            audit_events.append(
+                {
+                    "rev": new_rev,
+                    "now": now,
+                    "kind": "cb",
+                    "section": None,
+                    "before": before_digest,
+                    "after": after_digest,
+                }
+            )
             results.append(
                 {"op": "cb", "target": target_rev, "rev": new_rev, "ok": True}
             )
@@ -7637,6 +7705,19 @@ def run(raw):
                 commit_history.pop(0)
             # cu 成功清除既有配置预约。
             reservation = None
+            # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 取被
+            # 替换顶层字段；before/after 即响应中的 base/target 摘要（值未变
+            # 两摘要相同仍记录）。
+            audit_events.append(
+                {
+                    "rev": new_rev,
+                    "now": now,
+                    "kind": "cu",
+                    "section": section,
+                    "before": before_digest,
+                    "after": target_digest,
+                }
+            )
             results.append(
                 {
                     "op": "cu",
@@ -7714,13 +7795,28 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             if next_rev > 10 ** 18:
                 fail(EXIT_STATE, "STATE")
+            before_digest = config_digest(export_config())
             apply_config(parse_config(snapshot), now)
-            commit_history.append((next_rev, export_config()))
+            new_snapshot = export_config()
+            commit_history.append((next_rev, new_snapshot))
+            after_digest = config_digest(new_snapshot)
             new_rev = next_rev
             next_rev += 1
             if len(commit_history) > 16:
                 commit_history.pop(0)
             reservation = None
+            # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
+            # null；before 为生效前指纹，after 为预约快照指纹（同响应 digest）。
+            audit_events.append(
+                {
+                    "rev": new_rev,
+                    "now": now,
+                    "kind": "ca",
+                    "section": None,
+                    "before": before_digest,
+                    "after": after_digest,
+                }
+            )
             results.append(
                 {"op": "ca", "digest": digest, "rev": new_rev, "ok": True}
             )
