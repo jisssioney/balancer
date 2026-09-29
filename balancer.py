@@ -253,6 +253,21 @@ upper 依次为 0/1/10/100/null；无样本则 rank=0，bucket 与 upper 为 nul
 配置 os 或 from 早于 max(0,now//60-59) 报 STATE/4。wp 只推进时钟，失败批
 回滚。时间 O(R)、空间 O(1)（R=to-from+1），仅标准库。
 
+排队等待分位告警：wa 精确键序 op,kind,w,p,hi,lo,n,now（键须按此序出现），
+kind 仅 A/E/C/V，对应 admitted/expired/cancelled/evicted，四 kind 各从 N
+态开始并独立维护状态机；w/now 为 0..10^9、p 为 1..100、hi/lo 为 0..4、n
+为 1..60 的非 bool 整数且 lo<hi；now 纳入共用非递减时钟，须
+max(0,now//60-59)≤w<now//60。取 w 窗该 kind 五等待桶按 wp 规则计算单窗
+samples、bucket、upper（桶上界依次为 0/1/10/100/null）；无样本三者为
+0、null、null 且连续数清零。首评固化 p/hi/lo/n；N 态连续 n 窗
+bucket≥hi 转 A，A 态连续 n 窗 bucket≤lo 转 N，方向不符（含无样本）清
+run，转换后 run=0；w 仅可同前或 +1，同窗同参原样返回缓存结果且不推进
+状态机。结果键序 op,kind,w,p,state,samples,bucket,upper,run,changed，
+state 仅 N/A，changed 仅转换时 true。键序、kind、类型、范围、关系或时钟
+非法报 INPUT/2；未配置 os、窗口越界、跳窗（含回退）或变参报 STATE/4。
+ci/cb/ca 成功清空告警，失败批回滚。wa 时空 O(1)，仅标准库；紧凑 UTF-8
+固定键序 JSON、单末尾换行及 record/replay 逐字节契约照常，其他操作不变。
+
 多维限流历史：oa/ot 检查已配置桶或配额的 B 后端、C 客户端、S 服务类
 时，按 window=now//60 记账：接纳则该窗该维 admitted 加 1、units 加该维
 成本；未接纳且该维在配桶补充后令牌不足成本则 token 加 1，在配配额推进
@@ -1992,7 +2007,7 @@ def parse_op(raw_op):
         "cs", "cr", "cg", "ds", "dr", "du", "dg",
         "ss",
         "ls", "la", "lg", "qs", "qg",
-        "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "wp", "bp", "bq", "qp", "rp", "rg",
+        "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "wp", "wa", "bp", "bq", "qp", "rp", "rg",
         "qa",
         "lh",
         "lt",
@@ -2388,6 +2403,54 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("wp", kind, start, end, percentile, now)
+
+    if name == "wa":
+        # 排队等待分位告警：精确键序 op,kind,w,p,hi,lo,n,now（键须按此序
+        # 出现）；kind 仅 A/E/C/V（对应 admitted/expired/cancelled/
+        # evicted），各 kind 独立维护状态机；w/now 为 0..10^9、p 为 1..100、
+        # hi/lo 为 0..4、n 为 1..60，皆为非 bool 整数且 lo<hi；now 纳入
+        # 共用非递减时钟（倒退执行期判 INPUT）。键序/类型/范围/lo<hi 在此
+        # 判 INPUT；窗关系 max(0,now//60-59)≤w<now//60、未 os、跳窗与变参
+        # 留执行期判 STATE。
+        if list(raw_op) != ["op", "kind", "w", "p", "hi", "lo", "n", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        kind = raw_op["kind"]
+        if not isinstance(kind, str) or kind not in ("A", "E", "C", "V"):
+            fail(EXIT_INPUT, "INPUT")
+        w = parse_metric_num(raw_op["w"])
+        now = parse_metric_num(raw_op["now"])
+        percentile = raw_op["p"]
+        if (
+            not isinstance(percentile, int)
+            or isinstance(percentile, bool)
+            or not 1 <= percentile <= 100
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        hi = raw_op["hi"]
+        # bool 是 int 的子类，必须显式排除。
+        if (
+            not isinstance(hi, int)
+            or isinstance(hi, bool)
+            or not 0 <= hi <= 4
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        lo = raw_op["lo"]
+        if (
+            not isinstance(lo, int)
+            or isinstance(lo, bool)
+            or not 0 <= lo <= 4
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if not lo < hi:
+            fail(EXIT_INPUT, "INPUT")
+        n = raw_op["n"]
+        if (
+            not isinstance(n, int)
+            or isinstance(n, bool)
+            or not 1 <= n <= 60
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("wa", kind, w, percentile, hi, lo, n, now)
 
     if name == "lh":
         # 多维限流历史：精确键序 op,scope,id,from,to,now（键须按此序出现），
@@ -3329,6 +3392,17 @@ def run(raw):
     # 10^18，只保留最近 60 窗，空窗不预建；ci/cb/ca 成功清空。wh 除时钟
     # 外只读。额外空间 O(60)。
     wait_hist = {}
+    # 排队等待分位告警（wa）：以 kind ∈ A/E/C/V 为键，四 kind 各自独立从
+    # N 态开始维护状态机；未首评为缺键，否则为
+    # {"p","hi","lo","n","state","run","w","result"}——(p,hi,lo,n) 为首评
+    # 固化的参数（p 1..100、hi 0..4、lo 0..3、lo<hi、n 1..60），state ∈
+    # N/A，run 为当前连续计数，w 为最近已评窗，result 为该窗结果（同窗同
+    # 参原样返回，不推进状态机）。窗值取 wait_hist 的 w 窗该 kind 五等待桶
+    # 按 wp 规则（单窗口径）计算的 samples/bucket/upper，桶上界依次为
+    # 0/1/10/100/null；无样本 0/null/null 并清 run。w 仅可同前或 +1，变参
+    # 或跳窗（含回退）报 STATE。ci/cb/ca 成功整体清空。dict 查找/写入
+    # O(1)，wa 时空 O(1)，额外空间 O(1)（固定四 kind）。
+    wait_alerts = {}
     # 多维限流历史（lh）：以 (scope, id) 唯一（scope ∈ B/C/S），window=
     # now//60 -> [admitted, units, token, quota]。oa/ot 检查在配桶或配额
     # 的维时记账：接纳 admitted+1、units+该维成本；未接纳且令牌不足记
@@ -4448,7 +4522,7 @@ def run(raw):
         nonlocal sticky_ttl, ttl_cfg, bp_cfg, bp_state, pick_mode, rr_ticket
         nonlocal hard_ttl_cfg
         nonlocal sticky_map, alert, alert_events, overload_hist, wait_hist, err_alerts
-        nonlocal err_events, percent_alerts, percent_events
+        nonlocal err_events, percent_alerts, percent_events, wait_alerts
         nonlocal mo_seq, mo_cache, queue_mode, dequeue_policy
         nonlocal full_mode, evict_count, evict_last, cap_overrides
         nonlocal limit_hist, aging_cfg
@@ -4584,6 +4658,8 @@ def run(raw):
         overload_hist = {}
         # ci/cb/ca 成功清空排队等待历史（等待项随队空一并清空，无遗留事件）。
         wait_hist = {}
+        # ci/cb/ca 成功清空四 kind 的排队等待分位告警状态（均回到未首评）。
+        wait_alerts = {}
         # ci/cb 成功清空多维限流历史（ls/qs 重配不清，但热加载/回滚整体
         # 重建运行态，同 id 历史不跨配置保留）。
         limit_hist = {}
@@ -4639,7 +4715,7 @@ def run(raw):
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
-            "fa", "fe", "ah", "oh", "wh", "wp", "br",
+            "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph",
             "cp", "cq", "ca",
         ):
@@ -6541,6 +6617,125 @@ def run(raw):
                     "upper": upper,
                 }
             )
+
+        elif op[0] == "wa":
+            # 排队等待分位告警（A/E/C/V 四 kind 各自独立状态机）：未 os 报
+            # STATE，先于窗口判定；w 窗须已结束且在最近 60 窗保留下界内。
+            # 首评固化 (p,hi,lo,n) 并自 N 态起评；此后参数须相同且 w 仅同前
+            # （同窗同参原样返回首评结果，不推进时钟外的状态机）或 +1，变参
+            # 或跳窗（含回退）报 STATE。窗值取 wait_hist 的 w 窗该 kind 五
+            # 等待桶按 wp 规则（单窗口径）计算 samples、bucket、upper（桶上
+            # 界依次为 0/1/10/100/null；无样本 0、null、null）。N 态连续 n
+            # 窗 bucket>=hi 转 A，A 态连续 n 窗 bucket<=lo 转 N；方向不符
+            # （含无样本 bucket=null）与转换后连续数清 0；转换时 changed=
+            # true。四 kind 互不影响；ci/cb/ca 成功清空。返回键序
+            # op,kind,w,p,state,samples,bucket,upper,run,changed。wa 为
+            # O(1) 时间、O(1) 额外空间（固定五桶求和）。
+            _, kind_code, w, percentile, hi, lo, n, now = op
+            if queue_cfg is None:
+                # 未配置 os 报 STATE。
+                fail(EXIT_STATE, "STATE")
+            current = now // 60
+            if w >= current or w < max(0, current - 59):
+                # 窗未结束（含未来窗），或已超出最近 60 窗的保留下界。
+                fail(EXIT_STATE, "STATE")
+            entry = wait_alerts.get(kind_code)
+            if entry is not None:
+                if (percentile, hi, lo, n) != (
+                    entry["p"], entry["hi"], entry["lo"], entry["n"]
+                ):
+                    # 变参。
+                    fail(EXIT_STATE, "STATE")
+                if w == entry["w"]:
+                    # 同窗同参重报：原样返回首评结果，不推进状态机。
+                    results.append(dict(entry["result"]))
+                    continue
+                if w != entry["w"] + 1:
+                    # 跳窗（含回退）。
+                    fail(EXIT_STATE, "STATE")
+            kind_name = {
+                "A": "admitted",
+                "E": "expired",
+                "C": "cancelled",
+                "V": "evicted",
+            }[kind_code]
+            row = wait_hist.get(w)
+            if row is None:
+                # 无样本：三者为 0、null、null，run 清零（沿 wp 口径）。
+                samples = 0
+                bucket = None
+                upper = None
+            else:
+                wait_buckets = list(row[kind_name])
+                # 单窗无需封顶求和：桶计数本身已封顶 10^18，samples 沿用
+                # wp 的五桶和再封顶。
+                samples = min(METRIC_CAP, sum(wait_buckets))
+                if samples > 0:
+                    # rank=ceil(p*samples/100)，按桶 0..4 累计（截至
+                    # samples）取首个累计≥rank 者；p≤100 故 rank≤samples。
+                    rank = (percentile * samples + 99) // 100
+                    cumulative = 0
+                    bucket = None
+                    for i in range(5):
+                        cumulative = min(samples, cumulative + wait_buckets[i])
+                        if cumulative >= rank:
+                            bucket = i
+                            break
+                    # 等待时长桶上界依次为 0、1、10、100、null（同 wp）。
+                    upper = (0, 1, 10, 100, None)[bucket]
+                else:
+                    bucket = None
+                    upper = None
+            if entry is None:
+                state = "N"
+                run_count = 0
+            else:
+                state = entry["state"]
+                run_count = entry["run"]
+            changed = False
+            if state == "N":
+                if bucket is not None and bucket >= hi:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "A"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符（含无样本 bucket=null）：连续数清 0。
+                    run_count = 0
+            else:
+                if bucket is not None and bucket <= lo:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "N"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符（含无样本 bucket=null）：连续数清 0。
+                    run_count = 0
+            result = {
+                "op": "wa",
+                "kind": kind_code,
+                "w": w,
+                "p": percentile,
+                "state": state,
+                "samples": samples,
+                "bucket": bucket,
+                "upper": upper,
+                "run": run_count,
+                "changed": changed,
+            }
+            wait_alerts[kind_code] = {
+                "p": percentile,
+                "hi": hi,
+                "lo": lo,
+                "n": n,
+                "state": state,
+                "run": run_count,
+                "w": w,
+                "result": dict(result),
+            }
+            results.append(result)
 
         elif op[0] == "lh":
             # 多维限流历史（只读）：B 的未知 id 报 BACKEND（先于状态检查）；
