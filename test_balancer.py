@@ -11464,6 +11464,466 @@ class RetryRemapAlertSummaryTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b"")
 
 
+class PoolAlertOverviewTest(unittest.TestCase):
+    """xp 池级 R/M 告警概览：明细、合计、排序、只读与错误前置。"""
+
+    def results(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def mr(retries=0, remaps=0, now=0, backend="b", ok=True):
+        return {"op": "mr", "id": backend, "ok": ok, "ms": 1,
+                "retries": retries, "remaps": remaps, "now": now}
+
+    @staticmethod
+    def xa(w, now, k="R", hi=5, lo=1, n=1, backend="b"):
+        return {"op": "xa", "id": backend, "k": k, "w": w,
+                "hi": hi, "lo": lo, "n": n, "now": now}
+
+    @staticmethod
+    def xp(start, end, now):
+        return {"op": "xp", "from": start, "to": end, "now": now}
+
+    @staticmethod
+    def add(backend="b"):
+        return {"op": "add", "id": backend, "weight": 1}
+
+    def alternating(self, count, k="R", backend="b"):
+        # w0..count-1 每窗交替：偶窗 N→A（retries=5），奇窗 A→N（retries=1）。
+        ops = [self.add(backend)]
+        for w in range(count):
+            ops.append(self.mr(
+                retries=5 if w % 2 == 0 else 1, now=w * 60 + 1,
+                backend=backend,
+            ))
+            ops.append(self.xa(w, w * 60 + 60, k=k, backend=backend))
+        return ops
+
+    ZERO_KIND = {"state": "N", "raised": 0, "cleared": 0}
+
+    def test_empty_pool(self):
+        # 空池：空数组与全零 total。
+        out = self.results([self.xp(0, 0, 0)])[-1]
+        self.assertEqual(
+            out,
+            {"op": "xp", "backends": [],
+             "total": {"R": {"alerting": 0, "raised": 0, "cleared": 0},
+                       "M": {"alerting": 0, "raised": 0, "cleared": 0}}},
+        )
+
+    def test_never_evaluated_is_quiet(self):
+        # 现存后端从未评估：R/M 均 state=N、计数 0，alerting=0。
+        out = self.results([self.add(), self.xp(0, 0, 60)])[-1]
+        self.assertEqual(
+            out["backends"],
+            [{"id": "b", "R": dict(self.ZERO_KIND),
+              "M": dict(self.ZERO_KIND)}],
+        )
+        self.assertEqual(
+            out["total"],
+            {"R": {"alerting": 0, "raised": 0, "cleared": 0},
+             "M": {"alerting": 0, "raised": 0, "cleared": 0}},
+        )
+
+    def test_detail_counts_and_current_state(self):
+        # w0 N→A、w1 A→N、w2 N→A：[0,2] 内 R raised=2、cleared=1，当前 A。
+        ops = self.alternating(3)
+        ops.append(self.xp(0, 2, 180))
+        item = self.results(ops)[-1]["backends"][0]
+        self.assertEqual(
+            item["R"],
+            {"state": "A", "raised": 2, "cleared": 1},
+        )
+        # M 从未评估，仍为 N/0/0。
+        self.assertEqual(item["M"], self.ZERO_KIND)
+
+    def test_closed_range_boundaries(self):
+        ops = self.alternating(4)
+        ops.append(self.xp(1, 2, 240))
+        item = self.results(ops)[-1]["backends"][0]
+        # 区间内 w1 的 A→N 与 w2 的 N→A 各一。
+        self.assertEqual(
+            item["R"], {"state": "N", "raised": 1, "cleared": 1}
+        )
+
+    def test_r_and_m_independent(self):
+        ops = [
+            self.add(),
+            self.mr(retries=5, remaps=2, now=0),
+            self.xa(0, 60, k="R"),
+            self.xa(0, 61, k="M", hi=3, lo=1),
+            self.xp(0, 0, 62),
+        ]
+        item = self.results(ops)[-1]["backends"][0]
+        self.assertEqual(
+            item["R"], {"state": "A", "raised": 1, "cleared": 0}
+        )
+        # M 值 2 未达 hi=3，停留 N。
+        self.assertEqual(item["M"], self.ZERO_KIND)
+
+    def test_totals_sum_details_and_alerting(self):
+        # b：R 在 [0,2] raised=2/cleared=1 且当前 A；c：M 在 w0 raised=1
+        # 当前 A。合计为明细之和，alerting 为当前 A 态后端数。
+        ops = [
+            self.add("b"),
+            self.add("c"),
+            self.mr(retries=5, now=1, backend="b"),
+            self.mr(remaps=5, now=1, backend="c"),
+            self.xa(0, 60, backend="b"),
+            self.xa(0, 60, k="M", backend="c"),
+            self.mr(retries=1, now=61, backend="b"),
+            self.xa(1, 120, backend="b"),
+            self.mr(retries=5, now=121, backend="b"),
+            self.xa(2, 180, backend="b"),
+            self.xp(0, 2, 180),
+        ]
+        out = self.results(ops)[-1]
+        b_item, c_item = out["backends"]
+        self.assertEqual(b_item["id"], "b")
+        self.assertEqual(
+            b_item["R"], {"state": "A", "raised": 2, "cleared": 1}
+        )
+        self.assertEqual(b_item["M"], self.ZERO_KIND)
+        self.assertEqual(c_item["id"], "c")
+        self.assertEqual(c_item["R"], self.ZERO_KIND)
+        self.assertEqual(
+            c_item["M"], {"state": "A", "raised": 1, "cleared": 0}
+        )
+        self.assertEqual(
+            out["total"],
+            {"R": {"alerting": 1, "raised": 2, "cleared": 1},
+             "M": {"alerting": 1, "raised": 1, "cleared": 0}},
+        )
+        # 合计即明细之和。
+        for kind in ("R", "M"):
+            details = [item[kind] for item in out["backends"]]
+            total = out["total"][kind]
+            self.assertEqual(
+                total["raised"], sum(d["raised"] for d in details)
+            )
+            self.assertEqual(
+                total["cleared"], sum(d["cleared"] for d in details)
+            )
+            self.assertEqual(
+                total["alerting"],
+                sum(1 for d in details if d["state"] == "A"),
+            )
+
+    def test_backends_sorted_by_utf8_bytes(self):
+        # 加入序 b、ä、a；按 id 的 UTF-8 字节升序应为 a、b、ä。
+        ops = [self.add("b"), self.add("ä"), self.add("a")]
+        ops.append(self.xp(0, 0, 60))
+        out = self.results(ops)[-1]
+        self.assertEqual([b["id"] for b in out["backends"]], ["a", "b", "ä"])
+        # 键序固定为 id,R,M。
+        self.assertEqual(list(out["backends"][0]), ["id", "R", "M"])
+
+    def test_removed_backend_absent_and_readd_clears(self):
+        ops = [
+            self.add(),
+            self.mr(retries=9, remaps=9, now=0),
+            self.xa(0, 60, hi=1, lo=0),
+            self.xa(0, 60, k="M", hi=1, lo=0),
+            {"op": "remove", "id": "b"},
+            self.xp(0, 0, 60),
+        ]
+        out = self.results(ops)[-1]
+        # 已移除后端不在概览内，合计全零。
+        self.assertEqual(out["backends"], [])
+        self.assertEqual(
+            out["total"],
+            {"R": {"alerting": 0, "raised": 0, "cleared": 0},
+             "M": {"alerting": 0, "raised": 0, "cleared": 0}},
+        )
+        # 同 id 重加：现存但回到未首评，历史不继承。
+        ops += [self.add(), self.xp(0, 1, 120)]
+        out = self.results(ops)[-1]
+        self.assertEqual(len(out["backends"]), 1)
+        self.assertEqual(out["backends"][0]["R"], self.ZERO_KIND)
+        self.assertEqual(out["backends"][0]["M"], self.ZERO_KIND)
+        self.assertEqual(
+            out["total"],
+            {"R": {"alerting": 0, "raised": 0, "cleared": 0},
+             "M": {"alerting": 0, "raised": 0, "cleared": 0}},
+        )
+
+    def test_read_only_does_not_advance_xa_or_trim(self):
+        # xp 不推进状态机：随后同窗 xa 命中缓存（changed 原样）；不裁剪历
+        # 史，xh 仍见区间内事件。
+        ops = [
+            self.add(),
+            self.mr(retries=5, now=0),
+            self.xa(0, 60),
+            self.xp(0, 1, 60),
+            self.xa(0, 60),
+            {"op": "xh", "id": "b", "k": "R",
+             "from": 0, "to": 1, "now": 60},
+        ]
+        results = self.results(ops)
+        self.assertTrue(results[4]["changed"])
+        self.assertEqual(results[4]["w"], 0)
+        self.assertEqual(
+            [e["window"] for e in results[-1]["events"]], [0]
+        )
+
+    def test_advances_clock(self):
+        # xp 成功即推进共用时钟：更小 now 的后续操作报 INPUT；相等允许。
+        self.assert_failure(
+            encode_ops([self.add(), self.xp(0, 0, 120),
+                        {"op": "mg", "id": "b", "now": 60}]),
+            2, "INPUT",
+        )
+        results = self.results([
+            self.add(), self.xp(0, 0, 120),
+            {"op": "mg", "id": "b", "now": 120},
+        ])
+        self.assertEqual(results[-1]["op"], "mg")
+
+    def test_ci_cb_ca_clear(self):
+        exported = self.results([
+            self.add(), {"op": "ce"},
+        ])[-1]["config"]
+
+        def cleared_ops(clear_op):
+            return [
+                self.add(),
+                self.mr(retries=5, remaps=5, now=0),
+                self.xa(0, 60),
+                self.xa(0, 60, k="M"),
+                clear_op,
+                self.xp(0, 1, 120),
+            ]
+
+        out = self.results(cleared_ops(
+            {"op": "ci", "config": exported, "now": 120}
+        ))[-1]
+        self.assertEqual(out["backends"][0]["R"], self.ZERO_KIND)
+        self.assertEqual(out["backends"][0]["M"], self.ZERO_KIND)
+        self.assertEqual(
+            out["total"],
+            {"R": {"alerting": 0, "raised": 0, "cleared": 0},
+             "M": {"alerting": 0, "raised": 0, "cleared": 0}},
+        )
+
+        cb_ops = [
+            {"op": "ci", "config": exported, "now": 0},
+            self.mr(retries=5, remaps=5, now=60),
+            self.xa(1, 120),
+            self.xa(1, 120, k="M"),
+            {"op": "cb", "rev": 1, "now": 180},
+            self.xp(0, 1, 180),
+        ]
+        out = self.results(cb_ops)[-1]
+        # cb 按 rev=1 快照重建：b 存在但告警与历史整体清空。
+        self.assertEqual(len(out["backends"]), 1)
+        self.assertEqual(out["backends"][0]["id"], "b")
+        self.assertEqual(out["backends"][0]["R"], self.ZERO_KIND)
+        self.assertEqual(out["backends"][0]["M"], self.ZERO_KIND)
+        self.assertEqual(
+            out["total"],
+            {"R": {"alerting": 0, "raised": 0, "cleared": 0},
+             "M": {"alerting": 0, "raised": 0, "cleared": 0}},
+        )
+
+        ca_ops = [
+            {"op": "ci", "config": exported, "now": 0},
+            self.mr(retries=5, remaps=5, now=60),
+            self.xa(1, 120),
+            self.xa(1, 120, k="M"),
+            {"op": "cp", "config": exported, "at": 180, "now": 121},
+            {"op": "ca", "now": 180},
+            self.xp(0, 1, 180),
+        ]
+        out = self.results(ca_ops)[-1]
+        # ca 按预约快照重建：b 存在但告警与历史整体清空。
+        self.assertEqual(len(out["backends"]), 1)
+        self.assertEqual(out["backends"][0]["id"], "b")
+        self.assertEqual(out["backends"][0]["R"], self.ZERO_KIND)
+        self.assertEqual(out["backends"][0]["M"], self.ZERO_KIND)
+        self.assertEqual(
+            out["total"],
+            {"R": {"alerting": 0, "raised": 0, "cleared": 0},
+             "M": {"alerting": 0, "raised": 0, "cleared": 0}},
+        )
+
+    def test_from_too_early_is_state(self):
+        # now=3600：当前窗 60、下界 1，from=0 → STATE。
+        self.assert_failure(
+            encode_ops([self.add(), self.xp(0, 0, 3600)]), 4, "STATE"
+        )
+
+    def test_lower_bound_boundary_allowed(self):
+        # now=3599 → current=59、下界 0，from=0 合法；to=59、to-from<60。
+        out = self.results([self.add(), self.xp(0, 59, 3599)])[-1]
+        self.assertEqual(out["op"], "xp")
+        self.assertEqual(len(out["backends"]), 1)
+
+    def test_clock_regression_is_input(self):
+        ops = [
+            self.add(),
+            {"op": "mg", "id": "b", "now": 120},
+            self.xp(0, 0, 60),
+        ]
+        self.assert_failure(encode_ops(ops), 2, "INPUT")
+
+    def test_clock_equal_allowed(self):
+        results = self.results([
+            self.add(),
+            {"op": "mg", "id": "b", "now": 120},
+            self.xp(0, 1, 120),
+        ])
+        self.assertEqual(results[-1]["op"], "xp")
+
+    def test_result_key_order(self):
+        out = self.results([
+            self.add(),
+            self.mr(retries=5, now=0),
+            self.xa(0, 60),
+            self.xp(0, 0, 60),
+        ])[-1]
+        self.assertEqual(list(out), ["op", "backends", "total"])
+        self.assertEqual(list(out["backends"][0]), ["id", "R", "M"])
+        self.assertEqual(
+            list(out["backends"][0]["R"]), ["state", "raised", "cleared"]
+        )
+        self.assertEqual(list(out["total"]), ["R", "M"])
+        self.assertEqual(
+            list(out["total"]["R"]), ["alerting", "raised", "cleared"]
+        )
+
+    def test_counter_types(self):
+        ops = self.alternating(2)
+        ops.append(self.xp(0, 1, 120))
+        out = self.results(ops)[-1]
+        for kind in ("R", "M"):
+            for field in ("alerting", "raised", "cleared"):
+                value = out["total"][kind][field]
+                self.assertIsInstance(value, int)
+                self.assertNotIsInstance(value, bool)
+                self.assertGreaterEqual(value, 0)
+            state = out["backends"][0][kind]["state"]
+            self.assertIn(state, ("N", "A"))
+
+    def test_key_order_and_shape_rejections(self):
+        head = b'{"ops":['
+        tail = b']}'
+        cases = [
+            # from/to/now 乱序。
+            b'{"op":"xp","from":0,"now":60,"to":0}',
+            b'{"op":"xp","to":0,"from":0,"now":60}',
+            # 缺键。
+            b'{"op":"xp","from":0,"to":0}',
+            b'{"op":"xp","to":0,"now":60}',
+            # 多键。
+            b'{"op":"xp","from":0,"to":0,"now":60,"x":1}',
+            # 非对象。
+            b'{"op":"xp","from":0,"to":0,"now":[]}',
+        ]
+        for body in cases:
+            self.assert_failure(head + body + tail, 2, "INPUT")
+
+    def test_type_range_and_relation_rejections(self):
+        head = b'{"ops":['
+        tail = b']}'
+        cases = [
+            b'{"op":"xp","from":-1,"to":0,"now":60}',
+            b'{"op":"xp","from":0,"to":-1,"now":60}',
+            b'{"op":"xp","from":0,"to":0,"now":-1}',
+            b'{"op":"xp","from":1000000001,"to":1000000001,"now":1000000001}',
+            b'{"op":"xp","from":0,"to":0,"now":true}',
+            b'{"op":"xp","from":0,"to":0.5,"now":60}',
+            b'{"op":"xp","from":"0","to":0,"now":60}',
+            b'{"op":"xp","from":null,"to":0,"now":60}',
+            # from>to。
+            b'{"op":"xp","from":1,"to":0,"now":60}',
+            # to>now//60。
+            b'{"op":"xp","from":0,"to":1,"now":59}',
+            # to-from>=60。
+            b'{"op":"xp","from":0,"to":60,"now":3600}',
+            b'{"op":"xp","from":0,"to":61,"now":3660}',
+        ]
+        for body in cases:
+            self.assert_failure(head + body + tail, 2, "INPUT")
+
+    def test_failed_batch_is_atomic(self):
+        # 合法 xa 产生 A 态后，xp 的 from 早于下界触发 STATE：整批无 stdout。
+        code, stdout, stderr = run_balancer("run", encode_ops([
+            self.add(),
+            self.mr(retries=5, now=0),
+            self.xa(0, 60),
+            self.xp(0, 0, 3600),
+        ]))
+        self.assertEqual((code, stdout), (4, b""))
+        self.assertEqual(stderr, b'{"error":"STATE"}\n')
+
+    def test_output_single_newline_and_compact(self):
+        _, out, _ = run_balancer("run", encode_ops([
+            self.add(),
+            self.mr(retries=5, remaps=2, now=0),
+            self.xa(0, 60, k="R"),
+            self.xp(0, 0, 60),
+        ]))
+        self.assertTrue(out.endswith(b"}\n") and out.count(b"\n") == 1)
+        self.assertIn(
+            b'"op":"xp","backends":[{"id":"b",'
+            b'"R":{"state":"A","raised":1,"cleared":0},'
+            b'"M":{"state":"N","raised":0,"cleared":0}}],'
+            b'"total":{"R":{"alerting":1,"raised":1,"cleared":0},'
+            b'"M":{"alerting":0,"raised":0,"cleared":0}}',
+            out,
+        )
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops([
+            self.add("b"),
+            self.add("c"),
+            self.mr(retries=5, remaps=9, now=0, backend="b"),
+            self.mr(remaps=5, now=0, backend="c"),
+            self.xa(0, 60, k="R", backend="b", n=2),
+            self.xa(0, 61, k="R", backend="b", n=2),
+            self.xa(0, 61, k="M", backend="b"),
+            self.xa(0, 62, k="M", backend="c"),
+            self.xa(1, 120, k="R", backend="b", n=2),
+            self.xp(0, 1, 120),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        record = json.loads(rec_stdout.decode("utf-8"))
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_code, 0)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stderr, b"")
+
+    def test_record_replay_failure_byte_identical(self):
+        # STATE 失败批次同样满足 record/replay 逐字节契约。
+        raw = encode_ops([self.add(), self.xp(0, 0, 3600)])
+        run_code, run_stdout, run_err = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_err = run_balancer("replay", rec_stdout)
+        self.assertEqual((run_code, run_stdout), (4, b""))
+        self.assertEqual(run_err, b'{"error":"STATE"}\n')
+        self.assertEqual(rec_code, 0)
+        self.assertEqual((rep_code, rep_stdout, rep_err),
+                         (run_code, run_stdout, run_err))
+
+
 class ReasonTimelineTest(unittest.TestCase):
     """rt 原因事件时刻查询：count/first/last 记账、区间窗序、错误与清除。"""
 

@@ -2079,7 +2079,7 @@ def parse_op(raw_op):
         "lh",
         "lt",
         "oq",
-        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg",
+        "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "ce", "ci", "cl", "cb", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "oi", "od",
@@ -2833,6 +2833,22 @@ def parse_op(raw_op):
             "xg", parse_backend_id(raw_op["id"]),
             kind, start, end, now,
         )
+
+    if name == "xp":
+        # 池级 R/M 告警概览：精确键序 op,from,to,now（键须按此序出现），
+        # 只读（仅成功推进共用时钟）；from/to/now 为 0..10^9 非 bool 整数；
+        # 窗关系 from≤to≤now//60 且 to-from<60，非法即 INPUT；now 纳入共用
+        # 非递减时钟（倒退执行期判 INPUT）。from 过早（早于
+        # max(0,now//60-59)）留执行期判 STATE。
+        if list(raw_op) != ["op", "from", "to", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        start = parse_metric_num(raw_op["from"])
+        end = parse_metric_num(raw_op["to"])
+        now = parse_metric_num(raw_op["now"])
+        # 窗关系：from≤to≤now//60 且 to-from<60，非法即 INPUT。
+        if not start <= end <= now // 60 or end - start >= 60:
+            fail(EXIT_INPUT, "INPUT")
+        return ("xp", start, end, now)
 
     if name == "ms":
         if keys != {"op", "id", "now"}:
@@ -4881,7 +4897,7 @@ def run(raw):
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
-            "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg",
+            "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "cp", "cq", "ca",
         ):
             now = op[-1]
@@ -8476,6 +8492,79 @@ def run(raw):
                  "state": state, "last": last_window,
                  "total": raised + cleared, "raised": raised,
                  "cleared": cleared}
+            )
+
+        elif op[0] == "xp":
+            # 池级重试/重映射告警概览：除共用时钟按 now 推进（批前通用时钟
+            # 块）外只读，不推进任何 xa 状态机、不裁剪历史，失败批次天然回
+            # 滚。from 早于最近 60 窗下界 max(0,now//60-59) 报 STATE。
+            # backends 仅列现存后端，按 id 的 UTF-8 字节升序；项键序
+            # id,R,M，R/M 均键序 state,raised,cleared：state 为该 (id,k)
+            # 当前 xa 的 N/A 态（未评估取 N），raised/cleared 为现存历史中
+            # window 落在闭区间 [from,to] 内的 N→A、A→N 次数（每键历史至
+            # 多 60 项）。total 键序 R,M，两项均键序
+            # alerting,raised,cleared：alerting 为当前 A 态后端数，
+            # raised/cleared 为各后端明细之和，三值封顶 10^18。空池返回空
+            # 数组与全零 total。排序 O(B log B)、遍历 O(60B)，整体时间
+            # O(B log B+60B)、空间 O(B)。
+            _, start, end, now = op
+            current = now // 60
+            if start < max(0, current - 59):
+                # from 早于最近 60 窗的下界。
+                fail(EXIT_STATE, "STATE")
+            totals = {
+                "R": {"alerting": 0, "raised": 0, "cleared": 0},
+                "M": {"alerting": 0, "raised": 0, "cleared": 0},
+            }
+            items = []
+            for backend_id in sorted(
+                backends, key=lambda bid: bid.encode("utf-8")
+            ):
+                kind_summary = {}
+                for kind_code in ("R", "M"):
+                    entry = retry_alerts.get((backend_id, kind_code))
+                    state = "N" if entry is None else entry["state"]
+                    raised = 0
+                    cleared = 0
+                    history = retry_events.get((backend_id, kind_code))
+                    if history is not None:
+                        for event in history:
+                            window = event["window"]
+                            if start <= window <= end:
+                                if event["to"] == "A":
+                                    # N→A。
+                                    raised += 1
+                                else:
+                                    # A→N。
+                                    cleared += 1
+                    kind_summary[kind_code] = {
+                        "state": state,
+                        "raised": raised,
+                        "cleared": cleared,
+                    }
+                    total = totals[kind_code]
+                    if state == "A":
+                        total["alerting"] += 1
+                    # 合计三值封顶 10^18（明细每键至多 60，无需另封）。
+                    total["raised"] = min(10 ** 18, total["raised"] + raised)
+                    total["cleared"] = min(
+                        10 ** 18, total["cleared"] + cleared
+                    )
+                items.append(
+                    {
+                        "id": backend_id,
+                        "R": kind_summary["R"],
+                        "M": kind_summary["M"],
+                    }
+                )
+            for total in totals.values():
+                total["alerting"] = min(10 ** 18, total["alerting"])
+            results.append(
+                {
+                    "op": "xp",
+                    "backends": items,
+                    "total": {"R": totals["R"], "M": totals["M"]},
+                }
             )
 
         elif op[0] == "fx":
