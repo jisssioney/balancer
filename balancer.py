@@ -296,6 +296,24 @@ op,scope,from,to,items；items 项键序 id,admitted,units,token,quota,blocked�
 lt 除推进时钟外只读，失败批回滚；历史清理同 lh。时间 O(UR+UlogU)、空间
 O(U)，U 为该 scope 在配标识数、R 为窗数，仅标准库。
 
+限流告警：le 精确键序 op,scope,id,w,hi,lo,n,now（键须按此序出现），
+scope 仅 B/C/S，id 沿用 ls 的非空 UTF-8 串校验，w/now 为 0..10^9、
+hi 为 1..10^18、lo 为 0..(10^18-1)、n 为 1..60，皆为非 bool 整数且
+lo<hi；now 进入共用非递减时钟，须 max(0,now//60-59)≤w<now//60（w 窗
+已结束且在最近 60 窗内）。每标识（scope,id）独立滞回状态机：取该标识
+lh 的 w 窗 token、quota，value 为二者之和并封顶 10^18；首评固化
+hi/lo/n 并自 N 态起评，N 态连续 n 窗 value≥hi 转 A，A 态连续 n 窗
+value≤lo 转 N，否则及转换后连续数清 0；w 此后仅同值或 +1，同窗同参
+返回首评结果、不推进状态机。返回键序
+op,scope,id,w,state,token,quota,value,run,changed；state 仅 N/A，
+changed 仅转换时为 true。键序、字段编码/类型/范围/关系或时钟倒退报
+INPUT/2；B 的未知 id 报 BACKEND/3；该标识既无在配桶也无在配配额、
+窗口未结束或过旧、跳窗或变参报 STATE/4。ls/qs 重配保留告警状态；
+remove 后同 id 重加清该 B 维告警，ci/cb/ca/cu 成功清全部，失败批次
+回滚。le 时间 O(1)、额外空间 O(K)（K 为标识数），仅标准库；紧凑
+UTF-8 固定键序 JSON、单换行及 record/replay 逐字节契约照常，其他
+操作不变。
+
 请求度量：mr 键集 op,id,ok,ms,retries,remaps,now，id 须现存否则 BACKEND，
 ok 仅 bool，ms/retries/remaps/now 四数均为 [0,10^9] 非 bool 整数，now 纳入
 共用非递减时钟。每后端按 window=now//60 只保留当前窗统计，换窗即全部清零；
@@ -1309,6 +1327,28 @@ def parse_na_lo(value):
     return value
 
 
+def parse_le_hi(value):
+    # le 的 hi ∈ [1,10^18]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 18
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def parse_le_lo(value):
+    # le 的 lo ∈ [0,10^18)，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value < 10 ** 18
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_queue_param(value):
     # os 的 cap/q/ttl ∈ [1, 10^6]，非 bool 整数。
     if (
@@ -2146,6 +2186,7 @@ def parse_op(raw_op):
         "qa",
         "lh",
         "lt",
+        "le",
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "na",
@@ -2629,6 +2670,37 @@ def parse_op(raw_op):
         if not start <= end <= now // 60 or end - start >= 60:
             fail(EXIT_INPUT, "INPUT")
         return ("lt", scope, start, end, limit_k, now)
+
+    if name == "le":
+        # 限流告警：精确键序 op,scope,id,w,hi,lo,n,now（键须按此序出现）；
+        # scope 仅 B/C/S，id 沿用 ls 的非空 UTF-8 串校验（B 的未知 id 留
+        # 执行期判 BACKEND），w/now 为 0..10^9、hi 为 1..10^18、lo 为
+        # 0..(10^18-1)、n 为 1..60，皆为非 bool 整数且 lo<hi；now 纳入
+        # 共用非递减时钟（倒退执行期判 INPUT）。键序、scope、类型、范围
+        # 与 lo<hi 在此判 INPUT；窗关系 max(0,now//60-59)≤w<now//60、
+        # 无桶无配额、跳窗与变参留执行期判 STATE。
+        if list(raw_op) != ["op", "scope", "id", "w", "hi", "lo", "n", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        scope = raw_op["scope"]
+        if scope not in ("B", "C", "S"):
+            fail(EXIT_INPUT, "INPUT")
+        w = parse_metric_num(raw_op["w"])
+        hi = parse_le_hi(raw_op["hi"])
+        lo = parse_le_lo(raw_op["lo"])
+        if not lo < hi:
+            fail(EXIT_INPUT, "INPUT")
+        n = raw_op["n"]
+        if (
+            not isinstance(n, int)
+            or isinstance(n, bool)
+            or not 1 <= n <= 60
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_metric_num(raw_op["now"])
+        return (
+            "le", scope, parse_key(raw_op["id"]),
+            w, hi, lo, n, now,
+        )
 
     if name == "bp":
         if keys != {"op", "low", "high"}:
@@ -3846,6 +3918,16 @@ def run(raw):
     # 均为 0）。remove 删除该后端键，同 id 重加回到未首评，ci/cb/ca/cu 成
     # 功整体清空。dict 查找/写入 O(1)，每后端至多一键，额外空间 O(B)。
     conc_alerts = {}
+    # 限流告警（le）：以 (scope, id) 唯一（scope ∈ B/C/S），各标识独立、
+    # 未首评为缺键，否则为 {"hi","lo","n","state","run","w","result"}——
+    # (hi,lo,n) 为首评固化的阈值（hi 1..10^18、lo 0..(10^18-1)、lo<hi、
+    # n 1..60），state ∈ N/A，run 为当前连续计数，w 为最近已评窗，result
+    # 为该窗结果（同窗同参原样返回，不推进状态机）。窗值取该标识 lh 的
+    # w 窗 token/quota（空窗均为 0），value 为二者之和并封顶 10^18。
+    # ls/qs 重配保留；remove 删除该后端的 B 键（同 id 重加回到未首评），
+    # ci/cb/ca/cu 成功整体清空。dict 查找/写入 O(1)，额外空间 O(K)，K 为
+    # 标识数。
+    limit_alerts = {}
     # 配置提交历史（cl/cb）：(rev, 规范化 version=11 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
@@ -4864,7 +4946,7 @@ def run(raw):
         nonlocal hard_ttl_cfg
         nonlocal sticky_map, alert, alert_events, overload_hist, wait_hist, err_alerts
         nonlocal err_events, percent_alerts, percent_events, wait_alerts, retry_alerts, retry_events
-        nonlocal conc_alerts
+        nonlocal conc_alerts, limit_alerts
         nonlocal mo_seq, mo_cache, queue_mode, dequeue_policy
         nonlocal full_mode, evict_count, evict_last, cap_overrides
         nonlocal limit_hist, aging_cfg
@@ -5049,6 +5131,8 @@ def run(raw):
         retry_events = {}
         # ci/cb/ca/cu 成功清空全部后端并发告警（na 各 id 均回到未首评）。
         conc_alerts = {}
+        # ci/cb/ca/cu 成功清空全部限流告警（le 各标识均回到未首评）。
+        limit_alerts = {}
         # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
@@ -5060,7 +5144,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
-            "oq", "lh", "lt",
+            "oq", "lh", "lt", "le",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
@@ -5246,6 +5330,8 @@ def run(raw):
             retry_events.pop((backend_id, "M"), None)
             # remove 删除该后端并发告警；同 id 重加回到未首评。
             conc_alerts.pop(backend_id, None)
+            # remove 删除该后端的 B 维限流告警；同 id 重加回到未首评。
+            limit_alerts.pop(("B", backend_id), None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -9063,6 +9149,104 @@ def run(raw):
                 "changed": changed,
             }
             conc_alerts[backend_id] = {
+                "hi": hi,
+                "lo": lo,
+                "n": n,
+                "state": state,
+                "run": run_count,
+                "w": w,
+                "result": dict(result),
+            }
+            results.append(result)
+
+        elif op[0] == "le":
+            # 限流告警（每 (scope,id) 独立状态机）：首评固化 (hi,lo,n) 并自
+            # N 态起评；此后阈值须相同且 w 仅同前（同窗同参原样返回首评结
+            # 果，不推进状态机）或 +1，变参或跳窗（含回退）报 STATE。B 的
+            # 未知 id 先于一切判定报 BACKEND；该标识既无在配桶也无在配配
+            # 额、窗口未结束（含未来窗）或超出最近 60 窗保留下界均报
+            # STATE；窗口判定先于阈值/缓存，与 na 同序。窗值取该标识 lh
+            # 的 w 窗 token/quota（空窗均为 0），value 为二者之和并封顶
+            # 10^18。N 态连续 n 窗 value>=hi 转 A，A 态连续 n 窗
+            # value<=lo 转 N；方向不符与转换后连续数清 0；转换时
+            # changed=true。返回键序
+            # op,scope,id,w,state,token,quota,value,run,changed。le 记账
+            # 均摊 O(1)、额外空间 O(K)。
+            _, scope, alert_id, w, hi, lo, n, now = op
+            if scope == "B" and alert_id not in backends:
+                # B 的未知 id 先于一切状态机判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            key_pair = (scope, alert_id)
+            if key_pair not in buckets and key_pair not in quotas:
+                # 该标识既无在配桶也无在配配额：无窗值可评。
+                fail(EXIT_STATE, "STATE")
+            current = now // 60
+            if w >= current or w < max(0, current - 59):
+                # 窗未结束（含未来窗），或已超出最近 60 窗的保留下界。
+                fail(EXIT_STATE, "STATE")
+            entry = limit_alerts.get(key_pair)
+            if entry is not None:
+                if (hi, lo, n) != (entry["hi"], entry["lo"], entry["n"]):
+                    # 变参。
+                    fail(EXIT_STATE, "STATE")
+                if w == entry["w"]:
+                    # 同窗同参重报：原样返回首评结果，不推进状态机。
+                    results.append(dict(entry["result"]))
+                    continue
+                if w != entry["w"] + 1:
+                    # 跳窗（含回退）。
+                    fail(EXIT_STATE, "STATE")
+            history = limit_hist.get(key_pair)
+            row = history.get(w) if history is not None else None
+            if row is None:
+                # 空窗：token/quota 均为 0。
+                token = 0
+                quota = 0
+            else:
+                # 取 lh 同步维护的窗计数，O(1)，不逐窗扫描。
+                token = row[2]
+                quota = row[3]
+            value = min(METRIC_CAP, token + quota)
+            if entry is None:
+                state = "N"
+                run_count = 0
+            else:
+                state = entry["state"]
+                run_count = entry["run"]
+            changed = False
+            if state == "N":
+                if value >= hi:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "A"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符：连续数清 0。
+                    run_count = 0
+            else:
+                if value <= lo:
+                    run_count += 1
+                    if run_count >= n:
+                        state = "N"
+                        run_count = 0
+                        changed = True
+                else:
+                    # 方向不符：连续数清 0。
+                    run_count = 0
+            result = {
+                "op": "le",
+                "scope": scope,
+                "id": alert_id,
+                "w": w,
+                "state": state,
+                "token": token,
+                "quota": quota,
+                "value": value,
+                "run": run_count,
+                "changed": changed,
+            }
+            limit_alerts[key_pair] = {
                 "hi": hi,
                 "lo": lo,
                 "n": n,
