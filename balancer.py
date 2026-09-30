@@ -2204,6 +2204,47 @@ def config_digest(exported):
     return hashlib.sha256(canonical).hexdigest()
 
 
+# ad 段级差异的顶层段序：ce 规范化 version=11 配置的顶层键序（version 首
+# 置）排除 version；与 CU_SECTIONS 同序。
+AD_SECTIONS = (
+    "backends", "vnodes", "limits", "overload", "sticky", "idle",
+    "backpressure", "scheduler", "faults", "quotas", "queue",
+    "capacities", "lifetime",
+)
+
+
+def section_digest(value):
+    """单个顶层段规范化 JSON 值的指纹：与 config_digest 同款紧凑 UTF-8
+    （ensure_ascii=False、分隔符 ,/:、固定键序）编码后取 SHA-256，返回
+    小写 64 位十六进制。O(L)，L 为该段编码长度。"""
+    canonical = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def config_section_changes(before_export, after_export):
+    """计算两份 ce 规范化 v11 导出（操作前/后）的段级差异：按 AD_SECTIONS
+    的固定顶层键序遍历（排除 version），仅收前后值不同的段，每项为
+    (section, before_fingerprint, after_fingerprint) 三元组（只存指纹、不
+    复制整份配置）。两份导出本就逐层固定键序，段值 != 比较与各自规范化编码
+    的逐字节比较等价。时间 O(C)，C 为配置编码长度；额外空间 O(S)，S 为
+    变化段数（上界为规范化顶层段数 13）。"""
+    changes = []
+    for section in AD_SECTIONS:
+        before_value = before_export[section]
+        after_value = after_export[section]
+        if before_value != after_value:
+            changes.append(
+                (
+                    section,
+                    section_digest(before_value),
+                    section_digest(after_value),
+                )
+            )
+    return changes
+
+
 def parse_base(value):
     # ci 乐观并发的 base：小写 64 位十六进制串（ct 输出的配置指纹）；
     # 类型、长度或字符集不符判 INPUT。
@@ -2245,7 +2286,7 @@ def parse_op(raw_op):
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "na",
-        "ce", "ci", "cl", "al", "ai", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
+        "ce", "ci", "cl", "al", "ai", "ad", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "ft", "oi", "od",
         "fb", "fp", "fq", "fd", "fc",
@@ -3692,6 +3733,22 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("ai", after, limit)
 
+    if name == "ad":
+        # 审计段级差异查询：精确键序 op,rev（键须按此序出现），只读、不推进
+        # 时钟。rev 为 1..10^18 的非 bool 整数；键序、类型或范围非法报
+        # INPUT，rev 尚未分配、超过最新修订或其事件已随 64 条窗口淘汰留执行
+        # 期判 STATE。
+        if list(raw_op) != ["op", "rev"]:
+            fail(EXIT_INPUT, "INPUT")
+        rev = raw_op["rev"]
+        if (
+            not isinstance(rev, int)
+            or isinstance(rev, bool)
+            or not 1 <= rev <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("ad", rev)
+
     if name == "cb":
         # 配置回滚：精确键集 op,rev,now；rev 为 1..10^18 非 bool 整数
         # （是否仍被保留留执行期判 STATE），now 沿用 ci 并进入共用非递减
@@ -4063,6 +4120,14 @@ def run(raw):
     # 替换顶层字段、其余 None，before/after 为操作前后规范化 version=11 配
     # 置的 ct 摘要（值未变两摘要相同仍记录）。额外空间 O(A)，A≤64。
     audit_events = deque(maxlen=64)
+    # 段级审计（ad）：与 audit_events 平行、同 maxlen=64、同序追加与淘汰，
+    # 每项与同下标审计事件一一对应，为
+    # (section, before_fingerprint, after_fingerprint) 三元组的元组，仅列
+    # 该次变更前后值不同的顶层段（按 AD_SECTIONS 序），只存段指纹、不复制
+    # 整份配置；值未变的成功事件对应空元组。ci/cb/cu/ca 成功分配新 rev 的
+    # 同一事务内与事件一起固化，失败不追加。额外空间 O(64S)，S 为规范化
+    # 顶层段数。
+    audit_sections = deque(maxlen=64)
     results = []
 
     def backend_routable(record, drain_strict=False):
@@ -7687,7 +7752,8 @@ def run(raw):
             # 配置载入，v1..v8 为默认 F/T；capacities 显式覆盖随配置原子
             # 替换，旧版或 [] 清空；硬时限按 lifetime 载入，null 或 v1..v10
             # 清除）。
-            before_digest = config_digest(export_config())
+            before_export = export_config()
+            before_digest = config_digest(before_export)
             apply_config(config, now)
             # 成功后把规范化 version=11 配置存为提交：rev 从 1 起递增，
             # 仅保留最近 16 条；失败不分配、不改历史。export_config 产出
@@ -7704,6 +7770,7 @@ def run(raw):
             reservation = None
             # 审计：成功并分配新 rev 时按 rev 升序追加（仅留最近 64 条），
             # section 恒 null；before 为操作前指纹，after 为新提交指纹。
+            # 同一事件内固化段级差异（仅指纹，按顶层键序）。
             audit_events.append(
                 {
                     "rev": new_rev,
@@ -7713,6 +7780,9 @@ def run(raw):
                     "before": before_digest,
                     "after": after_digest,
                 }
+            )
+            audit_sections.append(
+                tuple(config_section_changes(before_export, new_snapshot))
             )
             results.append({"op": "ci", "ok": True})
 
@@ -8023,6 +8093,48 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "ad":
+            # 审计段级差异查询（只读，不推进时钟、不改淘汰窗口）：按 rev 取
+            # 与 al/ai 同窗口（最近 64 条）保留的事件。audit_events 与
+            # audit_sections 同序追加与淘汰，同下标即同一修订的段级差异。
+            # rev 从未分配、大于最新修订或其事件已随窗口淘汰：STATE。响应固
+            # 定键序 op,rev,now,kind,section,before,after,changes；前七项
+            # 与同 rev 的 al/ai 事件逐值一致；changes 按 AD_SECTIONS 顶层键
+            # 序（排除 version）仅列前后值不同的段，项键序
+            # section,before,after，两指纹为段值的 64 位小写 SHA-256。重复
+            # 查询逐项全新复制、逐字节一致。O(S) 时间与额外空间，S 为规范
+            # 化顶层段数；失败批次回滚且无 stdout。
+            _, target_rev = op
+            target_event = None
+            target_changes = None
+            for index, event in enumerate(audit_events):
+                if event["rev"] == target_rev:
+                    target_event = event
+                    target_changes = audit_sections[index]
+                    break
+            if target_event is None:
+                fail(EXIT_STATE, "STATE")
+            results.append(
+                {
+                    "op": "ad",
+                    "rev": target_event["rev"],
+                    "now": target_event["now"],
+                    "kind": target_event["kind"],
+                    "section": target_event["section"],
+                    "before": target_event["before"],
+                    "after": target_event["after"],
+                    "changes": [
+                        {
+                            "section": section,
+                            "before": before_digest,
+                            "after": after_digest,
+                        }
+                        for section, before_digest, after_digest
+                        in target_changes
+                    ],
+                }
+            )
+
         elif op[0] == "cb":
             # 配置回滚：按目标快照执行 ci 的原子替换与默认运行态重建，成功
             # 另建新 rev；全部校验先于任何变更，失败天然回滚时钟、配置、
@@ -8048,7 +8160,8 @@ def run(raw):
             # full 随快照恢复，队列清空且淘汰计数、最近淘汰 cid 重置（0、
             # null）；capacities 覆盖随快照恢复；硬时限按快照 lifetime
             # 载入，null 清除。
-            before_digest = config_digest(export_config())
+            before_export = export_config()
+            before_digest = config_digest(before_export)
             apply_config(parse_config(snapshot), now)
             # 原历史保留，追加新 rev 后再按 16 条淘汰。
             new_snapshot = export_config()
@@ -8061,7 +8174,8 @@ def run(raw):
             # cb 成功清除既有配置预约。
             reservation = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
-            # null；before 为回滚前指纹，after 为目标快照指纹。
+            # null；before 为回滚前指纹，after 为目标快照指纹。同一事件内
+            # 固化段级差异（仅指纹，按顶层键序）。
             audit_events.append(
                 {
                     "rev": new_rev,
@@ -8071,6 +8185,9 @@ def run(raw):
                     "before": before_digest,
                     "after": after_digest,
                 }
+            )
+            audit_sections.append(
+                tuple(config_section_changes(before_export, new_snapshot))
             )
             results.append(
                 {"op": "cb", "target": target_rev, "rev": new_rev, "ok": True}
@@ -8132,7 +8249,8 @@ def run(raw):
             reservation = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 取被
             # 替换顶层字段；before/after 即响应中的 base/target 摘要（值未变
-            # 两摘要相同仍记录）。
+            # 两摘要相同仍记录）。同一事件内固化段级差异：按实际前后规范化
+            # 值计算，section 字段仅表示请求替换的段，值未变时不列入 changes。
             audit_events.append(
                 {
                     "rev": new_rev,
@@ -8142,6 +8260,9 @@ def run(raw):
                     "before": before_digest,
                     "after": target_digest,
                 }
+            )
+            audit_sections.append(
+                tuple(config_section_changes(before_export, target_export))
             )
             results.append(
                 {
@@ -8220,7 +8341,8 @@ def run(raw):
                 fail(EXIT_STATE, "STATE")
             if next_rev > 10 ** 18:
                 fail(EXIT_STATE, "STATE")
-            before_digest = config_digest(export_config())
+            before_export = export_config()
+            before_digest = config_digest(before_export)
             apply_config(parse_config(snapshot), now)
             new_snapshot = export_config()
             commit_history.append((next_rev, new_snapshot))
@@ -8232,6 +8354,7 @@ def run(raw):
             reservation = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
             # null；before 为生效前指纹，after 为预约快照指纹（同响应 digest）。
+            # 同一事件内固化段级差异（仅指纹，按顶层键序）。
             audit_events.append(
                 {
                     "rev": new_rev,
@@ -8241,6 +8364,9 @@ def run(raw):
                     "before": before_digest,
                     "after": after_digest,
                 }
+            )
+            audit_sections.append(
+                tuple(config_section_changes(before_export, new_snapshot))
             )
             results.append(
                 {"op": "ca", "digest": digest, "rev": new_rev, "ok": True}

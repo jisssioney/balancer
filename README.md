@@ -42,6 +42,16 @@
 - 事件项键序 `rev,now,kind,section,before,after`，两查询值义相同：`now` 为该变更操作的显式时钟，`kind` ∈ ci/cb/cu/ca，`section` 仅 `cu` 取被替换的顶层字段、其余为 null，`before`/`after` 为变更前后规范化 version=11 配置的 ct 摘要。
 - `ai` 时间 O(A)、额外空间 O(limit)，A≤64，仅用标准库；紧凑 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节契约不变。
 
+## 审计段级差异：ad
+
+按审计修订号返回该次变更涉及的规范化顶层配置段及各段前后指纹；只读，不推进时钟、不改淘汰窗口。
+
+- `ad`：精确键序 `op,rev`（键须按此序出现）；`rev` 为 1..10^18 的非 bool 整数。键序、字段集合、`rev` 类型或范围非法报 INPUT/2；`rev` 尚未分配、超过最新修订，或其事件已随六十四条窗口淘汰报 STATE/4。失败不产生 stdout 并回滚整批操作。
+- 每次 ci/cb/cu/ca 成功分配 rev 时，在同一审计事件内固化段级差异（只存段指纹、不复制整份配置），与现有事件同窗口保留与淘汰。
+- 返回固定键序 `op,rev,now,kind,section,before,after,changes`；前七项与同 rev 的 `al` 或 `ai` 事件逐值一致。
+- `changes` 按 ce 规范化 version=11 配置的顶层键序排列但排除 `version`（backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler,faults,quotas,queue,capacities,lifetime），只列前后值不同的段；每项固定键序 `section,before,after`，两指纹都是对该段规范化 JSON 值按现有紧凑 UTF-8 与固定键序编码后取得的 64 位小写 SHA-256。即使成功操作生成相同的整配置指纹，事件仍保留且 `changes` 为空数组；cu 的 `section` 继续表示请求替换的段，不据此伪造实际差异。
+- 重复查询逐字节一致；record 和 replay 继续覆盖成功与失败结果。段级记录保留空间上界 O(64S)，`ad` 时间与额外空间 O(S)，成功配置变更新增的指纹计算 O(C)，其中 S 为规范化顶层段数、C 为配置编码长度，仅用标准库。
+
 ## 后端并发告警：na
 
 每后端独立的并发滞回告警，窗值取该后端 `w` 窗 `mx` 口径的 `samples`/`peak`（空窗均为 0）。
