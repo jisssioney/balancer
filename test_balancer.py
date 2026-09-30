@@ -3093,6 +3093,309 @@ class FdDiffDryRunTest(unittest.TestCase):
         self.assertEqual(rep_stderr, run_stderr)
 
 
+class FcCandidateCheckTest(unittest.TestCase):
+    """故障候选单键预演 fc：at 时刻当前/候选时间线各模拟一次 fr 并带 trace。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if err:
+            self.assertEqual(code, 0, err)
+        self.assertEqual(err, b"")
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def base_ops(self):
+        return [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "chash", "vnodes": 8},
+        ]
+
+    def fc_op(self, items, key="k", at=0, timeout=9, max_attempts=3, now=0):
+        return {
+            "op": "fc", "items": items, "key": key, "at": at,
+            "timeout": timeout, "max": max_attempts, "now": now,
+        }
+
+    def test_result_shape_and_key_order(self):
+        results = self.run_ops(
+            self.base_ops() + [self.fc_op([])]
+        )
+        result = results[-1]
+        self.assertEqual(
+            list(result), ["op", "key", "at", "before", "after", "changed"]
+        )
+        self.assertEqual(result["op"], "fc")
+        self.assertEqual(result["key"], "k")
+        self.assertEqual(result["at"], 0)
+        for side in ("before", "after"):
+            snap = result[side]
+            self.assertEqual(
+                list(snap),
+                ["state", "backend", "attempts", "retries",
+                 "remaps", "latency", "trace"],
+            )
+            self.assertIn(snap["state"], ("A", "R"))
+            self.assertEqual(
+                snap["retries"], max(snap["attempts"] - 1, 0)
+            )
+            self.assertEqual(snap["remaps"], snap["retries"])
+            self.assertEqual(snap["latency"],
+                             sum(e["cost"] for e in snap["trace"]))
+            self.assertEqual(len(snap["trace"]), snap["attempts"])
+            for entry in snap["trace"]:
+                self.assertEqual(list(entry), ["id", "kind", "cost", "result"])
+                self.assertIn(entry["kind"], ("D", "F", "S", None))
+                self.assertIsInstance(entry["cost"], int)
+                self.assertNotIsInstance(entry["cost"], bool)
+                self.assertGreaterEqual(entry["cost"], 0)
+                self.assertIn(entry["result"], ("D", "T", "A"))
+            # 接纳项仅末项出现一次；被拒结果无 A。
+            results_letters = [e["result"] for e in snap["trace"]]
+            if snap["state"] == "A":
+                self.assertEqual(results_letters[-1], "A")
+                self.assertEqual(results_letters.count("A"), 1)
+            else:
+                self.assertNotIn("A", results_letters)
+        self.assertEqual(
+            result["changed"], result["before"] != result["after"]
+        )
+
+    def test_before_after_diff_on_candidate_plan(self):
+        # 当前 a 在 [0,10) 为 D；候选收窄到 [5,10)：at=0 前后不同。
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "D", "a": 0, "z": 10, "v": 0}]
+            + [self.fc_op(
+                [{"id": "a", "k": "D", "a": 5, "z": 10, "v": 0}], at=0,
+            )]
+        )
+        result = results[-1]
+        before, after = result["before"], result["after"]
+        self.assertTrue(result["changed"])
+        self.assertEqual(
+            (before["state"], before["backend"], before["attempts"],
+             before["latency"]),
+            ("A", "b", 2, 0),
+        )
+        self.assertEqual(
+            [tuple(sorted(e.items())) for e in before["trace"]],
+            [
+                (("cost", 0), ("id", "a"), ("kind", "D"), ("result", "D")),
+                (("cost", 0), ("id", "b"), ("kind", None), ("result", "A")),
+            ],
+        )
+        self.assertEqual(
+            (after["state"], after["backend"], after["attempts"],
+             after["latency"]),
+            ("A", "a", 1, 0),
+        )
+        self.assertEqual(
+            after["trace"],
+            [{"id": "a", "kind": None, "cost": 0, "result": "A"}],
+        )
+
+    def test_f_phase_trace_kind_is_f(self):
+        # a 为 F 抖动 v=2：at=1 下线相位 result=D，at=2 上线相位接纳但
+        # kind 仍为 "F"、cost=0。
+        ops = (
+            self.base_ops()
+            + [{"op": "fp", "items": [
+                {"id": "a", "k": "F", "a": 0, "z": 100, "v": 2}]}]
+        )
+        down = self.run_ops(ops + [self.fc_op([], at=1)])[-1]["before"]
+        up = self.run_ops(ops + [self.fc_op([], at=2)])[-1]["before"]
+        self.assertEqual(
+            (down["state"], down["backend"], down["latency"]),
+            ("A", "b", 0),
+        )
+        self.assertEqual(down["trace"][0]["kind"], "F")
+        self.assertEqual(down["trace"][0]["result"], "D")
+        self.assertEqual(
+            (up["state"], up["backend"], up["attempts"], up["latency"]),
+            ("A", "a", 1, 0),
+        )
+        self.assertEqual(
+            up["trace"][0],
+            {"id": "a", "kind": "F", "cost": 0, "result": "A"},
+        )
+
+    def test_slow_timeout_cost_and_rejection_trace(self):
+        ops = (
+            self.base_ops()
+            + [{"op": "fp", "items": [
+                {"id": "a", "k": "S", "a": 0, "z": 100, "v": 9}]}]
+        )
+        # a 慢超时 cost=timeout 后落到 b：latency=3、trace T+A。
+        accepted = self.run_ops(
+            ops + [self.fc_op([], timeout=3, max_attempts=3)]
+        )[-1]["before"]
+        self.assertEqual(
+            (accepted["state"], accepted["backend"],
+             accepted["attempts"], accepted["latency"]),
+            ("A", "b", 2, 3),
+        )
+        self.assertEqual(
+            accepted["trace"],
+            [
+                {"id": "a", "kind": "S", "cost": 3, "result": "T"},
+                {"id": "b", "kind": None, "cost": 0, "result": "A"},
+            ],
+        )
+        # 仅一个慢后端、max=1：耗尽为 R，backend=null，trace 仅一项 T。
+        rejected = self.run_ops(
+            [{"op": "add", "id": "a", "weight": 1},
+             {"op": "chash", "vnodes": 8}]
+            + [{"op": "fp", "items": [
+                {"id": "a", "k": "S", "a": 0, "z": 100, "v": 9}]}]
+            + [self.fc_op([], timeout=3, max_attempts=1)]
+        )[-1]["before"]
+        self.assertEqual(
+            (rejected["state"], rejected["backend"],
+             rejected["attempts"], rejected["latency"]),
+            ("R", None, 1, 3),
+        )
+        self.assertEqual(
+            rejected["trace"],
+            [{"id": "a", "kind": "S", "cost": 3, "result": "T"}],
+        )
+
+    def test_segment_gap_kind_is_null(self):
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "fp", "items": [
+                {"id": "a", "k": "D", "a": 0, "z": 5, "v": 0}]}]
+            + [self.fc_op([], at=7)]
+        )
+        before = results[-1]["before"]
+        self.assertEqual(
+            (before["state"], before["backend"], before["attempts"]),
+            ("A", "a", 1),
+        )
+        self.assertEqual(
+            before["trace"][0],
+            {"id": "a", "kind": None, "cost": 0, "result": "A"},
+        )
+
+    def test_empty_plan_is_stable_and_read_only(self):
+        results = self.run_ops(
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "S", "a": 0, "z": 100, "v": 5}]
+            + [self.fc_op([], at=0, timeout=9)]
+            + [{"op": "fm", "id": "a"}]
+            + [{"op": "fq", "now": 0}]
+        )
+        fc_result, fm, fq = results[-3], results[-2], results[-1]
+        self.assertFalse(fc_result["changed"])
+        self.assertEqual(fc_result["before"], fc_result["after"])
+        # 只读：fm 全零，fq 时间线仍为 fs 登记的 S。
+        for kind in ("D", "F", "S"):
+            self.assertEqual(
+                fm[kind],
+                {"affected": 0, "rejected": 0, "retries": 0,
+                 "remaps": 0, "recovered": 0},
+            )
+        self.assertEqual(
+            fq["faults"],
+            [{"id": "a", "k": "S", "a": 0, "z": 100, "v": 5,
+              "effect": "S"}],
+        )
+
+    def test_at_does_not_advance_clock(self):
+        # at=100 不推进时钟：后续 now=5 的操作合法。
+        results = self.run_ops(
+            self.base_ops()
+            + [self.fc_op([], at=100, now=5)]
+            + [{"op": "fq", "now": 5}]
+        )
+        self.assertEqual(results[-2]["at"], 100)
+        # now=5 早于上一操作 now=5 不构成倒退（相等允许）。
+        self.assertEqual(results[-1]["op"], "fq")
+
+    def test_input_violations(self):
+        # 键序乱序（key/items 颠倒）。
+        self.assert_failure(
+            self.base_ops()
+            + [{"op": "fc", "key": "k", "items": [], "at": 0,
+                "timeout": 9, "max": 1, "now": 0}],
+            2, "INPUT",
+        )
+        # 缺键 / 多键。
+        code, stdout, stderr = run_balancer(
+            "run",
+            b'{"ops":[{"op":"fc","items":[],"key":"k","at":0,'
+            b'"timeout":9,"max":1}]}',
+        )
+        self.assertEqual((code, stdout, stderr),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+        # at<now；at/now 为 bool、越界、负数；key 空串；max=0；items 非数组。
+        for bad in (
+            self.fc_op([], at=4, now=5),
+            self.fc_op([], at=True),
+            self.fc_op([], at=10 ** 9 + 1),
+            self.fc_op([], now=-1),
+            self.fc_op([], key=""),
+            self.fc_op([], max_attempts=0),
+            self.fc_op({}, at=0),
+        ):
+            self.assert_failure(self.base_ops() + [bad], 2, "INPUT")
+
+    def test_backend_state_and_clock_errors(self):
+        # 候选引用未知后端报 BACKEND。
+        self.assert_failure(
+            self.base_ops()
+            + [self.fc_op(
+                [{"id": "zz", "k": "D", "a": 0, "z": 1, "v": 0}])],
+            3, "BACKEND",
+        )
+        # 未配环报 STATE。
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1}, self.fc_op([])],
+            4, "STATE",
+        )
+        # 环内无合格候选（唯一后端不健康）报 STATE。
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1},
+             {"op": "chash", "vnodes": 1},
+             {"op": "hset", "id": "a", "fail": 1, "success": 1},
+             {"op": "probe", "id": "a", "ok": False, "now": 0},
+             self.fc_op([])],
+            4, "STATE",
+        )
+        # 时钟倒退报 INPUT（整批回滚）。
+        self.assert_failure(
+            self.base_ops()
+            + [self.fc_op([], at=5, now=5)]
+            + [self.fc_op([], at=5, now=4)],
+            2, "INPUT",
+        )
+
+    def test_record_replay_covers_fc(self):
+        ops = (
+            self.base_ops()
+            + [{"op": "fs", "id": "a", "k": "F", "a": 0, "z": 100, "v": 2}]
+            + [self.fc_op(
+                [{"id": "a", "k": "S", "a": 0, "z": 50, "v": 7}],
+                key="日本語", at=3,
+            )]
+        )
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, _ = run_balancer("record", raw)
+        self.assertEqual(rec_code, 0)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, run_stderr)
+
+
 class MoSnapshotTest(unittest.TestCase):
     """全池增量快照 mo：游标、缓存、基线、跨窗与重置契约。"""
 

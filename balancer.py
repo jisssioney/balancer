@@ -1453,10 +1453,12 @@ def parse_fault_segment(fields):
 
 
 def parse_fault_plan(raw_items):
-    """fp/fd 共用的全量计划校验：items 为 0..4096 项数组（bool 不是数组），
+    """fp/fd/fc 共用的全量计划校验：items 为 0..4096 项数组（bool 不是数组），
     项精确键序 id,k,a,z,v（键须按此序出现），字段约束沿用 fs；同一 id
     多段须按 a 升序且 [a,z) 互不重叠（相邻端点可接）。返回
-    {id: [segment, ...]}，各 id 段已按 a 规范化排序。"""
+    {id: [segment, ...]}，各 id 段已按 a 规范化排序。分组 O(T)，规范化
+    排序用稳定基数排序 sort_fault_segments（O(T)，a∈[0,10^9]<2^32 四轮
+    LSD），合计 O(T)。"""
     if (
         not isinstance(raw_items, list)
         or isinstance(raw_items, bool)
@@ -1477,10 +1479,11 @@ def parse_fault_plan(raw_items):
         )
     plan = {}
     for item_id, segments in grouped.items():
-        # 规范化：同 id 段先按 a 升序排序，再校验半开区间互不重叠
-        # （z_i<=a_{i+1}，相等为相邻可接）。乱序但可排成不重叠序列的
-        # 计划合法；同 a 或任何相交在此被拒。
-        segments.sort(key=lambda segment: segment[1])
+        # 规范化：同 id 段先按 a 升序（稳定基数排序 O(T_b)，合计 O(T)，
+        # 与 parse_config_faults 同款），再校验半开区间互不重叠（z_i<=
+        # a_{i+1}，相等为相邻可接）。乱序但可排成不重叠序列的计划合法；
+        # 同 a 或任何相交在此被拒。
+        segments = sort_fault_segments(segments)
         for idx in range(len(segments) - 1):
             if segments[idx][2] > segments[idx + 1][1]:
                 fail(EXIT_INPUT, "INPUT")
@@ -2245,7 +2248,7 @@ def parse_op(raw_op):
         "ce", "ci", "cl", "al", "ai", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
         "cp", "cq", "ca",
         "fs", "fx", "fr", "fi", "ft", "oi", "od",
-        "fb", "fp", "fq", "fd",
+        "fb", "fp", "fq", "fd", "fc",
         "br",
         "hm", "fm", "fh",
         "fa", "fe", "ah",
@@ -3511,6 +3514,28 @@ def parse_op(raw_op):
             now,
         )
 
+    if name == "fc":
+        # 故障候选单键预演：精确键序 op,items,key,at,timeout,max,now（键须
+        # 按此序出现）；items 为 fp 同款全量候选计划（parse_fault_plan），
+        # key 沿用 route 校验，timeout/max/now 沿用 fr（now 纳入共用非递减
+        # 时钟），at 为 0..10^9 非 bool 整数且 at>=now（at 不进时钟，模拟
+        # 时刻可以晚于 now）。候选引用未知 id 留执行期判 BACKEND；未配环或
+        # 无合格候选的 STATE 留执行期判（fd 同款）。
+        if list(raw_op) != [
+            "op", "items", "key", "at", "timeout", "max", "now",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        plan = parse_fault_plan(raw_op["items"])
+        key = parse_key(raw_op["key"])
+        at = parse_fault_num(raw_op["at"])
+        timeout = parse_fault_num(raw_op["timeout"])
+        max_attempts = parse_attempt_max(raw_op["max"])
+        now = parse_fault_num(raw_op["now"])
+        if at < now:
+            # 只读模拟时刻不得早于当前时钟输入值。
+            fail(EXIT_INPUT, "INPUT")
+        return ("fc", plan, key, at, timeout, max_attempts, now)
+
     if name in ("ce", "ci"):
         if name == "ce":
             if keys != {"op"}:
@@ -4587,6 +4612,73 @@ def run(raw):
             break
         return state, chosen_id, attempts, latency
 
+    def simulate_fc(tokens, digests, key, timeout, max_attempts, at,
+                    fault_view=None):
+        """fc 只读模拟：同 simulate_fr 的哈希遍历与 D/F/S 规则，但在 at 时刻
+        求值并按尝试序产出 trace。返回
+        (state, backend, attempts, latency, trace)：state ∈ A/R，backend 仅
+        A 为 id 否则 null，attempts 为尝试后端数，latency 为各次计入耗时之
+        和（与 simulate_fr 同口径）。trace 每项键序 id,kind,cost,result：
+        kind 为该候选 at 时刻活动段的登记种类（D/F/S），段间隙或未登记为
+        null（F 非故障相位仍记 "F"）；cost 为计入 latency 的本次耗时；
+        result ∈ D/T/A，依次表示下线（D 或 F 故障相位，cost=0）、慢超时
+        （S 且 v>timeout，cost=timeout）、接纳（cost 为 v 或 0，末项且
+        state=A）。fault_view 语义同 simulate_fr（候选时间线视图）。
+        不建连、不记度量与故障统计；tokens 非空（空环由调用方先报 STATE）。"""
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash)
+        if index == len(tokens):
+            index = 0  # 越界回绕到环首
+        attempts = 0
+        latency = 0
+        chosen_id = None
+        state = "R"
+        seen = set()
+        trace = []
+        for offset in range(len(tokens)):
+            if attempts >= max_attempts:
+                break
+            backend_id = tokens[(index + offset) % len(tokens)][3]
+            if backend_id in seen:
+                continue
+            seen.add(backend_id)
+            if fault_view is None:
+                segment = active_fault(backends[backend_id], at)
+            else:
+                view_faults, view_a = fault_view[backend_id]
+                segment = active_segment(view_faults, view_a, at)
+            effect = fault_effect(segment, at)
+            kind = None if segment is None else segment[0]
+            attempts += 1
+            if effect == "D":
+                # D/故障相位 F：本尝试失败、耗时 0。
+                trace.append(
+                    {"id": backend_id, "kind": kind, "cost": 0, "result": "D"}
+                )
+                continue
+            cost = segment[3] if effect == "S" else 0
+            if cost > timeout:
+                # S 且 v>timeout：本尝试失败，耗时按 timeout 计后重试。
+                latency += timeout
+                trace.append(
+                    {
+                        "id": backend_id, "kind": kind,
+                        "cost": timeout, "result": "T",
+                    }
+                )
+                continue
+            # 首个成功尝试即终止：耗时 v 或 0。
+            latency += cost
+            trace.append(
+                {"id": backend_id, "kind": kind, "cost": cost, "result": "A"}
+            )
+            chosen_id = backend_id
+            state = "A"
+            break
+        return state, chosen_id, attempts, latency, trace
+
     def simulate_oi(tokens, digests, key, c, s, costs, timeout,
                     max_attempts, now):
         """只读模拟一次 oi 预演，返回
@@ -5245,7 +5337,7 @@ def run(raw):
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
-            "fd",
+            "fd", "fc",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "na",
@@ -9704,6 +9796,89 @@ def run(raw):
                         "stable": len(cases) - changed_count,
                         "changed": changed_count,
                     },
+                }
+            )
+
+        elif op[0] == "fc":
+            # 故障候选单键预演（只读）：在 at 时刻分别用当前故障时间线与
+            # 候选计划（fd 同款语义：列入 id 的时间线原子替换、未列入的保持
+            # 原样）各模拟一次 fr 的哈希遍历与 D/F/S 规则，并按尝试序产出
+            # trace；at 仅为只读模拟时刻、不进时钟，除共用时钟按 now 推进外
+            # 不改任何运行态（不读写粘性映射、不建连、不记 mr/fm/fh、不动
+            # 告警），失败批次天然回滚。环与候选视图各只建一次，建环排序
+            # O(BV log(BV))，两次模拟各至多遍历 max 个不同后端，总时间
+            # O(T+BV log(BV))；环/digests/视图 O(BV)、候选计划 O(T)，
+            # 两侧 trace 各至多 max 项且不超过环上后端数，额外空间
+            # O(T+BV)（T 为 items 项数，B 为后端数，V 为每后端虚拟节点）。
+            _, plan, key, at, timeout, max_attempts, now = op
+            for item_id in plan:
+                if item_id not in backends:
+                    # 候选引用未知后端报 BACKEND，先于环状态判定（同 fd）。
+                    fail(EXIT_BACKEND, "BACKEND")
+            if ring_vnodes is None:
+                # 未配环报 STATE，同 fr/fi/ft/fd。
+                fail(EXIT_STATE, "STATE")
+            tokens = build_ring(backends, ring_vnodes)
+            if not tokens:
+                # 环内无合格候选同样报 STATE（同 fr/fi/ft/fd）。
+                fail(EXIT_STATE, "STATE")
+            digests = [token[0] for token in tokens]
+            # 候选视图同 fd：列入 id 用计划段（解析期已按 a 规范化），未列入
+            # 沿用当前时间线；前后两次模拟复用同一份只读视图。
+            after_view = {}
+            for backend_id, record in backends.items():
+                new_faults = plan.get(backend_id)
+                if new_faults is None:
+                    after_view[backend_id] = (
+                        record["faults"],
+                        record["fault_a"],
+                    )
+                else:
+                    after_view[backend_id] = (
+                        new_faults,
+                        [segment[1] for segment in new_faults],
+                    )
+            (
+                before_state, before_id, before_attempts,
+                before_latency, before_trace,
+            ) = simulate_fc(
+                tokens, digests, key, timeout, max_attempts, at
+            )
+            (
+                after_state, after_id, after_attempts,
+                after_latency, after_trace,
+            ) = simulate_fc(
+                tokens, digests, key, timeout, max_attempts, at,
+                after_view,
+            )
+            before_retries = max(before_attempts - 1, 0)
+            after_retries = max(after_attempts - 1, 0)
+            before = {
+                "state": before_state,
+                "backend": before_id,
+                "attempts": before_attempts,
+                "retries": before_retries,
+                "remaps": before_retries,
+                "latency": before_latency,
+                "trace": before_trace,
+            }
+            after = {
+                "state": after_state,
+                "backend": after_id,
+                "attempts": after_attempts,
+                "retries": after_retries,
+                "remaps": after_retries,
+                "latency": after_latency,
+                "trace": after_trace,
+            }
+            results.append(
+                {
+                    "op": "fc",
+                    "key": key,
+                    "at": at,
+                    "before": before,
+                    "after": after,
+                    "changed": before != after,
                 }
             )
 
