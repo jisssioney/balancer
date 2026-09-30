@@ -15146,5 +15146,287 @@ class AuditCursorTest(unittest.TestCase):
         self.assertEqual((rep_code, rep_stdout), (run_code, run_stdout))
 
 
+class AuditDiffTest(unittest.TestCase):
+    """审计段级差异查询 ad：段指纹、键序、淘汰、INPUT/STATE 与只读契约。"""
+
+    def ad(self, rev):
+        return {"op": "ad", "rev": rev}
+
+    def ci(self, weight, now, **overrides):
+        return {
+            "op": "ci",
+            "config": config_v11(weight, **overrides),
+            "now": now,
+        }
+
+    def run_ops(self, ops):
+        return run_balancer("run", encode_ops(ops))
+
+    def result(self, ops):
+        code, stdout, stderr = self.run_ops(ops)
+        self.assertEqual((code, stderr), (0, b""))
+        return json.loads(stdout.decode("utf-8"))["results"][-1]
+
+    def section_digest(self, value):
+        # 与实现同款的单段规范化编码：紧凑 UTF-8、固定键序、SHA-256。
+        canonical = json.dumps(
+            value, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def test_top_and_change_key_order(self):
+        r = self.result([self.ci(1, 1), self.ad(1)])
+        self.assertEqual(
+            list(r),
+            ["op", "rev", "now", "kind", "section", "before", "after",
+             "changes"],
+        )
+        self.assertEqual(
+            (r["op"], r["rev"], r["now"], r["kind"], r["section"]),
+            ("ad", 1, 1, "ci", None),
+        )
+        change = r["changes"][0]
+        self.assertEqual(list(change), ["section", "before", "after"])
+
+    def test_section_digests_and_whole_digest_match_ct(self):
+        # 初始空配置 -> v11(7)：仅 backends 段变化；段指纹独立复算，
+        # 整配置 after 与同批 ct 摘要一致。
+        code, stdout, stderr = self.run_ops(
+            [self.ci(7, 1), {"op": "ct"}, self.ad(1)]
+        )
+        self.assertEqual((code, stderr), (0, b""))
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        ct_digest = results[1]["digest"]
+        r = results[2]
+        backends = config_v11(7)["backends"]
+        self.assertEqual(
+            r["changes"],
+            [
+                {
+                    "section": "backends",
+                    "before": self.section_digest([]),
+                    "after": self.section_digest(backends),
+                }
+            ],
+        )
+        self.assertEqual(r["after"], ct_digest)
+        self.assertEqual(len(r["after"]), 64)
+        self.assertTrue(
+            all(char in "0123456789abcdef" for char in r["after"])
+        )
+
+    def test_multiple_sections_follow_top_level_order(self):
+        ops = [
+            self.ci(1, 1),
+            self.ci(2, 2, lifetime=9),
+            self.ad(2),
+        ]
+        r = self.result(ops)
+        self.assertEqual(
+            [c["section"] for c in r["changes"]],
+            ["backends", "lifetime"],
+        )
+        before_cfg = config_v11(1)
+        after_cfg = config_v11(2, lifetime=9)
+        self.assertEqual(
+            r["changes"][0],
+            {
+                "section": "backends",
+                "before": self.section_digest(before_cfg["backends"]),
+                "after": self.section_digest(after_cfg["backends"]),
+            },
+        )
+        self.assertEqual(
+            r["changes"][1],
+            {
+                "section": "lifetime",
+                "before": self.section_digest(None),
+                "after": self.section_digest({"ttl": 9}),
+            },
+        )
+
+    def test_same_whole_digest_event_kept_with_empty_changes(self):
+        # 值未变的重复导入：事件保留、前后整配置指纹相同、changes 为 []。
+        r = self.result([self.ci(3, 1), self.ci(3, 2), self.ad(2)])
+        self.assertEqual(r["kind"], "ci")
+        self.assertEqual(r["before"], r["after"])
+        self.assertEqual(r["changes"], [])
+
+    def test_first_seven_fields_match_al_and_ai(self):
+        ops = [self.ci(1, 1), self.ci(2, 2)]
+        code, stdout, stderr = self.run_ops(
+            ops + [{"op": "al"}, self.ai(0, 64), self.ad(2)]
+        )
+        self.assertEqual((code, stderr), (0, b""))
+        results = json.loads(stdout.decode("utf-8"))["results"]
+        al_event = results[2]["events"][1]
+        ai_event = results[3]["events"][1]
+        r = results[4]
+        for event in (al_event, ai_event):
+            self.assertEqual(
+                list(event),
+                ["rev", "now", "kind", "section", "before", "after"],
+            )
+            self.assertEqual(
+                (r["rev"], r["now"], r["kind"], r["section"],
+                 r["before"], r["after"]),
+                (event["rev"], event["now"], event["kind"], event["section"],
+                 event["before"], event["after"]),
+            )
+
+    def ai(self, after, limit):
+        return {"op": "ai", "after": after, "limit": limit}
+
+    def test_cu_section_is_requested_but_changes_are_actual(self):
+        # 规范化后等值的替换：section 为请求段，changes 为空（不伪造差异）。
+        base = self.section_digest(config_v11(4))
+        r = self.result([
+            self.ci(4, 1),
+            {"op": "cu", "base": base, "section": "vnodes",
+             "value": None, "now": 2},
+            self.ad(2),
+        ])
+        self.assertEqual((r["kind"], r["section"]), ("cu", "vnodes"))
+        self.assertEqual(r["before"], r["after"])
+        self.assertEqual(r["changes"], [])
+        # 真实变化仅列 vnodes 一段。
+        r = self.result([
+            self.ci(4, 1),
+            {"op": "cu", "base": base, "section": "vnodes",
+             "value": 7, "now": 2},
+            self.ad(2),
+        ])
+        self.assertEqual(
+            r["changes"],
+            [
+                {
+                    "section": "vnodes",
+                    "before": self.section_digest(None),
+                    "after": self.section_digest(7),
+                }
+            ],
+        )
+
+    def test_cb_and_ca_events(self):
+        # cb 回滚到 rev1：rev3 事件 kind=cb、section=null，差异为实际结果。
+        r = self.result([
+            self.ci(1, 1), self.ci(5, 2),
+            {"op": "cb", "rev": 1, "now": 3}, self.ad(3),
+        ])
+        self.assertEqual((r["kind"], r["section"]), ("cb", None))
+        self.assertEqual([c["section"] for c in r["changes"]], ["backends"])
+        # ca 预约生效：rev2 事件 kind=ca。
+        pending = config_v11(1)
+        pending["vnodes"] = 3
+        r = self.result([
+            self.ci(1, 1),
+            {"op": "cp", "config": pending, "at": 5, "now": 2},
+            {"op": "ca", "now": 5},
+            self.ad(2),
+        ])
+        self.assertEqual((r["kind"], r["section"]), ("ca", None))
+        self.assertEqual(
+            [c["section"] for c in r["changes"]], ["vnodes"]
+        )
+
+    def test_unallocated_and_beyond_latest_are_state(self):
+        code, stdout, stderr = self.run_ops([self.ad(1)])
+        self.assertEqual((code, stdout, stderr),
+                         (4, b"", b'{"error":"STATE"}\n'))
+        code, stdout, stderr = self.run_ops([self.ci(1, 1), self.ad(2)])
+        self.assertEqual((code, stdout, stderr),
+                         (4, b"", b'{"error":"STATE"}\n'))
+        # 10^18 类型范围合法但从未分配：STATE。
+        code, stdout, stderr = self.run_ops([self.ad(10 ** 18)])
+        self.assertEqual((code, stdout, stderr),
+                         (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_evicted_event_is_state_but_retained_one_reads(self):
+        ops = [self.ci(i, i) for i in range(1, 66)]
+        code, stdout, stderr = self.run_ops(ops + [self.ad(1)])
+        self.assertEqual((code, stdout, stderr),
+                         (4, b"", b'{"error":"STATE"}\n'))
+        r = self.result(ops + [self.ad(2)])
+        self.assertEqual(r["rev"], 2)
+        # 与 al/ai 的六十四条窗口一致：最旧事件即 rev2。
+        code, stdout, stderr = self.run_ops(ops + [self.ai(0, 64)])
+        self.assertEqual(code, 0)
+        events = json.loads(stdout.decode("utf-8"))["results"][-1]["events"]
+        self.assertEqual([e["rev"] for e in events], list(range(2, 66)))
+
+    def test_invalid_shapes_are_input(self):
+        bad_raw = [
+            b'{"ops":[{"op":"ad"}]}',
+            b'{"ops":[{"op":"ad","rev":0}]}',
+            b'{"ops":[{"op":"ad","rev":-1}]}',
+            b'{"ops":[{"op":"ad","rev":1000000000000000001}]}',
+            b'{"ops":[{"op":"ad","rev":true}]}',
+            b'{"ops":[{"op":"ad","rev":1.0}]}',
+            b'{"ops":[{"op":"ad","rev":"1"}]}',
+            b'{"ops":[{"op":"ad","rev":null}]}',
+            b'{"ops":[{"op":"ad","rev":[1]}]}',
+            b'{"ops":[{"op":"ad","rev":1,"now":1}]}',
+            b'{"ops":[{"op":"ad","rev":1,"x":1}]}',
+            b'{"ops":[{"op":"rev":1}]}',
+            b'{"ops":[{"op":"ad","now":1,"rev":1}]}',
+            b'{"ops":[{"op":"ad","rev":1,"rev":2}]}',
+        ]
+        for raw in bad_raw:
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual(
+                (code, stdout, stderr),
+                (2, b"", b'{"error":"INPUT"}\n'),
+                raw,
+            )
+
+    def test_read_only_does_not_move_clock_or_window(self):
+        # ad 不占用时钟：其后 now=4 的 ci 仍按时钟倒退报 INPUT，now=5 可成功。
+        base_ops = [self.ci(1, 5)]
+        code, _, _ = self.run_ops(base_ops + [self.ad(1), self.ci(2, 4)])
+        self.assertEqual(code, 2)
+        code, _, stderr = self.run_ops(base_ops + [self.ad(1), self.ci(2, 5)])
+        self.assertEqual((code, stderr), (0, b""))
+        # 重复查询逐字节一致，且不改变 al 窗口。
+        code, out1, _ = self.run_ops(base_ops + [self.ad(1)])
+        code, out2, _ = self.run_ops(
+            base_ops + [self.ad(1), self.ad(1)]
+        )
+        self.assertEqual(code, 0)
+        results = json.loads(out2.decode("utf-8"))["results"]
+        self.assertEqual(results[-2], results[-1])
+        self.assertEqual(
+            json.loads(out1.decode("utf-8"))["results"][-1], results[-1]
+        )
+
+    def test_failure_rolls_back_whole_batch(self):
+        code, stdout, stderr = self.run_ops([self.ci(1, 1), self.ad(9)])
+        self.assertEqual((code, stdout, stderr),
+                         (4, b"", b'{"error":"STATE"}\n'))
+        code, stdout, stderr = self.run_ops([self.ci(1, 1), self.ad(0)])
+        self.assertEqual((code, stdout, stderr),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_record_replay_success_and_failure(self):
+        raw = encode_ops([
+            self.ci(1, 1), self.ci(2, 2, lifetime=3), self.ad(2),
+        ])
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        _, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual((run_code, rec_stderr), (0, b""))
+        self.assertEqual(rep_stderr, b"")
+        self.assertEqual((rep_code, rep_stdout), (run_code, run_stdout))
+        # 失败结果同样可记录与重放。
+        raw = encode_ops([self.ad(5)])
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual((run_code, run_stdout), (4, b""))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

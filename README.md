@@ -42,6 +42,15 @@
 - 事件项键序 `rev,now,kind,section,before,after`，两查询值义相同：`now` 为该变更操作的显式时钟，`kind` ∈ ci/cb/cu/ca，`section` 仅 `cu` 取被替换的顶层字段、其余为 null，`before`/`after` 为变更前后规范化 version=11 配置的 ct 摘要。
 - `ai` 时间 O(A)、额外空间 O(limit)，A≤64，仅用标准库；紧凑 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节契约不变。
 
+## 审计段级差异查询：ad
+
+按审计修订号返回某次配置变更的顶层段级前后指纹与实际差异；与 al/ai 事件同寿命、同淘汰。只读、不推进时钟、不改变淘汰窗口，失败批次回滚。
+
+- `ad`：精确键序仅 `op,rev`；`rev` 为 1..10^18 的非 bool 整数。键集、键序、类型或范围非法报 INPUT/2；`rev` 尚未分配、超过最新修订，或其事件已随六十四条窗口淘汰报 STATE/4。
+- 每次 ci/cb/cu/ca 成功分配 rev 时在同一审计事件内固化段级差异（仅存各段前后指纹、不复制整份配置），随事件一起保留和淘汰；即使整配置前后指纹相同也保留事件，此时 `changes=[]`。
+- 返回固定键序 `op,rev,now,kind,section,before,after,changes`：前七项与同 rev 的 al 或 ai 事件逐值一致；`changes` 按 ce 规范化 version=11 配置的顶层键序排列但排除 version，只列前后值不同的段，项固定键序 `section,before,after`，两指纹为该段规范化 JSON 值按紧凑 UTF-8 与固定键序编码后的 SHA-256 小写六十四位十六进制。`cu` 的 `section` 仍为请求替换的段名，是否实际变化以 `changes` 为准（规范化后等值的替换不产生差异项）。
+- 段级记录额外空间 O(64S)，ad 查询时间与额外空间 O(S)，成功配置变更的段级连同整配置指纹计算为 O(C)（S 为规范化顶层段数，C 为配置编码长度）；重复查询逐字节一致，record/replay 继续覆盖成功与失败结果，仅用标准库。
+
 ## 后端并发告警：na
 
 每后端独立的并发滞回告警，窗值取该后端 `w` 窗 `mx` 口径的 `samples`/`peak`（空窗均为 0）。
