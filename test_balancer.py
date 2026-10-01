@@ -9020,6 +9020,466 @@ class RuUnavailabilityTest(unittest.TestCase):
         )
 
 
+class UaUnavailabilityAlertTest(unittest.TestCase):
+    """连续不可用时长告警 ua：按 (id,reason) 独立的阈值状态机与 ru 同口径。"""
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def assert_failure_raw(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""), err)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def ua(self, ops, backend_id, reason, threshold, now):
+        return self.run_ops(
+            ops + [{"op": "ua", "id": backend_id, "reason": reason,
+                    "threshold": threshold, "now": now}]
+        )[-1]
+
+    def test_byte_layout_and_fixed_key_order(self):
+        raw = encode_ops([
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 2},
+            {"op": "ua", "id": "a", "reason": "health",
+             "threshold": 5, "now": 6},
+        ])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertIn(
+            b'{"op":"ua","id":"a","reason":"health","threshold":5,'
+            b'"state":"N","active":true,"since":2,"duration":4,'
+            b'"changed":false}',
+            out,
+        )
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertNotIn(b"\n", out[:-1])
+        results = json.loads(out.decode("utf-8"))["results"]
+        self.assertEqual(
+            list(results[-1]),
+            ["op", "id", "reason", "threshold", "state", "active",
+             "since", "duration", "changed"],
+        )
+
+    def test_inactive_reason_is_false_null_zero(self):
+        result = self.ua(
+            [{"op": "add", "id": "a", "weight": 1}],
+            "a", "health", 5, 7,
+        )
+        self.assertEqual(
+            result,
+            {"op": "ua", "id": "a", "reason": "health", "threshold": 5,
+             "state": "N", "active": False, "since": None, "duration": 0,
+             "changed": False},
+        )
+
+    def test_first_eval_over_threshold_changed_true(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 2},
+        ]
+        # 首次评估已超阈：以前态 N 计，N→A，changed=true。
+        result = self.ua(ops, "a", "health", 5, 10)
+        self.assertEqual(result["state"], "A")
+        self.assertEqual(result["active"], True)
+        self.assertEqual(result["since"], 2)
+        self.assertEqual(result["duration"], 8)
+        self.assertIs(result["changed"], True)
+        # duration==threshold 即为 A。
+        result = self.ua(ops, "a", "health", 8, 10)
+        self.assertEqual(result["state"], "A")
+        self.assertIs(result["changed"], True)
+        # 差一为 N，首评未转换，changed=false。
+        result = self.ua(ops, "a", "health", 9, 10)
+        self.assertEqual(result["state"], "N")
+        self.assertIs(result["changed"], False)
+
+    def test_transition_sequence_n_a_n_a(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 10},
+        ]
+        # 未达阈：N，changed=false。
+        r = self.ua(ops, "a", "health", 5, 12)
+        self.assertEqual((r["state"], r["changed"]), ("N", False))
+        ops.append({"op": "ua", "id": "a", "reason": "health",
+                    "threshold": 5, "now": 12})
+        # 达阈：N→A。
+        r = self.ua(ops, "a", "health", 5, 15)
+        self.assertEqual((r["state"], r["duration"], r["changed"]),
+                         ("A", 5, True))
+        ops.append({"op": "ua", "id": "a", "reason": "health",
+                    "threshold": 5, "now": 15})
+        # 原因消失（恢复 healthy）：A→N，active=false/null/0。
+        ops.append({"op": "probe", "id": "a", "ok": True, "now": 20})
+        r = self.ua(ops, "a", "health", 5, 20)
+        self.assertEqual((r["state"], r["active"], r["since"],
+                          r["duration"], r["changed"]),
+                         ("N", False, None, 0, True))
+        ops.append({"op": "ua", "id": "a", "reason": "health",
+                    "threshold": 5, "now": 20})
+        # 再次下线未达阈：N 态保持，changed=false。
+        ops.append({"op": "probe", "id": "a", "ok": False, "now": 30})
+        r = self.ua(ops, "a", "health", 5, 31)
+        self.assertEqual((r["state"], r["since"], r["duration"],
+                          r["changed"]), ("N", 30, 1, False))
+        ops.append({"op": "ua", "id": "a", "reason": "health",
+                    "threshold": 5, "now": 31})
+        # 达阈：N→A，since 为新区间起点 30。
+        r = self.ua(ops, "a", "health", 5, 35)
+        self.assertEqual((r["state"], r["since"], r["duration"],
+                          r["changed"]), ("A", 30, 5, True))
+
+    def test_reasons_evaluated_independently_without_shadowing(self):
+        # 四原因同时生效：高优先级 drain 不得遮蔽其余三项。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 2},
+            {"op": "ds", "id": "a", "t": 100},
+            {"op": "dr", "id": "a", "now": 3},
+            {"op": "fs", "id": "a", "k": "D", "a": 4, "z": 100, "v": 0},
+        ]
+        expected = {
+            "drain": (3, 7),
+            "health": (1, 9),
+            "circuit": (2, 8),
+            "fault": (4, 6),
+        }
+        # 各原因独立阈值，互不影响状态。
+        for reason, (since, duration) in expected.items():
+            r = self.ua(ops, "a", reason, duration + 1, 10)
+            self.assertEqual(r["active"], True, reason)
+            self.assertEqual(r["since"], since, reason)
+            self.assertEqual(r["duration"], duration, reason)
+            self.assertEqual(r["state"], "N", reason)
+            self.assertIs(r["changed"], False, reason)
+        # 同批内四原因全部首评超阈，各自独立 A、changed=true。
+        ops2 = list(ops)
+        for reason, (since, duration) in expected.items():
+            r = self.ua(ops2, "a", reason, duration, 10)
+            self.assertEqual((r["state"], r["changed"], r["since"],
+                              r["duration"]),
+                             ("A", True, since, duration), reason)
+
+    def test_fault_facts_align_with_ru(self):
+        # F 振荡段：ua 与同一时刻 ru 的 fault 项逐值一致。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "F", "a": 10, "z": 100, "v": 5},
+        ]
+        # 下线相位 [10,15)：active，since=10。
+        results = self.run_ops(ops + [
+            {"op": "ua", "id": "a", "reason": "fault",
+             "threshold": 4, "now": 14},
+            {"op": "ru", "id": "a", "now": 14},
+        ])
+        ua_result, ru_result = results[-2], results[-1]
+        self.assertEqual(
+            (ua_result["active"], ua_result["since"],
+             ua_result["duration"], ua_result["state"],
+             ua_result["changed"]),
+            (True, 10, 4, "A", True),
+        )
+        self.assertEqual(
+            ru_result["reasons"],
+            [{"reason": "fault", "since": 10, "duration": 4}],
+        )
+        # 上线相位 [15,20)：inactive。
+        results = self.run_ops(ops + [
+            {"op": "ru", "id": "a", "now": 17},
+        ])
+        self.assertEqual(results[-1]["reasons"], [])
+
+    def test_threshold_fixed_after_first_eval(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {"op": "ua", "id": "a", "reason": "health",
+             "threshold": 5, "now": 0},
+        ]
+        # 已登记组合变更 threshold：STATE。
+        self.assert_failure(
+            ops + [{"op": "ua", "id": "a", "reason": "health",
+                    "threshold": 6, "now": 1}],
+            4, "STATE",
+        )
+        # 失败批次整批丢弃：不含首评的等价批次里 threshold=6 是全新首评
+        # （now=1 未超阈为 N；若 5 的登记泄漏出来则会报 STATE）。
+        fresh = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+        ]
+        r = self.ua(fresh, "a", "health", 6, 1)
+        self.assertEqual((r["state"], r["changed"]), ("N", False))
+        # 同 threshold 推进时刻合法，状态沿用上一成功评估。
+        r = self.ua(ops, "a", "health", 5, 5)
+        self.assertEqual((r["state"], r["changed"]), ("A", True))
+
+    def test_same_now_replay_returns_first_result_verbatim(self):
+        # fs 不携带时钟：ua 首评后于同一 now 替换故障时间线，同参重报仍原样
+        # 返回首次结果；原因变化到更大的 now 才可见。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 100, "v": 0},
+            {"op": "ua", "id": "a", "reason": "fault",
+             "threshold": 5, "now": 10},
+        ]
+        first = self.run_ops(ops)[-1]
+        self.assertEqual(
+            (first["state"], first["since"], first["duration"],
+             first["changed"]),
+            ("A", 0, 10, True),
+        )
+        # 替换为 S 段（永不阻断），同 now 重报原样返回首次 A 结果。
+        ops += [
+            {"op": "fs", "id": "a", "k": "S", "a": 0, "z": 100, "v": 7},
+            {"op": "ua", "id": "a", "reason": "fault",
+             "threshold": 5, "now": 10},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1], first)
+        # 更大 now：A→N，changed=true。
+        ops.append({"op": "ua", "id": "a", "reason": "fault",
+                    "threshold": 5, "now": 11})
+        results = self.run_ops(ops)
+        self.assertEqual(
+            (results[-1]["state"], results[-1]["active"],
+             results[-1]["since"], results[-1]["duration"],
+             results[-1]["changed"]),
+            ("N", False, None, 0, True),
+        )
+
+    def test_remove_readd_clears_registrations(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {"op": "ua", "id": "a", "reason": "health",
+             "threshold": 1, "now": 2},
+            {"op": "close", "cid": "x", "now": 3},
+            {"op": "remove", "id": "a"},
+            {"op": "add", "id": "a", "weight": 1},
+        ]
+        # 同 id 重加：该组合回到未首评，新后端 healthy，首评 N 且
+        # changed=false（若沿用旧 A 态，原因消失会报 changed=true）。
+        r = self.ua(ops, "a", "health", 1, 4)
+        self.assertEqual(
+            (r["state"], r["active"], r["changed"]), ("N", False, False)
+        )
+
+    def test_ci_cb_ca_cu_clear_all_ua(self):
+        def armed(now):
+            return [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "hset", "id": "a", "fail": 1, "success": 1},
+                {"op": "probe", "id": "a", "ok": False, "now": 0},
+                {"op": "ua", "id": "a", "reason": "health",
+                 "threshold": 1, "now": now},
+            ]
+
+        # 配置变更前：A。
+        self.assertEqual(self.ua(armed(2), "a", "health", 1, 2)["state"],
+                         "A")
+
+        def expect_fresh_n(change_ops):
+            # 原因在配置重建后已消失（healthy）；若 ua 状态被清空，首评即 N
+            # 且 changed=false；若错误保留旧 A 态则会报 changed=true。
+            ops = armed(2)
+            ops += [{"op": "probe", "id": "a", "ok": True, "now": 3}]
+            ops += change_ops
+            r = self.ua(ops, "a", "health", 1, 6)
+            self.assertEqual(
+                (r["state"], r["active"], r["changed"]),
+                ("N", False, False),
+            )
+
+        expect_fresh_n([{"op": "ci", "config": config_v10(1), "now": 3}])
+        expect_fresh_n([
+            {"op": "ci", "config": config_v11(1), "now": 3},
+            {"op": "cb", "rev": 1, "now": 4},
+        ])
+        expect_fresh_n([
+            {"op": "ci", "config": config_v11(1), "now": 3},
+            {"op": "cp", "config": config_v11(1), "at": 4, "now": 3},
+            {"op": "ca", "now": 4},
+        ])
+        base = digest_of(config_v11(1))
+        expect_fresh_n([
+            {"op": "ci", "config": config_v11(1), "now": 3},
+            {"op": "cu", "base": base, "section": "vnodes",
+             "value": None, "now": 4},
+        ])
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            [{"op": "add", "id": "a", "weight": 1},
+             {"op": "ua", "id": "b", "reason": "health",
+              "threshold": 1, "now": 0}],
+            3, "BACKEND",
+        )
+        self.assert_failure(
+            [{"op": "ua", "id": "a", "reason": "health",
+              "threshold": 1, "now": 0}],
+            3, "BACKEND",
+        )
+
+    def test_input_errors(self):
+        base = [{"op": "add", "id": "a", "weight": 1}]
+        # 键序反、多键、缺键。
+        self.assert_failure_raw(
+            b'{"ops":[{"now":0,"threshold":1,"reason":"health","id":"a",'
+            b'"op":"ua"}]}',
+            2, "INPUT",
+        )
+        self.assert_failure(
+            base + [{"op": "ua", "id": "a", "reason": "health",
+                     "threshold": 1, "now": 0, "x": 1}],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            base + [{"op": "ua", "id": "a", "reason": "health",
+                     "threshold": 1}],
+            2, "INPUT",
+        )
+        # reason 非法：枚举外串、bool、null、数字、大小写。
+        for bad_reason in ("removed", "DRAIN", "", True, False, None, 0, 3):
+            self.assert_failure(
+                base + [{"op": "ua", "id": "a", "reason": bad_reason,
+                         "threshold": 1, "now": 0}],
+                2, "INPUT",
+            )
+        # threshold：bool、0、超 10^9、字符串、浮点、null。
+        for bad in (True, False, 0, 10 ** 9 + 1, "1", 1.0, None):
+            self.assert_failure(
+                base + [{"op": "ua", "id": "a", "reason": "health",
+                         "threshold": bad, "now": 0}],
+                2, "INPUT",
+            )
+        # now：bool、负数、超 10^9、字符串、浮点、null。
+        for bad in (True, False, -1, 10 ** 9 + 1, "0", 1.0, None):
+            self.assert_failure(
+                base + [{"op": "ua", "id": "a", "reason": "health",
+                         "threshold": 1, "now": bad}],
+                2, "INPUT",
+            )
+        # id：空串与非 UTF-8（孤立代理）。
+        self.assert_failure(
+            base + [{"op": "ua", "id": "", "reason": "health",
+                     "threshold": 1, "now": 0}],
+            2, "INPUT",
+        )
+        self.assert_failure_raw(
+            b'{"ops":[{"op":"add","id":"a","weight":1},'
+            b'{"op":"ua","id":"\\ud800","reason":"health",'
+            b'"threshold":1,"now":0}]}',
+            2, "INPUT",
+        )
+
+    def test_threshold_boundaries_accepted(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+        ]
+        # 下界 1：duration==threshold 为 A。
+        r = self.ua(ops, "a", "health", 1, 1)
+        self.assertEqual((r["state"], r["duration"]), ("A", 1))
+        # 上界 10^9：合法首评，未达阈 N（独立批次，避免同组合阈值固化）。
+        r = self.ua(ops, "a", "health", 10 ** 9, 2)
+        self.assertEqual(r["state"], "N")
+
+    def test_clock_regression_is_input_and_rollback(self):
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "ua", "id": "a", "reason": "health",
+                 "threshold": 1, "now": 5},
+                {"op": "ua", "id": "a", "reason": "health",
+                 "threshold": 1, "now": 4},
+            ],
+            2, "INPUT",
+        )
+        # 与其他 now 操作共用同一时钟。
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "probe", "id": "a", "ok": True, "now": 9},
+                {"op": "ua", "id": "a", "reason": "health",
+                 "threshold": 1, "now": 8},
+            ],
+            2, "INPUT",
+        )
+
+    def test_ua_does_not_mutate_other_state(self):
+        # ua 前后同刻 br 快照必须逐值一致；ua 只推进时钟与自身告警状态。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 2},
+            {"op": "br", "now": 10},
+            {"op": "ua", "id": "a", "reason": "health",
+             "threshold": 1, "now": 10},
+            {"op": "br", "now": 10},
+            {"op": "ru", "id": "a", "now": 10},
+        ]
+        results = self.run_ops(ops)
+        before_snapshot, after_snapshot = results[-4], results[-2]
+        self.assertEqual(before_snapshot, after_snapshot)
+
+    def test_record_replay_byte_identical(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "fs", "id": "a", "k": "F", "a": 0, "z": 100, "v": 5},
+            {"op": "ua", "id": "a", "reason": "health",
+             "threshold": 3, "now": 6},
+            {"op": "ua", "id": "a", "reason": "fault",
+             "threshold": 2, "now": 6},
+            {"op": "ua", "id": "a", "reason": "health",
+             "threshold": 3, "now": 6},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+        results = json.loads(run_stdout.decode("utf-8"))["results"]
+        # now=6：health since=1 duration=5 超阈 A（首评 changed）；fault 落
+        # 在 F 上线相位 [5,10) 为 inactive N；同参重报原样。
+        self.assertEqual(results[-3]["state"], "A")
+        self.assertEqual(results[-2]["state"], "N")
+        self.assertEqual(results[-1], results[-3])
+
+
 class HashDryRunTest(unittest.TestCase):
     """哈希配置预演 hd：以当前/候选配置的 backends、vnodes 建环（忽略运行态
     与粘性），按 keys 原序预演 chash 映射，不应用配置。"""
