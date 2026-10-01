@@ -16227,5 +16227,361 @@ class AuditDiffTest(unittest.TestCase):
         self.assertEqual(rep_code, 4)
 
 
+class CheckpointTest(unittest.TestCase):
+    """运行态检查点 se/si：导出、恢复、摘要、规范化键序、错误优先级与
+    record/replay 逐字节契约。"""
+
+    CONFIG = {
+        "version": 11,
+        "backends": [
+            {"id": "b1", "weight": 3, "d": 0, "fail": 2, "success": 2,
+             "circuit": {"n": 4, "m": 2, "r": 50, "w": 10, "q": 2},
+             "drain": None, "endpoint": {"host": "10.0.0.1", "port": 80}},
+            {"id": "b2", "weight": 5, "d": 10, "fail": 3, "success": 2,
+             "circuit": None, "drain": None, "endpoint": None},
+        ],
+        "vnodes": 4,
+        "limits": [{"scope": "B", "id": "b1", "r": 2, "b": 5},
+                   {"scope": "C", "id": "c1", "r": 1, "b": 3}],
+        "overload": {"cap": 3, "q": 5, "ttl": 30},
+        "sticky": {"ttl": 100}, "idle": None,
+        "backpressure": {"low": 1, "high": 4},
+        "scheduler": {"pick": "W"},
+        "faults": [],
+        "quotas": [{"scope": "S", "id": "s1", "limit": 10, "span": 60}],
+        "queue": {"dequeue": "F", "full": "T"},
+        "capacities": [],
+        "lifetime": None,
+    }
+
+    SETUP = [
+        {"op": "ci", "config": CONFIG, "now": 0},
+        {"op": "route", "key": "k1", "now": 5},
+        {"op": "cr", "id": "b1", "ok": False, "now": 6},
+        {"op": "open", "cid": "c0", "flow": FLOW, "now": 7},
+        {"op": "probe", "id": "b1", "ok": False, "now": 8},
+        {"op": "mr", "id": "b1", "ok": False, "ms": 5,
+         "retries": 0, "remaps": 1, "now": 8},
+        {"op": "ms", "id": "b1", "now": 8},
+        {"op": "la", "c": "c1", "s": "s1", "key": "kk",
+         "bc": 1, "cc": 1, "sc": 1, "now": 9},
+        {"op": "mo", "seq": 1, "now": 60},
+    ]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        return code, out, err
+
+    def export(self, ops):
+        code, out, err = self.run_ops(ops + [{"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        result = json.loads(out)["results"][-1]
+        return result
+
+    def checkpoint(self, result):
+        return {"op": "si", "version": result["version"],
+                "digest": result["digest"], "state": result["state"]}
+
+    def canonical(self, result):
+        return json.dumps(
+            {"version": result["version"], "state": result["state"]},
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+
+    def test_empty_export_shape(self):
+        result = self.export([])
+        self.assertEqual(list(result), ["op", "version", "digest", "state"])
+        self.assertEqual(result["op"], "se")
+        self.assertEqual(result["version"], 1)
+        self.assertRegex(result["digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            hashlib.sha256(self.canonical(result)).hexdigest(),
+            result["digest"],
+        )
+        state = result["state"]
+        self.assertIsNone(state["now"])
+        self.assertEqual(state["next_rev"], 1)
+        self.assertEqual(state["backends"], [])
+        self.assertEqual(state["connections"], [])
+
+    def test_deterministic_export_bytes(self):
+        code, out, err = self.run_ops(
+            self.SETUP + [{"op": "se"}, {"op": "se"}]
+        )
+        self.assertEqual(code, 0)
+        results = json.loads(out)["results"]
+        self.assertEqual(results[-1], results[-2])
+
+    def test_se_does_not_advance_clock(self):
+        # se 夹在 now=8 与 now=9 之间不推进时钟；紧接 now=8 仍合法（非递减）。
+        code, _, err = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "probe", "id": "b", "ok": True, "now": 8},
+            {"op": "se"},
+            {"op": "probe", "id": "b", "ok": True, "now": 8},
+        ])
+        self.assertEqual((code, err), (0, b""))
+
+    def test_import_idempotent_and_reproduces(self):
+        result = self.export(self.SETUP)
+        cp = self.checkpoint(result)
+        code, out, err = self.run_ops([cp, cp, {"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        reexport = json.loads(out)["results"][-1]
+        self.assertEqual(reexport["version"], result["version"])
+        self.assertEqual(reexport["digest"], result["digest"])
+        self.assertEqual(reexport["state"], result["state"])
+
+    def test_continuation_byte_equivalence(self):
+        result = self.export(self.SETUP)
+        cp = self.checkpoint(result)
+        # 带 now 的读操作时刻须非递减（沿用全局显式时钟）；无 now 的查询
+        # （cl/al/ad/ce/ct/get/rg/bq/og/ai/hm/fm）不推进时钟，穿插即可。
+        cont = [
+            {"op": "wg", "id": "b1", "now": 61},
+            {"op": "hget", "id": "b1"},
+            {"op": "route", "key": "k1", "now": 63},
+            {"op": "cl"}, {"op": "al"}, {"op": "ad", "rev": 1},
+            {"op": "ce"}, {"op": "ct"},
+            {"op": "get", "cid": "c0"},
+            {"op": "mg", "id": "b1", "now": 64},
+            {"op": "br", "now": 65}, {"op": "cq", "now": 66},
+            {"op": "qg", "scope": "S", "id": "s1", "now": 67},
+            {"op": "lg", "scope": "C", "id": "c1", "now": 68},
+            {"op": "ru", "id": "b1", "now": 69},
+            {"op": "rg"}, {"op": "bq"}, {"op": "og"},
+            {"op": "ai", "after": 0, "limit": 10},
+            {"op": "hm", "id": "b1"}, {"op": "fm", "id": "b1"},
+            {"op": "mh", "id": "b1", "from": 0, "to": 1, "now": 119},
+            {"op": "mx", "id": "b1", "from": 0, "to": 1, "now": 119},
+        ]
+        code_a, out_a, err_a = self.run_ops(self.SETUP + cont)
+        code_b, out_b, err_b = self.run_ops([cp] + cont)
+        self.assertEqual((code_a, err_a), (code_b, err_b))
+        a = json.loads(out_a)
+        b = json.loads(out_b)
+        self.assertEqual(a["results"][-len(cont):], b["results"][-len(cont):])
+        self.assertEqual(a["backends"], b["backends"])
+
+    def test_following_mutation_equivalent(self):
+        result = self.export(self.SETUP)
+        cp = self.checkpoint(result)
+        mutations = [
+            {"op": "probe", "id": "b1", "ok": True, "now": 70},
+            {"op": "route", "key": "k9", "now": 71},
+            {"op": "mr", "id": "b1", "ok": True, "ms": 3,
+             "retries": 0, "remaps": 0, "now": 72},
+            {"op": "se"},
+        ]
+        code_a, out_a, err_a = self.run_ops(self.SETUP + mutations)
+        code_b, out_b, err_b = self.run_ops([cp] + mutations)
+        self.assertEqual((code_a, code_b, err_a, err_b), (0, 0, b"", b""))
+        a = json.loads(out_a)["results"][-1]
+        b = json.loads(out_b)["results"][-1]
+        self.assertEqual(a, b)
+
+    def assert_input(self, ops):
+        code, out, err = self.run_ops(ops)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"INPUT"}\n')
+
+    def assert_state(self, ops):
+        code, out, err = self.run_ops(ops)
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"STATE"}\n')
+
+    def test_input_key_and_version_errors(self):
+        result = self.export(self.SETUP)
+        st, dg = result["state"], result["digest"]
+        self.assert_input([{"op": "se", "now": 1}])
+        self.assert_input([{"op": "si"}])
+        self.assert_input(
+            [{"op": "si", "digest": dg, "version": 1, "state": st}])
+        self.assert_input([{"op": "si", "version": 2, "digest": dg,
+                           "state": st}])
+        self.assert_input([{"op": "si", "version": "1", "digest": dg,
+                           "state": st}])
+        self.assert_input([{"op": "si", "version": 1, "digest": "0" * 64,
+                           "state": st}])
+        self.assert_input([{"op": "si", "version": 1,
+                           "digest": dg.upper(), "state": st}])
+        self.assert_input([{"op": "si", "version": 1, "digest": dg,
+                           "state": "not-an-object"}])
+
+    def test_digest_mismatch_input(self):
+        result = self.export(self.SETUP)
+        self.assert_input([{"op": "si", "version": 1,
+                           "digest": "a" * 64, "state": result["state"]}])
+
+    def test_state_type_and_range_input(self):
+        result = self.export(self.SETUP)
+
+        def import_with(mutator):
+            st = json.loads(json.dumps(result["state"]))
+            mutator(st)
+            envelope = json.dumps(
+                {"version": 1, "state": st},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            digest = hashlib.sha256(envelope).hexdigest()
+            return [{"op": "si", "version": 1, "digest": digest,
+                     "state": st}]
+
+        self.assert_input(import_with(lambda st: st.__setitem__("vnodes", 0)))
+        self.assert_input(import_with(lambda st: st.__setitem__("now", True)))
+        self.assert_input(import_with(lambda st: st.__setitem__("now", -1)))
+        self.assert_input(
+            import_with(lambda st: st["pick"].__setitem__("mode", "X")))
+        self.assert_input(import_with(lambda st: st.__setitem__("extra", 1)))
+        st = json.loads(json.dumps(result["state"]))
+        del st["now"]
+        env = json.dumps({"version": 1, "state": st},
+                         ensure_ascii=False, separators=(",", ":")).encode()
+        self.assert_input([{"op": "si", "version": 1,
+                           "digest": hashlib.sha256(env).hexdigest(),
+                           "state": st}])
+
+    def test_state_dangling_and_contradiction(self):
+        result = self.export(self.SETUP)
+
+        def import_state(st):
+            envelope = json.dumps(
+                {"version": 1, "state": st},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            return [{"op": "si", "version": 1,
+                     "digest": hashlib.sha256(envelope).hexdigest(),
+                     "state": st}]
+
+        st = json.loads(json.dumps(result["state"]))
+        st["sticky"][0]["b"] = "ghost"
+        self.assert_state(import_state(st))
+
+        st = json.loads(json.dumps(result["state"]))
+        st["backends"].append(json.loads(json.dumps(st["backends"][0])))
+        self.assert_state(import_state(st))
+
+        st = json.loads(json.dumps(result["state"]))
+        st["backends"][0]["conns"] = 99
+        self.assert_state(import_state(st))
+
+        st = json.loads(json.dumps(result["state"]))
+        st["backends"][0]["since"]["health"] = 1
+        self.assert_state(import_state(st))
+
+        st = json.loads(json.dumps(result["state"]))
+        st["queue"]["mode"] = "P"
+        self.assert_state(import_state(st))
+
+    def test_failed_import_rolls_back(self):
+        result = self.export(self.SETUP)
+        cp = self.checkpoint(result)
+        # 导入失败后同一批内的 se 不得执行：整批无 stdout、STATE/INPUT。
+        code, out, _ = self.run_ops([
+            {"op": "si", "version": 1, "digest": "f" * 64,
+             "state": result["state"]},
+            {"op": "se"},
+        ])
+        self.assertEqual((code, out), (2, b""))
+        # 成功导入后摘要与导出一致（恢复确实生效）。
+        code, out, err = self.run_ops([cp, {"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            json.loads(out)["results"][-1]["digest"], result["digest"])
+
+    def test_overload_export_and_import(self):
+        # 导出超限：足够多后端使 state 紧凑编码 > 8MiB。
+        adds = [{"op": "add", "id": "b%07d" % i, "weight": 1}
+                for i in range(40000)]
+        code, out, err = self.run_ops(adds + [{"op": "se"}])
+        self.assertEqual((code, out), (7, b""))
+        self.assertEqual(err, b'{"error":"OVERLOAD"}\n')
+        # 导入超限：构造自洽但超 8MiB 的检查点。
+        base_result = self.export([{"op": "add", "id": "x", "weight": 1}])
+        st = json.loads(json.dumps(base_result["state"]))
+        template = json.loads(json.dumps(st["backends"][0]))
+        st["backends"] += [
+            dict(template, id="z%07d" % i) for i in range(40000)
+        ]
+        envelope = json.dumps(
+            {"version": 1, "state": st},
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        code, out, err = self.run_ops([{"op": "si", "version": 1,
+                                    "digest": hashlib.sha256(envelope).hexdigest(),
+                                    "state": st}])
+        self.assertEqual((code, out), (7, b""))
+
+    def test_record_replay_success_and_failure(self):
+        result = self.export(self.SETUP)
+        raw = encode_ops([self.checkpoint(result), {"op": "se"}])
+        code, direct, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, record, err = run_balancer("record", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(replayed, direct)
+        # 失败 si（摘要不符 INPUT/2）同样可 record/replay。
+        bad = encode_ops([{"op": "si", "version": 1,
+                          "digest": "f" * 64, "state": result["state"]}])
+        code, bad_out, bad_err = run_balancer("run", bad)
+        self.assertEqual(code, 2)
+        code, record, _ = run_balancer("record", bad)
+        code, replayed, replayed_err = run_balancer("replay", record)
+        self.assertEqual((code, replayed, replayed_err),
+                         (2, bad_out, bad_err))
+
+    def test_commit_audit_and_reservation_carried(self):
+        # 提交、审计与预约随检查点携带，恢复后立即可见。
+        cp_cfg = json.loads(json.dumps(self.CONFIG))
+        cp_cfg["vnodes"] = None
+        ops = [
+            {"op": "ci", "config": self.CONFIG, "now": 0},
+            {"op": "cp", "config": cp_cfg, "at": 100, "now": 10},
+        ]
+        result = self.export(ops)
+        cp = self.checkpoint(result)
+        code, out, err = self.run_ops([cp, {"op": "cl"}, {"op": "al"},
+                                   {"op": "cq", "now": 20}])
+        self.assertEqual(code, 0)
+        results = json.loads(out)["results"]
+        self.assertEqual(results[1]["current"], 1)
+        self.assertEqual(len(results[1]["commits"]), 1)
+        self.assertEqual(len(results[2]["events"]), 1)
+        self.assertEqual(results[3]["pending"], True)
+        self.assertEqual(results[3]["at"], 100)
+
+    def test_utf8_ordering_rules(self):
+        # 非 ASCII id 与多键桶按 UTF-8 字节规则稳定导出/导入。
+        config = json.loads(json.dumps(self.CONFIG))
+        config["backends"] = [
+            {"id": "é", "weight": 1, "d": 0, "fail": 3, "success": 2,
+             "circuit": None, "drain": None, "endpoint": None},
+            {"id": "a", "weight": 1, "d": 0, "fail": 3, "success": 2,
+             "circuit": None, "drain": None, "endpoint": None},
+        ]
+        config["vnodes"] = None
+        config["limits"] = []
+        config["overload"] = None
+        config["sticky"] = None
+        config["backpressure"] = None
+        config["quotas"] = []
+        ops = [
+            {"op": "ci", "config": config, "now": 0},
+            {"op": "ls", "scope": "C", "id": "é", "r": 1, "b": 1, "now": 0},
+            {"op": "ls", "scope": "C", "id": "a", "r": 1, "b": 1, "now": 0},
+        ]
+        result = self.export(ops)
+        cp = self.checkpoint(result)
+        code_a, out_a, _ = self.run_ops(ops + [{"op": "se"}])
+        code_b, out_b, _ = self.run_ops([cp, {"op": "se"}])
+        self.assertEqual((code_a, code_b), (0, 0))
+        self.assertEqual(json.loads(out_a)["results"][-1],
+                         json.loads(out_b)["results"][-1])
+
+
 if __name__ == "__main__":
     unittest.main()

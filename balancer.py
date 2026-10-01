@@ -1022,6 +1022,34 @@ since=a+2*v*((now-a)//(2*v))，F 上线相位与 S 段不列入。同参重报
 O(log(T+1))、空间 O(1)（T 为故障段数），仅用标准库；沿用紧凑 UTF-8
 固定键序 JSON、单换行及 record/replay 逐字节契约，其他子命令不变且不
 属本题范围。
+
+可移植运行态检查点：在 JSON 操作流中新增 se/si，使一次调用导出的状态
+能在另一条全新调用中恢复并继续处理公开操作；不依赖文件、网络或进程时
+间。对任意合法后续操作序列，直接继续与“导出后在空实例恢复再继续”所
+得退出码、stdout、stderr 逐字节一致。se 精确键序仅 op，不推进显式时
+钟、不改状态，返回固定键序 op,version,digest,state：version 初始为
+1，state 为逐层固定键序的规范化 JSON 对象，有业务顺序的集合（后端加
+入序、连接建连序、等待队列 FIFO、提交/审计 rev 序、告警转换事件窗序、
+分钟窗时序）保持原序，其余集合（粘性键、桶/配额与池级告警标识、老化
+服务类等）沿用 UTF-8 字节排序（复合键 scope 先按 B/C/S）；state 包含
+全部影响后续公开行为的状态——逻辑时钟、纯登记配置与待生效计划、后端
+顺序与健康/权重预热/熔断/排空/不可用起点/登记端点、令牌桶当前令牌与补
+充时刻、固定窗口配额 window/used、活动连接与建连端点快照、粘性映射、
+等待队列、各类分钟历史、故障计划/统计/恢复基线、请求与采样指标及 mo
+游标缓存、全部告警状态机（fe/ea/pa/xa/na/le/ua/wa）及转换历史、提交
+历史与 next_rev、审计事件与段级差异、配置预约。digest 为紧凑 UTF-8
+编码（ensure_ascii=False、分隔符 ,/:、无末尾换行）的
+{"version":1,"state":...} 的小写 SHA-256；相同状态逐字节导出相同结
+果。si 精确接受 op,version,digest,state（键须按此序出现），校验通过
+后原子替换当前状态，返回固定键序 op,digest,ok（ok=true）；连续导入同
+一检查点幂等，恢复后 se 复现相同 version/digest/state。键集合、键序、
+类型、范围、UTF-8、未知 version、摘要格式或摘要不符报 INPUT/2；摘要
+相符但有悬空引用、重复标识、矛盾计数或非法状态组合报 STATE/4；state
+紧凑编码超 8388608（8MiB）字节报 OVERLOAD/7（导出导入同限）；任何失
+败均无 stdout 并回滚整批状态。摘要不符先于 state 语义校验；以规范化
+往返（恢复后重新导出与所给 state 的紧凑编码逐字节一致）兜底确定性。
+se/si 及校验为 O(N) 时间、O(N) 额外空间，N 为检查点编码字节数；其余
+操作、错误优先级与 run/record/replay 逐字节契约不变，仅用标准库。
 """
 
 import base64
@@ -2310,6 +2338,7 @@ def parse_op(raw_op):
         "ru",
         "ua",
         "mu",
+        "se", "si",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -3858,10 +3887,96 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("fw", parse_cid(raw_op["cid"]))
 
+    if name == "se":
+        # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
+        # 规范化全部状态并按 O(N) 计算摘要，state 紧凑编码超 8MiB 报
+        # OVERLOAD/7。
+        if list(raw_op) != ["op"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("se",)
+
+    if name == "si":
+        # 运行态检查点导入：精确键序 op,version,digest,state（键须按此序
+        # 出现）。version 仅收 1；digest 为小写 64 位十六进制；state 的
+        # 结构、类型、范围、UTF-8 编码与未知版本留执行期判 INPUT，悬空
+        # 引用、重复标识、矛盾计数或非法状态组合判 STATE；摘要不符先于
+        # state 结构校验判 INPUT。紧凑编码超 8MiB 报 OVERLOAD/7。
+        if list(raw_op) != ["op", "version", "digest", "state"]:
+            fail(EXIT_INPUT, "INPUT")
+        version = raw_op["version"]
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != 1
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        digest = raw_op["digest"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("si", version, digest, raw_op["state"])
+
     # get
     if keys != {"op", "cid"}:
         fail(EXIT_INPUT, "INPUT")
     return ("get", parse_cid(raw_op["cid"]))
+
+
+CHECKPOINT_VERSION = 1
+# state 紧凑 UTF-8 编码上限：8 MiB。
+CHECKPOINT_LIMIT = 8 * 1024 * 1024
+
+
+def cp_nonneg(value):
+    """检查点字段：非负非 bool 整数。"""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def cp_time(value):
+    """检查点时刻字段：0..10^9 非 bool 整数（显式时钟与各 now 同域）。"""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def cp_bool(value):
+    if not isinstance(value, bool):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def cp_list(value):
+    if not isinstance(value, list):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
+def cp_state_int():
+    """非法状态组合（悬空引用、重复标识、矛盾计数、非法组合）。"""
+    fail(EXIT_STATE, "STATE")
+
+
+def cp_hex_digest(value):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
 
 
 def effective_weight(record, now):
@@ -5459,6 +5574,2047 @@ def run(raw):
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
         mo_cache = None
+
+    # -- 运行态检查点（se/si）---------------------------------------------
+    # state 为逐层固定键序的规范化 JSON 对象：有业务顺序的集合（后端加入
+    # 序、连接建连序、FIFO 队列、提交/审计 rev 序、告警事件窗序、分钟窗
+    # 时序）保持原序；无业务顺序的集合（粘性键、桶/配额 (scope,id)、池级
+    # 告警标识、老化服务类等）统一按 UTF-8 字节（scope 先按 B/C/S）排序。
+    # 摘要为紧凑 UTF-8 编码的 {"version":1,"state":...} 的小写 SHA-256。
+    def enc_fault_stats(stats):
+        return {kind: [
+            stats[kind]["affected"], stats[kind]["rejected"],
+            stats[kind]["retries"], stats[kind]["remaps"],
+            stats[kind]["recovered"],
+        ] for kind in "DFS"}
+
+    def export_bundle(b):
+        """把一个完整运行态束 b（dict，键见 BUNDLE_KEYS）规范化为新 JSON
+        结构。se 直接传当前闭包变量构成的束；si 先在局部构造候选束并据此
+        校验、计算摘要，全部通过后才整体替换闭包变量（原子）。O(N)，N 为
+        编码字节数的同阶。只读，不推进时钟、不改束内状态。"""
+        backends = b["backends"]
+        connections = b["connections"]
+        conn_endpoints = b["conn_endpoints"]
+        sticky_map = b["sticky_map"]
+        buckets = b["buckets"]
+        quotas = b["quotas"]
+        wait_queue = b["wait_queue"]
+        cap_overrides = b["cap_overrides"]
+        overload_hist = b["overload_hist"]
+        wait_hist = b["wait_hist"]
+        limit_hist = b["limit_hist"]
+        err_alerts = b["err_alerts"]
+        err_events = b["err_events"]
+        percent_alerts = b["percent_alerts"]
+        percent_events = b["percent_events"]
+        retry_alerts = b["retry_alerts"]
+        retry_events = b["retry_events"]
+        conc_alerts = b["conc_alerts"]
+        limit_alerts = b["limit_alerts"]
+        wait_alerts = b["wait_alerts"]
+        unavail_alerts = b["unavail_alerts"]
+        alert = b["alert"]
+        alert_events = b["alert_events"]
+        commit_history = b["commit_history"]
+        audit_events = b["audit_events"]
+        audit_sections = b["audit_sections"]
+        reservation = b["reservation"]
+        mo_cache = b["mo_cache"]
+        last_now = b["last_now"]
+        ring_vnodes = b["ring_vnodes"]
+        sticky_ttl = b["sticky_ttl"]
+        ttl_cfg = b["idle_ttl"]
+        hard_ttl_cfg = b["hard_ttl"]
+        pick_mode = b["pick_mode"]
+        rr_ticket = b["rr_ticket"]
+        queue_cfg = b["queue_cfg"]
+        bp_cfg = b["bp_cfg"]
+        bp_state = b["bp_state"]
+        dequeue_policy = b["dequeue_policy"]
+        queue_mode = b["queue_mode"]
+        full_mode = b["full_mode"]
+        evict_count = b["evict_count"]
+        evict_last = b["evict_last"]
+        aging_cfg = b["aging_cfg"]
+        mo_seq = b["mo_seq"]
+        next_rev = b["next_rev"]
+        backend_states = []
+        for backend_id, record in backends.items():
+            metrics = [
+                {
+                    "w": window,
+                    "v": [
+                        row[0], row[1], row[2], row[3], list(row[4]),
+                    ],
+                }
+                for window, row in sorted(record["metrics"].items())
+            ]
+            mobase = record["mo_base"]
+            samples = [
+                {
+                    "w": window,
+                    "samples": snapshot["samples"],
+                    "peak": snapshot["peak"],
+                    "points": [
+                        {"t": point_now, "c": conns, "r": reason}
+                        for point_now, (conns, reason)
+                        in sorted(snapshot["points"].items())
+                    ],
+                }
+                for window, snapshot in sorted(record["samples"].items())
+            ]
+            fault_hist = [
+                {"w": window, "v": enc_fault_stats(stats)}
+                for window, stats in sorted(record["fault_hist"].items())
+            ]
+            reason_hist = []
+            for window, counts in sorted(record["reason_hist"].items()):
+                reason_hist.append(
+                    {
+                        "w": window,
+                        "health": list(counts["health"]),
+                        "drain": list(counts["drain"]),
+                        "circuit": list(counts["circuit"]),
+                        "overload": list(counts["overload"]),
+                    }
+                )
+            retry_hist = [
+                {
+                    "w": window,
+                    "retries": list(entry["retries"]),
+                    "remaps": list(entry["remaps"]),
+                }
+                for window, entry in sorted(record["retry_hist"].items())
+            ]
+            # fault_base 为段集合，无独立业务顺序：按 (a,k,z,v) 排序。
+            fault_base = [
+                {"k": seg[0], "a": seg[1], "z": seg[2], "v": seg[3]}
+                for seg in sorted(
+                    record["fault_base"],
+                    key=lambda seg: (seg[1], seg[0], seg[2], seg[3]),
+                )
+            ]
+            faults = [
+                {"k": seg[0], "a": seg[1], "z": seg[2], "v": seg[3]}
+                for seg in record["faults"]
+            ]
+            circuit = record["circuit"]
+            if circuit is None:
+                circuit_state = None
+            else:
+                cr = circuit["cr_now"]
+                circuit_state = {
+                    "n": circuit["params"][0],
+                    "m": circuit["params"][1],
+                    "r": circuit["params"][2],
+                    "w": circuit["params"][3],
+                    "q": circuit["params"][4],
+                    "state": circuit["state"],
+                    "win": list(circuit["window"]),
+                    "next": circuit["next"],
+                    "used": circuit["used"],
+                    "cr": (
+                        None if cr is None
+                        else {"t": cr, "ok": circuit["cr_ok"]}
+                    ),
+                }
+            drain = record["drain"]
+            last_op = record["last_op"]
+            if last_op is None:
+                last_op_state = None
+            elif last_op[0] == "add3":
+                last_op_state = {"k": "add3", "w": last_op[1],
+                                 "d": None, "t": None}
+            else:
+                last_op_state = {"k": last_op[0], "w": last_op[1],
+                                 "d": last_op[2], "t": last_op[3]}
+            endpoint = record["endpoint"]
+            # 每后端告警：ea/eh、pa/ph、xa/xh（R/M）、na、ua 四因。
+            err_entry = err_alerts.get(backend_id)
+            pa_entry = percent_alerts.get(backend_id)
+            alerts_state = {
+                "err": (
+                    None if err_entry is None
+                    else [
+                        err_entry["hi"], err_entry["lo"], err_entry["n"],
+                        err_entry["state"], err_entry["run"], err_entry["w"],
+                        err_entry["result"]["requests"],
+                        err_entry["result"]["errors"],
+                        err_entry["result"]["rate"],
+                        err_entry["result"]["changed"],
+                    ]
+                ),
+                "err_events": [
+                    [event["window"], event["from"], event["to"],
+                     event["rate"], event["hi"], event["lo"], event["n"]]
+                    for event in err_events.get(backend_id, ())
+                ],
+                "pa": (
+                    None if pa_entry is None
+                    else [
+                        pa_entry["p"], pa_entry["hi"], pa_entry["lo"],
+                        pa_entry["n"], pa_entry["state"], pa_entry["run"],
+                        pa_entry["w"], pa_entry["result"]["samples"],
+                        pa_entry["result"]["bucket"],
+                        pa_entry["result"]["upper"],
+                        pa_entry["result"]["changed"],
+                    ]
+                ),
+                "pa_events": [
+                    [event["window"], event["from"], event["to"],
+                     event["p"], event["samples"], event["bucket"],
+                     event["upper"], event["hi"], event["lo"], event["n"]]
+                    for event in percent_events.get(backend_id, ())
+                ],
+                "xa": {},
+                "xa_events": {},
+                "na": None,
+                "ua": {},
+            }
+            for kind_code in ("R", "M"):
+                entry = retry_alerts.get((backend_id, kind_code))
+                alerts_state["xa"][kind_code] = (
+                    None if entry is None
+                    else [
+                        entry["hi"], entry["lo"], entry["n"],
+                        entry["state"], entry["run"], entry["w"],
+                        entry["result"]["value"], entry["result"]["changed"],
+                    ]
+                )
+                alerts_state["xa_events"][kind_code] = [
+                    [event["window"], event["from"], event["to"],
+                     event["value"], event["hi"], event["lo"], event["n"]]
+                    for event in retry_events.get((backend_id, kind_code), ())
+                ]
+            na_entry = conc_alerts.get(backend_id)
+            alerts_state["na"] = (
+                None if na_entry is None
+                else [
+                    na_entry["hi"], na_entry["lo"], na_entry["n"],
+                    na_entry["state"], na_entry["run"], na_entry["w"],
+                    na_entry["result"]["samples"],
+                    na_entry["result"]["peak"],
+                    na_entry["result"]["changed"],
+                ]
+            )
+            for reason_code in ("drain", "health", "circuit", "fault"):
+                entry = unavail_alerts.get((backend_id, reason_code))
+                alerts_state["ua"][reason_code] = (
+                    None if entry is None
+                    else [
+                        entry["threshold"], entry["state"], entry["now"],
+                        entry["result"]["active"], entry["result"]["since"],
+                        entry["result"]["duration"],
+                        entry["result"]["changed"],
+                    ]
+                )
+            backend_states.append(
+                {
+                    "id": backend_id,
+                    "weight": record["weight"],
+                    "current": record["current"],
+                    "conns": record["conns"],
+                    "healthy": record["healthy"],
+                    "fail": record["fail"],
+                    "success": record["success"],
+                    "failures": record["failures"],
+                    "successes": record["successes"],
+                    "probe": (
+                        None if record["probe_now"] is None
+                        else {"t": record["probe_now"], "ok": record["probe_ok"]}
+                    ),
+                    "warm": {
+                        "stage": record["stage"],
+                        "d": record["warm_d"],
+                        "from": record["warm_from"],
+                        "start": record["warm_start"],
+                        "end": record["warm_end"],
+                    },
+                    "circuit": circuit_state,
+                    "drain": {
+                        "t": drain["t"],
+                        "state": drain["state"],
+                        "start": drain["start"],
+                        "end": drain["end"],
+                        "deadline": drain["deadline"],
+                        "forced": drain["forced"],
+                    },
+                    "since": {
+                        "health": record["unavail_since"]["health"],
+                        "drain": record["unavail_since"]["drain"],
+                        "circuit": record["unavail_since"]["circuit"],
+                    },
+                    "lastop": last_op_state,
+                    "endpoint": (
+                        None if endpoint is None
+                        else {"host": endpoint[0], "port": endpoint[1]}
+                    ),
+                    "metrics": metrics,
+                    "mobase": {
+                        "w": mobase[0],
+                        "v": [
+                            mobase[1], mobase[2], mobase[3], mobase[4],
+                            list(mobase[5]),
+                        ],
+                    },
+                    "pickcounts": {
+                        "total": record["pick_counts"]["total"],
+                        "first": record["pick_counts"]["first"],
+                        "sticky": record["pick_counts"]["sticky"],
+                        "expired": record["pick_counts"]["expired"],
+                        "removed": record["pick_counts"]["removed"],
+                        "health": record["pick_counts"]["health"],
+                        "circuit": record["pick_counts"]["circuit"],
+                        "drain": record["pick_counts"]["drain"],
+                    },
+                    "samples": samples,
+                    "faults": faults,
+                    "faultbase": fault_base,
+                    "faultstats": enc_fault_stats(record["fault_stats"]),
+                    "faulthist": fault_hist,
+                    "reasonhist": reason_hist,
+                    "retryhist": retry_hist,
+                    "alerts": alerts_state,
+                }
+            )
+
+        # 连接按建连序（dict 保序）；端点快照内联（键恒为连接 cid 子集）。
+        connection_states = []
+        for cid, connection in connections.items():
+            endpoint = conn_endpoints.get(cid)
+            connection_states.append(
+                {
+                    "cid": cid,
+                    "b": connection[0],
+                    "flow": list(connection[1]),
+                    "opened": connection[2],
+                    "last": connection[3],
+                    "ep": (
+                        None if endpoint is None
+                        else {"host": endpoint[0], "port": endpoint[1]}
+                    ),
+                }
+            )
+
+        # 粘性映射无业务顺序：按 key 的 UTF-8 字节升序。
+        sticky_states = [
+            {"key": key, "b": sticky_map[key][0], "e": sticky_map[key][1]}
+            for key in sorted(sticky_map, key=lambda k: k.encode("utf-8"))
+        ]
+
+        scope_rank = {"B": 0, "C": 1, "S": 2}
+
+        def pair_sort_key(pair):
+            return (scope_rank[pair[0]], pair[1].encode("utf-8"))
+
+        bucket_states = [
+            {
+                "scope": scope,
+                "id": bucket_id,
+                "r": bucket["r"],
+                "b": bucket["b"],
+                "t": bucket["t"],
+                "at": bucket["at"],
+                "last": (
+                    None if bucket["last"] is None
+                    else [bucket["last"][0], bucket["last"][1],
+                          bucket["last"][2]]
+                ),
+            }
+            for (scope, bucket_id), bucket in sorted(
+                buckets.items(),
+                key=lambda item: pair_sort_key(item[0]),
+            )
+        ]
+        quota_states = [
+            {
+                "scope": scope,
+                "id": quota_id,
+                "limit": quota["limit"],
+                "span": quota["span"],
+                "window": quota["window"],
+                "used": quota["used"],
+                "last": (
+                    None if quota["last"] is None
+                    else [quota["last"][0], quota["last"][1],
+                          quota["last"][2]]
+                ),
+            }
+            for (scope, quota_id), quota in sorted(
+                quotas.items(),
+                key=lambda item: pair_sort_key(item[0]),
+            )
+        ]
+
+        # 等待队列按 FIFO（OrderedDict 保序）。
+        wait_states = [
+            {
+                "cid": item[0],
+                "flow": list(item[1]),
+                "c": item[2],
+                "s": item[3],
+                "key": item[4],
+                "cost": [item[5], item[6], item[7]],
+                "now": item[8],
+            }
+            for item in wait_queue.values()
+        ]
+
+        capacity_states = [
+            {"id": backend_id, "cap": cap_overrides[backend_id]}
+            for backend_id in backends
+            if backend_id in cap_overrides
+        ]
+
+        overload_hist_states = [
+            {
+                "w": window,
+                "v": list(row),
+            }
+            for window, row in sorted(overload_hist.items())
+        ]
+        wait_hist_states = [
+            {
+                "w": window,
+                "a": list(row["admitted"]),
+                "e": list(row["expired"]),
+                "c": list(row["cancelled"]),
+                "v": list(row["evicted"]),
+            }
+            for window, row in sorted(wait_hist.items())
+        ]
+        limit_hist_states = []
+        for scope, hist_id in sorted(limit_hist, key=pair_sort_key):
+            history = limit_hist[(scope, hist_id)]
+            limit_hist_states.append(
+                {
+                    "scope": scope,
+                    "id": hist_id,
+                    "rows": [
+                        {"w": window, "v": list(history[window])}
+                        for window in sorted(history)
+                    ],
+                }
+            )
+
+        # 池级告警：fe/ah 一份；wa 按 kind UTF-8 排序；le 按 (scope,id)
+        # UTF-8 排序。
+        pool_alerts = {
+            "fault": (
+                None if alert is None
+                else [
+                    alert["hi"], alert["lo"], alert["n"], alert["state"],
+                    alert["run"], alert["w"], alert["result"]["v"],
+                    alert["result"]["changed"],
+                ]
+            ),
+            "fault_events": [
+                [event["window"], event["from"], event["to"], event["v"],
+                 event["hi"], event["lo"], event["n"]]
+                for event in alert_events
+            ],
+            "wait": [
+                {
+                    "kind": kind_code,
+                    "e": (
+                        lambda entry: [
+                            entry["p"], entry["hi"], entry["lo"], entry["n"],
+                            entry["state"], entry["run"], entry["w"],
+                            entry["result"]["samples"],
+                            entry["result"]["bucket"],
+                            entry["result"]["upper"],
+                            entry["result"]["changed"],
+                        ]
+                    )(wait_alerts[kind_code]),
+                }
+                for kind_code in sorted(wait_alerts)
+            ],
+            "limit": [
+                {
+                    "scope": scope,
+                    "id": alert_id,
+                    "e": [
+                        entry["hi"], entry["lo"], entry["n"], entry["state"],
+                        entry["run"], entry["w"],
+                        entry["result"]["token"], entry["result"]["quota"],
+                        entry["result"]["value"], entry["result"]["changed"],
+                    ],
+                }
+                for (scope, alert_id), entry in sorted(
+                    limit_alerts.items(),
+                    key=lambda item: pair_sort_key(item[0]),
+                )
+            ],
+        }
+
+        commit_states = [
+            {"rev": rev, "config": snapshot}
+            for rev, snapshot in commit_history
+        ]
+        audit_states = []
+        for index, event in enumerate(audit_events):
+            changes = audit_sections[index]
+            audit_states.append(
+                {
+                    "rev": event["rev"],
+                    "now": event["now"],
+                    "kind": event["kind"],
+                    "section": event["section"],
+                    "before": event["before"],
+                    "after": event["after"],
+                    "changes": [
+                        {"section": section, "before": before_digest,
+                         "after": after_digest}
+                        for section, before_digest, after_digest in changes
+                    ],
+                }
+            )
+        reservation_state = None
+        if reservation is not None:
+            snapshot, at, digest = reservation
+            reservation_state = {"at": at, "digest": digest,
+                                 "config": snapshot}
+
+        return {
+            "now": last_now,
+            "vnodes": ring_vnodes,
+            "sticky_ttl": sticky_ttl,
+            "idle_ttl": ttl_cfg,
+            "hard_ttl": hard_ttl_cfg,
+            "pick": {"mode": pick_mode, "ticket": rr_ticket},
+            "overload": (
+                None if queue_cfg is None
+                else {"cap": queue_cfg[0], "q": queue_cfg[1],
+                      "ttl": queue_cfg[2]}
+            ),
+            "backpressure": (
+                None if bp_cfg is None
+                else {"low": bp_cfg[0], "high": bp_cfg[1],
+                      "state": bp_state}
+            ),
+            "queue": {
+                "dequeue": dequeue_policy,
+                "mode": queue_mode,
+                "full": full_mode,
+                "evicted": evict_count,
+                "last": evict_last,
+            },
+            "aging": (
+                None if aging_cfg is None
+                else {
+                    "step": aging_cfg[0],
+                    "items": [
+                        {"s": s_value, "p": aging_cfg[1][s_value]}
+                        for s_value in sorted(
+                            aging_cfg[1], key=lambda s: s.encode("utf-8")
+                        )
+                    ],
+                }
+            ),
+            "backends": backend_states,
+            "connections": connection_states,
+            "sticky": sticky_states,
+            "buckets": bucket_states,
+            "quotas": quota_states,
+            "wait_queue": wait_states,
+            "capacities": capacity_states,
+            "overload_hist": overload_hist_states,
+            "wait_hist": wait_hist_states,
+            "limit_hist": limit_hist_states,
+            "alerts": pool_alerts,
+            "commits": commit_states,
+            "next_rev": next_rev,
+            "audit": audit_states,
+            "reservation": reservation_state,
+            "mo": {
+                "seq": mo_seq,
+                "cache": (
+                    None if mo_cache is None
+                    else {"seq": mo_cache[0], "now": mo_cache[1],
+                          "result": mo_cache[2]}
+                ),
+            },
+        }
+
+    BUNDLE_KEYS = (
+        "last_now", "ring_vnodes", "sticky_ttl", "idle_ttl", "hard_ttl",
+        "pick_mode", "rr_ticket", "queue_cfg", "bp_cfg", "bp_state",
+        "dequeue_policy", "queue_mode", "full_mode", "evict_count",
+        "evict_last", "aging_cfg",
+        "backends", "connections", "conn_endpoints", "sticky_map",
+        "buckets", "quotas", "wait_queue", "cap_overrides",
+        "overload_hist", "wait_hist", "limit_hist", "wait_alerts",
+        "alert", "alert_events",
+        "err_alerts", "err_events", "percent_alerts", "percent_events",
+        "retry_alerts", "retry_events", "conc_alerts", "limit_alerts",
+        "unavail_alerts",
+        "commit_history", "next_rev", "audit_events", "audit_sections",
+        "reservation", "mo_seq", "mo_cache",
+    )
+
+    def current_bundle():
+        """引用当前闭包运行态构成一个束（不拷贝）；供 se 规范化。"""
+        return {
+            "last_now": last_now,
+            "ring_vnodes": ring_vnodes,
+            "sticky_ttl": sticky_ttl,
+            "idle_ttl": ttl_cfg,
+            "hard_ttl": hard_ttl_cfg,
+            "pick_mode": pick_mode,
+            "rr_ticket": rr_ticket,
+            "queue_cfg": queue_cfg,
+            "bp_cfg": bp_cfg,
+            "bp_state": bp_state,
+            "dequeue_policy": dequeue_policy,
+            "queue_mode": queue_mode,
+            "full_mode": full_mode,
+            "evict_count": evict_count,
+            "evict_last": evict_last,
+            "aging_cfg": aging_cfg,
+            "backends": backends,
+            "connections": connections,
+            "conn_endpoints": conn_endpoints,
+            "sticky_map": sticky_map,
+            "buckets": buckets,
+            "quotas": quotas,
+            "wait_queue": wait_queue,
+            "cap_overrides": cap_overrides,
+            "overload_hist": overload_hist,
+            "wait_hist": wait_hist,
+            "limit_hist": limit_hist,
+            "wait_alerts": wait_alerts,
+            "alert": alert,
+            "alert_events": alert_events,
+            "err_alerts": err_alerts,
+            "err_events": err_events,
+            "percent_alerts": percent_alerts,
+            "percent_events": percent_events,
+            "retry_alerts": retry_alerts,
+            "retry_events": retry_events,
+            "conc_alerts": conc_alerts,
+            "limit_alerts": limit_alerts,
+            "unavail_alerts": unavail_alerts,
+            "commit_history": commit_history,
+            "next_rev": next_rev,
+            "audit_events": audit_events,
+            "audit_sections": audit_sections,
+            "reservation": reservation,
+            "mo_seq": mo_seq,
+            "mo_cache": mo_cache,
+        }
+
+    def install_bundle(b):
+        """si 全部校验通过后原子替换全部运行态闭包变量。"""
+        nonlocal last_now, ring_vnodes, sticky_ttl, ttl_cfg, hard_ttl_cfg
+        nonlocal pick_mode, rr_ticket, queue_cfg, bp_cfg, bp_state
+        nonlocal dequeue_policy, queue_mode, full_mode, evict_count, evict_last
+        nonlocal aging_cfg
+        nonlocal backends, connections, conn_endpoints, sticky_map
+        nonlocal buckets, quotas, wait_queue, cap_overrides
+        nonlocal overload_hist, wait_hist, limit_hist, wait_alerts
+        nonlocal alert, alert_events
+        nonlocal err_alerts, err_events, percent_alerts, percent_events
+        nonlocal retry_alerts, retry_events, conc_alerts, limit_alerts
+        nonlocal unavail_alerts
+        nonlocal commit_history, next_rev, audit_events, audit_sections
+        nonlocal reservation, mo_seq, mo_cache
+        last_now = b["last_now"]
+        ring_vnodes = b["ring_vnodes"]
+        sticky_ttl = b["sticky_ttl"]
+        ttl_cfg = b["idle_ttl"]
+        hard_ttl_cfg = b["hard_ttl"]
+        pick_mode = b["pick_mode"]
+        rr_ticket = b["rr_ticket"]
+        queue_cfg = b["queue_cfg"]
+        bp_cfg = b["bp_cfg"]
+        bp_state = b["bp_state"]
+        dequeue_policy = b["dequeue_policy"]
+        queue_mode = b["queue_mode"]
+        full_mode = b["full_mode"]
+        evict_count = b["evict_count"]
+        evict_last = b["evict_last"]
+        aging_cfg = b["aging_cfg"]
+        backends = b["backends"]
+        connections = b["connections"]
+        conn_endpoints = b["conn_endpoints"]
+        sticky_map = b["sticky_map"]
+        buckets = b["buckets"]
+        quotas = b["quotas"]
+        wait_queue = b["wait_queue"]
+        cap_overrides = b["cap_overrides"]
+        overload_hist = b["overload_hist"]
+        wait_hist = b["wait_hist"]
+        limit_hist = b["limit_hist"]
+        wait_alerts = b["wait_alerts"]
+        alert = b["alert"]
+        alert_events = b["alert_events"]
+        err_alerts = b["err_alerts"]
+        err_events = b["err_events"]
+        percent_alerts = b["percent_alerts"]
+        percent_events = b["percent_events"]
+        retry_alerts = b["retry_alerts"]
+        retry_events = b["retry_events"]
+        conc_alerts = b["conc_alerts"]
+        limit_alerts = b["limit_alerts"]
+        unavail_alerts = b["unavail_alerts"]
+        commit_history = b["commit_history"]
+        next_rev = b["next_rev"]
+        audit_events = b["audit_events"]
+        audit_sections = b["audit_sections"]
+        reservation = b["reservation"]
+        mo_seq = b["mo_seq"]
+        mo_cache = b["mo_cache"]
+
+    # ------------------------------------------------------------------
+    # si 导入：把规范化 state 严格解析回内部运行态束。
+    # 结构/键集/键序/类型/范围/UTF-8 非法 → INPUT/2；重复标识、悬空引用、
+    # 矛盾计数或非法状态组合 → STATE/4。调用方须已确认摘要相符。
+    def parse_checkpoint(raw):
+        if not isinstance(raw, dict):
+            fail(EXIT_INPUT, "INPUT")
+
+        def o(value, keys):
+            # 对象键集与键序都须与规范化形态逐字一致（键序偏差属 INPUT）。
+            if not isinstance(value, dict) or list(value) != list(keys):
+                fail(EXIT_INPUT, "INPUT")
+            return value
+
+        def ni(value):
+            return cp_nonneg(value)
+
+        def ti(value):
+            return cp_time(value)
+
+        def si2(value, lo, hi):
+            # 指定闭区间的非 bool 整数。
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not lo <= value <= hi
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            return value
+
+        def enum(value, choices):
+            if not isinstance(value, str) or value not in choices:
+                fail(EXIT_INPUT, "INPUT")
+            return value
+
+        def abstime(value):
+            # 派生绝对时刻（now+ttl/w/d 等）：now 与登记时长各 ≤10^9，故上
+            # 界为 2·10^9；非 bool 整数。
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= 2 * 10 ** 9
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            return value
+
+        def ident(value):
+            return parse_key(value)
+
+        def alert_chain(events, state):
+            """校验滞回告警转换事件链（仅含 60 窗保留窗口，更早事件可能已被
+            前端裁剪，故不假设首事件 from=N）：from/to 在 N/A 间交替、相邻
+            事件 to==下一 from、窗严格递增、末事件 to 等于当前状态（无事件
+            时当前态须为 N）。"""
+            previous_window = None
+            previous_to = None
+            for event in events:
+                if event["to"] == event["from"]:
+                    cp_state_int()
+                window = event["window"]
+                if previous_window is not None:
+                    if window <= previous_window:
+                        cp_state_int()
+                    if event["from"] != previous_to:
+                        cp_state_int()
+                previous_window = window
+                previous_to = event["to"]
+            if events:
+                if events[-1]["to"] != state:
+                    cp_state_int()
+            elif state == "A":
+                cp_state_int()
+
+        def five(value):
+            if (
+                not isinstance(value, list) or len(value) != 5
+                or any(
+                    not isinstance(x, int) or isinstance(x, bool)
+                    or not 0 <= x <= METRIC_CAP
+                    for x in value
+                )
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            return [cp_nonneg(x) for x in value]
+
+        def bools(value, limit=None):
+            if not isinstance(value, list):
+                fail(EXIT_INPUT, "INPUT")
+            if limit is not None and len(value) > limit:
+                cp_state_int()
+            for x in value:
+                cp_bool(x)
+            return deque(value, maxlen=limit)
+        def cfl(value):
+            # [count, first, last]：count=0 须 first=last=null；count>0 须
+            # 两者为非负整数且 first<=last。
+            if not isinstance(value, list) or len(value) != 3:
+                fail(EXIT_INPUT, "INPUT")
+            count, first, last = value
+            si2(count, 0, METRIC_CAP)
+            if count == 0:
+                if first is not None or last is not None:
+                    cp_state_int()
+                return [0, None, None]
+            if first is None or last is None:
+                cp_state_int()
+            ti(first)
+            ti(last)
+            if first > last:
+                cp_state_int()
+            return [count, first, last]
+
+        root = o(raw, (
+            "now", "vnodes", "sticky_ttl", "idle_ttl", "hard_ttl", "pick",
+            "overload", "backpressure", "queue", "aging",
+            "backends", "connections", "sticky", "buckets", "quotas",
+            "wait_queue", "capacities", "overload_hist", "wait_hist",
+            "limit_hist", "alerts", "commits", "next_rev", "audit",
+            "reservation", "mo",
+        ))
+
+        last_now = root["now"]
+        if last_now is not None:
+            ti(last_now)
+        ring_vnodes = root["vnodes"]
+        if ring_vnodes is not None:
+            si2(ring_vnodes, 1, 1024)
+        sticky_ttl = root["sticky_ttl"]
+        if sticky_ttl is not None:
+            si2(sticky_ttl, 1, 10 ** 9)
+        idle_ttl = root["idle_ttl"]
+        if idle_ttl is not None:
+            si2(idle_ttl, 1, 10 ** 9)
+        hard_ttl = root["hard_ttl"]
+        if hard_ttl is not None:
+            si2(hard_ttl, 1, 10 ** 9)
+        pick_obj = o(root["pick"], ("mode", "ticket"))
+        pick_mode = enum(pick_obj["mode"], ("W", "R", "L", "H"))
+        rr_ticket = ni(pick_obj["ticket"])
+        if pick_mode == "H" and ring_vnodes is None:
+            cp_state_int()
+
+        overload_raw = root["overload"]
+        if overload_raw is None:
+            queue_cfg = None
+        else:
+            ov = o(overload_raw, ("cap", "q", "ttl"))
+            queue_cfg = (
+                si2(ov["cap"], 1, 10 ** 6),
+                si2(ov["q"], 1, 10 ** 6),
+                si2(ov["ttl"], 1, 10 ** 6),
+            )
+        bp_raw = root["backpressure"]
+        if bp_raw is None:
+            bp_cfg = None
+            bp_state = "N"
+        else:
+            bp = o(bp_raw, ("low", "high", "state"))
+            low = si2(bp["low"], 0, 10 ** 6)
+            high = si2(bp["high"], 0, 10 ** 6)
+            bp_state = enum(bp["state"], ("N", "P"))
+            if not low < high:
+                fail(EXIT_INPUT, "INPUT")
+            if queue_cfg is None:
+                cp_state_int()
+            if high > queue_cfg[1]:
+                fail(EXIT_INPUT, "INPUT")
+            bp_cfg = (low, high)
+
+        qobj = o(root["queue"], ("dequeue", "mode", "full", "evicted", "last"))
+        dequeue_policy = enum(qobj["dequeue"], ("F", "S"))
+        queue_mode = enum(qobj["mode"], ("F", "S", "P"))
+        full_mode = enum(qobj["full"], ("T", "H"))
+        evict_count = si2(qobj["evicted"], 0, METRIC_CAP)
+        evict_last = qobj["last"]
+        if evict_last is not None:
+            ident(evict_last)
+
+        aging_raw = root["aging"]
+        if aging_raw is None:
+            aging_cfg = None
+        else:
+            ag = o(aging_raw, ("step", "items"))
+            step = si2(ag["step"], 1, 10 ** 9)
+            aging_items = cp_list(ag["items"])
+            aging_map = {}
+            for item in aging_items:
+                it = o(item, ("s", "p"))
+                s_value = ident(it["s"])
+                if s_value in aging_map:
+                    cp_state_int()
+                aging_map[s_value] = si2(it["p"], 0, 10 ** 9)
+            aging_cfg = (step, aging_map)
+        if queue_mode == "P" and aging_cfg is None:
+            cp_state_int()
+
+        # ---- 后端记录 ----
+        backends = OrderedDict()
+        err_alerts = {}
+        err_events = {}
+        percent_alerts = {}
+        percent_events = {}
+        retry_alerts = {}
+        retry_events = {}
+        conc_alerts = {}
+        unavail_alerts = {}
+
+        def fault_segments(value):
+            arr = cp_list(value)
+            segments = []
+            for seg in arr:
+                s = o(seg, ("k", "a", "z", "v"))
+                kind = enum(s["k"], ("D", "F", "S"))
+                a = ti(s["a"])
+                z = ti(s["z"])
+                v = ti(s["v"])
+                if not a < z:
+                    fail(EXIT_INPUT, "INPUT")
+                if kind == "D":
+                    if v != 0:
+                        fail(EXIT_INPUT, "INPUT")
+                elif v == 0:
+                    fail(EXIT_INPUT, "INPUT")
+                if segments and segments[-1][2] > a:
+                    # 规范化段须按 a 升序且半开区间不重叠（相邻端点可接）。
+                    cp_state_int()
+                segments.append((kind, a, z, v))
+            return segments
+
+        def fstats(value):
+            objv = o(value, ("D", "F", "S"))
+            result = {}
+            for kind in "DFS":
+                arr = objv[kind]
+                nums = five(arr)
+                result[kind] = {
+                    "affected": nums[0], "rejected": nums[1],
+                    "retries": nums[2], "remaps": nums[3],
+                    "recovered": nums[4],
+                }
+            return result
+
+        backend_list = cp_list(root["backends"])
+        for bentry in backend_list:
+            be = o(bentry, (
+                "id", "weight", "current", "conns", "healthy", "fail",
+                "success", "failures", "successes", "probe", "warm",
+                "circuit", "drain", "since", "lastop", "endpoint",
+                "metrics", "mobase", "pickcounts", "samples", "faults",
+                "faultbase", "faultstats", "faulthist", "reasonhist",
+                "retryhist", "alerts",
+            ))
+            backend_id = parse_backend_id(be["id"])
+            if backend_id in backends:
+                cp_state_int()
+            weight = si2(be["weight"], 1, 100)
+            current = ni(be["current"])
+            conns = ni(be["conns"])
+            healthy = cp_bool(be["healthy"])
+            fail_t = si2(be["fail"], 1, 100)
+            succ_t = si2(be["success"], 1, 100)
+            failures = si2(be["failures"], 0, fail_t)
+            successes = si2(be["successes"], 0, succ_t)
+            probe_raw = be["probe"]
+            if probe_raw is None:
+                probe_now = probe_ok = None
+            else:
+                pr = o(probe_raw, ("t", "ok"))
+                probe_now = ti(pr["t"])
+                probe_ok = cp_bool(pr["ok"])
+
+            warm = o(be["warm"], ("stage", "d", "from", "start", "end"))
+            stage = enum(warm["stage"], ("warm", "steady"))
+            warm_d = si2(warm["d"], 0, 10 ** 9)
+            warm_from = warm["from"]
+            warm_start = warm["start"]
+            warm_end = warm["end"]
+            if stage == "warm":
+                if warm_d == 0 or warm_from is None or warm_start is None \
+                        or warm_end is None:
+                    cp_state_int()
+                ni(warm_from)
+                ti(warm_start)
+                abstime(warm_end)
+                if not warm_start < warm_end or warm_end - warm_start != warm_d:
+                    cp_state_int()
+            else:
+                if warm_from is not None or warm_start is not None \
+                        or warm_end is not None:
+                    cp_state_int()
+
+            circuit_raw = be["circuit"]
+            if circuit_raw is None:
+                circuit = None
+            else:
+                c = o(circuit_raw, (
+                    "n", "m", "r", "w", "q", "state", "win", "next",
+                    "used", "cr",
+                ))
+                n = si2(c["n"], 1, 100)
+                m = si2(c["m"], 1, n)
+                r = si2(c["r"], 1, 100)
+                w = si2(c["w"], 1, 10 ** 9)
+                q = si2(c["q"], 1, 100)
+                cstate = enum(c["state"], ("C", "O", "H"))
+                window = bools(c["win"], n)
+                cnext = c["next"]
+                used = ni(c["used"])
+                if cstate == "O":
+                    if cnext is None or not (isinstance(cnext, int)
+                                             and not isinstance(cnext, bool)):
+                        cp_state_int()
+                    abstime(cnext)
+                    if used != 0:
+                        cp_state_int()
+                else:
+                    if cnext is not None:
+                        cp_state_int()
+                if cstate == "H":
+                    if not 0 <= used <= q:
+                        cp_state_int()
+                elif used != 0:
+                    cp_state_int()
+                cr_raw = c["cr"]
+                cr_now = cr_ok = None
+                if cr_raw is not None:
+                    cr = o(cr_raw, ("t", "ok"))
+                    cr_now = ti(cr["t"])
+                    cr_ok = cp_bool(cr["ok"])
+                circuit = {
+                    "params": (n, m, r, w, q),
+                    "state": cstate,
+                    "window": window,
+                    "next": cnext,
+                    "used": used,
+                    "cr_now": cr_now,
+                    "cr_ok": cr_ok,
+                }
+
+            drain_raw = o(be["drain"], (
+                "t", "state", "start", "end", "deadline", "forced",
+            ))
+            drain_t = drain_raw["t"]
+            if drain_t is not None:
+                si2(drain_t, 1, 10 ** 9)
+            dstate = enum(drain_raw["state"], ("A", "D", "X"))
+            dstart = drain_raw["start"]
+            dend = drain_raw["end"]
+            ddeadline = drain_raw["deadline"]
+            dforced = ni(drain_raw["forced"])
+            for x in (dstart, dend):
+                if x is not None:
+                    ti(x)
+            if ddeadline is not None:
+                abstime(ddeadline)
+            if dstate == "A":
+                if dstart is not None or dend is not None \
+                        or ddeadline is not None or dforced != 0:
+                    cp_state_int()
+            elif dstate == "D":
+                if drain_t is None or dstart is None or ddeadline is None \
+                        or dend is not None or dforced != 0:
+                    cp_state_int()
+            else:  # X
+                if drain_t is None or dstart is None or dend is None \
+                        or ddeadline is None:
+                    cp_state_int()
+
+            since_raw = o(be["since"], ("health", "drain", "circuit"))
+            since_health = since_raw["health"]
+            since_drain = since_raw["drain"]
+            since_circuit = since_raw["circuit"]
+            for x in (since_health, since_drain, since_circuit):
+                if x is not None:
+                    ti(x)
+            # ru 不变量：health 起点 ⇔ unhealthy；drain 起点 ⇔ D/X；
+            # circuit 起点 ⇔ O/H（未配熔断器须无起点）。矛盾即非法状态组合。
+            if (since_health is None) != healthy:
+                cp_state_int()
+            if (since_drain is not None) != (dstate in ("D", "X")):
+                cp_state_int()
+            if circuit is not None:
+                if (since_circuit is not None) != (
+                    circuit["state"] in ("O", "H")
+                ):
+                    cp_state_int()
+            elif since_circuit is not None:
+                cp_state_int()
+
+            lastop_raw = be["lastop"]
+            if lastop_raw is None:
+                last_op = None
+            else:
+                lo = o(lastop_raw, ("k", "w", "d", "t"))
+                lok = enum(lo["k"], ("add3", "add5", "ws"))
+                low_ = si2(lo["w"], 1, 100)
+                if lok == "add3":
+                    if lo["d"] is not None or lo["t"] is not None:
+                        cp_state_int()
+                    last_op = ("add3", low_)
+                else:
+                    lod = ti(lo["d"])
+                    lot = ti(lo["t"])
+                    last_op = (lok, low_, lod, lot)
+
+            endpoint_raw = be["endpoint"]
+            if endpoint_raw is None:
+                endpoint = None
+            else:
+                ep = o(endpoint_raw, ("host", "port"))
+                endpoint = (
+                    parse_endpoint_host(ep["host"]),
+                    parse_endpoint_port(ep["port"]),
+                )
+
+            # 分钟度量历史。
+            metrics = {}
+            for wentry in cp_list(be["metrics"]):
+                wv = o(wentry, ("w", "v"))
+                window = ti(wv["w"])
+                vals = cp_list(wv["v"])
+                if len(vals) != 5:
+                    fail(EXIT_INPUT, "INPUT")
+                req = si2(vals[0], 0, METRIC_CAP)
+                errc = si2(vals[1], 0, METRIC_CAP)
+                retries = si2(vals[2], 0, METRIC_CAP)
+                remaps = si2(vals[3], 0, METRIC_CAP)
+                lat = five(vals[4])
+                # errors 不可能超过 requests（每条 mr 至多一个 error）。
+                if errc > req:
+                    cp_state_int()
+                if window in metrics:
+                    cp_state_int()
+                metrics[window] = [req, errc, retries, remaps, lat]
+
+            mobase_raw = o(be["mobase"], ("w", "v"))
+            mbw = mobase_raw["w"]
+            if mbw is not None:
+                ti(mbw)
+            mbvals = cp_list(mobase_raw["v"])
+            if len(mbvals) != 5:
+                fail(EXIT_INPUT, "INPUT")
+            mo_base = [
+                mbw,
+                si2(mbvals[0], 0, METRIC_CAP), si2(mbvals[1], 0, METRIC_CAP),
+                si2(mbvals[2], 0, METRIC_CAP), si2(mbvals[3], 0, METRIC_CAP),
+                five(mbvals[4]),
+            ]
+
+            pc_raw = o(be["pickcounts"], (
+                "total", "first", "sticky", "expired", "removed",
+                "health", "circuit", "drain",
+            ))
+            pick_counts = {
+                key: si2(pc_raw[key], 0, METRIC_CAP)
+                for key in (
+                    "total", "first", "sticky", "expired", "removed",
+                    "health", "circuit", "drain",
+                )
+            }
+
+            samples = {}
+            for sentry in cp_list(be["samples"]):
+                sv = o(sentry, ("w", "samples", "peak", "points"))
+                swindow = ti(sv["w"])
+                scount = ni(sv["samples"])
+                speak = ni(sv["peak"])
+                points = {}
+                for p in cp_list(sv["points"]):
+                    pv = o(p, ("t", "c", "r"))
+                    pt = ti(pv["t"])
+                    pc = ni(pv["c"])
+                    reason = pv["r"]
+                    if reason is not None:
+                        enum(reason, ("drain", "health", "circuit", "fault"))
+                    # ms 按 now//60 分窗：采样时刻必须落在所属窗。
+                    if pt // 60 != swindow:
+                        cp_state_int()
+                    if pt in points:
+                        cp_state_int()
+                    points[pt] = (pc, reason)
+                if scount != len(points):
+                    cp_state_int()
+                expected_peak = 0
+                for _, (pc, _) in points.items():
+                    if pc > expected_peak:
+                        expected_peak = pc
+                if speak != expected_peak:
+                    cp_state_int()
+                if swindow in samples:
+                    cp_state_int()
+                samples[swindow] = {
+                    "points": points, "samples": scount, "peak": speak,
+                }
+
+            faults = fault_segments(be["faults"])
+            fault_a = [seg[1] for seg in faults]
+            fault_base = set()
+            for fbentry in cp_list(be["faultbase"]):
+                seg = fault_segments([fbentry])[0]
+                if seg not in faults:
+                    cp_state_int()
+                fault_base.add(seg)
+            fault_stats = fstats(be["faultstats"])
+
+            fault_hist = {}
+            for fentry in cp_list(be["faulthist"]):
+                fv = o(fentry, ("w", "v"))
+                fwindow = ti(fv["w"])
+                if fwindow in fault_hist:
+                    cp_state_int()
+                fault_hist[fwindow] = fstats(fv["v"])
+
+            reason_hist = {}
+            for rentry in cp_list(be["reasonhist"]):
+                rv = o(rentry, (
+                    "w", "health", "drain", "circuit", "overload",
+                ))
+                rwindow = ti(rv["w"])
+                if rwindow in reason_hist:
+                    cp_state_int()
+                reason_hist[rwindow] = {
+                    name: cfl(rv[name])
+                    for name in ("health", "drain", "circuit", "overload")
+                }
+
+            retry_hist = {}
+            for xentry in cp_list(be["retryhist"]):
+                xv = o(xentry, ("w", "retries", "remaps"))
+                xwindow = ti(xv["w"])
+                if xwindow in retry_hist:
+                    cp_state_int()
+                retry_hist[xwindow] = {
+                    "retries": cfl(xv["retries"]),
+                    "remaps": cfl(xv["remaps"]),
+                }
+
+            # ---- 每后端告警 ----
+            al = o(be["alerts"], (
+                "err", "err_events", "pa", "pa_events", "xa", "xa_events",
+                "na", "ua",
+            ))
+
+            def rate_str(value):
+                if (
+                    not isinstance(value, str)
+                    or len(value) < 4
+                    or value[-3] != "."
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                head, frac = value[:-3], value[-2:]
+                if not head.isdigit() or not frac.isdigit():
+                    fail(EXIT_INPUT, "INPUT")
+                return value
+
+            err_entry = None
+            if al["err"] is not None:
+                arr = cp_list(al["err"])
+                if len(arr) != 10:
+                    fail(EXIT_INPUT, "INPUT")
+                hi = si2(arr[0], 1, 10000)
+                lo = si2(arr[1], 0, 9999)
+                n = si2(arr[2], 1, 60)
+                if not lo < hi:
+                    fail(EXIT_INPUT, "INPUT")
+                estate = enum(arr[3], ("N", "A"))
+                run = ni(arr[4])
+                ew = ti(arr[5])
+                requests = ni(arr[6])
+                errors = ni(arr[7])
+                if errors > requests:
+                    cp_state_int()
+                rate_str(arr[8])
+                cp_bool(arr[9])
+                err_entry = {
+                    "hi": hi, "lo": lo, "n": n, "state": estate,
+                    "run": run, "w": ew,
+                    "result": {
+                        "op": "ea", "id": backend_id, "w": ew,
+                        "state": estate, "requests": requests,
+                        "errors": errors, "rate": arr[8], "run": run,
+                        "changed": arr[9],
+                    },
+                }
+            err_alerts[backend_id] = err_entry
+            ehist = deque()
+            for ev in cp_list(al["err_events"]):
+                vals = cp_list(ev)
+                if len(vals) != 7:
+                    fail(EXIT_INPUT, "INPUT")
+                ehist.append({
+                    "window": ti(vals[0]),
+                    "from": enum(vals[1], ("N", "A")),
+                    "to": enum(vals[2], ("N", "A")),
+                    "rate": rate_str(vals[3]),
+                    "hi": si2(vals[4], 1, 10000),
+                    "lo": si2(vals[5], 0, 9999),
+                    "n": si2(vals[6], 1, 60),
+                })
+            if ehist:
+                err_events[backend_id] = ehist
+            if err_entry is not None:
+                alert_chain(ehist, err_entry["state"])
+
+            pa_entry = None
+            if al["pa"] is not None:
+                arr = cp_list(al["pa"])
+                if len(arr) != 11:
+                    fail(EXIT_INPUT, "INPUT")
+                p = si2(arr[0], 1, 100)
+                hi = si2(arr[1], 0, 4)
+                lo = si2(arr[2], 0, 4)
+                n = si2(arr[3], 1, 60)
+                if not lo < hi:
+                    fail(EXIT_INPUT, "INPUT")
+                pastate = enum(arr[4], ("N", "A"))
+                run = ni(arr[5])
+                pw = ti(arr[6])
+                samples_v = ni(arr[7])
+                bucket = arr[8]
+                if bucket is not None:
+                    si2(bucket, 0, 4)
+                upper = arr[9]
+                if upper is not None and upper not in (1, 10, 100, 1000):
+                    fail(EXIT_INPUT, "INPUT")
+                cp_bool(arr[10])
+                pa_entry = {
+                    "p": p, "hi": hi, "lo": lo, "n": n, "state": pastate,
+                    "run": run, "w": pw,
+                    "result": {
+                        "op": "pa", "id": backend_id, "w": pw, "p": p,
+                        "state": pastate, "samples": samples_v,
+                        "bucket": bucket, "upper": upper, "run": run,
+                        "changed": arr[10],
+                    },
+                }
+            percent_alerts[backend_id] = pa_entry
+            phist = deque()
+            for ev in cp_list(al["pa_events"]):
+                vals = cp_list(ev)
+                if len(vals) != 10:
+                    fail(EXIT_INPUT, "INPUT")
+                pbucket = vals[5]
+                if pbucket is not None:
+                    si2(pbucket, 0, 4)
+                pupper = vals[6]
+                if pupper is not None and pupper not in (1, 10, 100, 1000):
+                    fail(EXIT_INPUT, "INPUT")
+                phist.append({
+                    "window": ti(vals[0]),
+                    "from": enum(vals[1], ("N", "A")),
+                    "to": enum(vals[2], ("N", "A")),
+                    "p": si2(vals[3], 1, 100),
+                    "samples": ni(vals[4]),
+                    "bucket": pbucket,
+                    "upper": pupper,
+                    "hi": si2(vals[7], 0, 4),
+                    "lo": si2(vals[8], 0, 4),
+                    "n": si2(vals[9], 1, 60),
+                })
+            if phist:
+                percent_events[backend_id] = phist
+            if pa_entry is not None:
+                alert_chain(phist, pa_entry["state"])
+
+            xa_obj = o(al["xa"], ("R", "M"))
+            xae_obj = o(al["xa_events"], ("R", "M"))
+            for kcode in ("R", "M"):
+                if xa_obj[kcode] is not None:
+                    arr = cp_list(xa_obj[kcode])
+                    if len(arr) != 8:
+                        fail(EXIT_INPUT, "INPUT")
+                    hi = si2(arr[0], 1, METRIC_CAP)
+                    lo = si2(arr[1], 0, METRIC_CAP - 1)
+                    n = si2(arr[2], 1, 60)
+                    if not lo < hi:
+                        fail(EXIT_INPUT, "INPUT")
+                    xstate = enum(arr[3], ("N", "A"))
+                    run = ni(arr[4])
+                    xw = ti(arr[5])
+                    value = ni(arr[6])
+                    cp_bool(arr[7])
+                    retry_alerts[(backend_id, kcode)] = {
+                        "hi": hi, "lo": lo, "n": n, "state": xstate,
+                        "run": run, "w": xw,
+                        "result": {
+                            "op": "xa", "id": backend_id, "k": kcode,
+                            "w": xw, "state": xstate, "value": value,
+                            "run": run, "changed": arr[7],
+                        },
+                    }
+                xhist = deque()
+                for ev in cp_list(xae_obj[kcode]):
+                    vals = cp_list(ev)
+                    if len(vals) != 7:
+                        fail(EXIT_INPUT, "INPUT")
+                    xhist.append({
+                        "window": ti(vals[0]),
+                        "from": enum(vals[1], ("N", "A")),
+                        "to": enum(vals[2], ("N", "A")),
+                        "value": ni(vals[3]),
+                        "hi": si2(vals[4], 1, METRIC_CAP),
+                        "lo": si2(vals[5], 0, METRIC_CAP - 1),
+                        "n": si2(vals[6], 1, 60),
+                    })
+                xentry = retry_alerts.get((backend_id, kcode))
+                if xhist:
+                    retry_events[(backend_id, kcode)] = xhist
+                if xentry is not None:
+                    alert_chain(xhist, xentry["state"])
+
+            na_entry = None
+            if al["na"] is not None:
+                arr = cp_list(al["na"])
+                if len(arr) != 9:
+                    fail(EXIT_INPUT, "INPUT")
+                hi = si2(arr[0], 1, 10 ** 9)
+                lo = si2(arr[1], 0, 10 ** 9 - 1)
+                n = si2(arr[2], 1, 60)
+                if not lo < hi:
+                    fail(EXIT_INPUT, "INPUT")
+                nastate = enum(arr[3], ("N", "A"))
+                run = ni(arr[4])
+                naw = ti(arr[5])
+                nasamples = ni(arr[6])
+                napeak = ni(arr[7])
+                cp_bool(arr[8])
+                na_entry = {
+                    "hi": hi, "lo": lo, "n": n, "state": nastate,
+                    "run": run, "w": naw,
+                    "result": {
+                        "op": "na", "id": backend_id, "w": naw,
+                        "state": nastate, "samples": nasamples,
+                        "peak": napeak, "run": run, "changed": arr[8],
+                    },
+                }
+            conc_alerts[backend_id] = na_entry
+
+            ua_obj = o(al["ua"], ("drain", "health", "circuit", "fault"))
+            for reason in ("drain", "health", "circuit", "fault"):
+                if ua_obj[reason] is not None:
+                    arr = cp_list(ua_obj[reason])
+                    if len(arr) != 7:
+                        fail(EXIT_INPUT, "INPUT")
+                    threshold = si2(arr[0], 1, 10 ** 9)
+                    ustate = enum(arr[1], ("N", "A"))
+                    unow = ti(arr[2])
+                    active = cp_bool(arr[3])
+                    since = arr[4]
+                    duration = ni(arr[5])
+                    cp_bool(arr[6])
+                    if active:
+                        if since is None:
+                            cp_state_int()
+                        ti(since)
+                        if duration != unow - since:
+                            cp_state_int()
+                    else:
+                        if since is not None or duration != 0:
+                            cp_state_int()
+                    unavail_alerts[(backend_id, reason)] = {
+                        "threshold": threshold, "state": ustate,
+                        "now": unow,
+                        "result": {
+                            "op": "ua", "id": backend_id, "reason": reason,
+                            "threshold": threshold, "state": ustate,
+                            "active": active, "since": since,
+                            "duration": duration, "changed": arr[6],
+                        },
+                    }
+
+            backends[backend_id] = {
+                "weight": weight,
+                "current": current,
+                "conns": conns,
+                "healthy": healthy,
+                "fail": fail_t,
+                "success": succ_t,
+                "failures": failures,
+                "successes": successes,
+                "probe_now": probe_now,
+                "probe_ok": probe_ok,
+                "stage": stage,
+                "warm_d": warm_d,
+                "warm_from": warm_from,
+                "warm_start": warm_start,
+                "warm_end": warm_end,
+                "circuit": circuit,
+                "drain": {
+                    "t": drain_t, "state": dstate, "start": dstart,
+                    "end": dend, "deadline": ddeadline, "forced": dforced,
+                },
+                "unavail_since": {
+                    "health": since_health, "drain": since_drain,
+                    "circuit": since_circuit,
+                },
+                "last_op": last_op,
+                "endpoint": endpoint,
+                "metrics": metrics,
+                "mo_base": mo_base,
+                "pick_counts": pick_counts,
+                "samples": samples,
+                "faults": faults,
+                "fault_a": fault_a,
+                "fault_stats": fault_stats,
+                "fault_base": fault_base,
+                "fault_hist": fault_hist,
+                "reason_hist": reason_hist,
+                "retry_hist": retry_hist,
+            }
+
+        # ---- 连接（建连序）与端点快照 ----
+        connections = OrderedDict()
+        conn_endpoints = {}
+        conn_count = {}
+        for centry in cp_list(root["connections"]):
+            ce = o(centry, ("cid", "b", "flow", "opened", "last", "ep"))
+            cid = parse_cid(ce["cid"])
+            if cid in connections:
+                cp_state_int()
+            target = parse_backend_id(ce["b"])
+            if target not in backends:
+                cp_state_int()
+            flow = parse_flow(ce["flow"])
+            opened = ti(ce["opened"])
+            lastv = ti(ce["last"])
+            if lastv < opened:
+                cp_state_int()
+            connections[cid] = [target, flow, opened, lastv]
+            conn_count[target] = conn_count.get(target, 0) + 1
+            ep_raw = ce["ep"]
+            if ep_raw is not None:
+                ep = o(ep_raw, ("host", "port"))
+                conn_endpoints[cid] = (
+                    parse_endpoint_host(ep["host"]),
+                    parse_endpoint_port(ep["port"]),
+                )
+        # 矛盾计数：每后端 conns 须等于引用它的活动连接数；D 态须有连接、
+        # X 态须无连接。
+        for backend_id, record in backends.items():
+            actual = conn_count.get(backend_id, 0)
+            if record["conns"] != actual:
+                cp_state_int()
+            dstate = record["drain"]["state"]
+            if dstate == "D" and actual == 0:
+                cp_state_int()
+            if dstate == "X" and actual != 0:
+                cp_state_int()
+            # mo 增量基线须不超过同窗 mr 累计（基线是该窗某时刻的累计快照，
+            # 各计数与延迟桶逐项 ≤ 现值）；跨窗基线仅用于被判定为零，无约束。
+            mbw = record["mo_base"][0]
+            if mbw is not None and mbw in record["metrics"]:
+                row = record["metrics"][mbw]
+                base_counts = record["mo_base"]
+                # mo_base 布局 [w, requests, errors, retries, remaps, 五桶]，
+                # metrics 布局 [requests, errors, retries, remaps, 五桶]。
+                if any(base_counts[i + 1] > row[i] for i in range(4)):
+                    cp_state_int()
+                if any(
+                    base_counts[5][i] > row[4][i] for i in range(5)
+                ):
+                    cp_state_int()
+
+        # ---- 粘性映射（按 key UTF-8 排序）----
+        sticky_map = {}
+        prev_key = None
+        for sentry in cp_list(root["sticky"]):
+            sk = o(sentry, ("key", "b", "e"))
+            key = parse_key(sk["key"])
+            target = parse_backend_id(sk["b"])
+            if target not in backends:
+                cp_state_int()
+            expires = sk["e"]
+            if expires is not None:
+                ni(expires)
+            if key in sticky_map:
+                cp_state_int()
+            encoded = key.encode("utf-8")
+            if prev_key is not None and not prev_key < encoded:
+                fail(EXIT_INPUT, "INPUT")
+            prev_key = encoded
+            sticky_map[key] = [target, expires]
+
+        scope_rank = {"B": 0, "C": 1, "S": 2}
+
+        def check_pair_order(items):
+            previous = None
+            for scope, identv in items:
+                key = (scope_rank[scope], identv.encode("utf-8"))
+                if previous is not None and not previous < key:
+                    fail(EXIT_INPUT, "INPUT")
+                previous = key
+
+        # ---- 令牌桶 ----
+        buckets = {}
+        pair_order = []
+        for bentry in cp_list(root["buckets"]):
+            bk = o(bentry, ("scope", "id", "r", "b", "t", "at", "last"))
+            scope = enum(bk["scope"], ("B", "C", "S"))
+            bucket_id = ident(bk["id"])
+            r = si2(bk["r"], 1, 10 ** 9)
+            bcap = si2(bk["b"], 1, 10 ** 9)
+            t = ni(bk["t"])
+            at = ti(bk["at"])
+            if t > bcap:
+                cp_state_int()
+            lastv = bk["last"]
+            if lastv is not None:
+                lvals = cp_list(lastv)
+                if len(lvals) != 3 or lvals[0] != r or lvals[1] != bcap:
+                    cp_state_int()
+                ti(lvals[2])
+                lastv = (r, bcap, lvals[2])
+            if scope == "B" and bucket_id not in backends:
+                cp_state_int()
+            pair = (scope, bucket_id)
+            if pair in buckets:
+                cp_state_int()
+            buckets[pair] = {
+                "r": r, "b": bcap, "t": t, "at": at, "last": lastv,
+            }
+            pair_order.append(pair)
+        check_pair_order(pair_order)
+
+        # ---- 固定窗口配额 ----
+        quotas = {}
+        pair_order = []
+        for qentry in cp_list(root["quotas"]):
+            qk = o(qentry, (
+                "scope", "id", "limit", "span", "window", "used", "last",
+            ))
+            scope = enum(qk["scope"], ("B", "C", "S"))
+            quota_id = ident(qk["id"])
+            limit = si2(qk["limit"], 1, 10 ** 18)
+            span = si2(qk["span"], 1, 10 ** 9)
+            window = ni(qk["window"])
+            used = ni(qk["used"])
+            if used > limit:
+                cp_state_int()
+            lastv = qk["last"]
+            if lastv is not None:
+                lvals = cp_list(lastv)
+                if len(lvals) != 3 or lvals[0] != limit or lvals[1] != span:
+                    cp_state_int()
+                ti(lvals[2])
+                lastv = (limit, span, lvals[2])
+            if scope == "B" and quota_id not in backends:
+                cp_state_int()
+            pair = (scope, quota_id)
+            if pair in quotas:
+                cp_state_int()
+            quotas[pair] = {
+                "limit": limit, "span": span, "window": window,
+                "used": used, "last": lastv,
+            }
+            pair_order.append(pair)
+        check_pair_order(pair_order)
+
+        # ---- 等待队列（FIFO）----
+        wait_queue = OrderedDict()
+        for wq in cp_list(root["wait_queue"]):
+            item = o(wq, ("cid", "flow", "c", "s", "key", "cost", "now"))
+            cid = parse_cid(item["cid"])
+            if cid in wait_queue or cid in connections:
+                cp_state_int()
+            flow = parse_flow(item["flow"])
+            cval = ident(item["c"])
+            sval = ident(item["s"])
+            key = parse_key(item["key"])
+            costs = cp_list(item["cost"])
+            if len(costs) != 3:
+                fail(EXIT_INPUT, "INPUT")
+            bc, cc, sc = (si2(costs[i], 0, 10 ** 9) for i in range(3))
+            if bc == 0 and cc == 0 and sc == 0:
+                fail(EXIT_INPUT, "INPUT")
+            enqueue_now = ti(item["now"])
+            wait_queue[cid] = (
+                cid, flow, cval, sval, key, bc, cc, sc, enqueue_now,
+            )
+        if queue_cfg is not None and len(wait_queue) > queue_cfg[1]:
+            cp_state_int()
+        if queue_cfg is None and wait_queue:
+            cp_state_int()
+
+        # ---- 接纳容量覆盖（按后端加入序）----
+        cap_overrides = {}
+        prev_index = -1
+        backend_order = {bid: i for i, bid in enumerate(backends)}
+        for centry in cp_list(root["capacities"]):
+            ck = o(centry, ("id", "cap"))
+            cap_id = parse_backend_id(ck["id"])
+            if cap_id not in backends:
+                cp_state_int()
+            cap = si2(ck["cap"], 1, 10 ** 6)
+            if cap_id in cap_overrides:
+                cp_state_int()
+            index = backend_order[cap_id]
+            if index <= prev_index:
+                fail(EXIT_INPUT, "INPUT")
+            prev_index = index
+            cap_overrides[cap_id] = cap
+
+        # ---- 全池分钟历史 ----
+        overload_hist = {}
+        for oentry in cp_list(root["overload_hist"]):
+            ov = o(oentry, ("w", "v"))
+            window = ti(ov["w"])
+            vals = cp_list(ov["v"])
+            if len(vals) != 5:
+                fail(EXIT_INPUT, "INPUT")
+            vals = [si2(x, 0, METRIC_CAP) for x in vals]
+            if window in overload_hist:
+                cp_state_int()
+            overload_hist[window] = vals
+
+        wait_hist = {}
+        for wentry in cp_list(root["wait_hist"]):
+            wh = o(wentry, ("w", "a", "e", "c", "v"))
+            window = ti(wh["w"])
+            row = {
+                "admitted": five(wh["a"]),
+                "expired": five(wh["e"]),
+                "cancelled": five(wh["c"]),
+                "evicted": five(wh["v"]),
+            }
+            if window in wait_hist:
+                cp_state_int()
+            wait_hist[window] = row
+
+        limit_hist = {}
+        pair_order = []
+        for lentry in cp_list(root["limit_hist"]):
+            lk = o(lentry, ("scope", "id", "rows"))
+            scope = enum(lk["scope"], ("B", "C", "S"))
+            hist_id = ident(lk["id"])
+            if scope == "B" and hist_id not in backends:
+                cp_state_int()
+            history = {}
+            for row_entry in cp_list(lk["rows"]):
+                rw = o(row_entry, ("w", "v"))
+                window = ti(rw["w"])
+                vals = cp_list(rw["v"])
+                if len(vals) != 4:
+                    fail(EXIT_INPUT, "INPUT")
+                vals = [si2(x, 0, METRIC_CAP) for x in vals]
+                if window in history:
+                    cp_state_int()
+                history[window] = vals
+            pair = (scope, hist_id)
+            if pair in limit_hist:
+                cp_state_int()
+            limit_hist[pair] = history
+            pair_order.append(pair)
+        check_pair_order(pair_order)
+
+        # ---- 池级告警 ----
+        alerts = o(root["alerts"], (
+            "fault", "fault_events", "wait", "limit",
+        ))
+        if alerts["fault"] is None:
+            pool_alert = None
+        else:
+            arr = cp_list(alerts["fault"])
+            if len(arr) != 8:
+                fail(EXIT_INPUT, "INPUT")
+            hi = si2(arr[0], 1, METRIC_CAP)
+            lo = si2(arr[1], 0, METRIC_CAP - 1)
+            n = si2(arr[2], 1, 60)
+            if not lo < hi:
+                fail(EXIT_INPUT, "INPUT")
+            astate = enum(arr[3], ("N", "A"))
+            run = ni(arr[4])
+            aw = ti(arr[5])
+            vval = si2(arr[6], 0, METRIC_CAP)
+            cp_bool(arr[7])
+            pool_alert = {
+                "hi": hi, "lo": lo, "n": n, "state": astate,
+                "run": run, "w": aw,
+                "result": {
+                    "op": "fe", "w": aw, "state": astate, "v": vval,
+                    "run": run, "changed": arr[7],
+                },
+            }
+        alert_events = deque()
+        for ev in cp_list(alerts["fault_events"]):
+            vals = cp_list(ev)
+            if len(vals) != 7:
+                fail(EXIT_INPUT, "INPUT")
+            alert_events.append({
+                "window": ti(vals[0]),
+                "from": enum(vals[1], ("N", "A")),
+                "to": enum(vals[2], ("N", "A")),
+                "v": si2(vals[3], 0, METRIC_CAP),
+                "hi": si2(vals[4], 1, METRIC_CAP),
+                "lo": si2(vals[5], 0, METRIC_CAP - 1),
+                "n": si2(vals[6], 1, 60),
+            })
+        if pool_alert is not None:
+            alert_chain(alert_events, pool_alert["state"])
+
+        wait_alerts = {}
+        prev_kind = None
+        for wentry in cp_list(alerts["wait"]):
+            wk = o(wentry, ("kind", "e"))
+            kind = enum(wk["kind"], ("A", "E", "C", "V"))
+            if prev_kind is not None and not prev_kind < kind:
+                fail(EXIT_INPUT, "INPUT")
+            prev_kind = kind
+            arr = cp_list(wk["e"])
+            if len(arr) != 11:
+                fail(EXIT_INPUT, "INPUT")
+            p = si2(arr[0], 1, 100)
+            hi = si2(arr[1], 0, 4)
+            lo = si2(arr[2], 0, 4)
+            n = si2(arr[3], 1, 60)
+            if not lo < hi:
+                fail(EXIT_INPUT, "INPUT")
+            wstate = enum(arr[4], ("N", "A"))
+            run = ni(arr[5])
+            ww = ti(arr[6])
+            samples_v = ni(arr[7])
+            bucket = arr[8]
+            if bucket is not None:
+                si2(bucket, 0, 4)
+            upper = arr[9]
+            if upper is not None and upper not in (0, 1, 10, 100):
+                fail(EXIT_INPUT, "INPUT")
+            cp_bool(arr[10])
+            wait_alerts[kind] = {
+                "p": p, "hi": hi, "lo": lo, "n": n, "state": wstate,
+                "run": run, "w": ww,
+                "result": {
+                    "op": "wa", "kind": kind, "w": ww, "p": p,
+                    "state": wstate, "samples": samples_v,
+                    "bucket": bucket, "upper": upper, "run": run,
+                    "changed": arr[10],
+                },
+            }
+
+        limit_alerts = {}
+        pair_order = []
+        for lentry in cp_list(alerts["limit"]):
+            lk = o(lentry, ("scope", "id", "e"))
+            scope = enum(lk["scope"], ("B", "C", "S"))
+            alert_id = ident(lk["id"])
+            if scope == "B" and alert_id not in backends:
+                cp_state_int()
+            arr = cp_list(lk["e"])
+            if len(arr) != 10:
+                fail(EXIT_INPUT, "INPUT")
+            hi = si2(arr[0], 1, METRIC_CAP)
+            lo = si2(arr[1], 0, METRIC_CAP - 1)
+            n = si2(arr[2], 1, 60)
+            if not lo < hi:
+                fail(EXIT_INPUT, "INPUT")
+            lstate = enum(arr[3], ("N", "A"))
+            run = ni(arr[4])
+            lw = ti(arr[5])
+            token = si2(arr[6], 0, METRIC_CAP)
+            quota = si2(arr[7], 0, METRIC_CAP)
+            value = si2(arr[8], 0, METRIC_CAP)
+            cp_bool(arr[9])
+            pair = (scope, alert_id)
+            if pair in limit_alerts:
+                cp_state_int()
+            limit_alerts[pair] = {
+                "hi": hi, "lo": lo, "n": n, "state": lstate,
+                "run": run, "w": lw,
+                "result": {
+                    "op": "le", "scope": scope, "id": alert_id, "w": lw,
+                    "state": lstate, "token": token, "quota": quota,
+                    "value": value, "run": run, "changed": arr[9],
+                },
+            }
+            pair_order.append(pair)
+        check_pair_order(pair_order)
+
+        # ---- 提交历史（rev 升序，至多 16）与审计（至多 64）----
+        def snapshot_config(value):
+            objv = o(value, (
+                "version", "backends", "vnodes", "limits", "overload",
+                "sticky", "idle", "backpressure", "scheduler", "faults",
+                "quotas", "queue", "capacities", "lifetime",
+            ))
+            if objv["version"] != 11:
+                fail(EXIT_INPUT, "INPUT")
+            # 复用 ci 同款全量校验（结构/键序/类型/范围/排序/交叉约束）。
+            parsed = parse_config(objv)
+            ids = {entry[0] for entry in parsed["backends"]}
+            for scope, bucket_id, _, _ in parsed["limits"]:
+                if scope == "B" and bucket_id not in ids:
+                    cp_state_int()
+            for scope, quota_id, _, _ in parsed["quotas"]:
+                if scope == "B" and quota_id not in ids:
+                    cp_state_int()
+            for fault_id in parsed["faults"]:
+                if fault_id not in ids:
+                    cp_state_int()
+            for override_id in parsed["capacities"]:
+                if override_id not in ids:
+                    cp_state_int()
+            # 规范化回显须与快照逐字节同构（整体 canonical 比对再次保证）。
+            if export_normalized_config(parsed) != objv:
+                fail(EXIT_INPUT, "INPUT")
+            return objv
+
+        commit_history = []
+        for centry in cp_list(root["commits"]):
+            ck = o(centry, ("rev", "config"))
+            rev = si2(ck["rev"], 1, 10 ** 18)
+            if commit_history and rev <= commit_history[-1][0]:
+                cp_state_int()
+            commit_history.append((rev, snapshot_config(ck["config"])))
+        if len(commit_history) > 16:
+            cp_state_int()
+
+        next_rev = si2(root["next_rev"], 1, 10 ** 18 + 1)
+        for rev, _ in commit_history:
+            if rev >= next_rev:
+                cp_state_int()
+
+        audit_events = deque(maxlen=64)
+        audit_sections = deque(maxlen=64)
+        for aentry in cp_list(root["audit"]):
+            ak = o(aentry, (
+                "rev", "now", "kind", "section", "before", "after",
+                "changes",
+            ))
+            rev = si2(ak["rev"], 1, 10 ** 18)
+            if audit_events and rev <= audit_events[-1]["rev"]:
+                cp_state_int()
+            if rev >= next_rev:
+                cp_state_int()
+            anow = ti(ak["now"])
+            kind = enum(ak["kind"], ("ci", "cb", "cu", "ca"))
+            section = ak["section"]
+            if section is not None:
+                enum(section, CU_SECTIONS)
+                if kind != "cu":
+                    cp_state_int()
+            elif kind == "cu":
+                cp_state_int()
+            before_d = cp_hex_digest(ak["before"])
+            after_d = cp_hex_digest(ak["after"])
+            changes = ()
+            seen_sections = set()
+            prev_section_index = -1
+            for ch in cp_list(ak["changes"]):
+                chobj = o(ch, ("section", "before", "after"))
+                chsection = enum(chobj["section"], AD_SECTIONS)
+                chindex = AD_SECTIONS.index(chsection)
+                if chsection in seen_sections or chindex <= prev_section_index:
+                    cp_state_int()
+                seen_sections.add(chsection)
+                prev_section_index = chindex
+                changes = changes + (
+                    (chsection, cp_hex_digest(chobj["before"]),
+                     cp_hex_digest(chobj["after"])),
+                )
+            audit_events.append({
+                "rev": rev, "now": anow, "kind": kind,
+                "section": section, "before": before_d, "after": after_d,
+            })
+            audit_sections.append(tuple(changes))
+        if len(audit_events) > 64:
+            cp_state_int()
+
+        reservation_raw = root["reservation"]
+        if reservation_raw is None:
+            reservation = None
+        else:
+            rs = o(reservation_raw, ("at", "digest", "config"))
+            at = ti(rs["at"])
+            rdigest = cp_hex_digest(rs["digest"])
+            snapshot = snapshot_config(rs["config"])
+            if config_digest(snapshot) != rdigest:
+                cp_state_int()
+            reservation = (snapshot, at, rdigest)
+
+        mo_raw = o(root["mo"], ("seq", "cache"))
+        mo_seq = si2(mo_raw["seq"], 1, 10 ** 18)
+        mo_cache = None
+        if mo_raw["cache"] is not None:
+            mc = o(mo_raw["cache"], ("seq", "now", "result"))
+            cseq = si2(mc["seq"], 1, 10 ** 18)
+            cnow = ti(mc["now"])
+            if cseq != mo_seq - 1:
+                cp_state_int()
+            result = mc["result"]
+            if not isinstance(result, dict) or result.get("op") != "mo" \
+                    or result.get("seq") != cseq or result.get("window") \
+                    != cnow // 60:
+                cp_state_int()
+            mitems = result.get("backends")
+            if not isinstance(mitems, list):
+                cp_state_int()
+            for item in mitems:
+                if not isinstance(item, dict) or item.get("id") not in backends:
+                    cp_state_int()
+            mo_cache = (cseq, cnow, result)
+
+        return {
+            "last_now": last_now,
+            "ring_vnodes": ring_vnodes,
+            "sticky_ttl": sticky_ttl,
+            "idle_ttl": idle_ttl,
+            "hard_ttl": hard_ttl,
+            "pick_mode": pick_mode,
+            "rr_ticket": rr_ticket,
+            "queue_cfg": queue_cfg,
+            "bp_cfg": bp_cfg,
+            "bp_state": bp_state,
+            "dequeue_policy": dequeue_policy,
+            "queue_mode": queue_mode,
+            "full_mode": full_mode,
+            "evict_count": evict_count,
+            "evict_last": evict_last,
+            "aging_cfg": aging_cfg,
+            "backends": backends,
+            "connections": connections,
+            "conn_endpoints": conn_endpoints,
+            "sticky_map": sticky_map,
+            "buckets": buckets,
+            "quotas": quotas,
+            "wait_queue": wait_queue,
+            "cap_overrides": cap_overrides,
+            "overload_hist": overload_hist,
+            "wait_hist": wait_hist,
+            "limit_hist": limit_hist,
+            "wait_alerts": wait_alerts,
+            "alert": pool_alert,
+            "alert_events": alert_events,
+            "err_alerts": err_alerts,
+            "err_events": err_events,
+            "percent_alerts": percent_alerts,
+            "percent_events": percent_events,
+            "retry_alerts": retry_alerts,
+            "retry_events": retry_events,
+            "conc_alerts": conc_alerts,
+            "limit_alerts": limit_alerts,
+            "unavail_alerts": unavail_alerts,
+            "commit_history": commit_history,
+            "next_rev": next_rev,
+            "audit_events": audit_events,
+            "audit_sections": audit_sections,
+            "reservation": reservation,
+            "mo_seq": mo_seq,
+            "mo_cache": mo_cache,
+        }
 
     for raw_op in ops:
         op = parse_op(raw_op)
@@ -10324,6 +12480,76 @@ def run(raw):
                     "host": endpoint[0],
                     "port": endpoint[1],
                 }
+            )
+
+        elif op[0] == "se":
+            # 运行态检查点导出：不推进时钟、不改状态。state 为规范化 JSON
+            # 对象；紧凑 UTF-8 编码超 8MiB 报 OVERLOAD/7（无 stdout、整批
+            # 回滚——se 本不改状态，故仅不产出结果）。digest 为紧凑编码
+            # {"version":1,"state":...} 的小写 SHA-256。
+            state = export_bundle(current_bundle())
+            envelope = {"version": CHECKPOINT_VERSION, "state": state}
+            try:
+                state_bytes = json.dumps(
+                    state, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                encoded = json.dumps(
+                    envelope, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            except UnicodeEncodeError:
+                fail(EXIT_INPUT, "INPUT")
+            if len(state_bytes) > CHECKPOINT_LIMIT:
+                fail(EXIT_OVERLOAD, "OVERLOAD")
+            digest = hashlib.sha256(encoded).hexdigest()
+            results.append(
+                {
+                    "op": "se",
+                    "version": CHECKPOINT_VERSION,
+                    "digest": digest,
+                    "state": state,
+                }
+            )
+
+        elif op[0] == "si":
+            # 运行态检查点导入：精确 op,version,digest,state（parse_op 已校
+            # 键序、version=1 与 digest 格式）。先按规范化紧凑编码校验大小
+            # 与摘要（超限 OVERLOAD/7、不符 INPUT/2），再完整解析语义（悬空
+            # 引用/重复标识/矛盾计数/非法组合 STATE/4）；全部通过后原子替换
+            # 当前状态。任何失败均无 stdout、整批状态回滚。
+            _, version, digest, raw_state = op
+            # 规范化摘要仅认固定键序的 {version,state} 紧凑编码：先把所给
+            # state 紧凑编码（所给 state 必须本身即规范化形态；任何键序、
+            # 类型或取值偏差都会令摘要不符判 INPUT）。
+            try:
+                state_bytes = json.dumps(
+                    raw_state, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                envelope_bytes = json.dumps(
+                    {"version": version, "state": raw_state},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+            except UnicodeEncodeError:
+                fail(EXIT_INPUT, "INPUT")
+            if len(state_bytes) > CHECKPOINT_LIMIT:
+                fail(EXIT_OVERLOAD, "OVERLOAD")
+            if hashlib.sha256(envelope_bytes).hexdigest() != digest:
+                fail(EXIT_INPUT, "INPUT")
+            # 摘要相符后做完整结构与语义校验，构造候选束；不触碰任何当前
+            # 闭包状态，故失败天然回滚。
+            candidate = parse_checkpoint(raw_state)
+            # 规范化往返：候选束重新规范化后的紧凑编码必须与所给 state 的
+            # 紧凑编码逐字节一致。这强制所给 state 本身即为规范化形态（逐层
+            # 键序、数组排序、取值格式全部固定），从而恢复后 se 复现完全相同
+            # 的 version/digest/state；任何键序或排序偏差在此判 STATE。
+            re_state = export_bundle(candidate)
+            re_bytes = json.dumps(
+                re_state, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            if re_bytes != state_bytes:
+                fail(EXIT_STATE, "STATE")
+            install_bundle(candidate)
+            results.append(
+                {"op": "si", "digest": digest, "ok": True}
             )
 
         else:  # get

@@ -81,6 +81,16 @@
 - 返回固定键序 `op,id,reason,threshold,state,active,since,duration,changed`。同一 `id,reason,threshold,now` 重报原样返回首次结果、不重复推进状态；同一时刻之后发生的原因变化从更大的 `now` 才可见。
 - 键序、字段、编码、类型、范围、reason 或时钟非法报 INPUT/2；未知后端报 BACKEND/3；已登记组合变更 threshold 报 STATE/4（按 INPUT、BACKEND、STATE 判定）；失败批次不留下时钟、缓存或告警状态。remove 后同 id 重加清除对应登记，ci/cb/ca/cu 成功清空全部 ua 状态。ua 除时钟和自身状态外不修改连接、粘性、指标、故障计划或调度结果。fault 活动段查找为 O(log T)、其余三因 O(1)，单次时间 O(log(T+1))、额外空间 O(1)，总空间 O(B)（每后端至多四键，T 为该后端故障段数、B 为后端数）。紧凑 UTF-8 固定键序 JSON、单换行及 run、record、replay 的逐字节结果保持兼容，仅用标准库。
 
+## 可移植运行态检查点：se / si
+
+在现有 JSON 操作流中新增 `se`、`si`，使一次调用导出的状态能在另一条全新调用中恢复并继续处理公开操作；不依赖文件、网络或进程时间。对任意合法后续操作序列，直接继续与“导出后在空实例恢复再继续”所得退出码、stdout、stderr 逐字节一致。
+
+- `se` 只接受 `op` 一个键，不推进显式时钟、不修改状态；返回固定键序 `op,version,digest,state`。`version` 初始为 1（非 bool 整数）；`state` 为规范化 JSON 对象，逐层键序固定，有业务顺序的集合（后端加入序、连接建连序、等待队列 FIFO、提交/审计 rev 序、告警转换事件窗序、分钟窗时序）保持原序，其余集合（粘性键、桶/配额与池级告警标识、老化服务类等）沿用 UTF-8 字节排序（复合键 scope 先按 B/C/S）。`state` 包含全部影响后续公开行为的状态：逻辑时钟、纯登记配置与待生效计划（vnodes、sticky/idle/lifetime、scheduler、overload、backpressure、queue 策略、aging、faults、quotas、capacities）、后端顺序及健康/权重预热/熔断/排空/不可用起点/登记端点、令牌桶（含当前令牌与补充时刻）、固定窗口配额（window、used）、活动连接与建连时端点快照、粘性映射、等待队列、限流配额与各类分钟历史、故障计划/统计/恢复基线、请求与采样指标及 mo 增量游标缓存、全部告警状态机（fe/ea/pa/xa/na/le/ua/wa）及其转换历史、配置提交历史与 next_rev、审计事件与段级差异、配置预约。
+- `digest` 为对紧凑 UTF-8 编码的 `{"version":1,"state":...}`（`ensure_ascii=False`、分隔符 `,:`、无末尾换行）计算的小写 SHA-256 十六进制；相同状态逐字节导出相同结果。
+- `si` 精确接受 `op,version,digest,state` 四键（键须按此序出现），成功后原子替换当前状态，返回固定键序 `op,digest,ok`（`ok=true`）。连续导入同一检查点幂等；恢复后再 `se` 复现相同 version、digest 与 state。
+- 错误判定：键集合、键序、类型、范围、UTF-8 编码、未知 version、摘要格式或摘要不符报 INPUT/2；摘要相符但存在悬空引用、重复标识、矛盾计数或非法状态组合报 STATE/4；state 紧凑编码超过 8388608（8MiB）字节报 OVERLOAD/7（导出与导入同限）。任何失败均无 stdout 并回滚整批状态。
+- 摘要不符先于 state 语义校验（INPUT）；状态规范化往返（恢复后重新导出与所给 state 的紧凑编码逐字节一致）保证恢复结果确定。se/si 及校验为 O(N) 时间、O(N) 额外空间，N 为检查点编码字节数；ce/ci、调度、连接、查询及错误优先级不变，run、record、replay 覆盖成功与失败检查点并保持逐字节契约，仅用标准库。
+
 ## 测试
 
     python -m unittest discover
