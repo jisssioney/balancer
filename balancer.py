@@ -733,21 +733,29 @@ op,id,sticky,remapped，三键追加 expired,expires，值义同 route。未配�
 递增，仅保留最近 16 条；失败不分配、不改历史，初始无提交。cl 精确键集
 仅 op，返回键序 op,current,commits：current 为最新 rev 或 null，
 commits 按 rev 升序，项键序 rev,config，config 复用 ce 的逐层键序与
-值格式（含 faults、quotas、queue、capacities 与末置 lifetime）。cb 精确键集
-op,rev,now：rev 为 1..10^18
+值格式（含 faults、quotas、queue、capacities 与末置 lifetime）。cb 接受
+两种形式：原三键键集 op,rev,now 语义不变——rev 为 1..10^18
 非 bool
-整数且须仍被保留，now 沿用 ci 并进入共用非递减时钟；按目标快照执行 ci
+整数且须仍被保留，now 沿用 ci 并进入共用非递减时钟；四键严格键序
+op,rev,base,now 为乐观并发形态——base 是操作开始前当前规范化 version=11
+配置的 ct 摘要（小写 64 位十六进制串），now 为 0..10^9 非 bool 整数并
+纳入同一非递减时钟。四键先完成输入校验并确认目标修订仍在十六条提交窗口
+内，再比较 base 与操作开始时当前配置摘要，不匹配报 STATE/4 且不得应用
+目标快照、清除预约、分配修订或写入审计；匹配后沿用三键 cb 的全部判定与
+效果。两种形式均按目标快照执行 ci
 的原子替换与默认运行态重建（恢复目标 faults 时间线并重置故障运行态，
 恢复目标 quotas 并以 cb.now 重置各配额 window=now//span、used=0，
 恢复目标 queue 的 dequeue/full 策略、清空队列并置 evicted=0、last=null，
 恢复目标 capacities 的每后端接纳容量覆盖，按目标 lifetime 载入硬时限、
 null 清除），
-成功另建新 rev，返回键序 op,target,rev,ok（ok=true），
-原历史保留后再按 16 条淘汰。目标不存在或 rev 耗尽（下一个 rev 将超过
-10^18）报 STATE/4；键集、rev 类型/范围或时钟非法报 INPUT/2；有活动
-连接或排队项报 STATE/4。失败回滚时钟、配置、运行态、rev、历史与预约。
+成功另建新 rev（即使目标配置与当前逐值相同也新建），返回键序
+op,target,rev,ok（ok=true），
+原历史保留后再按 16 条淘汰。目标不存在或已淘汰、base 不匹配、rev 耗尽
+（下一个 rev 将超过 10^18）、有活动连接或排队项均报 STATE/4；键集合、
+键序、base 格式、rev 或 now 的类型与范围、UTF-8 编码或时钟倒退报
+INPUT/2。失败回滚时钟、配置、运行态、rev、历史与预约。
 record/replay 逐字节覆盖；cl 与 cb 的额外时空上界 O(16N)（N 为规范化
-配置大小）；其余
+配置大小，四键的 base 比较为 O(1) 额外空间）；其余
 子命令与既有操作行为不变。
 
 单字段配置热加载：cu 精确键序 op,base,section,value,now（键须按此序
@@ -4006,19 +4014,36 @@ def parse_op(raw_op):
         return ("ad", rev)
 
     if name == "cb":
-        # 配置回滚：精确键集 op,rev,now；rev 为 1..10^18 非 bool 整数
-        # （是否仍被保留留执行期判 STATE），now 沿用 ci 并进入共用非递减
-        # 时钟（倒退在执行期与其余操作同序判 INPUT）。
-        if keys != {"op", "rev", "now"}:
-            fail(EXIT_INPUT, "INPUT")
-        rev = raw_op["rev"]
-        if (
-            not isinstance(rev, int)
-            or isinstance(rev, bool)
-            or not 1 <= rev <= 10 ** 18
-        ):
-            fail(EXIT_INPUT, "INPUT")
-        return ("cb", rev, parse_now(raw_op["now"]))
+        # 配置回滚：两种形式。原三键 op,rev,now 仅校验键集、语义不变：rev
+        # 1..10^18 非 bool 整数（是否仍被保留留执行期判 STATE），now 沿用
+        # ci 并进入共用非递减时钟（parse_now 不设上界，倒退在执行期与其余
+        # 操作同序判 INPUT）。四键 op,rev,base,now 为乐观并发形态：base 为
+        # 操作开始前当前规范化 version=11 配置的 ct 摘要（小写 64 位十六进
+        # 制串），now 仅收 0..10^9 非 bool 整数（同 ci 乐观形态与 cv/cd），
+        # 仍进入共用非递减时钟。目标修订淘汰、base 不匹配、rev 耗尽、活动
+        # 连接或排队项留执行期判 STATE。四键形态以独立首元素 "cb_cond" 区
+        # 分，时钟集合仍收 "cb"。
+        if keys == {"op", "rev", "now"}:
+            rev = raw_op["rev"]
+            if (
+                not isinstance(rev, int)
+                or isinstance(rev, bool)
+                or not 1 <= rev <= 10 ** 18
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            return ("cb", rev, parse_now(raw_op["now"]))
+        if list(raw_op) == ["op", "rev", "base", "now"]:
+            rev = raw_op["rev"]
+            if (
+                not isinstance(rev, int)
+                or isinstance(rev, bool)
+                or not 1 <= rev <= 10 ** 18
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            base = parse_base(raw_op["base"])
+            now = parse_warm_now(raw_op["now"])
+            return ("cb_cond", rev, base, now)
+        fail(EXIT_INPUT, "INPUT")
 
     if name == "cu":
         # 单字段配置热加载：精确键序 op,base,section,value,now（键须按此序
@@ -7918,7 +7943,7 @@ def run(raw):
             "oq", "lh", "lt", "le",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
-            "ci", "cb", "cu", "cv", "cd", "pd", "hd", "hb", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cb_cond", "cu", "cv", "cd", "pd", "hd", "hb", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fd", "fc",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ua", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
@@ -10827,11 +10852,22 @@ def run(raw):
                 }
             )
 
-        elif op[0] == "cb":
+        elif op[0] in ("cb", "cb_cond"):
             # 配置回滚：按目标快照执行 ci 的原子替换与默认运行态重建，成功
             # 另建新 rev；全部校验先于任何变更，失败天然回滚时钟、配置、
-            # 运行态、rev 与历史。
-            _, target_rev, now = op
+            # 运行态、rev 与历史。四键 cb_cond（op,rev,base,now）为乐观并
+            # 发形态：先确认目标修订仍在十六条提交窗口内（不存在或已淘汰
+            # 报 STATE），再比较 base 与操作开始时（共用时钟块推进 now 之
+            # 后、任何应用之前）当前规范化 version=11 配置的 ct 摘要，不
+            # 匹配报 STATE，且不能应用快照、推进时钟（时钟已由共用时钟块
+            # 推进，失败随整批丢弃即回滚）、清除预约、分配修订或写入审计。
+            # 匹配后沿用三键 cb 的全部判定（rev 耗尽、活动连接或排队项）
+            # 与效果；即使目标配置与当前配置逐值相同也照常新建修订。
+            if op[0] == "cb_cond":
+                _, target_rev, base, now = op
+            else:
+                _, target_rev, now = op
+                base = None
             snapshot = None
             for rev, committed in commit_history:
                 if rev == target_rev:
@@ -10839,6 +10875,10 @@ def run(raw):
                     break
             if snapshot is None:
                 # 目标不存在（从未分配或已按 16 条淘汰）。
+                fail(EXIT_STATE, "STATE")
+            if base is not None and base != config_digest(export_config()):
+                # 乐观并发保护：base 与操作开始时当前配置摘要不等即拒绝
+                # 回滚，先于 rev 耗尽与活动连接/排队检查。
                 fail(EXIT_STATE, "STATE")
             if next_rev > 10 ** 18:
                 # rev 耗尽。

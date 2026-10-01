@@ -417,6 +417,244 @@ class ConfigCommitTest(unittest.TestCase):
         self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
         self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
 
+    def _current_digest(self, ops):
+        """在 ops 之后追加 ct，返回当前规范化配置的 ct 摘要。"""
+        code, out, err = run_balancer("run", encode_ops(ops + [{"op": "ct"}]))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]["digest"]
+
+    def test_cb_cond_matching_base_rolls_back(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+        ]
+        digest = self._current_digest(ops)
+        code, out = self.run_ops(
+            ops
+            + [
+                {"op": "cb", "rev": 1, "base": digest, "now": 2},
+                {"op": "ce"},
+            ]
+        )
+        results = json.loads(out)["results"]
+        self.assertEqual(
+            results[2], {"op": "cb", "target": 1, "rev": 3, "ok": True}
+        )
+        self.assertEqual(list(results[2]), ["op", "target", "rev", "ok"])
+        self.assertEqual(results[3]["config"], config_v11(1))
+
+    def test_cb_cond_same_config_still_creates_rev(self):
+        ops = [{"op": "ci", "config": config_v6(1), "now": 0}]
+        digest = self._current_digest(ops)
+        code, out = self.run_ops(
+            ops + [{"op": "cb", "rev": 1, "base": digest, "now": 1}]
+        )
+        self.assertEqual(
+            json.loads(out)["results"][1],
+            {"op": "cb", "target": 1, "rev": 2, "ok": True},
+        )
+
+    def test_cb_cond_base_mismatch_is_state(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+            {"op": "cb", "rev": 1, "base": "0" * 64, "now": 2},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_cond_base_mismatch_precedes_active_connection(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 2},
+            {"op": "cb", "rev": 1, "base": "0" * 64, "now": 3},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_cond_unknown_rev_is_state_even_with_matching_base(self):
+        ops = [{"op": "ci", "config": config_v6(1), "now": 0}]
+        digest = self._current_digest(ops)
+        code, out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "cb", "rev": 2, "base": digest, "now": 1}])
+        )
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_cond_evicted_rev_is_state(self):
+        # 目标修订先于 base 判定：已淘汰 rev 即使 base 不匹配也只报 STATE。
+        ops = [
+            {"op": "ci", "config": config_v6(i), "now": i} for i in range(1, 21)
+        ]
+        ops.append({"op": "cb", "rev": 4, "base": "0" * 64, "now": 20})
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_cond_active_connection_is_state(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+        ]
+        digest = self._current_digest(ops)
+        ops += [
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 2},
+            {"op": "cb", "rev": 1, "base": digest, "now": 3},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_cond_wait_queue_is_state(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            {"op": "ci", "config": config_v11(2), "now": 1},
+            {"op": "chash", "vnodes": 1},
+            {"op": "os", "cap": 1, "q": 2, "ttl": 10},
+            {"op": "open", "cid": "y", "flow": FLOW, "now": 2},
+            {"op": "oa", "cid": "z", "flow": FLOW, "c": "k", "s": "k", "key": "k", "now": 2},
+        ]
+        digest = self._current_digest(ops)
+        code, out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "cb", "rev": 1, "base": digest, "now": 3}])
+        )
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_cond_shape_is_input(self):
+        good_base = "0" * 64
+        bad_ops = [
+            {"op": "cb", "rev": 1, "now": 0, "base": good_base},  # base 错位
+            {"op": "cb", "base": good_base, "rev": 1, "now": 0},  # base 提前
+            {"op": "cb", "rev": 1, "base": good_base},  # 缺 now
+            {"op": "cb", "rev": 1, "base": good_base, "now": 0, "x": 1},  # 多余键
+        ]
+        for raw_op in bad_ops:
+            code, out, err = run_balancer("run", encode_ops([raw_op]))
+            self.assertEqual(
+                (code, out, err), (2, b"", b'{"error":"INPUT"}\n'), raw_op
+            )
+
+    def test_cb_cond_base_format_is_input(self):
+        for bad_base in ("0" * 63, "0" * 65, "g" * 64, "A" * 64, 1, True, None, []):
+            raw_op = {"op": "cb", "rev": 1, "base": bad_base, "now": 0}
+            code, out, err = run_balancer("run", encode_ops([raw_op]))
+            self.assertEqual(
+                (code, out, err), (2, b"", b'{"error":"INPUT"}\n'), bad_base
+            )
+
+    def test_cb_cond_now_range_is_input(self):
+        # 四键 now 仅收 0..10^9（区别于三键 cb 的无上界 now）。
+        ops = [{"op": "ci", "config": config_v6(1), "now": 0}]
+        digest = self._current_digest(ops)
+        for bad_now in (-1, 10 ** 9 + 1, True, False, "0", 1.5, None):
+            raw_op = {"op": "cb", "rev": 1, "base": digest, "now": bad_now}
+            code, out, err = run_balancer("run", encode_ops(ops + [raw_op]))
+            self.assertEqual(
+                (code, out, err), (2, b"", b'{"error":"INPUT"}\n'), bad_now
+            )
+
+    def test_cb_cond_rev_is_input(self):
+        for bad_rev in (0, -1, 10 ** 18 + 1, True, "1", 1.5):
+            raw_op = {"op": "cb", "rev": bad_rev, "base": "0" * 64, "now": 0}
+            code, out, err = run_balancer("run", encode_ops([raw_op]))
+            self.assertEqual(
+                (code, out, err), (2, b"", b'{"error":"INPUT"}\n'), bad_rev
+            )
+
+    def test_cb_cond_clock_regression_is_input(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 10},
+        ]
+        digest = self._current_digest(ops)
+        # 时钟倒退先于 base 判定（即使 base 也已过期）。
+        code, out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "cb", "rev": 1, "base": "0" * 64, "now": 9}])
+        )
+        self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
+        code, out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "cb", "rev": 1, "base": digest, "now": 9}])
+        )
+        self.assertEqual((code, out, err), (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_cb_cond_failure_writes_nothing(self):
+        # base 不匹配：预约保留、不分配 rev、不写审计；失败批无 stdout。
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+            {"op": "cb", "rev": 1, "base": "0" * 64, "now": 2},
+            {"op": "cl"},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, out, err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_cb_cond_audit_event_and_sections(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+        ]
+        digest = self._current_digest(ops)
+        code, out = self.run_ops(
+            ops
+            + [
+                {"op": "cb", "rev": 1, "base": digest, "now": 2},
+                {"op": "al"},
+                {"op": "ad", "rev": 3},
+            ]
+        )
+        results = json.loads(out)["results"]
+        event = results[3]["events"][-1]
+        self.assertEqual(event["kind"], "cb")
+        self.assertEqual(event["rev"], 3)
+        self.assertEqual(event["section"], None)
+        self.assertEqual(
+            results[4],
+            {
+                "op": "ad",
+                "rev": 3,
+                "now": 2,
+                "kind": "cb",
+                "section": None,
+                "before": event["before"],
+                "after": event["after"],
+                "changes": results[4]["changes"],
+            },
+        )
+        sections = {change["section"] for change in results[4]["changes"]}
+        self.assertIn("backends", sections)
+
+    def test_cb_cond_record_replay_success_and_failure(self):
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+        ]
+        digest = self._current_digest(ops)
+        success = ops + [{"op": "cb", "rev": 1, "base": digest, "now": 2}]
+        rec_code, rec_out, rec_err = run_balancer("record", encode_ops(success))
+        self.assertEqual((rec_code, rec_err), (0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        record = json.loads(rec_out)
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_out, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_err, base64.b64decode(record["stderr"]))
+        failure = ops + [{"op": "cb", "rev": 1, "base": "0" * 64, "now": 2}]
+        rec_code, rec_out, rec_err = run_balancer("record", encode_ops(failure))
+        self.assertEqual((rec_code, rec_err), (0, b""))
+        self.assertEqual(json.loads(rec_out)["exit"], 4)
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual((rep_code, rep_out, rep_err), (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_three_key_cb_now_unbounded_unchanged(self):
+        # 三键 cb 的 now 仍无上界（沿用 parse_now）。
+        ops = [
+            {"op": "ci", "config": config_v6(1), "now": 0},
+            {"op": "ci", "config": config_v6(2), "now": 1},
+            {"op": "cb", "rev": 1, "now": 10 ** 9 + 5},
+        ]
+        code, out = self.run_ops(ops)
+        self.assertEqual(
+            json.loads(out)["results"][2],
+            {"op": "cb", "target": 1, "rev": 3, "ok": True},
+        )
+
 
 class ConfigPrecheckTest(unittest.TestCase):
     """配置预检 cv：只校验并回显规范化配置，不应用、不提交。"""
