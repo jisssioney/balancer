@@ -3812,12 +3812,28 @@ def parse_op(raw_op):
         return ("cq", parse_warm_now(raw_op["now"]))
 
     if name == "ca":
-        # 预约生效：精确键序 op,now；now ∈ [0,10^9] 非 bool 整数并进入
-        # 共用非递减时钟；仅 now≥at 时按快照执行 ci 的原子替换、默认态
-        # 重建并新建 rev。无预约、now<at、有连接或排队项留执行期判 STATE。
-        if list(raw_op) != ["op", "now"]:
-            fail(EXIT_INPUT, "INPUT")
-        return ("ca", parse_warm_now(raw_op["now"]))
+        # 预约生效：两键形态精确键序 op,now；now ∈ [0,10^9] 非 bool 整数并
+        # 进入共用非递减时钟；仅 now≥at 时按快照执行 ci 的原子替换、默认态
+        # 重建并新建 rev。条件形态精确键序 op,digest,at,now（键须按此序出
+        # 现，乱序报 INPUT）：digest 为小写 64 位十六进制 SHA-256，at、now
+        # 均为 0..10^9 非 bool 整数；now 进入共用非递减时钟（倒退在执行期
+        # 判 INPUT），at 仅作预约身份、不推进时钟。无预约、身份不符、
+        # now<at、有连接或排队项留执行期判 STATE；本函数只做形状与字段
+        # 校验，且两键语义保持不变。
+        if list(raw_op) == ["op", "now"]:
+            return ("ca", parse_warm_now(raw_op["now"]))
+        if list(raw_op) == ["op", "digest", "at", "now"]:
+            digest = parse_base(raw_op["digest"])
+            at = raw_op["at"]
+            if (
+                not isinstance(at, int)
+                or isinstance(at, bool)
+                or not 0 <= at <= 10 ** 9
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            now = parse_warm_now(raw_op["now"])
+            return ("ca", digest, at, now)
+        fail(EXIT_INPUT, "INPUT")
 
     if name == "cx":
         # 配置预约取消：精确键序 op,digest,at,now（键须按此序出现，乱序报
@@ -10768,14 +10784,27 @@ def run(raw):
 
         elif op[0] == "ca":
             # 预约生效：无预约、now<at、有活动连接或排队项报 STATE；rev 耗尽
-            # 同 ci 报 STATE。全部校验先于任何变更。通过后按保存的 v11 快照
-            # 执行 ci 的原子替换、以 now 重建默认运行态并新建 rev（快照来自
+            # 同 ci 报 STATE。条件形态（四键）额外要求当前预约的规范化配置
+            # 摘要与触发时刻分别等于请求的 digest、at，否则无预约或身份不
+            # 符同样报 STATE，且在任何到期/静默检查之前先判身份、不应用任
+            # 何配置。全部校验先于任何变更。通过后按保存的 v11 快照执行
+            # ci 的原子替换、以 now 重建默认运行态并新建 rev（快照来自
             # export_normalized_config，重解析必然合法），成功清除预约；
             # 失败天然原子回滚（预约、时钟、配置、rev 均不变）。
-            _, now = op
+            if len(op) == 2:
+                _, now = op
+                expected_digest = None
+                expected_at = None
+            else:
+                _, expected_digest, expected_at, now = op
             if reservation is None:
                 fail(EXIT_STATE, "STATE")
             snapshot, at, digest = reservation
+            if expected_digest is not None and (
+                digest != expected_digest or at != expected_at
+            ):
+                # 身份不符：不应用配置、不清除预约、不分配 rev、不写审计。
+                fail(EXIT_STATE, "STATE")
             if now < at:
                 fail(EXIT_STATE, "STATE")
             if connections or wait_queue:

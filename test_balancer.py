@@ -6702,6 +6702,318 @@ class ReservationReplaceTest(unittest.TestCase):
                              (run_code, run_out, run_err))
 
 
+class ReservationActivateTest(unittest.TestCase):
+    """ca 条件生效形态 op,digest,at,now：身份匹配后与旧 ca 等价；身份
+    不符/无预约 STATE 且无副作用；INPUT 校验、时钟、静默切换条件、
+    检查点 se/si 与 record/replay 逐字节。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def cp(self, config, at=10, now=1):
+        return {"op": "cp", "config": config, "at": at, "now": now}
+
+    def ca_cond(self, digest, at, now):
+        return {"op": "ca", "digest": digest, "at": at, "now": now}
+
+    # ---- 成功与输出形状 ----
+
+    def test_conditional_activate_matching_identity(self):
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        results = self.run_ops([
+            self.cp(cfg, 10, 1),
+            self.ca_cond(digest, 10, 10),
+            {"op": "cq", "now": 11},
+        ])
+        self.assertEqual(
+            results[1],
+            {"op": "ca", "digest": digest, "rev": 1, "ok": True},
+        )
+        self.assertEqual(list(results[1]),
+                         ["op", "digest", "rev", "ok"])
+        self.assertEqual(results[2],
+                         {"op": "cq", "pending": False,
+                          "digest": None, "at": None})
+
+    def test_output_is_single_line_compact_json(self):
+        cfg = config_v11(1)
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([self.cp(cfg), self.ca_cond(digest_of(cfg), 10, 10)]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out.count(b"\n"), 1)
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertNotIn(b", ", out)
+        self.assertNotIn(b": ", out)
+
+    def test_matches_two_key_ca_config_history_audit(self):
+        # 同状态下条件 ca 与旧两键 ca 成功后的配置、提交历史与审计一致。
+        current = config_v11(2)
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        tail = [{"op": "ct"}, {"op": "cl"}, {"op": "al"},
+                {"op": "ad", "rev": 2}]
+        old_ops = [
+            {"op": "ci", "config": current, "now": 0},
+            self.cp(cfg, 10, 1),
+            {"op": "ca", "now": 10},
+        ] + tail
+        new_ops = [
+            {"op": "ci", "config": current, "now": 0},
+            self.cp(cfg, 10, 1),
+            self.ca_cond(digest, 10, 10),
+        ] + tail
+        _, old_out, old_err = run_balancer("run", encode_ops(old_ops))
+        _, new_out, new_err = run_balancer("run", encode_ops(new_ops))
+        self.assertEqual(old_err, new_err)
+        old_results = json.loads(old_out)["results"]
+        new_results = json.loads(new_out)["results"]
+        # ca 响应两形态键集不同，仅比较之后的 ct/cl/al/ad 与 ca 载荷值。
+        self.assertEqual(new_results[2],
+                         {"op": "ca", "digest": digest,
+                          "rev": 2, "ok": True})
+        self.assertEqual(new_results[3:], old_results[3:])
+
+    # ---- 身份不符 / 无预约 ----
+
+    def test_wrong_digest_is_state_without_effects(self):
+        cfg = config_v11(1, lifetime=5)
+        self.assert_failure(
+            [self.cp(cfg), self.ca_cond("0" * 64, 10, 10)], 4, "STATE",
+        )
+
+    def test_wrong_at_is_state_without_effects(self):
+        cfg = config_v11(1, lifetime=5)
+        self.assert_failure(
+            [self.cp(cfg, 10, 1), self.ca_cond(digest_of(cfg), 9, 10)],
+            4, "STATE",
+        )
+
+    def test_no_reservation_is_state(self):
+        self.assert_failure(
+            [self.ca_cond("0" * 64, 10, 10)], 4, "STATE",
+        )
+
+    def test_identity_mismatch_keeps_reservation_and_rev(self):
+        # 身份不符后预约仍在，随后旧凭据仍能取消；失败批回滚不耗 rev。
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        self.assert_failure(
+            [self.cp(cfg), self.ca_cond("f" * 64, 10, 10)], 4, "STATE",
+        )
+        # 每次 run 是全新进程：另一批次中失败不耗 rev，首 rev 仍为 1；
+        # 预约在失败批内被回滚，cp 后 cq 仍为 pending。
+        results = self.run_ops([
+            self.cp(cfg, 10, 1),
+            {"op": "cq", "now": 2},
+        ])
+        self.assertTrue(results[1]["pending"])
+        results = self.run_ops([
+            self.cp(cfg, 10, 1),
+            self.ca_cond(digest, 10, 10),
+        ])
+        self.assertEqual(results[1]["rev"], 1)
+
+    def test_replaced_reservation_rejects_stale_identity(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        self.assert_failure([
+            self.cp(old, 10, 1),
+            {"op": "cp", "config": new, "at": 20, "now": 2},
+            self.ca_cond(digest_of(old), 10, 20),
+        ], 4, "STATE")
+        results = self.run_ops([
+            self.cp(old, 10, 1),
+            {"op": "cp", "config": new, "at": 20, "now": 2},
+            self.ca_cond(digest_of(new), 20, 20),
+        ])
+        self.assertEqual(results[2]["digest"], digest_of(new))
+
+    # ---- 到期与静默切换条件 ----
+
+    def test_identity_ok_but_early_is_state(self):
+        cfg = config_v11(1)
+        self.assert_failure(
+            [self.cp(cfg, 10, 1), self.ca_cond(digest_of(cfg), 10, 9)],
+            4, "STATE",
+        )
+
+    def test_identity_ok_but_active_connection_is_state(self):
+        cfg = config_v11(1, lifetime=9)
+        self.assert_failure([
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            {"op": "open", "cid": "c", "flow": self.FLOW, "now": 0},
+            self.cp(cfg, 10, 1),
+            self.ca_cond(digest_of(cfg), 10, 10),
+        ], 4, "STATE")
+
+    def test_identity_checked_before_quiet_and_time(self):
+        # 身份不符即使 now<at/有连接，仍按身份 STATE（同为 STATE，且预约
+        # 不动）：错误分类不因后续条件改变。
+        cfg = config_v11(1)
+        self.assert_failure(
+            [self.cp(cfg, 20, 1), self.ca_cond("9" * 64, 20, 5)],
+            4, "STATE",
+        )
+
+    # ---- INPUT 校验 ----
+
+    def test_input_shapes(self):
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        bad = (
+            # 键序
+            {"op": "ca", "at": 10, "digest": digest, "now": 10},
+            {"op": "ca", "now": 10, "digest": digest, "at": 10},
+            # 字段集合
+            {"op": "ca", "digest": digest, "at": 10},
+            {"op": "ca", "digest": digest, "at": 10, "now": 10,
+             "extra": 1},
+            # digest 格式
+            {"op": "ca", "digest": "A" * 64, "at": 10, "now": 10},
+            {"op": "ca", "digest": "0" * 63, "at": 10, "now": 10},
+            {"op": "ca", "digest": 64, "at": 10, "now": 10},
+            # at/now 类型范围
+            {"op": "ca", "digest": digest, "at": True, "now": 10},
+            {"op": "ca", "digest": digest, "at": -1, "now": 10},
+            {"op": "ca", "digest": digest, "at": 10 ** 9 + 1,
+             "now": 10},
+            {"op": "ca", "digest": digest, "at": 10, "now": False},
+            {"op": "ca", "digest": digest, "at": 10.0, "now": 10},
+        )
+        for request in bad:
+            self.assert_failure([self.cp(cfg), request], 2, "INPUT")
+
+    def test_clock_regression_input_rolls_back_batch(self):
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        self.assert_failure([
+            self.cp(cfg, 10, 5),
+            self.ca_cond(digest, 10, 10),
+            {"op": "cq", "now": 9},
+        ], 2, "INPUT")
+
+    def test_at_does_not_advance_clock(self):
+        # at 仅身份：cp(now=1) 后 at=10 的条件 ca 成功；其 now 才推进时钟。
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        results = self.run_ops([
+            self.cp(cfg, 10, 1),
+            self.ca_cond(digest, 10, 10),
+            {"op": "cq", "now": 10},  # 同刻重放合法
+        ])
+        self.assertTrue(results[1]["ok"])
+
+    def test_two_key_form_unchanged(self):
+        cfg = config_v11(1, lifetime=5)
+        results = self.run_ops([
+            self.cp(cfg, 10, 1),
+            {"op": "ca", "now": 10},
+        ])
+        self.assertEqual(
+            results[1],
+            {"op": "ca", "digest": digest_of(cfg), "rev": 1, "ok": True},
+        )
+
+    # ---- 检查点 se/si ----
+
+    def export(self, ops):
+        code, out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "se"}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def test_si_restore_conditional_ca_matches_direct(self):
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        prefix = [self.cp(cfg, 10, 1)]
+        cont_success = [self.ca_cond(digest, 10, 10),
+                        {"op": "cq", "now": 11}]
+        _, direct, direct_err = run_balancer(
+            "run", encode_ops(prefix + cont_success)
+        )
+        se = self.export(prefix)
+        si = {"op": "si", "version": se["version"],
+              "digest": se["digest"], "state": se["state"]}
+        _, restored, restored_err = run_balancer(
+            "run", encode_ops([si] + cont_success)
+        )
+        self.assertEqual(restored_err, direct_err)
+        direct_results = json.loads(direct)["results"]
+        restored_results = json.loads(restored)["results"]
+        self.assertEqual(restored_results[1:], direct_results[1:])
+        # 恢复后身份不符同样 STATE。
+        cont_fail = [self.ca_cond("1" * 64, 10, 10)]
+        code_d, _, err_d = run_balancer(
+            "run", encode_ops(prefix + cont_fail)
+        )
+        code_r, out_r, err_r = run_balancer(
+            "run", encode_ops([si] + cont_fail)
+        )
+        self.assertEqual((code_r, out_r, err_r),
+                         (code_d, b"", err_d))
+
+    def test_se_after_success_exports_null_reservation(self):
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        se = self.export([
+            self.cp(cfg, 10, 1),
+            self.ca_cond(digest, 10, 10),
+        ])
+        self.assertIsNone(se["state"]["reservation"])
+
+    # ---- record/replay ----
+
+    def test_record_replay_success_and_failures(self):
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        cases = (
+            ([self.cp(cfg, 10, 1),
+              self.ca_cond(digest, 10, 10)], 0),
+            # 幂等重报
+            ([self.cp(cfg, 10, 1),
+              self.ca_cond(digest, 10, 10),
+              self.ca_cond(digest, 10, 10)], 4),
+            ([self.ca_cond(digest, 10, 10)], 4),
+            ([self.cp(cfg, 10, 1),
+              self.ca_cond("2" * 64, 10, 10)], 4),
+            ([self.cp(cfg, 10, 1),
+              self.ca_cond(digest, 10, 9)], 4),
+            ([self.cp(cfg, 10, 5),
+              self.ca_cond(digest, 10, 4)], 2),
+            ([self.cp(cfg, 10, 1),
+              {"op": "ca", "digest": digest.upper(), "at": 10,
+               "now": 10}], 2),
+        )
+        for ops, expected in cases:
+            raw = encode_ops(ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual((run_code, rec_code, rec_err),
+                             (expected, 0, b""))
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual((rep_code, rep_out, rep_err),
+                             (run_code, run_out, run_err))
+            if expected == 0:
+                self.assertEqual(run_out.count(b"\n"), 1)
+
+
 class V7FaultNormalizationTest(unittest.TestCase):
     """v7 faults 规范化：乱序提交按 a 升序输出，重叠判定不变。"""
 
