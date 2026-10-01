@@ -1049,6 +1049,13 @@ DEFAULT_SUCCESS = 2
 # （affected/rejected/retries/remaps/recovered）均封顶 10^18。
 METRIC_CAP = 10 ** 18
 
+# se/si 检查点 state（即 {"version":1,"state":...} 紧凑 UTF-8 编码）的字节
+# 上限；导出或导入超限一律 OVERLOAD/7。
+CHECKPOINT_LIMIT = 8 * 1024 * 1024
+
+# 当前检查点格式版本；初始即 1，只接受 1。
+CHECKPOINT_VERSION = 1
+
 
 def new_fault_stats():
     """一组故障演练计数：D/F/S 三种登记种类各五键，键序固定
@@ -3605,6 +3612,26 @@ def parse_op(raw_op):
             # 只读模拟时刻不得早于当前时钟输入值。
             fail(EXIT_INPUT, "INPUT")
         return ("fc", plan, key, at, timeout, max_attempts, now)
+
+    if name in ("se", "si"):
+        # 可移植运行态检查点：se 精确键序仅 op（只读、不推进时钟、不改状
+        # 态）；si 精确键序 op,version,digest,state（键须按此序出现），原
+        # 始 version/digest/state 不在解析期深校验：版本、摘要类型与字符集、
+        # state 结构/类型/范围、悬空引用与非法组合一律留执行期按 INPUT/STATE
+        # 判定（摘要须先于结构重组比对，故不能在此规整）。二者都不进入共用
+        # 非递减时钟。
+        if name == "se":
+            if list(raw_op) != ["op"]:
+                fail(EXIT_INPUT, "INPUT")
+            return ("se",)
+        if list(raw_op) != ["op", "version", "digest", "state"]:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "si",
+            raw_op["version"],
+            raw_op["digest"],
+            raw_op["state"],
+        )
 
     if name in ("ce", "ci"):
         if name == "ce":
