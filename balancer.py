@@ -3812,12 +3812,29 @@ def parse_op(raw_op):
         return ("cq", parse_warm_now(raw_op["now"]))
 
     if name == "ca":
-        # 预约生效：精确键序 op,now；now ∈ [0,10^9] 非 bool 整数并进入
-        # 共用非递减时钟；仅 now≥at 时按快照执行 ci 的原子替换、默认态
-        # 重建并新建 rev。无预约、now<at、有连接或排队项留执行期判 STATE。
-        if list(raw_op) != ["op", "now"]:
-            fail(EXIT_INPUT, "INPUT")
-        return ("ca", parse_warm_now(raw_op["now"]))
+        # 预约生效：两种严格键序形式。两键 op,now 为现有直接生效形态：
+        # now ∈ [0,10^9] 非 bool 整数并进入共用非递减时钟，仅 now≥at 时按
+        # 快照执行 ci 的原子替换、默认态重建并新建 rev。四键
+        # op,digest,at,now 为条件生效形态：digest 为小写 64 位十六进制
+        # SHA-256（格式同 cx.digest，仅用于匹配预约身份），at、now 均为
+        # 0..10^9 非 bool 整数；now 同样进入共用时钟（倒退在执行期判
+        # INPUT），at 仅作为预约身份、不推进时钟。无预约或身份不符、
+        # now<at、有连接或排队项留执行期判 STATE；本函数只做形状与字段
+        # 校验。条件形态以独立首元素 "ca_cond" 区分，时钟集合仍收 "ca"。
+        if list(raw_op) == ["op", "now"]:
+            return ("ca", parse_warm_now(raw_op["now"]))
+        if list(raw_op) == ["op", "digest", "at", "now"]:
+            digest = parse_base(raw_op["digest"])
+            at = raw_op["at"]
+            if (
+                not isinstance(at, int)
+                or isinstance(at, bool)
+                or not 0 <= at <= 10 ** 9
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            now = parse_warm_now(raw_op["now"])
+            return ("ca_cond", digest, at, now)
+        fail(EXIT_INPUT, "INPUT")
 
     if name == "cx":
         # 配置预约取消：精确键序 op,digest,at,now（键须按此序出现，乱序报
@@ -4425,13 +4442,15 @@ def run(raw):
     # O(16(B+M+T+Q))。
     commit_history = []
     next_rev = 1
-    # 配置预约（cp/cq/ca/cx）：无预约为 None，否则为
+    # 配置预约（cp/cq/ca/cx/cy）：无预约为 None，否则为
     # (snapshot, at, digest)——snapshot 为 cp 当时规范化 version=11 配置的
     # 全新导出结构（不随后续运行态变化），at 为触发时刻（只表示时刻、不推进
     # 时钟），digest 为快照的 ct 摘要。cp 成功即整体替换，cq 只读 O(1)，
-    # ca 成功、ci/cb/cu 成功均清除；cx 在 digest、at 同时匹配时原子清除、
-    # 无预约时幂等空操作、有预约但任一不匹配报 STATE 且保留预约；其余操作
-    # 不影响预约。额外空间 O(N)，N 为规范化配置大小。
+    # ca 成功（含四键条件形态 ca_cond：digest、at 同时匹配才继续）、
+    # ci/cb/cu 成功均清除；cx 在 digest、at 同时匹配时原子清除、
+    # 无预约时幂等空操作、有预约但任一不匹配报 STATE 且保留预约；cy 按
+    # 旧值/新值条件替换；其余操作不影响预约。额外空间 O(N)，N 为规范化
+    # 配置大小。
     reservation = None
     # 配置变更审计（al）：deque(maxlen=64) 按 rev 升序保留最近 64 条，追加
     # O(1) 且超额自动淘汰最旧项；初始为空，独立于 commit_history 的 16 条
@@ -7844,7 +7863,7 @@ def run(raw):
             "ru", "ua", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "na",
             "mu",
-            "cp", "cq", "ca", "cx", "cy",
+            "cp", "cq", "ca", "ca_cond", "cx", "cy",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -10766,15 +10785,29 @@ def run(raw):
                     {"op": "cq", "pending": True, "digest": digest, "at": at}
                 )
 
-        elif op[0] == "ca":
-            # 预约生效：无预约、now<at、有活动连接或排队项报 STATE；rev 耗尽
-            # 同 ci 报 STATE。全部校验先于任何变更。通过后按保存的 v11 快照
-            # 执行 ci 的原子替换、以 now 重建默认运行态并新建 rev（快照来自
-            # export_normalized_config，重解析必然合法），成功清除预约；
-            # 失败天然原子回滚（预约、时钟、配置、rev 均不变）。
-            _, now = op
-            if reservation is None:
-                fail(EXIT_STATE, "STATE")
+        elif op[0] in ("ca", "ca_cond"):
+            # 预约生效：两种形态共用同一生效路径。两键 ca 直接按当前预约
+            # 生效；四键 ca（op,digest,at,now）为条件形态，仅当当前预约的
+            # 规范化配置摘要与触发时刻分别等于请求 digest、at 时继续，
+            # 没有预约或任一身份不符报 STATE，且不得应用配置、清除预约、
+            # 分配 rev 或写审计（身份比较 O(1)，先于其他一切 STATE 判定）。
+            # 身份匹配后与直接 ca 同序：now<at、有活动连接或排队项、rev
+            # 耗尽（同 ci）报 STATE。全部校验先于任何变更。通过后按保存的
+            # v11 快照执行 ci 的原子替换、以 now 重建默认运行态并新建 rev
+            # （快照来自 export_normalized_config，重解析必然合法），成功
+            # 清除预约；失败天然原子回滚（预约、时钟、配置、rev 均不变）。
+            if op[0] == "ca_cond":
+                _, wanted_digest, wanted_at, now = op
+                if (
+                    reservation is None
+                    or reservation[2] != wanted_digest
+                    or reservation[1] != wanted_at
+                ):
+                    fail(EXIT_STATE, "STATE")
+            else:
+                _, now = op
+                if reservation is None:
+                    fail(EXIT_STATE, "STATE")
             snapshot, at, digest = reservation
             if now < at:
                 fail(EXIT_STATE, "STATE")
@@ -10795,7 +10828,9 @@ def run(raw):
             reservation = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
             # null；before 为生效前指纹，after 为预约快照指纹（同响应 digest）。
-            # 同一事件内固化段级差异（仅指纹，按顶层键序）。
+            # 同一事件内固化段级差异（仅指纹，按顶层键序）。条件形态同样
+            # 追加 kind=ca 事件，与同状态下直接 ca 成功后的提交历史与审计
+            # 状态逐值一致。
             audit_events.append(
                 {
                     "rev": new_rev,
