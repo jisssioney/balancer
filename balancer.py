@@ -2395,7 +2395,7 @@ def parse_op(raw_op):
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "na",
         "ce", "ci", "cl", "al", "ai", "ad", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
-        "cp", "cq", "ca",
+        "cp", "cq", "ca", "cx",
         "fs", "fx", "fr", "fi", "ft", "oi", "od",
         "fb", "fp", "fq", "fd", "fc",
         "br",
@@ -3819,6 +3819,26 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("ca", parse_warm_now(raw_op["now"]))
 
+    if name == "cx":
+        # 配置预约条件取消：精确键序 op,digest,at,now（键须按此序出现，
+        # 乱序报 INPUT）；digest 为小写 64 位十六进制 SHA-256（格式同 ct
+        # 输出），at、now 均为 0..10^9 非 bool 整数；now 进入共用非递减
+        # 时钟（倒退在执行期与其余操作同序判 INPUT），at 仅用于与现存预
+        # 约匹配，不推进时钟。digest/at 任一与现存预约不符留执行期判
+        # STATE（INPUT 判定先于预约匹配）。
+        if list(raw_op) != ["op", "digest", "at", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        digest = parse_base(raw_op["digest"])
+        at = raw_op["at"]
+        if (
+            not isinstance(at, int)
+            or isinstance(at, bool)
+            or not 0 <= at <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_warm_now(raw_op["now"])
+        return ("cx", digest, at, now)
+
     if name == "ct":
         # 配置指纹查询：精确键序仅 op，只读且不推进时钟。
         if list(raw_op) != ["op"]:
@@ -4374,11 +4394,12 @@ def run(raw):
     # O(16(B+M+T+Q))。
     commit_history = []
     next_rev = 1
-    # 配置预约（cp/cq/ca）：无预约为 None，否则为
+    # 配置预约（cp/cq/ca/cx）：无预约为 None，否则为
     # (snapshot, at, digest)——snapshot 为 cp 当时规范化 version=11 配置的
     # 全新导出结构（不随后续运行态变化），at 为触发时刻（只表示时刻、不推进
     # 时钟），digest 为快照的 ct 摘要。cp 成功即整体替换，cq 只读 O(1)，
-    # ca 成功、ci/cb 成功均清除；其余操作不影响预约。额外空间 O(N)，N 为
+    # ca 成功、ci/cb/cu 成功与 cx 匹配取消均清除（cx 不匹配报 STATE 并保留，
+    # 无预约为幂等空操作）；其余操作不影响预约。额外空间 O(N)，N 为
     # 规范化配置大小。
     reservation = None
     # 配置变更审计（al）：deque(maxlen=64) 按 rev 升序保留最近 64 条，追加
@@ -7792,7 +7813,7 @@ def run(raw):
             "ru", "ua", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "na",
             "mu",
-            "cp", "cq", "ca",
+            "cp", "cq", "ca", "cx",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -10760,6 +10781,29 @@ def run(raw):
             results.append(
                 {"op": "ca", "digest": digest, "rev": new_rev, "ok": True}
             )
+
+        elif op[0] == "cx":
+            # 预约条件取消：now 已由共用时钟块校验并推进（时钟倒退报
+            # INPUT，先于下方预约匹配），at 仅作匹配不进时钟。无预约为幂
+            # 等空操作（cancelled=false，回显请求 digest/at），不建修订、
+            # 审计事件或其他状态；有预约须 digest 与 at 同时匹配才原子删
+            # 除，否则报 STATE 并保留原预约。取消不应用候选配置，不动当
+            # 前配置、后端、连接、队列、粘性、指标、告警、提交历史与
+            # next_rev。
+            _, digest, at, now = op
+            if reservation is None:
+                results.append(
+                    {"op": "cx", "cancelled": False,
+                     "digest": digest, "at": at}
+                )
+            elif (reservation[2], reservation[1]) != (digest, at):
+                fail(EXIT_STATE, "STATE")
+            else:
+                reservation = None
+                results.append(
+                    {"op": "cx", "cancelled": True,
+                     "digest": digest, "at": at}
+                )
 
         elif op[0] == "fs":
             _, backend_id, segment = op
