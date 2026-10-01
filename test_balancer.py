@@ -6087,6 +6087,621 @@ class ReservationCancelTest(unittest.TestCase):
                              (run_code, run_out, run_err))
 
 
+class ReservationReplaceTest(unittest.TestCase):
+    """配置预约条件替换 cy：旧值替换、新值幂等重报、STATE/BACKEND/INPUT
+    错误优先级、凭据轮换、副作用边界、检查点与 record/replay。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def cp(self, config, at, now):
+        return {"op": "cp", "config": config, "at": at, "now": now}
+
+    def cy(self, base, base_at, config, at, now):
+        return {"op": "cy", "base": base, "base_at": base_at,
+                "config": config, "at": at, "now": now}
+
+    def cx(self, digest, at, now):
+        return {"op": "cx", "digest": digest, "at": at, "now": now}
+
+    # ---- 成功替换与输出形状 ----
+
+    def test_replace_matching_old_reservation(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        d_old, d_new = digest_of(old), digest_of(new)
+        results = self.run_ops([
+            self.cp(old, 10, 1),
+            self.cy(d_old, 10, new, 20, 2),
+            {"op": "cq", "now": 3},
+        ])
+        self.assertEqual(
+            results[1],
+            {"op": "cy", "base": d_old, "digest": d_new,
+             "at": 20, "ok": True},
+        )
+        self.assertEqual(list(results[1]),
+                         ["op", "base", "digest", "at", "ok"])
+        self.assertEqual(results[2],
+                         {"op": "cq", "pending": True,
+                          "digest": d_new, "at": 20})
+
+    def test_replace_output_is_single_line_compact_json(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        d_old, d_new = digest_of(old), digest_of(new)
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([self.cp(old, 10, 1),
+                        self.cy(d_old, 10, new, 20, 2)]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out.count(b"\n"), 1)
+        self.assertIn(
+            b'{"op":"cy","base":"%s","digest":"%s","at":20,"ok":true}'
+            % (d_old.encode("ascii"), d_new.encode("ascii")),
+            out,
+        )
+
+    def test_reschedule_same_config(self):
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        # 同配置、仅改时刻：旧值匹配即替换。
+        results = self.run_ops([
+            self.cp(cfg, 10, 1),
+            self.cy(digest, 10, cfg, 30, 2),
+            {"op": "cq", "now": 3},
+        ])
+        self.assertEqual(results[1]["digest"], digest)
+        self.assertEqual(results[1]["at"], 30)
+        self.assertEqual(results[2]["at"], 30)
+
+    def test_change_config_same_at(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        d_new = digest_of(new)
+        results = self.run_ops([
+            self.cp(old, 10, 1),
+            self.cy(digest_of(old), 10, new, 10, 2),
+            {"op": "cq", "now": 3},
+        ])
+        self.assertEqual(results[1]["at"], 10)
+        self.assertEqual(results[1]["digest"], d_new)
+        self.assertEqual(results[2]["digest"], d_new)
+
+    def test_replace_after_old_at_expired(self):
+        # 旧触发时刻已过不影响旧值匹配：now>base_at 仍可替换，新 at≥now。
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        results = self.run_ops([
+            self.cp(old, 10, 1),
+            self.cy(digest_of(old), 10, new, 20, 15),
+        ])
+        self.assertTrue(results[1]["ok"])
+
+    def test_candidate_backends_are_own_reference_set(self):
+        # 候选后端引用按候选配置自身的后端集合判定，不要求现存后端：
+        # 候选只含后端 b（当前配置从未安装）仍成功。
+        old = config_v11(1)
+        new = config_v11(1)
+        new["backends"] = [{
+            "id": "b", "weight": 1, "d": 0, "fail": 3, "success": 2,
+            "circuit": None, "drain": None, "endpoint": None,
+        }]
+        d_new = digest_of(new)
+        results = self.run_ops([
+            self.cp(old, 10, 1),
+            self.cy(digest_of(old), 10, new, 20, 2),
+        ])
+        self.assertEqual(results[1]["digest"], d_new)
+
+    # ---- 幂等重报 ----
+
+    def test_repeat_same_request_is_idempotent(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        d_old, d_new = digest_of(old), digest_of(new)
+        request = self.cy(d_old, 10, new, 20, 2)
+        results = self.run_ops([
+            self.cp(old, 10, 1), request,
+            dict(request, now=3),
+            dict(request, now=4),
+        ])
+        self.assertEqual(results[1], results[2])
+        self.assertEqual(results[2], results[3])
+        self.assertEqual(
+            results[2],
+            {"op": "cy", "base": d_old, "digest": d_new,
+             "at": 20, "ok": True},
+        )
+
+    def test_replay_with_stale_base_after_concurrent_replace(self):
+        # 预约已被另一请求改成新值：base/base_at 已过期，但当前恰为该请求
+        # 的新值时视为幂等重报，成功且不改预约。
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        d_old, d_new = digest_of(old), digest_of(new)
+        results = self.run_ops([
+            self.cp(old, 10, 1),
+            self.cy(d_old, 10, new, 20, 2),
+            self.cy(d_old, 10, new, 20, 5),
+            {"op": "cq", "now": 6},
+        ])
+        self.assertTrue(results[2]["ok"])
+        self.assertEqual(results[2]["digest"], d_new)
+        self.assertEqual(results[3],
+                         {"op": "cq", "pending": True,
+                          "digest": d_new, "at": 20})
+
+    def test_first_replace_and_replay_are_byte_identical(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        request = self.cy(digest_of(old), 10, new, 20, 2)
+        prefix = [self.cp(old, 10, 1)]
+        _, first, _ = run_balancer("run", encode_ops(prefix + [request]))
+        _, second, _ = run_balancer(
+            "run", encode_ops(prefix + [request, dict(request, now=9)])
+        )
+        # 两次 cy 结果对象逐字节一致（首次替换与相同请求重报）。
+        first_cy = json.dumps(
+            json.loads(first)["results"][1],
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode()
+        second_cy = json.dumps(
+            json.loads(second)["results"][1],
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode()
+        replay_cy = json.dumps(
+            json.loads(second)["results"][2],
+            ensure_ascii=False, separators=(",", ":"),
+        ).encode()
+        self.assertEqual(first_cy, second_cy)
+        self.assertEqual(second_cy, replay_cy)
+
+    # ---- STATE/4 ----
+
+    def test_no_reservation_is_state(self):
+        new = config_v11(1, lifetime=7)
+        self.assert_failure(
+            [self.cy("0" * 64, 10, new, 20, 0)], 4, "STATE"
+        )
+
+    def test_neither_old_nor_new_matches_is_state(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        third = config_v11(1, lifetime=9)
+        # 当前预约为 (new,30)：请求旧值 (old,10)、新值 (third,20) 都不匹配。
+        self.assert_failure(
+            [self.cp(old, 10, 1), self.cy(digest_of(old), 10, new, 30, 2),
+             self.cy(digest_of(old), 10, third, 20, 3)],
+            4, "STATE",
+        )
+        # base_at 不匹配、摘要匹配同样 STATE。
+        self.assert_failure(
+            [self.cp(old, 10, 1),
+             self.cy(digest_of(old), 11, new, 20, 2)],
+            4, "STATE",
+        )
+
+    def test_state_failure_keeps_reservation(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        third = config_v11(1, lifetime=9)
+        self.assert_failure(
+            [self.cp(old, 10, 1),
+             self.cy("f" * 64, 10, new, 20, 2),
+             {"op": "cq", "now": 3}],
+            4, "STATE",
+        )
+        # 跨进程观察：失败的 cy 不改检查点中的预约，正确旧凭据仍可替换。
+        cp = self.checkpoint(self.export([self.cp(old, 10, 1)]))
+        self.assert_failure(
+            [cp, self.cy("f" * 64, 10, new, 20, 2)], 4, "STATE"
+        )
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([cp, self.cy(digest_of(old), 10, third, 20, 3),
+                        {"op": "cq", "now": 4}]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        self.assertEqual(results[2]["digest"], digest_of(third))
+        self.assertEqual(results[2]["at"], 20)
+
+    # ---- BACKEND/3 与错误优先级 ----
+
+    def test_unknown_candidate_backend_references_are_backend(self):
+        old = config_v11(1)
+        d_old = digest_of(old)
+        for field in (
+            {"limits": [{"scope": "B", "id": "ghost", "r": 1, "b": 1}]},
+            {"quotas": [{"scope": "B", "id": "ghost",
+                         "limit": 1, "span": 1}]},
+            {"faults": [{"id": "ghost", "k": "D", "a": 0, "z": 1, "v": 0}]},
+            {"capacities": [{"id": "ghost", "cap": 1}]},
+        ):
+            candidate = config_v11(1, lifetime=7)
+            candidate.update(field)
+            with self.subTest(field=field):
+                self.assert_failure(
+                    [self.cp(old, 10, 1),
+                     self.cy(d_old, 10, candidate, 20, 2)],
+                    3, "BACKEND",
+                )
+
+    def test_at_before_now_input_precedes_backend(self):
+        old = config_v11(1)
+        bad = config_v11(1, lifetime=7)
+        bad["capacities"] = [{"id": "ghost", "cap": 1}]
+        # at<now 为时间字段判定，先于 BACKEND；无预约时也先于 STATE。
+        self.assert_failure(
+            [self.cp(old, 10, 1),
+             self.cy(digest_of(old), 10, bad, 5, 8)],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            [self.cy("0" * 64, 10, bad, 5, 8)], 2, "INPUT"
+        )
+
+    def test_backend_precedes_state(self):
+        # 无预约本应 STATE，但候选引用非法先判 BACKEND。
+        candidate = config_v11(1)
+        candidate["limits"] = [
+            {"scope": "B", "id": "ghost", "r": 1, "b": 1}
+        ]
+        self.assert_failure(
+            [self.cy("0" * 64, 10, candidate, 20, 0)], 3, "BACKEND"
+        )
+
+    # ---- INPUT/2 形状与字段 ----
+
+    def test_input_shapes_are_input(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        d_old = digest_of(old)
+        good = {"op": "cy", "base": d_old, "base_at": 10,
+                "config": new, "at": 20, "now": 2}
+        bad_ops = [
+            {k: v for k, v in good.items() if k != "now"},        # 缺键
+            dict(good, x=0),                                      # 多键
+            {"op": "cy", "base_at": 10, "base": d_old,
+             "config": new, "at": 20, "now": 2},                  # 乱序
+            {"op": "cy", "base": d_old, "config": new,
+             "base_at": 10, "at": 20, "now": 2},                  # 乱序
+            {"op": "cy", "base": d_old, "base_at": 10,
+             "config": new, "now": 2, "at": 20},                  # 乱序
+        ]
+        for bad in bad_ops:
+            with self.subTest(bad=bad):
+                self.assert_failure([bad], 2, "INPUT")
+
+    def test_input_fields_are_input(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        d_old = digest_of(old)
+        bad_values = [
+            ("base", "ABCDEF" + "0" * 58),
+            ("base", "0" * 63),
+            ("base", "0" * 65),
+            ("base", 123),
+            ("base", None),
+            ("base", True),
+            ("base_at", -1),
+            ("base_at", 10 ** 9 + 1),
+            ("base_at", True),
+            ("base_at", 1.0),
+            ("base_at", None),
+            ("at", -1),
+            ("at", 10 ** 9 + 1),
+            ("at", False),
+            ("at", "20"),
+            ("now", -1),
+            ("now", 10 ** 9 + 1),
+            ("now", True),
+            ("now", None),
+        ]
+        for field, value in bad_values:
+            raw = {"op": "cy", "base": d_old, "base_at": 10,
+                   "config": new, "at": 20, "now": 2}
+            raw[field] = value
+            with self.subTest(field=field, value=value):
+                self.assert_failure([raw], 2, "INPUT")
+        # config 非对象判 INPUT。
+        self.assert_failure(
+            [{"op": "cy", "base": d_old, "base_at": 10,
+              "config": [], "at": 20, "now": 2}],
+            2, "INPUT",
+        )
+        # v11 配置缺 lifetime（十三键却声明 version=11）判 INPUT。
+        incomplete = {k: v for k, v in new.items() if k != "lifetime"}
+        self.assert_failure(
+            [{"op": "cy", "base": d_old, "base_at": 10,
+              "config": incomplete, "at": 20, "now": 2}],
+            2, "INPUT",
+        )
+
+    def test_boundary_values_accepted(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        # at=now=0：先 cp 建 at=0 的预约，再 cy 到 at=0。
+        results = self.run_ops([
+            self.cp(old, 0, 0),
+            self.cy(digest_of(old), 0, new, 0, 0),
+        ])
+        self.assertTrue(results[1]["ok"])
+        # at=now=10^9 合法。
+        results = self.run_ops([
+            self.cp(old, 0, 0),
+            self.cy(digest_of(old), 0, new, 10 ** 9, 10 ** 9),
+        ])
+        self.assertTrue(results[1]["ok"])
+
+    def test_clock_rollback_is_input(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        self.assert_failure(
+            [self.cp(old, 10, 5),
+             self.cy(digest_of(old), 10, new, 20, 4)],
+            2, "INPUT",
+        )
+
+    def test_now_advances_clock_at_does_not(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        d_old = digest_of(old)
+        # cy.now=2 推进时钟：随后 now=1 倒退报 INPUT；at=100 不推进时钟。
+        self.assert_failure(
+            [self.cp(old, 100, 1), self.cy(d_old, 100, new, 100, 2),
+             {"op": "cq", "now": 1}],
+            2, "INPUT",
+        )
+        results = self.run_ops([
+            self.cp(old, 100, 1), self.cy(d_old, 100, new, 100, 2),
+            {"op": "cq", "now": 3},
+        ])
+        self.assertTrue(results[1]["ok"])
+
+    # ---- 凭据轮换：ca/cx 只认新预约 ----
+
+    def test_ca_only_activates_new_reservation(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        d_old, d_new = digest_of(old), digest_of(new)
+        # 旧时刻 now=10 已到但新 at=20 未到：ca STATE。
+        self.assert_failure(
+            [self.cp(old, 10, 1), self.cy(d_old, 10, new, 20, 2),
+             {"op": "ca", "now": 10}],
+            4, "STATE",
+        )
+        # 到新时刻按新摘要生效。
+        results = self.run_ops([
+            self.cp(old, 10, 1), self.cy(d_old, 10, new, 20, 2),
+            {"op": "ca", "now": 20}, {"op": "ce"},
+        ])
+        self.assertEqual(
+            results[2],
+            {"op": "ca", "digest": d_new, "rev": 1, "ok": True},
+        )
+        self.assertEqual(results[3]["config"], new)
+
+    def test_cx_only_accepts_new_credentials(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        d_old, d_new = digest_of(old), digest_of(new)
+        # 旧摘要+旧时刻 STATE；旧摘要+新时刻 / 新摘要+旧时刻也 STATE。
+        for cred in ((d_old, 10), (d_old, 20), (d_new, 10)):
+            with self.subTest(cred=cred):
+                self.assert_failure(
+                    [self.cp(old, 10, 1),
+                     self.cy(d_old, 10, new, 20, 2),
+                     self.cx(cred[0], cred[1], 3)],
+                    4, "STATE",
+                )
+        # 新凭据成功取消。
+        results = self.run_ops([
+            self.cp(old, 10, 1), self.cy(d_old, 10, new, 20, 2),
+            self.cx(d_new, 20, 3), {"op": "cq", "now": 4},
+        ])
+        self.assertTrue(results[2]["cancelled"])
+        self.assertFalse(results[3]["pending"])
+
+    def test_chained_replacements_rotate_credentials(self):
+        c1 = config_v11(1, lifetime=1)
+        c2 = config_v11(1, lifetime=2)
+        c3 = config_v11(1, lifetime=3)
+        d1, d2, d3 = digest_of(c1), digest_of(c2), digest_of(c3)
+        results = self.run_ops([
+            self.cp(c1, 10, 1),
+            self.cy(d1, 10, c2, 20, 2),
+            self.cy(d2, 20, c3, 30, 3),
+            {"op": "cq", "now": 4},
+        ])
+        self.assertEqual(results[3],
+                         {"op": "cq", "pending": True,
+                          "digest": d3, "at": 30})
+        # d1/d2 凭据对 cx 均失效。
+        self.assert_failure(
+            [self.cp(c1, 10, 1),
+             self.cy(d1, 10, c2, 20, 2),
+             self.cy(d2, 20, c3, 30, 3),
+             self.cx(d1, 10, 4)],
+            4, "STATE",
+        )
+
+    # ---- 副作用边界 ----
+
+    def test_creates_no_revision_or_audit_and_keeps_current_config(self):
+        current = config_v11(1, lifetime=2)
+        pending = config_v11(1, lifetime=5)
+        newer = config_v11(1, lifetime=9)
+        d_cur = digest_of(current)
+        results = self.run_ops([
+            {"op": "ci", "config": current, "now": 0},
+            self.cp(pending, 10, 1),
+            self.cy(digest_of(pending), 10, newer, 20, 2),
+            {"op": "cl"}, {"op": "al"}, {"op": "ct"}, {"op": "ce"},
+        ])
+        # 不建 rev：current 仍为 1，审计仅 ci 一条，当前配置不变。
+        self.assertEqual(results[3]["current"], 1)
+        self.assertEqual(len(results[3]["commits"]), 1)
+        self.assertEqual(len(results[4]["events"]), 1)
+        self.assertEqual(results[4]["events"][0]["kind"], "ci")
+        self.assertEqual(results[5]["digest"], d_cur)
+        self.assertEqual(results[6]["config"], current)
+
+    def test_does_not_touch_connections_or_backends(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        results = self.run_ops([
+            {"op": "ci", "config": old, "now": 0},
+            {"op": "open", "cid": "c", "flow": self.FLOW, "now": 0},
+            self.cp(old, 20, 1),
+            self.cy(digest_of(old), 20, new, 20, 2),
+            {"op": "get", "cid": "c"},
+            {"op": "ce"},
+        ])
+        self.assertEqual(results[4]["cid"], "c")
+        self.assertEqual(results[4]["backend"], "a")
+        # 当前配置不被预约替换改变（活动连接也不受影响）。
+        self.assertEqual(results[5]["config"], old)
+
+    def test_failed_batch_has_no_stdout_and_rolls_back_clock(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        # 失败批次无 stdout；cp 与时钟推进随整批回滚。
+        self.assert_failure(
+            [self.cp(old, 10, 1),
+             self.cy("e" * 64, 10, new, 20, 2),
+             {"op": "cq", "now": 3}],
+            4, "STATE",
+        )
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([{"op": "cq", "now": 0}]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertFalse(json.loads(out)["results"][0]["pending"])
+
+    # ---- cp 无条件覆盖语义保留 ----
+
+    def test_cp_still_overwrites_unconditionally(self):
+        old = config_v11(1)
+        new = config_v11(1, lifetime=7)
+        d_new = digest_of(new)
+        results = self.run_ops([
+            self.cp(old, 10, 1),
+            self.cp(new, 30, 2),
+            {"op": "cq", "now": 3},
+        ])
+        self.assertEqual(results[1]["digest"], d_new)
+        self.assertEqual(results[2]["at"], 30)
+
+    # ---- 检查点 se/si/sd ----
+
+    def export(self, ops):
+        code, out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "se"}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def checkpoint(self, result):
+        return {"op": "si", "version": result["version"],
+                "digest": result["digest"], "state": result["state"]}
+
+    def test_se_exports_new_reservation(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        d_new = digest_of(new)
+        se = self.export([
+            self.cp(old, 10, 1),
+            self.cy(digest_of(old), 10, new, 20, 2),
+        ])
+        reservation = se["state"]["reservation"]
+        self.assertEqual(list(reservation), ["at", "digest", "config"])
+        self.assertEqual(reservation["at"], 20)
+        self.assertEqual(reservation["digest"], d_new)
+
+    def test_si_restore_continuation_matches_direct(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        d_new = digest_of(new)
+        request = self.cy(digest_of(old), 10, new, 20, 2)
+        prefix = [self.cp(old, 10, 1)]
+        cont = [request, {"op": "cq", "now": 3},
+                self.cx(d_new, 20, 4)]
+        _, direct, direct_err = run_balancer(
+            "run", encode_ops(prefix + cont)
+        )
+        cp = self.checkpoint(self.export(prefix))
+        _, restored, restored_err = run_balancer(
+            "run", encode_ops([cp] + cont)
+        )
+        self.assertEqual(restored_err, direct_err)
+        direct_results = json.loads(direct)["results"]
+        restored_results = json.loads(restored)["results"]
+        self.assertEqual(restored_results[1:], direct_results[1:])
+
+    def test_sd_observes_reservation_difference(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        prefix = [self.cp(old, 10, 1)]
+        before = self.export(prefix)
+        after = self.export(
+            prefix + [self.cy(digest_of(old), 10, new, 20, 2)]
+        )
+        sd = {"op": "sd", "version": after["version"],
+              "digest": after["digest"], "state": after["state"]}
+        code, out, err = run_balancer(
+            "run", encode_ops(prefix + [sd])
+        )
+        self.assertEqual((code, err), (0, b""))
+        sections = [c["section"]
+                    for c in json.loads(out)["results"][1]["changes"]]
+        self.assertIn("reservation", sections)
+
+    # ---- record/replay ----
+
+    def test_record_replay_replace_replay_and_failures(self):
+        old = config_v11(1, lifetime=5)
+        new = config_v11(1, lifetime=9)
+        d_old = digest_of(old)
+        cases = (
+            ([self.cp(old, 10, 1),
+              self.cy(d_old, 10, new, 20, 2)], 0),
+            ([self.cp(old, 10, 1),
+              self.cy(d_old, 10, new, 20, 2),
+              self.cy(d_old, 10, new, 20, 3)], 0),
+            ([self.cy(d_old, 10, new, 20, 2)], 4),
+            ([self.cp(old, 10, 1),
+              self.cy("f" * 64, 10, new, 20, 2)], 4),
+            ([self.cp(old, 10, 5),
+              self.cy(d_old, 10, new, 20, 4)], 2),
+        )
+        for ops, expected in cases:
+            raw = encode_ops(ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual((run_code, rec_code, rec_err),
+                             (expected, 0, b""))
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual((rep_code, rep_out, rep_err),
+                             (run_code, run_out, run_err))
+
+
 class V7FaultNormalizationTest(unittest.TestCase):
     """v7 faults 规范化：乱序提交按 a 升序输出，重叠判定不变。"""
 
