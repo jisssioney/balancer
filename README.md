@@ -30,6 +30,16 @@
 - 返回键序 `op,key,at,before,after,changed`；`before`/`after` 键序均为 `state,backend,attempts,retries,remaps,latency,trace`，前六项义同 `ft`；`trace` 按尝试序，项键序 `id,kind,cost,result`：`kind` 为该候选 `at` 时刻活动段的登记种类（`D`/`F`/`S`），段间隙或未登记为 null（F 非故障相位仍记 `F`）；`cost` 为计入 `latency` 的整数（D/F 故障相位 0，S 慢超时为 `timeout`，接纳为 v 或 0）；`result` ∈ `D,T,A`，依次表示下线（D 或 F 故障相位）、慢超时（S 且 v>timeout）、接纳（仅成功末项）。`changed` 为 `before≠after`。
 - 键序、字段类型/范围/编码或时钟倒退报 INPUT/2；候选引用未知后端报 BACKEND/3；未配置环或无合格候选报 STATE/4。仅 `now` 推进时钟，不改连接、粘性、指标、告警或故障状态，失败批回滚。时间 O(T+BV·log(BV))、空间 O(T+BV)（T 为 `items` 项数，B/V 为后端数与每后端虚拟节点），紧凑 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节契约不变，仅用标准库，旧行为不变。
 
+## 哈希分布预演：hb
+
+沿用 `hd` 的静态环与 SHA-256 规则，分别按两份规范化配置的后端加入顺序与 `vnodes` 建环，按后端汇总后端增删或虚拟节点调整造成的键落点偏斜；只读，忽略健康、熔断、排空、故障时间线及粘性运行态。
+
+- `hb`：精确键序 `op,config,keys,now`。`config` 的结构、规范化、版本兼容及后端引用检查沿用 `hd`；`keys` 为 1..4096 项允许重复的合法 route 键数组（非空、可直接 UTF-8 编码），重复键按出现次数计数；`now` 为 0..10⁹ 的非 bool 整数，服从全局非递减显式时钟。
+- 每个 key 在当前环（base）与候选环（target）独立映射：令牌为 SHA-256(UTF8(id)+0x00+无前导零 ASCII(i))，按摘要、加入序、i 排序，key 哈希取首个不小于它的令牌、越界回绕。
+- 返回固定键序 `op,base,target,backends,summary`；`base`/`target` 为当前与候选规范化 version=11 配置的 `ct` 摘要。`backends` 先按当前后端加入顺序排列，再按候选顺序补充仅在候选中存在的后端；每项键序 `id,before,after,delta`，后端不存在于某侧时该侧计数为 0，`delta=after-before`。
+- `summary` 固定键序 `total,stable,remapped,rate,before_min,before_max,after_min,after_max`：`stable`/`remapped` 按两侧落点是否相同计数（重复键按次数）；`rate` 为 `remapped` 占 `total` 的百分比，`floor(10000*remapped/total)/100` 向下截断为两位定点字符串；每侧 `min`/`max` 只统计该侧实际存在的后端。
+- 字段集合、键序、类型、范围、UTF-8 编码、`keys` 数量或时钟倒退报 INPUT/2；候选配置中的 B 维限流、B 配额、故障计划或容量覆盖存在悬空引用时报 BACKEND/3；任一侧未配置 `vnodes` 或没有后端时报 STATE/4，错误优先级沿用 `hd`。仅成功时推进 `now`，不改变其他运行态；失败整批回滚且不产生 stdout。时间 O(N log N+K log N)，额外空间 O(N+B)（N 为两环令牌总数、K 为 keys 项数、B 为两侧后端并集），仅用标准库；紧凑 UTF-8 固定键序 JSON、单末尾换行及 run、record、replay 逐字节契约不变，`hd` 与其他公开行为不变。
+
 ## 配置变更审计：al / ai
 
 配置变更（`ci`/`cb`/`cu`/`ca`）成功并分配新 rev 时追加一条审计事件；`rev` 从 1 起递增，事件按 rev 升序仅保留最近 64 条，超额淘汰最旧项。两查询均只读、不推进时钟，失败批次回滚。
