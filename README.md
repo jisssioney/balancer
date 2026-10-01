@@ -168,6 +168,16 @@
 - 条件形态只在成功时改变状态；任何失败都随整批回滚，预约、时钟、配置、rev 与审计均不变。成功后旧凭据失效：`cq` 报告 `pending=false`，重复同一条件 `ca` 按无预约返回 STATE/4。
 - `se` 导出与 `si` 恢复后，条件 `ca` 的成功或失败与直接继续一致；`sd`、`sx`、`sm` 仍只按既有检查点规则观察 reservation 段的变化。身份比较为 O(1) 时间与额外空间，完整生效仍以预约规范化配置及被重建状态大小 N 为 O(N) 时间和额外空间，仅使用 Python 标准库；run、record、replay 对成功与各类失败保持紧凑 UTF-8 固定键序 JSON、单末尾换行与逐字节一致，`cp`、`cq`、`cx`、`cy`、两键 `ca`、`ci`、`cb`、`cu` 及其他调度、连接、队列、粘性、指标和告警行为不变。
 
+## 全池排空投影与批量执行：dq / dx
+
+在单后端 `ds`/`dr`/`dg` 之外，提供确定性的全池排空只读投影与批量到期执行；既有单后端操作及其语义不变。
+
+- `dq`：精确键序 `op,now`（键须按此序出现）。`now` 为非负非 bool 整数，纳入共用非递减显式时钟（倒退报 INPUT/2）；键集、键序或 `now` 类型/范围非法报 INPUT/2。除推进时钟外不改变任何状态。
+- 返回固定键序 `op,now,items`；`items` 按后端加入顺序列出排空状态为 `D` 或 `X` 的后端（`A` 与未 `ds` 者不列），空池、无排空后端均不报错、返回空数组。每项固定键序 `id,state,connections,start,deadline,end,due,remaining,forced`：`due` 仅在 `D` 且 `now>=deadline` 时为 `true`（`X` 恒为 `false`）；`remaining` 在 `D` 为 `max(deadline-now,0)`、在 `X` 为 `0`；其余字段义同 `dg`，未开始时刻为 `null`。时间 O(B)、结果空间 O(B)。
+- `dx`：精确键序 `op,now`，校验规则同 `dq`。处理集合为状态 `D` 且 `deadline<=now` 的后端，按后端加入顺序处理；每个后端的连接按全局建连顺序关闭。关闭沿用 `dg` 强制到期的联动语义：删除活动连接及建连端点快照、递减并发，后端转为 `X`，`end=deadline`，`forced` 取本次关闭数；不消费等待队列、令牌或配额。
+- 返回固定键序 `op,now,backends,closed`；`backends` 只含本次到期项，按加入序，项固定键序 `id,deadline,cids`，`cids` 按关闭顺序排列，`closed` 为全部 `cids` 数量。没有到期项时返回空数组与 `0`；同一 `now` 重复执行为确定性空操作。处理原子完成，不留下部分转换；后续路由仍按既有规则处理 `X` 与粘性失效。时间 O(B+C)、结果空间 O(B+C)，C 为活动连接数。
+- 失败无 stdout，并回滚同批此前变化与逻辑时钟；`run`、`record`、`replay` 保持逐字节一致，检查点完整保留连接、排空状态与时钟变化，恢复后继续执行与直接继续一致；仅使用 Python 标准库。
+
 ## 测试
 
     python -m unittest discover

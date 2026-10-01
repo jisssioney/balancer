@@ -78,6 +78,23 @@ op,id,state,connections,start,end,deadline,forced，state ∈ A/D/X
 （可用/排空/已摘除），未开始时三时间为 null。未知 id 报 BACKEND，
 未 ds 的 dr/du/dg 报 STATE。
 
+全池排空：dq/dx 精确键序 op,now（键须按此序出现），now 为非负非
+bool 整数并纳入共用非递减时钟，倒退报 INPUT；键集或键序非法报 INPUT。
+dq 为只读投影，除推进时钟外不改状态，返回固定键序 op,now,items：
+items 按后端加入序列出 state ∈ {D,X} 的后端（A 与未 ds 不列），空池、
+无排空后端均不报错，每项固定键序
+id,state,connections,start,deadline,end,due,remaining,forced；due 仅
+在 D 且 now>=deadline 时为 true，D 的 remaining=max(deadline-now,0)，
+X 的 due=false、remaining=0。dx 批量执行：处理集合为 D 且
+deadline<=now 的后端，按加入序处理，每个后端的连接按全局建连顺序
+关闭，沿用 dg 强制到期联动（删除活动连接及端点快照、递减并发、转 X、
+end=deadline、forced=本次关闭数），不消费等待队列、令牌或配额；返回
+固定键序 op,now,backends,closed，backends 仅含本次到期项，项固定
+id,deadline,cids（cids 按关闭顺序），closed 为全部 cids 数量；无到期
+项返回空数组与 0，同一 now 重复执行为确定性空操作。dx 原子转换不留
+部分状态，后续路由仍按既有规则处理 X 与粘性失效；dq 时间 O(B)、结果
+空间 O(B)，dx 时间 O(B+C)、结果空间 O(B+C)。
+
 令牌桶：ls 键集 op,scope,id,r,b,now，scope ∈ B/C/S（后端/客户端/
 服务类），id/c/s/key 均为非空 UTF-8 串，r,b ∈ [1,10^9] 非 bool 整数，
 now ≥ 0 纳入共用非递减时钟；B 桶的 id 须为现存后端，否则 BACKEND。
@@ -2403,7 +2420,7 @@ def parse_op(raw_op):
     if name not in (
         "add", "remove", "pick", "open", "close", "get",
         "hset", "probe", "hget", "chash", "route", "ws", "wg",
-        "cs", "cr", "cg", "ds", "dr", "du", "dg",
+        "cs", "cr", "cg", "ds", "dr", "du", "dg", "dq", "dx",
         "ss",
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "wp", "wa", "bp", "bq", "qp", "rp", "rg",
@@ -2602,6 +2619,13 @@ def parse_op(raw_op):
         if keys != {"op", "id", "now"}:
             fail(EXIT_INPUT, "INPUT")
         return (name, parse_backend_id(raw_op["id"]), parse_now(raw_op["now"]))
+
+    if name in ("dq", "dx"):
+        # 全池排空投影/批量执行：精确键序 op,now（键须按此序出现）；now
+        # 为非负非 bool 整数，纳入共用非递减时钟（倒退执行期判 INPUT）。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return (name, parse_now(raw_op["now"]))
 
     if name == "ls":
         if keys != {"op", "scope", "id", "r", "b", "now"}:
@@ -7891,7 +7915,7 @@ def run(raw):
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
+            "dr", "du", "dg", "dq", "dx", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "oq", "lh", "lt", "le",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
@@ -8649,6 +8673,93 @@ def run(raw):
                     "end": drain["end"],
                     "deadline": drain["deadline"],
                     "forced": drain["forced"],
+                }
+            )
+
+        elif op[0] == "dq":
+            # 全池排空只读投影：除按共用非递减时钟推进 now 外不改任何状态。
+            # items 按后端加入序列出 state ∈ {D,X} 的后端；A（含未 ds）不
+            # 列。项固定键序 id,state,connections,start,deadline,end,due,
+            # remaining,forced：due 仅 D 且 now>=deadline 为 true；D 的
+            # remaining=max(deadline-now,0)，X 的 remaining=0。时间 O(B)、
+            # 结果空间 O(B)。
+            _, now = op
+            items = []
+            for backend_id, record in backends.items():
+                drain = record["drain"]
+                state = drain["state"]
+                if state not in ("D", "X"):
+                    continue
+                if state == "D":
+                    due = now >= drain["deadline"]
+                    remaining = max(drain["deadline"] - now, 0)
+                else:
+                    due = False
+                    remaining = 0
+                items.append(
+                    {
+                        "id": backend_id,
+                        "state": state,
+                        "connections": record["conns"],
+                        "start": drain["start"],
+                        "deadline": drain["deadline"],
+                        "end": drain["end"],
+                        "due": due,
+                        "remaining": remaining,
+                        "forced": drain["forced"],
+                    }
+                )
+            results.append({"op": "dq", "now": now, "items": items})
+
+        elif op[0] == "dx":
+            # 全池批量到期排空：处理集合为 state=D 且 deadline<=now 的后端，
+            # 按后端加入序；每个后端的连接按全局建连顺序（connections dict
+            # 保序）关闭。沿用 dg 强制到期联动：删除活动连接及端点快照、
+            # 递减并发、转 X、end=deadline、forced=本次关闭数；不消费等待
+            # 队列、令牌或配额，粘性映射留给后续路由按既有规则处理。先一趟
+            # 扫描全部连接归组（不在遍历中改写 dict），再按加入序原子转换，
+            # 中途无任何失败路径，不留下部分转换。时间 O(B+C)、结果空间
+            # O(B+C)；同 now 重放时到期项已为 X，确定性空操作。
+            _, now = op
+            due_backends = [
+                backend_id
+                for backend_id, record in backends.items()
+                if record["drain"]["state"] == "D"
+                and record["drain"]["deadline"] <= now
+            ]
+            out_backends = []
+            closed_total = 0
+            if due_backends:
+                due_set = set(due_backends)
+                cids_by_backend = {backend_id: [] for backend_id in due_backends}
+                for cid, connection in connections.items():
+                    if connection[0] in due_set:
+                        cids_by_backend[connection[0]].append(cid)
+                for backend_id in due_backends:
+                    cids = cids_by_backend[backend_id]
+                    for cid in cids:
+                        del connections[cid]
+                        conn_endpoints.pop(cid, None)
+                    record = backends[backend_id]
+                    record["conns"] = 0
+                    drain = record["drain"]
+                    drain["forced"] = len(cids)
+                    drain["state"] = "X"
+                    drain["end"] = drain["deadline"]
+                    out_backends.append(
+                        {
+                            "id": backend_id,
+                            "deadline": drain["deadline"],
+                            "cids": cids,
+                        }
+                    )
+                    closed_total += len(cids)
+            results.append(
+                {
+                    "op": "dx",
+                    "now": now,
+                    "backends": out_backends,
+                    "closed": closed_total,
                 }
             )
 
