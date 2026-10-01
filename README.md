@@ -91,6 +91,16 @@
 - 错误判定：键集合、键序、类型、范围、UTF-8 编码、未知 version、摘要格式或摘要不符报 INPUT/2；摘要相符但存在悬空引用、重复标识、矛盾计数或非法状态组合报 STATE/4；state 紧凑编码超过 8388608（8MiB）字节报 OVERLOAD/7（导出与导入同限）。任何失败均无 stdout 并回滚整批状态。
 - 摘要不符先于 state 语义校验（INPUT）；状态规范化往返（恢复后重新导出与所给 state 的紧凑编码逐字节一致）保证恢复结果确定。se/si 及校验为 O(N) 时间、O(N) 额外空间，N 为检查点编码字节数；ce/ci、调度、连接、查询及错误优先级不变，run、record、replay 覆盖成功与失败检查点并保持逐字节契约，仅用标准库。
 
+## 候选检查点只读差异：sd
+
+在不替换现状的前提下，判断候选检查点会改变哪些运行态；只读，不推进逻辑时钟、不改任何运行态或幂等缓存。
+
+- `sd` 精确接受依次排列的 `op,version,digest,state` 四键（键须按此序出现），后三项沿用 `si` 的公开含义；先按 `si` 的规则校验候选检查点（大小、摘要、结构、语义与规范化往返），再按 `se` 的规则取得当前状态的规范化内存快照。候选校验成功后，当前状态紧凑编码超过 `se` 的导出上限（8MiB）亦报 OVERLOAD/7。
+- 成功结果固定键序 `op,before,after,equal,changes,summary`。`before` 为当前检查点摘要（与同状态 `se` 的 `digest` 一致），`after` 原样返回输入摘要；`equal` 仅在两份规范化 state 的紧凑 UTF-8 编码逐字节相同时为 true。
+- `changes` 只列值不同的 state 顶层段，顺序沿用 `se` 的顶层键序，每项固定键序 `section,before,after`；两个指纹分别对该段的规范化 JSON 值按 `ensure_ascii=False`、分隔符 `,:`、无末尾换行编码后计算小写 64 位 SHA-256，是否列出以值比较为准。状态相同时 `changes` 为空。
+- `summary` 固定键序 `sections,changed,bytes_before,bytes_after`，依次为顶层段总数、差异段数及两份 state 紧凑编码的 UTF-8 字节数。重复查询逐字节一致。
+- 字段集合、键序、类型、UTF-8、版本、摘要格式与匹配、状态语义沿用 `si` 的校验规则、错误优先级及 INPUT/2、STATE/4、OVERLOAD/7 分类。任何失败均无 stdout 并回滚整批操作（含此前操作的临时变化）。时间与额外空间 O(N)，`changes` 另占 O(S)，N 为两份 state 编码字节数之和、S 为顶层段数；run、record、replay 覆盖成败，固定键序、紧凑 JSON、单末尾换行与逐字节确定性不变，仅用标准库，现有 se、si、配置、调度、连接与查询语义不变。
+
 ## 测试
 
     python -m unittest discover

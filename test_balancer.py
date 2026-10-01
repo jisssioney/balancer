@@ -16583,5 +16583,276 @@ class CheckpointTest(unittest.TestCase):
                          json.loads(out_b)["results"][-1])
 
 
+class StateDiffTest(unittest.TestCase):
+    """候选检查点只读差异 sd：si 同款校验、se 同款快照，固定键序结果、
+    段级指纹、字节计数、错误优先级、只读性与 record/replay 逐字节契约。"""
+
+    CONFIG = json.loads(json.dumps(CheckpointTest.CONFIG))
+
+    SETUP = list(CheckpointTest.SETUP)
+
+    def run_ops(self, ops):
+        return run_balancer("run", encode_ops(ops))
+
+    def export(self, ops):
+        code, out, err = self.run_ops(ops + [{"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def sd_op(self, result):
+        return {"op": "sd", "version": result["version"],
+                "digest": result["digest"], "state": result["state"]}
+
+    def compact_state(self, state):
+        return json.dumps(
+            state, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+
+    def section_fp(self, value):
+        return hashlib.sha256(
+            json.dumps(value, ensure_ascii=False,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def diff(self, ops, candidate_result):
+        code, out, err = self.run_ops(ops + [self.sd_op(candidate_result)])
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def test_equal_on_identical_state_same_batch(self):
+        result = self.export(self.SETUP)
+        code, out, err = self.run_ops(
+            self.SETUP + [self.sd_op(result), {"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        sd, se = results[-2], results[-1]
+        self.assertEqual(list(sd),
+                         ["op", "before", "after", "equal",
+                          "changes", "summary"])
+        self.assertEqual(sd["op"], "sd")
+        self.assertEqual(sd["before"], result["digest"])
+        self.assertEqual(sd["after"], result["digest"])
+        self.assertEqual(sd["before"], se["digest"])
+        self.assertIs(sd["equal"], True)
+        self.assertEqual(sd["changes"], [])
+        self.assertEqual(list(sd["summary"]),
+                         ["sections", "changed",
+                          "bytes_before", "bytes_after"])
+        n = len(result["state"])
+        size = len(self.compact_state(result["state"]))
+        self.assertEqual(sd["summary"],
+                         {"sections": n, "changed": 0,
+                          "bytes_before": size, "bytes_after": size})
+
+    def test_equal_cross_process_is_byte_deterministic(self):
+        # 另一条全新调用重放同一序列得到的检查点，应判 equal 且逐字节稳定。
+        result = self.export(self.SETUP)
+        sd_first = self.diff(self.SETUP, result)
+        sd_second = self.diff(self.SETUP, result)
+        self.assertEqual(sd_first, sd_second)
+        self.assertIs(sd_first["equal"], True)
+
+    def test_different_state_changes_and_fingerprints(self):
+        empty = self.export([])
+        current = self.export(self.SETUP)
+        sd = self.diff(self.SETUP, empty)
+        self.assertIs(sd["equal"], False)
+        # before 为当前状态检查点摘要，after 原样回显输入摘要。
+        self.assertEqual(sd["before"], current["digest"])
+        self.assertEqual(sd["after"], empty["digest"])
+        # 以 se 顶层键序独立计算期望差异段集合。
+        expected = [
+            section for section in current["state"]
+            if current["state"][section] != empty["state"][section]
+        ]
+        self.assertEqual([c["section"] for c in sd["changes"]], expected)
+        for change in sd["changes"]:
+            self.assertEqual(list(change), ["section", "before", "after"])
+            section = change["section"]
+            self.assertEqual(
+                change["before"],
+                self.section_fp(current["state"][section]))
+            self.assertEqual(
+                change["after"],
+                self.section_fp(empty["state"][section]))
+        summary = sd["summary"]
+        self.assertEqual(summary["sections"], len(current["state"]))
+        self.assertEqual(summary["changed"], len(expected))
+        self.assertEqual(summary["bytes_before"],
+                         len(self.compact_state(current["state"])))
+        self.assertEqual(summary["bytes_after"],
+                         len(self.compact_state(empty["state"])))
+
+    def test_section_fingerprint_uses_unescaped_utf8(self):
+        # 非 ASCII 段值指纹须按 ensure_ascii=False 编码；与转义形式不同。
+        ops = [
+            {"op": "ci", "config": self.CONFIG, "now": 0},
+            {"op": "route", "key": "键é", "now": 1},
+        ]
+        current = self.export(ops)
+        empty = self.export([])
+        sd = self.diff(ops, empty)
+        sticky = [c for c in sd["changes"] if c["section"] == "sticky"][0]
+        self.assertEqual(sticky["before"],
+                         self.section_fp(current["state"]["sticky"]))
+        escaped = hashlib.sha256(json.dumps(
+            current["state"]["sticky"], ensure_ascii=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        self.assertNotEqual(sticky["before"], escaped)
+
+    def test_repeated_query_byte_identical(self):
+        empty = self.export([])
+        raw = encode_ops(self.SETUP + [self.sd_op(empty)])
+        code_a, out_a, err = run_balancer("run", raw)
+        code_b, out_b, err_b = run_balancer("run", raw)
+        self.assertEqual((code_a, err, code_b, err_b), (0, b"", 0, b""))
+        self.assertEqual(out_a, out_b)
+
+    def test_read_only_no_clock_or_cache_change(self):
+        empty = self.export([])
+        # sd 不推进时钟：其后紧接同刻操作仍合法；前后 se 摘要一致。
+        code, out, err = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "probe", "id": "b", "ok": True, "now": 8},
+            self.sd_op(empty),
+            {"op": "probe", "id": "b", "ok": True, "now": 8},
+            {"op": "se"},
+        ])
+        self.assertEqual((code, err), (0, b""))
+        # sd 前后状态导出逐字节相同（含 mo 增量游标等幂等缓存均未变）。
+        code_a, out_a, _ = self.run_ops(
+            self.SETUP + [{"op": "se"}])
+        code_b, out_b, _ = self.run_ops(
+            self.SETUP + [self.sd_op(empty), {"op": "se"}])
+        self.assertEqual((code_a, code_b), (0, 0))
+        self.assertEqual(
+            json.loads(out_a)["results"][-1],
+            json.loads(out_b)["results"][-1])
+        # 幂等重报在 sd 插入后行为不变：mo 同 seq 重放返回同一缓存结果。
+        ops = list(self.SETUP) + [{"op": "mo", "seq": 1, "now": 60}]
+        ops_sd = list(self.SETUP) + [self.sd_op(empty),
+                                    {"op": "mo", "seq": 1, "now": 60}]
+        _, out_plain, _ = self.run_ops(ops)
+        _, out_with_sd, _ = self.run_ops(ops_sd)
+        self.assertEqual(
+            json.loads(out_plain)["results"][-1],
+            json.loads(out_with_sd)["results"][-1])
+
+    def assert_input(self, ops):
+        code, out, err = self.run_ops(ops)
+        self.assertEqual((code, out), (2, b""))
+        self.assertEqual(err, b'{"error":"INPUT"}\n')
+
+    def test_input_key_set_order_version_digest(self):
+        result = self.export(self.SETUP)
+        st, dg = result["state"], result["digest"]
+        self.assert_input([{"op": "sd"}])
+        self.assert_input([{"op": "sd", "version": 1, "digest": dg}])
+        self.assert_input([{"op": "sd", "digest": dg, "state": st}])
+        self.assert_input(
+            [{"op": "sd", "digest": dg, "version": 1, "state": st}])
+        self.assert_input([{"op": "sd", "version": 1, "digest": dg,
+                           "state": st, "extra": 1}])
+        self.assert_input([{"op": "sd", "version": 2,
+                           "digest": dg, "state": st}])
+        self.assert_input([{"op": "sd", "version": "1",
+                           "digest": dg, "state": st}])
+        self.assert_input([{"op": "sd", "version": True,
+                           "digest": dg, "state": st}])
+        self.assert_input([{"op": "sd", "version": 1,
+                           "digest": "0" * 63, "state": st}])
+        self.assert_input([{"op": "sd", "version": 1,
+                           "digest": dg.upper(), "state": st}])
+        self.assert_input([{"op": "sd", "version": 1,
+                           "digest": 1, "state": st}])
+
+    def test_digest_mismatch_is_input(self):
+        result = self.export(self.SETUP)
+        self.assert_input([{"op": "sd", "version": 1,
+                           "digest": "a" * 64, "state": result["state"]}])
+
+    def test_semantic_and_normalization_errors_parity_with_si(self):
+        # 摘要相符但状态矛盾：sd 与 si 同判 STATE/4。
+        base = self.export([{"op": "add", "id": "b1", "weight": 1}])
+        st = json.loads(json.dumps(base["state"]))
+        st["backends"][0]["conns"] = 99
+        envelope = json.dumps(
+            {"version": 1, "state": st},
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(envelope).hexdigest()
+        code, out, _ = self.run_ops(
+            [{"op": "sd", "version": 1, "digest": digest, "state": st}])
+        self.assertEqual((code, out), (4, b""))
+        code_si, _, _ = self.run_ops(
+            [{"op": "si", "version": 1, "digest": digest, "state": st}])
+        self.assertEqual(code_si, code)
+        # 键序非常态但摘要自洽：si/sd 同判 INPUT/2（结构校验先于往返）。
+        empty = self.export([])
+        reordered = {k: empty["state"][k]
+                     for k in reversed(list(empty["state"]))}
+        env2 = json.dumps(
+            {"version": 1, "state": reordered},
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        d2 = hashlib.sha256(env2).hexdigest()
+        self.assertEqual(
+            self.run_ops([{"op": "sd", "version": 1,
+                           "digest": d2, "state": reordered}])[0],
+            self.run_ops([{"op": "si", "version": 1,
+                           "digest": d2, "state": reordered}])[0])
+
+    def test_failure_rolls_back_whole_batch(self):
+        result = self.export(self.SETUP)
+        code, out, _ = self.run_ops([
+            {"op": "add", "id": "temp", "weight": 1},
+            {"op": "sd", "version": 1, "digest": "f" * 64,
+             "state": result["state"]},
+        ])
+        self.assertEqual((code, out), (2, b""))
+
+    def test_overload_candidate_and_current(self):
+        # 候选 state 超 8MiB：OVERLOAD/7。
+        base = self.export([{"op": "add", "id": "x", "weight": 1}])
+        st = json.loads(json.dumps(base["state"]))
+        template = json.loads(json.dumps(st["backends"][0]))
+        st["backends"] += [
+            dict(template, id="z%07d" % i) for i in range(40000)
+        ]
+        envelope = json.dumps(
+            {"version": 1, "state": st},
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        code, out, err = self.run_ops([{"op": "sd", "version": 1,
+                                    "digest": hashlib.sha256(envelope).hexdigest(),
+                                    "state": st}])
+        self.assertEqual((code, out), (7, b""))
+        self.assertEqual(err, b'{"error":"OVERLOAD"}\n')
+        # 候选合法（摘要匹配）但当前状态超 se 导出上限：OVERLOAD/7。按错误
+        # 优先级，候选校验先通过后才检查当前导出大小。
+        empty = self.export([])
+        adds = [{"op": "add", "id": "b%07d" % i, "weight": 1}
+                for i in range(40000)]
+        code, out, _ = self.run_ops(adds + [self.sd_op(empty)])
+        self.assertEqual((code, out), (7, b""))
+
+    def test_record_replay_success_and_failure(self):
+        empty = self.export([])
+        raw = encode_ops(self.SETUP + [self.sd_op(empty)])
+        code, direct, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, record, err = run_balancer("record", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(replayed, direct)
+        # 失败 sd（摘要不符 INPUT/2）同样可 record/replay。
+        bad = encode_ops([{"op": "sd", "version": 1,
+                           "digest": "f" * 64, "state": empty["state"]}])
+        code, bad_out, bad_err = run_balancer("run", bad)
+        self.assertEqual(code, 2)
+        code, record, _ = run_balancer("record", bad)
+        code, replayed, replayed_err = run_balancer("replay", record)
+        self.assertEqual((code, replayed, replayed_err),
+                         (2, bad_out, bad_err))
+
+
 if __name__ == "__main__":
     unittest.main()

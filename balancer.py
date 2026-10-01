@@ -2338,7 +2338,7 @@ def parse_op(raw_op):
         "ru",
         "ua",
         "mu",
-        "se", "si",
+        "se", "si", "sd",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -3918,6 +3918,28 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("si", version, digest, raw_op["state"])
+
+    if name == "sd":
+        # 候选检查点只读差异：精确键序 op,version,digest,state，后三项沿用
+        # si 的公开含义与错误优先级（解析期仅校键序、version=1 与 digest
+        # 格式；摘要、大小、结构与语义校验留执行期，且全程不改任何运行态）。
+        if list(raw_op) != ["op", "version", "digest", "state"]:
+            fail(EXIT_INPUT, "INPUT")
+        version = raw_op["version"]
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version != 1
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        digest = raw_op["digest"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("sd", version, digest, raw_op["state"])
 
     # get
     if keys != {"op", "cid"}:
@@ -6270,6 +6292,53 @@ def run(raw):
     # si 导入：把规范化 state 严格解析回内部运行态束。
     # 结构/键集/键序/类型/范围/UTF-8 非法 → INPUT/2；重复标识、悬空引用、
     # 矛盾计数或非法状态组合 → STATE/4。调用方须已确认摘要相符。
+    def candidate_checkpoint(version, digest, raw_state):
+        """按 si 的同一规则只读校验候选检查点（不触碰任何闭包状态），返回
+        (候选束, 所给 state 的规范化紧凑编码)。错误优先级与 si 完全一致：
+        UTF-8 编码 INPUT/2 → state 超 8MiB OVERLOAD/7 → 摘要不符 INPUT/2 →
+        结构/语义 STATE/4 → 规范化往返 STATE/4。"""
+        try:
+            state_bytes = json.dumps(
+                raw_state, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            envelope_bytes = json.dumps(
+                {"version": version, "state": raw_state},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+        except UnicodeEncodeError:
+            fail(EXIT_INPUT, "INPUT")
+        if len(state_bytes) > CHECKPOINT_LIMIT:
+            fail(EXIT_OVERLOAD, "OVERLOAD")
+        if hashlib.sha256(envelope_bytes).hexdigest() != digest:
+            fail(EXIT_INPUT, "INPUT")
+        candidate = parse_checkpoint(raw_state)
+        re_bytes = json.dumps(
+            export_bundle(candidate), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        if re_bytes != state_bytes:
+            fail(EXIT_STATE, "STATE")
+        return candidate, state_bytes
+
+    def se_snapshot():
+        """按 se 的规则取得当前状态的规范化内存快照与紧凑编码；不推进时钟、
+        不改任何状态。当前 state 编码超 se 的导出上限报 OVERLOAD/7。返回
+        (规范化 state, state 紧凑 UTF-8 编码, 检查点摘要)；摘要为紧凑编码
+        {"version":1,"state":...}（与 se/si 同口径）的小写 SHA-256。"""
+        state = export_bundle(current_bundle())
+        try:
+            state_bytes = json.dumps(
+                state, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            envelope_bytes = json.dumps(
+                {"version": CHECKPOINT_VERSION, "state": state},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+        except UnicodeEncodeError:
+            fail(EXIT_INPUT, "INPUT")
+        if len(state_bytes) > CHECKPOINT_LIMIT:
+            fail(EXIT_OVERLOAD, "OVERLOAD")
+        return state, state_bytes, hashlib.sha256(envelope_bytes).hexdigest()
+
     def parse_checkpoint(raw):
         if not isinstance(raw, dict):
             fail(EXIT_INPUT, "INPUT")
@@ -12517,40 +12586,48 @@ def run(raw):
             # 引用/重复标识/矛盾计数/非法组合 STATE/4）；全部通过后原子替换
             # 当前状态。任何失败均无 stdout、整批状态回滚。
             _, version, digest, raw_state = op
-            # 规范化摘要仅认固定键序的 {version,state} 紧凑编码：先把所给
-            # state 紧凑编码（所给 state 必须本身即规范化形态；任何键序、
-            # 类型或取值偏差都会令摘要不符判 INPUT）。
-            try:
-                state_bytes = json.dumps(
-                    raw_state, ensure_ascii=False, separators=(",", ":")
-                ).encode("utf-8")
-                envelope_bytes = json.dumps(
-                    {"version": version, "state": raw_state},
-                    ensure_ascii=False, separators=(",", ":"),
-                ).encode("utf-8")
-            except UnicodeEncodeError:
-                fail(EXIT_INPUT, "INPUT")
-            if len(state_bytes) > CHECKPOINT_LIMIT:
-                fail(EXIT_OVERLOAD, "OVERLOAD")
-            if hashlib.sha256(envelope_bytes).hexdigest() != digest:
-                fail(EXIT_INPUT, "INPUT")
-            # 摘要相符后做完整结构与语义校验，构造候选束；不触碰任何当前
-            # 闭包状态，故失败天然回滚。
-            candidate = parse_checkpoint(raw_state)
-            # 规范化往返：候选束重新规范化后的紧凑编码必须与所给 state 的
-            # 紧凑编码逐字节一致。这强制所给 state 本身即为规范化形态（逐层
-            # 键序、数组排序、取值格式全部固定），从而恢复后 se 复现完全相同
-            # 的 version/digest/state；任何键序或排序偏差在此判 STATE。
-            re_state = export_bundle(candidate)
-            re_bytes = json.dumps(
-                re_state, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
-            if re_bytes != state_bytes:
-                fail(EXIT_STATE, "STATE")
+            candidate, _ = candidate_checkpoint(version, digest, raw_state)
             install_bundle(candidate)
             results.append(
                 {"op": "si", "digest": digest, "ok": True}
             )
+
+        elif op[0] == "sd":
+            # 候选检查点只读差异：先按 si 的规则只读校验候选（全程不触碰闭
+            # 包状态，故失败天然不影响此前批内临时变化之外的任何运行态；失
+            # 败仍无 stdout、整批回滚），再按 se 的规则取当前状态规范化快
+            # 照。不推进逻辑时钟、不改任何运行态或幂等缓存。
+            _, version, digest, raw_state = op
+            _, after_bytes = candidate_checkpoint(version, digest, raw_state)
+            before_state, before_bytes, before_digest = se_snapshot()
+            equal = before_bytes == after_bytes
+            # changes 顺序沿用 se 规范化 state 的顶层键序（dict 保序），仅
+            # 列值不同的顶层段；段指纹为该段规范化 JSON 值（ensure_ascii=
+            # False、分隔符 ,:、无末尾换行）的小写 64 位 SHA-256。
+            changes = []
+            if not equal:
+                for section in before_state:
+                    before_value = before_state[section]
+                    after_value = raw_state[section]
+                    if before_value != after_value:
+                        changes.append({
+                            "section": section,
+                            "before": section_digest(before_value),
+                            "after": section_digest(after_value),
+                        })
+            results.append({
+                "op": "sd",
+                "before": before_digest,
+                "after": digest,
+                "equal": equal,
+                "changes": changes,
+                "summary": {
+                    "sections": len(before_state),
+                    "changed": len(changes),
+                    "bytes_before": len(before_bytes),
+                    "bytes_after": len(after_bytes),
+                },
+            })
 
         else:  # get
             _, cid = op
