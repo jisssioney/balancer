@@ -91,6 +91,19 @@
 - 返回固定键序 `op,id,reason,threshold,state,active,since,duration,changed`。同一 `id,reason,threshold,now` 重报原样返回首次结果、不重复推进状态；同一时刻之后发生的原因变化从更大的 `now` 才可见。
 - 键序、字段、编码、类型、范围、reason 或时钟非法报 INPUT/2；未知后端报 BACKEND/3；已登记组合变更 threshold 报 STATE/4（按 INPUT、BACKEND、STATE 判定）；失败批次不留下时钟、缓存或告警状态。remove 后同 id 重加清除对应登记，ci/cb/ca/cu 成功清空全部 ua 状态。ua 除时钟和自身状态外不修改连接、粘性、指标、故障计划或调度结果。fault 活动段查找为 O(log T)、其余三因 O(1)，单次时间 O(log(T+1))、额外空间 O(1)，总空间 O(B)（每后端至多四键，T 为该后端故障段数、B 为后端数）。紧凑 UTF-8 固定键序 JSON、单换行及 run、record、replay 的逐字节结果保持兼容，仅用标准库。
 
+## 全池排空投影与批量到期：dq / dx
+
+在单后端 `ds`/`dr`/`du`/`dg` 之外提供确定性的全池排空投影与批量执行；既有单后端操作语义与结果不变。
+
+- `dq`：精确键序 `op,now`（键须按此序出现）；`now` 为非负非 bool 整数，纳入共用非递减显式时钟（倒退报 INPUT/2）。除推进时钟外为只读，不改变任何状态。
+  - 返回固定键序 `op,now,items`；`items` 按后端加入顺序列出排空状态为 D 或 X 的后端，每项固定键序 `id,state,connections,start,deadline,end,due,remaining,forced`。
+  - `due` 仅在 D 且 `now` 不早于 `deadline` 时为 true；D 的 `remaining=max(deadline-now,0)`，X 的 `remaining` 恒为 0。空池或无 D/X 后端时 `items=[]`，不报错。时间 O(B)、结果空间 O(B)。
+- `dx`：精确键序 `op,now`，`now` 校验与时钟语义同 `dq`。处理集合为状态 D 且 `deadline<=now` 的后端，按后端加入顺序处理；每个后端的连接按全局建连顺序关闭。
+  - 关闭沿用 `dg` 强制到期的联动语义：删除活动连接及建连时端点快照、该后端并发归零、转为 X、`end=deadline`、`forced=本次关闭数`；不消费等待队列、令牌或配额。
+  - 返回固定键序 `op,now,backends,closed`；`backends` 只含本次到期项，项固定键序 `id,deadline,cids`，`cids` 按关闭顺序排列，`closed` 为全部 cids 数量。无到期项时为空数组和 0；同一 `now` 重复执行为确定性空操作；处理无失败路径，天然原子，不留部分转换。时间 O(B+C)、结果空间 O(B+C)，B 为后端数、C 为活动连接数。
+- 后续路由仍按既有规则处理 X（不参与新映射、旧粘性失效并依环迁移）。两项操作的键集合、键序、`now` 类型或范围非法以及时钟倒退统一返回 INPUT/2，失败无 stdout，并回滚同批此前变化和逻辑时钟。
+- `run`、`record`、`replay` 继续逐字节一致；检查点完整保留连接、排空状态与时钟变化，`se` 导出后 `si` 恢复继续执行与直接继续一致。仅使用 Python 标准库，不访问网络或系统时间。
+
 ## 可移植运行态检查点：se / si
 
 在现有 JSON 操作流中新增 `se`、`si`，使一次调用导出的状态能在另一条全新调用中恢复并继续处理公开操作；不依赖文件、网络或进程时间。对任意合法后续操作序列，直接继续与“导出后在空实例恢复再继续”所得退出码、stdout、stderr 逐字节一致。

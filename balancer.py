@@ -77,6 +77,21 @@ X 的旧粘性按原环迁移。du 转 A，取消 D 时 end=now，不恢复已�
 op,id,state,connections,start,end,deadline,forced，state ∈ A/D/X
 （可用/排空/已摘除），未开始时三时间为 null。未知 id 报 BACKEND，
 未 ds 的 dr/du/dg 报 STATE。
+全池排空投影 dq：精确键序 op,now，now 为非负非 bool 整数并纳入共用非
+递减时钟；只读、仅推进时钟，时间 O(B)、结果空间 O(B)。返回键序
+op,now,items，items 按后端加入序列出 D/X 后端，项键序
+id,state,connections,start,deadline,end,due,remaining,forced；due 仅
+D 且 now>=deadline 为 true，D 的 remaining=max(deadline-now,0)，X 的
+remaining 恒为 0。空池、无 D/X 后端均返回空 items，不报错。
+全池批量到期 dx：精确键序 op,now，now 义同 dq；处理集合为 D 且
+deadline<=now 的后端，按加入顺序处理，各后端连接按全局建连顺序关闭，
+沿用 dg 强制到期联动（删连接与端点快照、并发归零、转 X、end=deadline、
+forced=本次关闭数），不消费等待队列、令牌或配额。返回键序
+op,now,backends,closed，backends 只含本次到期项，项键序
+id,deadline,cids（cids 按关闭序），closed 为全部 cids 数量；无到期项
+返回空数组与 0，同一 now 重复执行为确定性空操作，天然原子。时间
+O(B+C)、结果空间 O(B+C)。两操作键集合、键序、now 类型/范围或时钟倒退
+统一报 INPUT/2，失败无 stdout 并回滚同批此前变化和逻辑时钟。
 
 令牌桶：ls 键集 op,scope,id,r,b,now，scope ∈ B/C/S（后端/客户端/
 服务类），id/c/s/key 均为非空 UTF-8 串，r,b ∈ [1,10^9] 非 bool 整数，
@@ -2403,7 +2418,7 @@ def parse_op(raw_op):
     if name not in (
         "add", "remove", "pick", "open", "close", "get",
         "hset", "probe", "hget", "chash", "route", "ws", "wg",
-        "cs", "cr", "cg", "ds", "dr", "du", "dg",
+        "cs", "cr", "cg", "ds", "dr", "du", "dg", "dq", "dx",
         "ss",
         "ls", "la", "lg", "qs", "qg",
         "os", "pc", "pg", "oa", "ot", "og", "oc", "oh", "wh", "wp", "wa", "bp", "bq", "qp", "rp", "rg",
@@ -2602,6 +2617,14 @@ def parse_op(raw_op):
         if keys != {"op", "id", "now"}:
             fail(EXIT_INPUT, "INPUT")
         return (name, parse_backend_id(raw_op["id"]), parse_now(raw_op["now"]))
+
+    if name in ("dq", "dx"):
+        # 全池排空投影（dq）与批量到期执行（dx）：精确键序 op,now（键须按
+        # 此序出现，乱序或缺/多键报 INPUT）；now 为非负非 bool 整数
+        # （parse_now 不设上界），纳入共用非递减时钟（倒退执行期判 INPUT）。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return (name, parse_now(raw_op["now"]))
 
     if name == "ls":
         if keys != {"op", "scope", "id", "r", "b", "now"}:
@@ -7891,7 +7914,7 @@ def run(raw):
 
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
-            "dr", "du", "dg", "ls", "la", "lg", "qs", "qg", "oa", "ot",
+            "dr", "du", "dg", "dq", "dx", "ls", "la", "lg", "qs", "qg", "oa", "ot",
             "oq", "lh", "lt", "le",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
@@ -8649,6 +8672,86 @@ def run(raw):
                     "end": drain["end"],
                     "deadline": drain["deadline"],
                     "forced": drain["forced"],
+                }
+            )
+
+        elif op[0] == "dq":
+            # 全池排空投影（只读）：按后端加入顺序列出 D/X 后端，仅推进
+            # 时钟（已在循环开头完成），不改任何状态。due 仅在 D 且
+            # now>=deadline 为 true；D 的 remaining=max(deadline-now,0)，
+            # X 的 remaining 恒为 0。时间 O(B)、结果空间 O(B)。
+            _, now = op
+            items = []
+            for backend_id, record in backends.items():
+                drain = record["drain"]
+                state = drain["state"]
+                if state not in ("D", "X"):
+                    continue
+                if state == "D":
+                    due = now >= drain["deadline"]
+                    remaining = max(drain["deadline"] - now, 0)
+                else:
+                    due = False
+                    remaining = 0
+                items.append(
+                    {
+                        "id": backend_id,
+                        "state": state,
+                        "connections": record["conns"],
+                        "start": drain["start"],
+                        "deadline": drain["deadline"],
+                        "end": drain["end"],
+                        "due": due,
+                        "remaining": remaining,
+                        "forced": drain["forced"],
+                    }
+                )
+            results.append({"op": "dq", "now": now, "items": items})
+
+        elif op[0] == "dx":
+            # 全池批量到期排空：处理集合为 D 且 deadline<=now 的后端，按
+            # 加入顺序逐个处理；每个后端的连接按全局建连顺序关闭。关闭沿用
+            # dg 强制到期的联动语义（删除活动连接与端点快照、并发归零、转
+            # X、end=deadline、forced=本次关闭数），但不消费等待队列、令牌
+            # 或配额。先按建连顺序单遍分组（O(C)），再按加入序遍历后端
+            # （O(B)），整体 O(B+C)；处理中不存在失败路径，天然原子。
+            _, now = op
+            due_backends = [
+                (backend_id, record)
+                for backend_id, record in backends.items()
+                if record["drain"]["state"] == "D"
+                and record["drain"]["deadline"] <= now
+            ]
+            # 单遍按后端分组 cids，组内保持全局建连顺序。
+            conn_groups = {}
+            for cid, connection in connections.items():
+                conn_groups.setdefault(connection[0], []).append(cid)
+            result_backends = []
+            closed_total = 0
+            for backend_id, record in due_backends:
+                cids = conn_groups.pop(backend_id, [])
+                for cid in cids:
+                    del connections[cid]
+                    conn_endpoints.pop(cid, None)
+                record["conns"] = 0
+                drain = record["drain"]
+                drain["forced"] = len(cids)
+                drain["state"] = "X"
+                drain["end"] = drain["deadline"]
+                result_backends.append(
+                    {
+                        "id": backend_id,
+                        "deadline": drain["deadline"],
+                        "cids": cids,
+                    }
+                )
+                closed_total += len(cids)
+            results.append(
+                {
+                    "op": "dx",
+                    "now": now,
+                    "backends": result_backends,
+                    "closed": closed_total,
                 }
             )
 

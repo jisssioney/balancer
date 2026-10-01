@@ -20396,5 +20396,447 @@ class SmCheckpointMergeTest(unittest.TestCase):
                          (4, bad_out, bad_err))
 
 
+class PoolDrainProjectionTest(unittest.TestCase):
+    """全池排空投影 dq：固定键序投影、due/remaining、只读与时钟、校验。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def last_of(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def assert_failure(self, ops, exit_code=2, label="INPUT"):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(out, b"")
+        self.assertEqual(
+            err, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def drain_setup(self):
+        # 加入序 b,a,c；连接按 c1(b) c2(a) c3(c) c4(b) c5(a) 建连。
+        return [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c3", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c4", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c5", "flow": FLOW, "now": 0},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "ds", "id": "a", "t": 10},
+            {"op": "dr", "id": "b", "now": 1},   # D, deadline 6
+            {"op": "dr", "id": "a", "now": 2},   # D, deadline 12
+        ]
+
+    def test_empty_pool(self):
+        self.assertEqual(
+            self.last_of([{"op": "dq", "now": 0}]),
+            {"op": "dq", "now": 0, "items": []},
+        )
+
+    def test_only_d_and_x_in_join_order_a_excluded(self):
+        ops = self.drain_setup()
+        # c 保持 A（未 ds），不出现在 items。
+        result = self.last_of(ops + [{"op": "dq", "now": 4}])
+        self.assertEqual([item["id"] for item in result["items"]], ["b", "a"])
+        self.assertEqual(result["items"][0], {
+            "id": "b", "state": "D", "connections": 2,
+            "start": 1, "deadline": 6, "end": None,
+            "due": False, "remaining": 2, "forced": 0,
+        })
+        self.assertEqual(result["items"][1], {
+            "id": "a", "state": "D", "connections": 2,
+            "start": 2, "deadline": 12, "end": None,
+            "due": False, "remaining": 8, "forced": 0,
+        })
+
+    def test_due_boundary_and_remaining_floor(self):
+        ops = self.drain_setup()
+        # now=5：b deadline 6 未到期；remaining=1。
+        result = self.last_of(ops + [{"op": "dq", "now": 5}])
+        b_item = result["items"][0]
+        self.assertFalse(b_item["due"])
+        self.assertEqual(b_item["remaining"], 1)
+        # now=6：恰好到期，remaining 下溢封顶 0。
+        result = self.last_of(ops + [{"op": "dq", "now": 6}])
+        b_item = result["items"][0]
+        self.assertTrue(b_item["due"])
+        self.assertEqual(b_item["remaining"], 0)
+        # a 仍未到期。
+        self.assertFalse(result["items"][1]["due"])
+        self.assertEqual(result["items"][1]["remaining"], 6)
+
+    def test_x_item_shape(self):
+        # dr 时无连接直接 X：start=end=now，forced=0。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "dr", "id": "b", "now": 3},
+            {"op": "dq", "now": 100},
+        ]
+        self.assertEqual(
+            self.last_of(ops),
+            {"op": "dq", "now": 100, "items": [{
+                "id": "b", "state": "X", "connections": 0,
+                "start": 3, "deadline": 8, "end": 3,
+                "due": False, "remaining": 0, "forced": 0,
+            }]},
+        )
+
+    def test_read_only_even_when_due(self):
+        # now>=deadline 的 dq 只投影、不强关：随后 dg 仍见 D 与活动连接，
+        # 同刻 dq 重报逐值一致。
+        ops = self.drain_setup() + [{"op": "dq", "now": 6}]
+        first = self.run_ops(ops)[-1]
+        second = self.run_ops(ops + [{"op": "dq", "now": 6}])[-1]
+        self.assertEqual(first, second)
+        dg = self.last_of(ops + [{"op": "dg", "id": "b", "now": 6}])
+        self.assertEqual(dg["state"], "X")
+        self.assertEqual(dg["forced"], 2)
+        self.assertEqual(dg["end"], 6)
+
+    def test_dq_advances_clock(self):
+        # dq 推进共用时钟：之后更小 now 的操作时钟倒退报 INPUT。
+        self.assert_failure([
+            {"op": "dq", "now": 10},
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "dg", "id": "b", "now": 9},
+        ])
+
+    def test_raw_byte_layout(self):
+        raw = encode_ops(self.drain_setup() + [{"op": "dq", "now": 6}])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertIn(
+            b'{"op":"dq","now":6,"items":['
+            b'{"id":"b","state":"D","connections":2,"start":1,"deadline":6,'
+            b'"end":null,"due":true,"remaining":0,"forced":0}',
+            out,
+        )
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertNotIn(b"\n", out[:-1])
+
+    def test_input_validation(self):
+        valid_prefix = [{"op": "add", "id": "b", "weight": 1}]
+        bad_bodies = [
+            {"op": "dq"},               # 缺 now
+            {"op": "dq", "now": 1, "x": 1},  # 多键
+            {"op": "dq", "now": 1, "id": "b"},  # 混入 id 键
+        ]
+        for body in bad_bodies:
+            self.assert_failure(valid_prefix + [body])
+        # 键序颠倒。
+        code, out, err = run_balancer(
+            "run", b'{"ops":[{"now":1,"op":"dq"}]}'
+        )
+        self.assertEqual((code, out), (2, b""))
+        for bad_now in (True, False, -1, 1.0, "1", None):
+            self.assert_failure(
+                valid_prefix + [{"op": "dq", "now": bad_now}]
+            )
+            self.assert_failure(
+                valid_prefix + [{"op": "dx", "now": bad_now}]
+            )
+
+    def test_clock_regression(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "dg", "id": "b", "now": 10},
+        ]
+        self.assert_failure(ops + [{"op": "dq", "now": 9}])
+        self.assert_failure(ops + [{"op": "dx", "now": 9}])
+
+
+class PoolDrainBatchTest(unittest.TestCase):
+    """全池批量到期 dx：处理集合、关闭序、联动语义、幂等、原子、校验。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def last_of(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def assert_failure(self, ops, exit_code=2, label="INPUT"):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(out, b"")
+        self.assertEqual(
+            err, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def drain_setup(self):
+        # 加入序 b,a,c；连接按 c1(b) c2(a) c3(c) c4(b) c5(a) 建连。
+        return [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "add", "id": "c", "weight": 1},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c3", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c4", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c5", "flow": FLOW, "now": 0},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "ds", "id": "a", "t": 10},
+            {"op": "dr", "id": "b", "now": 1},   # D, deadline 6
+            {"op": "dr", "id": "a", "now": 2},   # D, deadline 12
+        ]
+
+    def test_empty_pool_and_nothing_due(self):
+        self.assertEqual(
+            self.last_of([{"op": "dx", "now": 0}]),
+            {"op": "dx", "now": 0, "backends": [], "closed": 0},
+        )
+        # b deadline 6：now=5 无到期项，D 状态保持。
+        result = self.last_of(self.drain_setup() + [{"op": "dx", "now": 5}])
+        self.assertEqual(result, {"op": "dx", "now": 5,
+                                  "backends": [], "closed": 0})
+        dq = self.last_of(self.drain_setup() + [
+            {"op": "dx", "now": 5}, {"op": "dq", "now": 5}])
+        self.assertEqual([i["state"] for i in dq["items"]], ["D", "D"])
+
+    def test_due_set_join_order_global_cid_order(self):
+        result = self.last_of(self.drain_setup() + [{"op": "dx", "now": 12}])
+        self.assertEqual(result["op"], "dx")
+        self.assertEqual(result["now"], 12)
+        self.assertEqual(result["closed"], 4)
+        self.assertEqual(
+            [(b["id"], b["deadline"], b["cids"]) for b in result["backends"]],
+            [("b", 6, ["c1", "c4"]), ("a", 12, ["c2", "c5"])],
+        )
+        # c（A 态、无 ds）不受影响，c3 仍活动。
+        dq = self.last_of(self.drain_setup() + [
+            {"op": "dx", "now": 12}, {"op": "dq", "now": 12}])
+        self.assertEqual(
+            [i["id"] for i in dq["items"]], ["b", "a"]
+        )
+        for item in dq["items"]:
+            self.assertEqual(item["state"], "X")
+            self.assertEqual(item["connections"], 0)
+            self.assertEqual(item["end"], item["deadline"])
+            self.assertFalse(item["due"])
+            self.assertEqual(item["remaining"], 0)
+        self.assertEqual(dq["items"][0]["forced"], 2)
+        self.assertEqual(dq["items"][1]["forced"], 2)
+
+    def test_partial_batch_only_due_backends(self):
+        # now=6：仅 b 到期（deadline==now 边界含），a 保留 D 与连接。
+        result = self.last_of(self.drain_setup() + [{"op": "dx", "now": 6}])
+        self.assertEqual(result["backends"], [{
+            "id": "b", "deadline": 6, "cids": ["c1", "c4"],
+        }])
+        self.assertEqual(result["closed"], 1 + 1)
+        # a 的 c2/c5 未关闭；b 的 c1/c4 已不存在（get 报 CONNECTION）。
+        code, _, err = run_balancer("run", encode_ops(
+            self.drain_setup() + [
+                {"op": "dx", "now": 6},
+                {"op": "get", "cid": "c2"},
+            ]))
+        self.assertEqual((code, err), (0, b""))
+        code, out, err = run_balancer("run", encode_ops(
+            self.drain_setup() + [
+                {"op": "dx", "now": 6},
+                {"op": "get", "cid": "c1"},
+            ]))
+        self.assertEqual(code, 5)
+        self.assertEqual(out, b"")
+        self.assertIn(b"CONNECTION", err)
+
+    def test_idempotent_same_now(self):
+        ops = self.drain_setup() + [
+            {"op": "dx", "now": 6},
+            {"op": "dx", "now": 6},
+            {"op": "dx", "now": 6},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1], {"op": "dx", "now": 6,
+                                       "backends": [], "closed": 0})
+        self.assertEqual(results[-2], results[-1])
+        # X 后端的 forced 不被重复执行覆盖（仍为 2）。
+        dq = self.last_of(ops + [{"op": "dq", "now": 6}])
+        self.assertEqual(dq["items"][0]["forced"], 2)
+
+    def test_equivalent_to_dg_then_dq(self):
+        # dx 与逐后端 dg 到期后，同刻 dq 投影与 backends 数组逐值一致。
+        prefix = self.drain_setup()
+        code, dx_out, dx_err = run_balancer("run", encode_ops(prefix + [
+            {"op": "dx", "now": 12}, {"op": "dq", "now": 13}]))
+        self.assertEqual((code, dx_err), (0, b""))
+        code, dg_out, dg_err = run_balancer("run", encode_ops(prefix + [
+            {"op": "dg", "id": "b", "now": 12},
+            {"op": "dg", "id": "a", "now": 12},
+            {"op": "dq", "now": 13}]))
+        self.assertEqual((code, dg_err), (0, b""))
+        dx_obj, dg_obj = (json.loads(x.decode()) for x in (dx_out, dg_out))
+        self.assertEqual(dx_obj["results"][-1], dg_obj["results"][-1])
+        self.assertEqual(dx_obj["backends"], dg_obj["backends"])
+        # dg 在 dx 之后看到 X 与同一 forced。
+        after = self.last_of(prefix + [
+            {"op": "dx", "now": 12}, {"op": "dg", "id": "b", "now": 12}])
+        self.assertEqual(after["state"], "X")
+        self.assertEqual(after["forced"], 2)
+        self.assertEqual(after["end"], 6)
+
+    def test_endpoint_snapshot_removed(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "dr", "id": "b", "now": 0},
+            {"op": "dx", "now": 5},
+            {"op": "fw", "cid": "x"},
+        ]
+        self.assert_failure(ops, exit_code=5, label="CONNECTION")
+
+    def test_tokens_quotas_queue_not_consumed(self):
+        # 令牌桶：无 la 扣减，dx 后 t 仍为满桶 10。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "ls", "scope": "B", "id": "b", "r": 1, "b": 10,
+             "now": 0},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "dr", "id": "b", "now": 0},
+            {"op": "dx", "now": 5},
+            {"op": "lg", "scope": "B", "id": "b", "now": 5},
+        ]
+        self.assertEqual(self.last_of(ops)["t"], 10)
+        # 固定窗口配额 used 不增。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "qs", "scope": "B", "id": "b", "limit": 7,
+             "span": 60, "now": 0},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "dr", "id": "b", "now": 0},
+            {"op": "dx", "now": 5},
+            {"op": "qg", "scope": "B", "id": "b", "now": 5},
+        ]
+        qg = self.last_of(ops)
+        self.assertEqual(qg["used"], 0)
+        self.assertEqual(qg["remaining"], 7)
+        # 等待队列不被消费：两后端各占满 cap=1，oa 入队一项；dx 排空
+        # 两后端后排队项仍在（不自动接纳）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "os", "cap": 1, "q": 5, "ttl": 100},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "y", "flow": FLOW, "now": 0},
+            {"op": "oa", "cid": "w", "flow": FLOW, "c": "c", "s": "s",
+             "key": "zzz", "now": 0},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "ds", "id": "a", "t": 5},
+            {"op": "dr", "id": "b", "now": 0},
+            {"op": "dr", "id": "a", "now": 0},
+            {"op": "dx", "now": 5},
+            {"op": "og"},
+        ]
+        self.assertEqual(self.last_of(ops)["queue"], ["w"])
+
+    def test_sticky_invalidated_after_dx(self):
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "route", "key": "k"},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "dr", "id": "b", "now": 0},
+            {"op": "dx", "now": 5},
+            {"op": "route", "key": "k"},
+        ]
+        routes = [r for r in self.run_ops(ops) if r["op"] == "route"]
+        self.assertEqual(routes[0]["backend"], "b")
+        self.assertEqual(routes[1]["backend"], "a")
+        self.assertTrue(routes[1]["remapped"])
+
+    def test_x_and_undrained_backends_excluded(self):
+        # d1 持有全部连接并处于 D 但未到期；x1 已 X、a1 从未 ds；dx 空操作。
+        ops = [
+            {"op": "add", "id": "d1", "weight": 1},
+            {"op": "add", "id": "x1", "weight": 1},
+            {"op": "add", "id": "a1", "weight": 1},
+            {"op": "open", "cid": "d", "flow": FLOW, "now": 0},
+            # x1：dr 时无连接直接 X。
+            {"op": "ds", "id": "x1", "t": 1},
+            {"op": "dr", "id": "x1", "now": 0},
+            {"op": "ds", "id": "d1", "t": 10},
+            {"op": "dr", "id": "d1", "now": 0},
+            {"op": "dx", "now": 5},
+        ]
+        # X 的 x1 与 A 的 a1 都不在处理集合；d1 deadline 10 未到期。
+        self.assertEqual(
+            self.last_of(ops),
+            {"op": "dx", "now": 5, "backends": [], "closed": 0},
+        )
+
+    def test_failure_no_stdout_and_rollback(self):
+        # 时钟倒退：同批此前的 dr 与时钟随失败回滚（无 stdout）。
+        ops = [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ds", "id": "b", "t": 5},
+            {"op": "dr", "id": "b", "now": 10},
+            {"op": "dx", "now": 9},
+        ]
+        self.assert_failure(ops)
+        # now 类型非法同样整批无 stdout。
+        self.assert_failure([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "dx", "now": True},
+        ])
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops(self.drain_setup() + [
+            {"op": "dx", "now": 6},
+            {"op": "dx", "now": 6},
+            {"op": "dq", "now": 7},
+            {"op": "dx", "now": 12},
+        ])
+        code, direct, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, record, err = run_balancer("record", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual((code, replayed, err), (0, direct, b""))
+
+    def test_checkpoint_roundtrip_after_dx(self):
+        prefix = self.drain_setup() + [{"op": "dx", "now": 6}]
+        cont = [
+            {"op": "dq", "now": 7},
+            {"op": "dx", "now": 12},
+            {"op": "dq", "now": 12},
+        ]
+        results = self.run_ops(prefix + [{"op": "se"}] + cont)
+        exported = results[len(prefix)]
+        si_op = {"op": "si", "version": 1,
+                 "digest": exported["digest"], "state": exported["state"]}
+        resumed = self.run_ops([si_op] + cont)
+        self.assertEqual(resumed[1:], results[len(prefix) + 1:])
+        # 恢复后立即 se 逐字节复现摘要与状态。
+        again = self.last_of([si_op, {"op": "se"}])
+        self.assertEqual(again["digest"], exported["digest"])
+        self.assertEqual(again["state"], exported["state"])
+
+    def test_checkpoint_roundtrip_mid_drain(self):
+        # D 态（含活动连接）导出恢复后，dq/dx 结果与直接继续一致。
+        prefix = self.drain_setup()
+        cont = [{"op": "dq", "now": 5}, {"op": "dx", "now": 6}]
+        results = self.run_ops(prefix + [{"op": "se"}] + cont)
+        exported = results[len(prefix)]
+        si_op = {"op": "si", "version": 1,
+                 "digest": exported["digest"], "state": exported["state"]}
+        resumed = self.run_ops([si_op] + cont)
+        self.assertEqual(resumed[1:], results[len(prefix) + 1:])
+
+
 if __name__ == "__main__":
     unittest.main()
