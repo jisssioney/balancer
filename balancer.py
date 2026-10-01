@@ -2471,6 +2471,7 @@ def parse_op(raw_op):
         "ts", "tm", "te", "tk", "tg", "tx",
         "ep", "fw",
         "eq", "ec",
+        "er", "ex",
         "ru",
         "ua",
         "mu",
@@ -4154,6 +4155,27 @@ def parse_op(raw_op):
         if before > now:
             fail(EXIT_INPUT, "INPUT")
         return ("ec", parse_backend_id(raw_op["id"]), before, now)
+
+    if name == "er":
+        # 全池端点轮换盘点：精确键序 op,now（键须按此序出现）；now 为
+        # 0..10^9 非 bool 整数并进入共用非递减时钟；除推进时钟外只读。空
+        # 池或无已登记端点由执行期返回空数组与全零汇总。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("er", parse_metric_num(raw_op["now"]))
+
+    if name == "ex":
+        # 全池端点轮换批量清理：精确键序 op,before,now（键须按此序出现）；
+        # before/now 均为 0..10^9 非 bool 整数且 before<=now，now 进入共用
+        # 非递减时钟。只关闭有当前端点的后端中快照不同且 opened<=before 的
+        # 活动连接；目标集合、关闭顺序与排空联动留执行期处理。
+        if list(raw_op) != ["op", "before", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        before = parse_metric_num(raw_op["before"])
+        now = parse_metric_num(raw_op["now"])
+        if before > now:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ex", before, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -7996,6 +8018,7 @@ def run(raw):
             "mu",
             "cp", "cq", "ca", "ca_cond", "cx", "cy",
             "eq", "ec",
+            "er", "ex",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -13209,6 +13232,121 @@ def run(raw):
                     "now": now,
                     "closed": len(closed_cids),
                     "cids": closed_cids,
+                }
+            )
+
+        elif op[0] == "er":
+            # 全池端点轮换盘点（只读）：除推进时钟（已在循环开头完成）外不
+            # 改任何运行态。先按后端加入顺序 O(B) 登记有当前端点的后端，再
+            # 单遍 O(C) 扫描活动连接（dict 保序即全局建连顺序）：快照与当
+            # 前端点完全相同为 fresh，其余（含无快照）为 stale；connections
+            # 沿用 eq 的 cid,host,port,opened,age 口径（只列 stale，组内保
+            # 全局建连顺序），无快照项 host/port 为 null，age=now-opened。
+            # 汇总随单遍累计。整体 O(B+C)。
+            _, now = op
+            ordered = []
+            acc = {}
+            for backend_id, record in backends.items():
+                endpoint = record["endpoint"]
+                if endpoint is None:
+                    continue
+                ordered.append(backend_id)
+                acc[backend_id] = [0, 0, [], endpoint]
+            for cid, connection in connections.items():
+                entry = acc.get(connection[0])
+                if entry is None:
+                    continue
+                entry[0] += 1
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == entry[3]:
+                    entry[1] += 1
+                else:
+                    opened = connection[2]
+                    entry[2].append(
+                        {
+                            "cid": cid,
+                            "host": None if snapshot is None else snapshot[0],
+                            "port": None if snapshot is None else snapshot[1],
+                            "opened": opened,
+                            "age": now - opened,
+                        }
+                    )
+            items = []
+            sum_total = 0
+            sum_fresh = 0
+            for backend_id in ordered:
+                total, fresh, conn_items, endpoint = acc[backend_id]
+                items.append(
+                    {
+                        "id": backend_id,
+                        "current": {"host": endpoint[0], "port": endpoint[1]},
+                        "total": total,
+                        "fresh": fresh,
+                        "stale": total - fresh,
+                        "connections": conn_items,
+                    }
+                )
+                sum_total += total
+                sum_fresh += fresh
+            results.append(
+                {
+                    "op": "er",
+                    "now": now,
+                    "items": items,
+                    "summary": {
+                        "backends": len(items),
+                        "total": sum_total,
+                        "fresh": sum_fresh,
+                        "stale": sum_total - sum_fresh,
+                    },
+                }
+            )
+
+        elif op[0] == "ex":
+            # 全池端点轮换批量清理：只关闭有当前端点的后端中快照不同于当前
+            # 端点且 opened<=before 的活动连接，按全局建连顺序关闭。先按建
+            # 连顺序单遍把命中连接归入其后端（组内保持全局顺序，同时跳过无
+            # 当前端点的后端），再按后端加入顺序删除连接及快照、逐条递减并
+            # 发；items 仅列本次有关闭项的后端、cids 保持全局关闭顺序。不
+            # 扣令牌或配额、不消费等待队列、不触发重新调度。排空 D 后端失
+            # 去最后连接时沿用 close/ec 转 X、end=now，forced 不变。无失败
+            # 路径，天然原子；同参重复为确定性空操作。O(B+C)。
+            _, before, now = op
+            groups = {}
+            for cid, connection in connections.items():
+                backend_id = connection[0]
+                record = backends[backend_id]
+                endpoint = record["endpoint"]
+                if endpoint is None:
+                    continue
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == endpoint or connection[2] > before:
+                    continue
+                groups.setdefault(backend_id, []).append(cid)
+            items = []
+            closed_total = 0
+            for backend_id, record in backends.items():
+                cids = groups.pop(backend_id, None)
+                if not cids:
+                    continue
+                for cid in cids:
+                    del connections[cid]
+                    conn_endpoints.pop(cid, None)
+                    record["conns"] -= 1
+                drain = record["drain"]
+                if drain["state"] == "D" and record["conns"] == 0:
+                    # 沿用 close/ec：排空中最后连接被清理即转 X，end 取本次
+                    # now；不记 dg 的 forced 强关数。
+                    drain["state"] = "X"
+                    drain["end"] = now
+                items.append({"id": backend_id, "cids": cids})
+                closed_total += len(cids)
+            results.append(
+                {
+                    "op": "ex",
+                    "now": now,
+                    "items": items,
+                    "closed": closed_total,
                 }
             )
 

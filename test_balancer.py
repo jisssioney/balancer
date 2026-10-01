@@ -21677,5 +21677,458 @@ class EndpointRotationTest(unittest.TestCase):
         self.assertEqual(again["state"], exported["state"])
 
 
+class PoolEndpointRotationTest(unittest.TestCase):
+    """全池端点轮换盘点 er 与批量清理 ex。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def run_raw(self, raw):
+        return run_balancer("run", raw)
+
+    def last_of(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def assert_failure(self, ops, exit_code=2, label="INPUT"):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(out, b"")
+        self.assertEqual(
+            err, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def setup_ops(self):
+        # 加入序 b,a；均先 ep@(10.0.0.1,80)。open 最少连接优先、并列取最早
+        # 加入者：c1(b,0) c2(a,0) 后并列，c3(2) 落 b。两端点改为新值后，
+        # c4(5) 落连接更少的 a（新快照）。随后再加入无端点后端 z，c5(6)
+        # 落 z（无快照，盘点与清理均不计）。
+        return [
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "ep", "id": "a", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c3", "flow": FLOW, "now": 2},
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            {"op": "ep", "id": "a", "host": "10.0.0.2", "port": 81},
+            {"op": "open", "cid": "c4", "flow": FLOW, "now": 5},
+            {"op": "add", "id": "z", "weight": 1},
+            {"op": "open", "cid": "c5", "flow": FLOW, "now": 6},
+        ]
+
+    # ---- er 盘点口径 ----
+
+    def test_er_structure_orders_and_counts(self):
+        result = self.last_of(self.setup_ops() + [
+            {"op": "er", "now": 7}])
+        self.assertEqual(list(result), ["op", "now", "items", "summary"])
+        self.assertEqual(result["op"], "er")
+        self.assertEqual(result["now"], 7)
+        # items 按后端加入顺序，仅含有当前端点的 b、a（无端点 z 排除）。
+        self.assertEqual([item["id"] for item in result["items"]], ["b", "a"])
+        for item in result["items"]:
+            self.assertEqual(
+                list(item),
+                ["id", "current", "total", "fresh", "stale", "connections"],
+            )
+            self.assertEqual(list(item["current"]), ["host", "port"])
+            for conn in item["connections"]:
+                self.assertEqual(
+                    list(conn), ["cid", "host", "port", "opened", "age"]
+                )
+        b_item, a_item = result["items"]
+        self.assertEqual(b_item["current"],
+                         {"host": "10.0.0.2", "port": 81})
+        # b：c1/c3 stale（旧快照）；connections 仅列 stale 且按全局建连序。
+        self.assertEqual(
+            (b_item["total"], b_item["fresh"], b_item["stale"]), (2, 0, 2)
+        )
+        self.assertEqual(b_item["connections"], [
+            {"cid": "c1", "host": "10.0.0.1", "port": 80,
+             "opened": 0, "age": 7},
+            {"cid": "c3", "host": "10.0.0.1", "port": 80,
+             "opened": 2, "age": 5},
+        ])
+        # a：c2 stale（旧快照），c4 fresh（新快照）。
+        self.assertEqual(
+            (a_item["total"], a_item["fresh"], a_item["stale"]), (2, 1, 1)
+        )
+        self.assertEqual(a_item["connections"], [
+            {"cid": "c2", "host": "10.0.0.1", "port": 80,
+             "opened": 0, "age": 7},
+        ])
+        self.assertEqual(list(result["summary"]),
+                         ["backends", "total", "fresh", "stale"])
+        self.assertEqual(result["summary"],
+                         {"backends": 2, "total": 4, "fresh": 1,
+                          "stale": 3})
+
+    def test_er_backend_with_endpoint_but_no_connections_listed(self):
+        result = self.last_of([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "er", "now": 3},
+        ])
+        self.assertEqual(len(result["items"]), 1)
+        item = result["items"][0]
+        self.assertEqual(item["id"], "b")
+        self.assertEqual(
+            (item["total"], item["fresh"], item["stale"]), (0, 0, 0)
+        )
+        self.assertEqual(item["connections"], [])
+        self.assertEqual(result["summary"],
+                         {"backends": 1, "total": 0, "fresh": 0,
+                          "stale": 0})
+
+    def test_er_empty_pool_and_no_registered_endpoints(self):
+        result = self.last_of([{"op": "er", "now": 0}])
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["summary"],
+                         {"backends": 0, "total": 0, "fresh": 0,
+                          "stale": 0})
+        # 有后端但均未登记端点：同样空数组与全零。
+        result = self.last_of([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "er", "now": 1},
+        ])
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["summary"],
+                         {"backends": 0, "total": 0, "fresh": 0,
+                          "stale": 0})
+
+    def test_er_snapshotless_on_endpoint_backend_is_stale_null(self):
+        # 建连时后端尚无端点：连接无快照；登记端点后盘点算 stale、null。
+        result = self.last_of([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "open", "cid": "c0", "flow": FLOW, "now": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "er", "now": 4},
+        ])
+        item = result["items"][0]
+        self.assertEqual(
+            (item["total"], item["fresh"], item["stale"]), (1, 0, 1)
+        )
+        self.assertEqual(item["connections"], [
+            {"cid": "c0", "host": None, "port": None,
+             "opened": 1, "age": 3},
+        ])
+
+    def test_er_read_only_and_same_now_deterministic(self):
+        ops = self.setup_ops() + [
+            {"op": "er", "now": 7},
+            {"op": "er", "now": 7},
+            {"op": "fw", "cid": "c1"},
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-3], results[-2])
+        # 旧连接快照保持建连时端点，不受 er 影响。
+        self.assertEqual(results[-1], {
+            "op": "fw", "cid": "c1", "backend": "b",
+            "host": "10.0.0.1", "port": 80,
+        })
+
+    def test_er_advances_clock(self):
+        self.assert_failure([
+            {"op": "er", "now": 7},
+            {"op": "er", "now": 6},
+        ])
+
+    # ---- ex 批量清理口径 ----
+
+    def test_ex_closes_across_pool_in_global_order(self):
+        results = self.run_ops(self.setup_ops() + [
+            {"op": "ex", "before": 2, "now": 8},
+            {"op": "er", "now": 8},
+        ])
+        ex_r, er_r = results[-2], results[-1]
+        self.assertEqual(list(ex_r), ["op", "now", "items", "closed"])
+        self.assertEqual(ex_r["now"], 8)
+        # b 关 c1,c3；a 的 c2 opened=0<=2 也应关闭；仅列有关闭项后端，
+        # 按后端加入顺序 b 然后 a；cids 为全局建连顺序。
+        self.assertEqual(
+            [item["id"] for item in ex_r["items"]], ["b", "a"]
+        )
+        for item in ex_r["items"]:
+            self.assertEqual(list(item), ["id", "cids"])
+        self.assertEqual(ex_r["items"][0]["cids"], ["c1", "c3"])
+        self.assertEqual(ex_r["items"][1]["cids"], ["c2"])
+        self.assertEqual(ex_r["closed"], 3)
+        # 存活：a 的 fresh c4；无端点 z 的无快照 c5 不被处理。b 已排空但
+        # 仍有当前端点，故仍列入 items（全零）。
+        by_id = {item["id"]: item for item in er_r["items"]}
+        self.assertEqual(
+            (by_id["b"]["total"], by_id["b"]["fresh"],
+             by_id["b"]["stale"]),
+            (0, 0, 0),
+        )
+        self.assertEqual(by_id["b"]["connections"], [])
+        self.assertEqual(
+            (by_id["a"]["total"], by_id["a"]["fresh"],
+             by_id["a"]["stale"]),
+            (1, 1, 0),
+        )
+        self.assertEqual(er_r["summary"],
+                         {"backends": 2, "total": 1, "fresh": 1,
+                          "stale": 0})
+
+    def test_ex_before_boundary_inclusive(self):
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "at2", "flow": FLOW, "now": 2},
+            {"op": "open", "cid": "at3", "flow": FLOW, "now": 3},
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            {"op": "ex", "before": 2, "now": 5},
+            {"op": "er", "now": 5},
+        ])
+        self.assertEqual(results[-2]["items"],
+                         [{"id": "b", "cids": ["at2"]}])
+        self.assertEqual(results[-2]["closed"], 1)
+        self.assertEqual(
+            [c["cid"] for c in results[-1]["items"][0]["connections"]],
+            ["at3"],
+        )
+
+    def test_ex_fresh_connections_never_closed(self):
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            {"op": "open", "cid": "new", "flow": FLOW, "now": 1},
+            {"op": "ex", "before": 9, "now": 9},
+            {"op": "fw", "cid": "new"},
+        ])
+        self.assertEqual(results[-2], {
+            "op": "ex", "now": 9, "items": [], "closed": 0,
+        })
+        self.assertEqual(results[-1]["host"], "10.0.0.2")
+
+    def test_ex_skips_backends_without_endpoint(self):
+        # 无端点后端的无快照连接不在处理集合；登记端点后仍可见该连接。
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "open", "cid": "c0", "flow": FLOW, "now": 0},
+            {"op": "ex", "before": 2, "now": 2},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "eq", "id": "b", "now": 2},
+        ])
+        self.assertEqual(results[-3], {
+            "op": "ex", "now": 2, "items": [], "closed": 0,
+        })
+        self.assertEqual(results[-1]["total"], 1)
+        # 混合：无端点后端即便有连接也跳过，有端点后端照常关闭。
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c3", "flow": FLOW, "now": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.9", "port": 81},
+            {"op": "ex", "before": 5, "now": 5},
+            {"op": "ep", "id": "a", "host": "10.0.0.1", "port": 80},
+            {"op": "eq", "id": "a", "now": 5},
+        ])
+        # c1/c3 落 b 被关；c2 落无端点 a，保持存活。
+        self.assertEqual(results[-3]["items"][0]["cids"], ["c1", "c3"])
+        self.assertEqual(results[-1]["total"], 1)
+        self.assertEqual([i["cid"] for i in results[-1]["items"]], ["c2"])
+
+    def test_ex_empty_and_idempotent_repeat(self):
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            {"op": "ex", "before": 5, "now": 5},
+            {"op": "ex", "before": 5, "now": 5},
+            {"op": "ex", "before": 5, "now": 6},
+        ])
+        self.assertEqual(results[-3]["closed"], 1)
+        self.assertEqual(results[-2], {
+            "op": "ex", "now": 5, "items": [], "closed": 0,
+        })
+        self.assertEqual(results[-1], {
+            "op": "ex", "now": 6, "items": [], "closed": 0,
+        })
+
+    def test_ex_empty_pool_is_success_noop(self):
+        result = self.last_of([{"op": "ex", "before": 0, "now": 0}])
+        self.assertEqual(result, {
+            "op": "ex", "now": 0, "items": [], "closed": 0,
+        })
+
+    def test_ex_drained_backend_last_connection_goes_x_forced_kept(self):
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            {"op": "ds", "id": "b", "t": 100},
+            {"op": "dr", "id": "b", "now": 5},
+            {"op": "ex", "before": 10, "now": 10},
+            {"op": "dg", "id": "b", "now": 10},
+        ])
+        self.assertEqual(results[-2]["items"],
+                         [{"id": "b", "cids": ["c1"]}])
+        dg = results[-1]
+        self.assertEqual(dg["state"], "X")
+        self.assertEqual(dg["connections"], 0)
+        self.assertEqual(dg["end"], 10)
+        # 不记 dg 的 forced 强关数。
+        self.assertEqual(dg["forced"], 0)
+
+    def test_ex_drained_backend_kept_d_with_fresh_remaining(self):
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "old", "flow": FLOW, "now": 0},
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            {"op": "open", "cid": "new", "flow": FLOW, "now": 3},
+            {"op": "ds", "id": "b", "t": 100},
+            {"op": "dr", "id": "b", "now": 5},
+            {"op": "ex", "before": 6, "now": 6},
+            {"op": "dg", "id": "b", "now": 6},
+        ])
+        self.assertEqual(results[-2]["items"],
+                         [{"id": "b", "cids": ["old"]}])
+        self.assertEqual(results[-1]["state"], "D")
+        self.assertEqual(results[-1]["connections"], 1)
+        self.assertIsNone(results[-1]["end"])
+
+    def test_ex_does_not_consume_queue_tokens_or_quota(self):
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "chash", "vnodes": 4},
+            {"op": "os", "cap": 1, "q": 5, "ttl": 100},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "oa", "cid": "w", "flow": FLOW, "c": "c", "s": "s",
+             "key": "k", "now": 0},
+            {"op": "ls", "scope": "B", "id": "b", "r": 1, "b": 10,
+             "now": 0},
+            {"op": "qs", "scope": "B", "id": "b", "limit": 7,
+             "span": 60, "now": 0},
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            {"op": "ex", "before": 5, "now": 5},
+            {"op": "og"},
+            {"op": "lg", "scope": "B", "id": "b", "now": 5},
+            {"op": "qg", "scope": "B", "id": "b", "now": 5},
+        ])
+        # 等待队列不被消费；令牌与配额不被扣减。
+        self.assertEqual(results[-3]["queue"], ["w"])
+        self.assertEqual(results[-2]["t"], 10)
+        self.assertEqual(results[-1]["used"], 0)
+        self.assertEqual(results[-1]["remaining"], 7)
+
+    def test_ex_closing_releases_cid_for_reopen(self):
+        results = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "ep", "id": "b", "host": "10.0.0.1", "port": 80},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            {"op": "ex", "before": 5, "now": 5},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 6},
+            {"op": "er", "now": 6},
+        ])
+        item = results[-1]["items"][0]
+        self.assertEqual(item["fresh"], 1)
+        self.assertEqual(item["connections"], [])
+
+    # ---- 校验、回滚与逐字节契约 ----
+
+    def test_strict_key_order_and_key_set(self):
+        for raw in (
+            b'{"ops":[{"now":1,"op":"er"}]}',
+            b'{"ops":[{"op":"er"}]}',
+            b'{"ops":[{"op":"er","now":1,"x":1}]}',
+            b'{"ops":[{"now":1,"before":0,"op":"ex"}]}',
+            b'{"ops":[{"op":"ex","now":1}]}',
+            b'{"ops":[{"op":"ex","before":0}]}',
+            b'{"ops":[{"op":"ex","before":0,"now":1,"x":1}]}',
+        ):
+            code, out, err = self.run_raw(raw)
+            self.assertEqual((code, out, err), (
+                2, b"", b'{"error":"INPUT"}\n',
+            ), raw)
+
+    def test_type_and_range_validation(self):
+        bad_values = (True, False, -1, 10 ** 9 + 1, 1.0, "1", None, [])
+        for value in bad_values:
+            self.assert_failure([{"op": "er", "now": value}])
+            self.assert_failure([
+                {"op": "ex", "before": value, "now": 0}])
+            self.assert_failure([
+                {"op": "ex", "before": 0, "now": value}])
+        self.assertEqual(self.last_of([
+            {"op": "er", "now": 10 ** 9}])["now"], 10 ** 9)
+        self.assertEqual(self.last_of([
+            {"op": "ex", "before": 10 ** 9, "now": 10 ** 9}])["now"],
+            10 ** 9)
+
+    def test_before_greater_than_now_and_clock_rollback(self):
+        self.assert_failure([
+            {"op": "ex", "before": 6, "now": 5}])
+        self.assert_failure([
+            {"op": "er", "now": 5},
+            {"op": "ex", "before": 4, "now": 4},
+        ])
+
+    def test_failure_no_stdout_and_batch_rollback(self):
+        # ex 成功后同批 er 时钟倒退：整批无 stdout、无连接被删。
+        self.assert_failure(self.setup_ops() + [
+            {"op": "ex", "before": 2, "now": 8},
+            {"op": "er", "now": 7},
+        ])
+
+    def test_output_compact_single_trailing_newline(self):
+        raw = encode_ops(self.setup_ops() + [{"op": "er", "now": 9}])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertFalse(out.endswith(b"\n\n"))
+        self.assertNotIn(b", ", out)
+        self.assertNotIn(b": ", out)
+
+    def test_record_replay_byte_identical(self):
+        ops = self.setup_ops() + [
+            {"op": "er", "now": 7},
+            {"op": "ex", "before": 2, "now": 8},
+            {"op": "er", "now": 9},
+        ]
+        raw = encode_ops(ops)
+        code, direct, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, record, err = run_balancer("record", raw)
+        self.assertEqual((code, err), (0, b""))
+        record_obj = json.loads(record)
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual(code, record_obj["exit"])
+        self.assertEqual(replayed, direct)
+        self.assertEqual(
+            err, base64.b64decode(record_obj["stderr"])
+        )
+
+    def test_checkpoint_roundtrip(self):
+        prefix = self.setup_ops()
+        cont = [
+            {"op": "er", "now": 7},
+            {"op": "ex", "before": 2, "now": 8},
+            {"op": "er", "now": 9},
+        ]
+        results = self.run_ops(prefix + [{"op": "se"}] + cont)
+        exported = results[len(prefix)]
+        si_op = {"op": "si", "version": 1,
+                 "digest": exported["digest"], "state": exported["state"]}
+        resumed = self.run_ops([si_op] + cont)
+        self.assertEqual(resumed[1:], results[len(prefix) + 1:])
+        again = self.last_of([si_op, {"op": "se"}])
+        self.assertEqual(again["digest"], exported["digest"])
+        self.assertEqual(again["state"], exported["state"])
+
+
 if __name__ == "__main__":
     unittest.main()
