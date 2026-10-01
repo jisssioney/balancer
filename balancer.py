@@ -2395,7 +2395,7 @@ def parse_op(raw_op):
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "na",
         "ce", "ci", "cl", "al", "ai", "ad", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
-        "cp", "cq", "ca", "cx",
+        "cp", "cq", "ca", "cx", "cy",
         "fs", "fx", "fr", "fi", "ft", "oi", "od",
         "fb", "fp", "fq", "fd", "fc",
         "br",
@@ -3839,6 +3839,35 @@ def parse_op(raw_op):
         now = parse_warm_now(raw_op["now"])
         return ("cx", digest, at, now)
 
+    if name == "cy":
+        # 配置预约条件替换：精确键序 op,base,base_at,config,at,now（键须
+        # 按此序出现，乱序报 INPUT）；base 为旧预约的小写 64 位十六进制
+        # SHA-256 摘要（格式同 ct，仅用于匹配），base_at 为旧触发时刻，
+        # config 沿用 cp 的 v11 配置校验语义，at、now 均为 0..10^9 非 bool
+        # 整数；now 进入共用非递减时钟（倒退在执行期判 INPUT），at 仅表示
+        # 新触发时刻、不推进时钟，at<now 与候选后端引用留执行期判定。预约
+        # 现状匹配与否留执行期判 STATE；本函数只做形状与字段校验。
+        if list(raw_op) != ["op", "base", "base_at", "config", "at", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        base = parse_base(raw_op["base"])
+        base_at = raw_op["base_at"]
+        if (
+            not isinstance(base_at, int)
+            or isinstance(base_at, bool)
+            or not 0 <= base_at <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        at = raw_op["at"]
+        if (
+            not isinstance(at, int)
+            or isinstance(at, bool)
+            or not 0 <= at <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        parse_warm_now(raw_op["now"])
+        config = parse_config(raw_op["config"])
+        return ("cy", base, base_at, config, at, raw_op["now"])
+
     if name == "ct":
         # 配置指纹查询：精确键序仅 op，只读且不推进时钟。
         if list(raw_op) != ["op"]:
@@ -4394,13 +4423,15 @@ def run(raw):
     # O(16(B+M+T+Q))。
     commit_history = []
     next_rev = 1
-    # 配置预约（cp/cq/ca/cx）：无预约为 None，否则为
+    # 配置预约（cp/cq/ca/cx/cy）：无预约为 None，否则为
     # (snapshot, at, digest)——snapshot 为 cp 当时规范化 version=11 配置的
     # 全新导出结构（不随后续运行态变化），at 为触发时刻（只表示时刻、不推进
     # 时钟），digest 为快照的 ct 摘要。cp 成功即整体替换，cq 只读 O(1)，
     # ca 成功、ci/cb/cu 成功均清除；cx 在 digest、at 同时匹配时原子清除、
-    # 无预约时幂等空操作、有预约但任一不匹配报 STATE 且保留预约；其余操作
-    # 不影响预约。额外空间 O(N)，N 为规范化配置大小。
+    # 无预约时幂等空操作、有预约但任一不匹配报 STATE 且保留预约；cy 凭
+    # base、base_at 旧凭据原子改期或换配置、当前已等于新值时幂等重报，
+    # 旧值新值皆不符报 STATE 且保留预约；其余操作不影响预约。额外空间
+    # O(N)，N 为规范化配置大小。
     reservation = None
     # 配置变更审计（al）：deque(maxlen=64) 按 rev 升序保留最近 64 条，追加
     # O(1) 且超额自动淘汰最旧项；初始为空，独立于 commit_history 的 16 条
@@ -7813,7 +7844,7 @@ def run(raw):
             "ru", "ua", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "na",
             "mu",
-            "cp", "cq", "ca", "cx",
+            "cp", "cq", "ca", "cx", "cy",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -10808,6 +10839,56 @@ def run(raw):
                     {"op": "cx", "cancelled": True,
                      "digest": digest, "at": at}
                 )
+
+        elif op[0] == "cy":
+            # 配置预约条件替换：时钟倒退已由共用时钟块先判 INPUT。执行期
+            # 依次判 at<now（INPUT，先于后端引用）、候选配置的 B 限流/B
+            # 配额/faults/capacities 引用候选后端集合之外的 id（BACKEND），
+            # 全部通过后才读取当前预约：无预约报 STATE；当前预约等于 base、
+            # base_at 指定的旧值时原子替换为规范化候选快照；当前预约已等于
+            # 候选规范化摘要与 at 指定的新值时视为幂等重报——即使旧值已过期
+            # 也成功且不得重写状态；两者皆不符报 STATE 并保留原预约。替换
+            # 只改待生效预约：不应用候选配置、不建 rev 或审计事件，当前配置、
+            # 后端、连接、队列、粘性、指标、告警均不变。
+            _, base, base_at, config, at, now = op
+            if at < now:
+                # at 仅表示新触发时刻：早于本次 now 非法，时间字段判定先于
+                # 候选后端引用 BACKEND 检查（同 cp 的优先级）。
+                fail(EXIT_INPUT, "INPUT")
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for override_id in config["capacities"]:
+                if override_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            snapshot = export_normalized_config(config)
+            digest = config_digest(snapshot)
+            if reservation is None:
+                fail(EXIT_STATE, "STATE")
+            _, reserved_at, reserved_digest = reservation
+            if reserved_digest == digest and reserved_at == at:
+                # 当前已等于新值：幂等重报，不重写状态（即使 base、base_at
+                # 指定的旧值已过期）。此判定先于旧值匹配，保证新旧恰相等时
+                # 也绝不重写预约。
+                pass
+            elif reserved_digest == base and reserved_at == base_at:
+                # 旧值匹配：原子替换为规范化候选快照。
+                reservation = (snapshot, at, digest)
+            else:
+                # 既不等于旧值也不等于新值：凭据失效，保留原预约。
+                fail(EXIT_STATE, "STATE")
+            # 首次替换与相同请求重报输出逐字节一致。
+            results.append(
+                {"op": "cy", "base": base, "digest": digest,
+                 "at": at, "ok": True}
+            )
 
         elif op[0] == "fs":
             _, backend_id, segment = op
