@@ -9020,6 +9020,766 @@ class RuUnavailabilityTest(unittest.TestCase):
         )
 
 
+class UaUnavailableAlertTest(unittest.TestCase):
+    """连续不可用时长告警 ua：按 (id,reason) 独立的阈值评估、首评固化、
+    同刻重报、起算/清除、错误优先级与逐字节契约。"""
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def assert_failure_raw(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def ua_run(self, ops, backend_id, reason, threshold, now):
+        code, stdout, stderr = run_balancer(
+            "run",
+            encode_ops(
+                ops + [
+                    {
+                        "op": "ua", "id": backend_id, "reason": reason,
+                        "threshold": threshold, "now": now,
+                    }
+                ]
+            ),
+        )
+        self.assertEqual((code, stderr), (0, b""))
+        return json.loads(stdout.decode("utf-8"))["results"][-1]
+
+    def test_inactive_first_eval_is_n(self):
+        self.assertEqual(
+            self.ua_run(
+                [{"op": "add", "id": "a", "weight": 1}],
+                "a", "health", 5, 0,
+            ),
+            {
+                "op": "ua", "id": "a", "reason": "health", "threshold": 5,
+                "state": "N", "active": False, "since": None,
+                "duration": 0, "changed": False,
+            },
+        )
+
+    def test_byte_layout(self):
+        raw = encode_ops([
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 2},
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 10,
+            },
+        ])
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertIn(
+            b'{"op":"ua","id":"a","reason":"health","threshold":5,'
+            b'"state":"A","active":true,"since":2,"duration":8,'
+            b'"changed":true}',
+            out,
+        )
+        self.assertTrue(out.endswith(b"\n"))
+        self.assertNotIn(b"\n", out[:-1])
+
+    def test_first_eval_over_threshold_is_changed(self):
+        # 首次以前态 N 起评：首评 active 且 duration>=threshold 即 A、
+        # changed=true。
+        result = self.ua_run(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "hset", "id": "a", "fail": 1, "success": 1},
+                {"op": "probe", "id": "a", "ok": False, "now": 0},
+            ],
+            "a", "health", 5, 10,
+        )
+        self.assertEqual(result["state"], "A")
+        self.assertTrue(result["changed"])
+
+    def test_n_to_a_transition_and_recovery_to_n(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+        ]
+        # duration=3<5：N，未转换。
+        r3 = self.ua_run(ops, "a", "health", 5, 3)
+        self.assertEqual((r3["state"], r3["changed"]), ("N", False))
+        # duration=5 达阈值：N→A。
+        ops += [
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 3,
+            }
+        ]
+        r5 = self.ua_run(ops, "a", "health", 5, 5)
+        self.assertEqual(
+            (r5["state"], r5["active"], r5["since"], r5["duration"],
+             r5["changed"]),
+            ("A", True, 0, 5, True),
+        )
+        # 仍超阈值：A 保持，changed=false。
+        ops += [
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 5,
+            }
+        ]
+        r6 = self.ua_run(ops, "a", "health", 5, 6)
+        self.assertEqual((r6["state"], r6["changed"]), ("A", False))
+        # 恢复 healthy：原因不生效 A→N。
+        ops += [
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 6,
+            },
+            {"op": "probe", "id": "a", "ok": True, "now": 7},
+        ]
+        r7 = self.ua_run(ops, "a", "health", 5, 7)
+        self.assertEqual(
+            (r7["state"], r7["active"], r7["since"], r7["duration"],
+             r7["changed"]),
+            ("N", False, None, 0, True),
+        )
+
+    def test_same_now_replay_returns_first_result(self):
+        # 同 id,reason,threshold,now 重报原样返回首评结果、不推进状态；
+        # 同一时刻之后发生的原因变化须更大 now 才可见。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 10,
+            },
+            # now=10 同刻恢复：事实已变，但同刻重报仍取首评结果。
+            {"op": "probe", "id": "a", "ok": True, "now": 10},
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 10,
+            },
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out.decode("utf-8"))["results"]
+        self.assertEqual(results[3], results[5])
+        self.assertEqual(results[5]["state"], "A")
+        # 更大 now 才可见恢复后的事实：A→N。
+        ops += [
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 11,
+            }
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        last = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(
+            (last["state"], last["active"], last["changed"]),
+            ("N", False, True),
+        )
+
+    def test_replay_not_an_evaluation(self):
+        # 同刻重报不推进状态：首评 now=10 为 A，重报后 now=11 仍 A，
+        # changed 相对首评仍为 false。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 10,
+            },
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 10,
+            },
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 11,
+            },
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out.decode("utf-8"))["results"]
+        # 首评（下标 3）与同刻重报（下标 4）逐值一致。
+        self.assertEqual(results[3], results[4])
+        # 更大 now 正常评估：A 保持，changed 相对首评仍为 false。
+        self.assertEqual(
+            (results[5]["state"], results[5]["duration"],
+             results[5]["changed"]),
+            ("A", 11, False),
+        )
+
+    def test_threshold_fixed_first_eval_change_is_state(self):
+        base = [
+            {"op": "add", "id": "a", "weight": 1},
+            {
+                "op": "ua", "id": "a", "reason": "drain",
+                "threshold": 5, "now": 0,
+            },
+        ]
+        # 已登记组合变更 threshold：STATE。
+        self.assert_failure(
+            base + [
+                {
+                    "op": "ua", "id": "a", "reason": "drain",
+                    "threshold": 6, "now": 1,
+                }
+            ],
+            4, "STATE",
+        )
+        # 同 threshold 在更大 now 正常评估（不报错）。
+        code, _, err = run_balancer(
+            "run",
+            encode_ops(
+                base + [
+                    {
+                        "op": "ua", "id": "a", "reason": "drain",
+                        "threshold": 5, "now": 1,
+                    }
+                ]
+            ),
+        )
+        self.assertEqual((code, err), (0, b""))
+
+    def test_state_failure_rolls_back_batch(self):
+        # threshold 变更致 STATE：整批失败，前序 add/ua 不落任何输出，
+        # 时钟与告警状态均不留存（新进程天然全新，故验证无输出与退出码）。
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {
+                    "op": "ua", "id": "a", "reason": "drain",
+                    "threshold": 5, "now": 0,
+                },
+                {
+                    "op": "ua", "id": "a", "reason": "drain",
+                    "threshold": 6, "now": 0,
+                },
+            ],
+            4, "STATE",
+        )
+
+    def test_each_reason_independent_without_masking(self):
+        # 四因同时生效（drain 优先级最高）：各 ua 仍独立取本因事实，不被
+        # 更高优先级原因遮蔽。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 2},
+            {"op": "ds", "id": "a", "t": 100},
+            {"op": "dr", "id": "a", "now": 3},
+            {"op": "fs", "id": "a", "k": "D", "a": 4, "z": 100, "v": 0},
+        ]
+        expected = {
+            "drain": (3, 7),
+            "health": (1, 9),
+            "circuit": (2, 8),
+            "fault": (4, 6),
+        }
+        for reason, (since, duration) in expected.items():
+            result = self.ua_run(ops, "a", reason, 5, 10)
+            self.assertEqual(result["active"], True, reason)
+            self.assertEqual(result["since"], since, reason)
+            self.assertEqual(result["duration"], duration, reason)
+            self.assertEqual(result["state"], "A", reason)
+            self.assertEqual(result["changed"], True, reason)
+
+    def test_reasons_keep_independent_state(self):
+        # 同 id 不同 reason 各自固化 threshold 与状态，互不变参、互不转换。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 10,
+            },
+            # drain 原因未生效：独立首评 N，不受 health 的 A 影响。
+            {
+                "op": "ua", "id": "a", "reason": "drain",
+                "threshold": 1, "now": 10,
+            },
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out.decode("utf-8"))["results"]
+        self.assertEqual(
+            (results[3]["state"], results[3]["changed"]), ("A", True)
+        )
+        self.assertEqual(
+            (results[4]["state"], results[4]["active"],
+             results[4]["changed"]),
+            ("N", False, False),
+        )
+
+    def test_fault_d_f_flapping_and_s(self):
+        # F 下线相位 [10,15)、[20,25)、[30,35)，上线相位居中。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "F", "a": 10, "z": 100, "v": 5},
+        ]
+        first = self.ua_run(ops, "a", "fault", 3, 14)
+        self.assertEqual(
+            (first["active"], first["since"], first["duration"],
+             first["state"], first["changed"]),
+            (True, 10, 4, "A", True),
+        )
+        # 落入上线相位：A→N，active=false/null/0。
+        gap = self.ua_run(
+            ops + [
+                {
+                    "op": "ua", "id": "a", "reason": "fault",
+                    "threshold": 3, "now": 14,
+                }
+            ],
+            "a", "fault", 3, 17,
+        )
+        self.assertEqual(
+            (gap["active"], gap["since"], gap["duration"], gap["state"],
+             gap["changed"]),
+            (False, None, 0, "N", True),
+        )
+        # 新下线相位时长不足：N 保持，changed=false。
+        short = self.ua_run(
+            ops + [
+                {
+                    "op": "ua", "id": "a", "reason": "fault",
+                    "threshold": 3, "now": 14,
+                },
+                {
+                    "op": "ua", "id": "a", "reason": "fault",
+                    "threshold": 3, "now": 17,
+                },
+            ],
+            "a", "fault", 3, 22,
+        )
+        self.assertEqual((short["state"], short["changed"]), ("N", False))
+        # S 仅变慢，永远不算该原因生效。
+        s_ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "S", "a": 0, "z": 100, "v": 7},
+        ]
+        s_result = self.ua_run(s_ops, "a", "fault", 1, 50)
+        self.assertEqual(
+            (s_result["active"], s_result["since"], s_result["duration"],
+             s_result["state"]),
+            (False, None, 0, "N"),
+        )
+
+    def test_fault_fact_matches_ru_at_same_now(self):
+        # ua 单原因事实须与同刻 ru 对应项逐值一致。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "fs", "id": "a", "k": "D", "a": 4, "z": 100, "v": 0},
+        ]
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(
+                ops + [
+                    {"op": "ru", "id": "a", "now": 10},
+                    {
+                        "op": "ua", "id": "a", "reason": "fault",
+                        "threshold": 2, "now": 10,
+                    },
+                ]
+            ),
+        )
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out.decode("utf-8"))["results"]
+        ru_item = results[-2]["reasons"][0]
+        ua_result = results[-1]
+        self.assertEqual(ru_item["reason"], "fault")
+        self.assertEqual(ua_result["since"], ru_item["since"])
+        self.assertEqual(ua_result["duration"], ru_item["duration"])
+        self.assertTrue(ua_result["active"])
+
+    def test_remove_readd_clears_registration(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 10,
+            },
+            {"op": "remove", "id": "a"},
+            {"op": "add", "id": "a", "weight": 1},
+        ]
+        # 重加后该组合回到未首评：可固化新 threshold，且当前无 health
+        # 生效，N、changed=false（不继承旧 A）。
+        result = self.ua_run(ops, "a", "health", 99, 11)
+        self.assertEqual(
+            (result["threshold"], result["state"], result["active"],
+             result["changed"]),
+            (99, "N", False, False),
+        )
+
+    def test_ci_cb_ca_cu_clear_all_ua_state(self):
+        cfg = config_v11(1)
+
+        def unhealthy_ops(prefix):
+            return prefix + [
+                {"op": "hset", "id": "a", "fail": 1, "success": 1},
+                {"op": "probe", "id": "a", "ok": False, "now": 0},
+                {
+                    "op": "ua", "id": "a", "reason": "health",
+                    "threshold": 5, "now": 10,
+                },
+            ]
+
+        # ci 成功：清空全部 ua 状态，同 threshold 重新首评（当前 healthy，
+        # N、changed=false），且不视为变参。
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(
+                unhealthy_ops([{"op": "add", "id": "a", "weight": 1}])
+                + [{"op": "ci", "config": cfg, "now": 11}]
+                + [
+                    {
+                        "op": "ua", "id": "a", "reason": "health",
+                        "threshold": 5, "now": 12,
+                    }
+                ]
+            ),
+        )
+        self.assertEqual((code, err), (0, b""))
+        last = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual((last["state"], last["changed"]), ("N", False))
+
+        # cb 成功同样清空。
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(
+                [
+                    {"op": "add", "id": "a", "weight": 1},
+                    {"op": "ci", "config": cfg, "now": 0},
+                ]
+                + unhealthy_ops([])[1:]
+                + [
+                    {"op": "cb", "rev": 1, "now": 11},
+                    {
+                        "op": "ua", "id": "a", "reason": "health",
+                        "threshold": 5, "now": 12,
+                    },
+                ]
+            ),
+        )
+        self.assertEqual((code, err), (0, b""))
+        last = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual((last["state"], last["changed"]), ("N", False))
+
+        # ca 成功清空：清空后旧 threshold 可改值（否则报 STATE）。
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(
+                [
+                    {"op": "add", "id": "a", "weight": 1},
+                    {"op": "cp", "config": cfg, "at": 5, "now": 0},
+                    {
+                        "op": "ua", "id": "a", "reason": "drain",
+                        "threshold": 5, "now": 0,
+                    },
+                    {"op": "ca", "now": 5},
+                    {
+                        "op": "ua", "id": "a", "reason": "drain",
+                        "threshold": 9, "now": 6,
+                    },
+                ]
+            ),
+        )
+        self.assertEqual((code, err), (0, b""))
+        last = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(last["threshold"], 9)
+
+        # cu 成功清空：先取 ct 摘要为 base，替换 sticky 段后旧 threshold
+        # 可改值。
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([{"op": "add", "id": "a", "weight": 1}, {"op": "ct"}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        base = json.loads(out.decode("utf-8"))["results"][-1]["digest"]
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(
+                [
+                    {"op": "add", "id": "a", "weight": 1},
+                    {
+                        "op": "ua", "id": "a", "reason": "drain",
+                        "threshold": 5, "now": 0,
+                    },
+                    {
+                        "op": "cu", "base": base, "section": "sticky",
+                        "value": {"ttl": 60}, "now": 1,
+                    },
+                    {
+                        "op": "ua", "id": "a", "reason": "drain",
+                        "threshold": 9, "now": 2,
+                    },
+                ]
+            ),
+        )
+        self.assertEqual((code, err), (0, b""))
+        last = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(last["threshold"], 9)
+
+    def test_ua_does_not_mutate_runtime(self):
+        # ua 除时钟与自身告警状态外不修改连接、粘性、指标、故障计划或调度；
+        # 同刻 ru 在 ua 前后逐字节一致。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 0},
+            {"op": "fs", "id": "a", "k": "D", "a": 0, "z": 100, "v": 0},
+            {"op": "ru", "id": "a", "now": 10},
+        ]
+        ru_before = self.run_last(ops)
+        ops_with_ua = ops + [
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 1, "now": 10,
+            },
+            {
+                "op": "ua", "id": "a", "reason": "fault",
+                "threshold": 1, "now": 10,
+            },
+            {"op": "ru", "id": "a", "now": 10},
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops_with_ua))
+        self.assertEqual((code, err), (0, b""))
+        ru_after = json.loads(out.decode("utf-8"))["results"][-1]
+        self.assertEqual(ru_after, ru_before)
+
+    def run_last(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"][-1]
+
+    def test_unknown_id_is_backend(self):
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {
+                    "op": "ua", "id": "b", "reason": "drain",
+                    "threshold": 1, "now": 0,
+                },
+            ],
+            3, "BACKEND",
+        )
+        self.assert_failure(
+            [
+                {
+                    "op": "ua", "id": "a", "reason": "drain",
+                    "threshold": 1, "now": 0,
+                }
+            ],
+            3, "BACKEND",
+        )
+
+    def test_input_errors(self):
+        base = [{"op": "add", "id": "a", "weight": 1}]
+        ua = {"id": "a", "reason": "drain", "threshold": 1, "now": 0}
+
+        def raw_with(order):
+            fields = {"op": "ua", "id": "a", "reason": "drain",
+                      "threshold": 1, "now": 0}
+            return json.dumps(
+                {"ops": [{"op": "add", "id": "a", "weight": 1}]
+                 + [dict((k, fields[k]) for k in order)]},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+
+        # 正确键序本身合法。
+        code, _, err = run_balancer(
+            "run", raw_with(("op", "id", "reason", "threshold", "now"))
+        )
+        self.assertEqual((code, err), (0, b""))
+        # 键序反：now 提前。
+        self.assert_failure_raw(
+            raw_with(("op", "id", "reason", "now", "threshold")),
+            2, "INPUT",
+        )
+        # 多键、缺键。
+        extra = dict(ua, op="ua", x=1)
+        self.assert_failure(base + [extra], 2, "INPUT")
+        missing = {"op": "ua", "id": "a", "reason": "drain", "now": 0}
+        self.assert_failure(base + [missing], 2, "INPUT")
+        # reason 非法：未知串、非串、null。
+        for bad_reason in ("D", "healthx", "FAULT", 0, 1, True, None,
+                           ["drain"]):
+            self.assert_failure(
+                base + [
+                    {
+                        "op": "ua", "id": "a", "reason": bad_reason,
+                        "threshold": 1, "now": 0,
+                    }
+                ],
+                2, "INPUT",
+            )
+        # threshold：bool、0、超 10^9、字符串、浮点、null。
+        for bad_t in (True, False, 0, -1, 10 ** 9 + 1, "1", 1.0, None):
+            self.assert_failure(
+                base + [
+                    {
+                        "op": "ua", "id": "a", "reason": "drain",
+                        "threshold": bad_t, "now": 0,
+                    }
+                ],
+                2, "INPUT",
+            )
+        # now：bool、负数、超 10^9、字符串、浮点、null。
+        for bad_now in (True, False, -1, 10 ** 9 + 1, "0", 1.0, None):
+            self.assert_failure(
+                base + [
+                    {
+                        "op": "ua", "id": "a", "reason": "drain",
+                        "threshold": 1, "now": bad_now,
+                    }
+                ],
+                2, "INPUT",
+            )
+        # id：空串与非 UTF-8（孤立代理）。
+        self.assert_failure(
+            base + [
+                {
+                    "op": "ua", "id": "", "reason": "drain",
+                    "threshold": 1, "now": 0,
+                }
+            ],
+            2, "INPUT",
+        )
+        self.assert_failure_raw(
+            b'{"ops":[{"op":"add","id":"a","weight":1},'
+            b'{"op":"ua","id":"\\ud800","reason":"drain",'
+            b'"threshold":1,"now":0}]}',
+            2, "INPUT",
+        )
+
+    def test_threshold_bounds_accepted(self):
+        # threshold=1 与 10^9 均合法。
+        for threshold in (1, 10 ** 9):
+            code, _, err = run_balancer(
+                "run",
+                encode_ops(
+                    [
+                        {"op": "add", "id": "a", "weight": 1},
+                        {
+                            "op": "ua", "id": "a", "reason": "drain",
+                            "threshold": threshold, "now": 0,
+                        },
+                    ]
+                ),
+            )
+            self.assertEqual((code, err), (0, b""), threshold)
+
+    def test_clock_regression_is_input_and_rollback(self):
+        # ua 时钟倒退整批回滚。
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {
+                    "op": "ua", "id": "a", "reason": "drain",
+                    "threshold": 1, "now": 5,
+                },
+                {
+                    "op": "ua", "id": "a", "reason": "drain",
+                    "threshold": 1, "now": 4,
+                },
+            ],
+            2, "INPUT",
+        )
+        # 与其他 now 操作共用同一非递减时钟。
+        self.assert_failure(
+            [
+                {"op": "add", "id": "a", "weight": 1},
+                {"op": "probe", "id": "a", "ok": True, "now": 9},
+                {
+                    "op": "ua", "id": "a", "reason": "drain",
+                    "threshold": 1, "now": 8,
+                },
+            ],
+            2, "INPUT",
+        )
+
+    def test_record_replay_byte_identical(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "open", "cid": "x", "flow": FLOW, "now": 0},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "cs", "id": "a", "n": 1, "m": 1, "r": 1, "w": 100,
+             "q": 1},
+            {"op": "cr", "id": "a", "ok": False, "now": 2},
+            {"op": "ds", "id": "a", "t": 100},
+            {"op": "dr", "id": "a", "now": 3},
+            {"op": "fs", "id": "a", "k": "D", "a": 4, "z": 100, "v": 0},
+        ]
+        for reason in ("drain", "health", "circuit", "fault"):
+            ops.append(
+                {
+                    "op": "ua", "id": "a", "reason": reason,
+                    "threshold": 5, "now": 10,
+                }
+            )
+        # 同刻重报也纳入逐字节契约。
+        ops.append(
+            {
+                "op": "ua", "id": "a", "reason": "health",
+                "threshold": 5, "now": 10,
+            }
+        )
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual((run_code, rep_code), (0, 0))
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+    def test_record_replay_state_failure_byte_identical(self):
+        # threshold 变更的 STATE 失败批次同样逐字节可重放。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {
+                "op": "ua", "id": "a", "reason": "drain",
+                "threshold": 5, "now": 0,
+            },
+            {
+                "op": "ua", "id": "a", "reason": "drain",
+                "threshold": 6, "now": 1,
+            },
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        _, rec_stdout, _ = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(run_code, 4)
+        self.assertEqual(
+            (rep_code, rep_stdout, rep_stderr),
+            (run_code, run_stdout, run_stderr),
+        )
+
+
 class HashDryRunTest(unittest.TestCase):
     """哈希配置预演 hd：以当前/候选配置的 backends、vnodes 建环（忽略运行态
     与粘性），按 keys 原序预演 chash 映射，不应用配置。"""

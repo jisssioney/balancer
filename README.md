@@ -70,6 +70,17 @@
 - 返回键序 `op,scope,id,w,state,token,quota,value,run,changed`；`state` 仅 N/A，`changed` 仅转换时为 true。
 - 键序、字段编码/类型/范围/关系或时钟倒退报 INPUT/2；B 未知 id 报 BACKEND/3；无桶且无配额、窗口未结束或过旧、跳窗或变参报 STATE/4。`ls`/`qs` 重配保留；remove 后重加清该 B 维告警，ci/cb/ca/cu 成功清全部，失败批次回滚。时间 O(1)、额外空间 O(K)，仅用标准库。
 
+## 连续不可用时长告警：ua
+
+按后端与原因独立评估的连续不可用时长阈值告警，单项原因的 `active`/`since`/`duration` 沿用同一时刻 `ru` 的事实口径，不因更高优先级原因存在而遮蔽。
+
+- `ua`：精确键序 `op,id,reason,threshold,now`。`id` 沿用后端标识；`reason` 仅 `drain`、`health`、`circuit`、`fault`；`threshold` 为 1..10⁹ 非 bool 整数；`now` 沿用全局 0..10⁹ 非递减显式时钟。
+- 每个 `(id,reason)` 组合首次评估时固定 `threshold`，之后改值返回 STATE/4。
+- 原因不生效时取 `active=false`、`since=null`、`duration=0`；生效时 `since` 为本次连续区间起点（health/drain/circuit 为各转换点维护的起点，fault 同 `ru`：D 段为 `a`、F 下线相位对齐到 `a+2v·((now-a)//(2v))`，F 上线相位与 S 不生效），`duration=now-since`。
+- 状态仅 N/A：`active` 且 `duration≥threshold` 为 A，否则为 N；`changed` 仅表示相对该组合上次成功评估发生转换。首次以前态 N 计算，故首次已超阈值时 `changed=true`。
+- 返回固定键序 `op,id,reason,threshold,state,active,since,duration,changed`。同一 `id,reason,threshold,now` 重报原样返回首次结果、不重复推进状态；同一时刻之后发生的原因变化从更大的 `now` 才可见。
+- 键序、字段、编码、类型、范围、reason 或时钟非法报 INPUT/2；未知后端报 BACKEND/3；已登记组合变更 threshold 报 STATE/4（按 INPUT、BACKEND、STATE 判定）；失败批次不留下时钟、缓存或告警状态。remove 后同 id 重加清除对应登记，ci/cb/ca/cu 成功清空全部 ua 状态。ua 除时钟和自身状态外不修改连接、粘性、指标、故障计划或调度结果。fault 活动段查找为 O(log T)、其余三因 O(1)，单次时间 O(log(T+1))、额外空间 O(1)，总空间 O(B)（每后端至多四键，T 为该后端故障段数、B 为后端数）。紧凑 UTF-8 固定键序 JSON、单换行及 run、record、replay 的逐字节结果保持兼容，仅用标准库。
+
 ## 测试
 
     python -m unittest discover

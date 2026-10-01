@@ -1365,6 +1365,17 @@ def parse_le_lo(value):
     return value
 
 
+def parse_ua_threshold(value):
+    # ua 的 threshold ∈ [1,10^9]，非 bool 整数。
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 10 ** 9
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    return value
+
+
 def parse_queue_param(value):
     # os 的 cap/q/ttl ∈ [1, 10^6]，非 bool 整数。
     if (
@@ -2297,6 +2308,7 @@ def parse_op(raw_op):
         "ts", "tm", "te", "tk", "tg", "tx",
         "ep", "fw",
         "ru",
+        "ua",
         "mu",
     ):
         fail(EXIT_INPUT, "INPUT")
@@ -3283,6 +3295,23 @@ def parse_op(raw_op):
         return ("ru", parse_backend_id(raw_op["id"]),
                 parse_metric_num(raw_op["now"]))
 
+    if name == "ua":
+        # 连续不可用时长告警：精确键序 op,id,reason,threshold,now（键须按
+        # 此序出现）；id 为非空 UTF-8 串（未知 id 留执行期判 BACKEND），
+        # reason 仅 drain/health/circuit/fault，threshold 为 1..10^9 非
+        # bool 整数，now 为 0..10^9 非 bool 整数并纳入共用非递减时钟。
+        # 每 (id,reason) 首评固化 threshold，此后改值留执行期判 STATE。
+        if list(raw_op) != ["op", "id", "reason", "threshold", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        reason = raw_op["reason"]
+        if reason not in ("drain", "health", "circuit", "fault"):
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "ua", parse_backend_id(raw_op["id"]), reason,
+            parse_ua_threshold(raw_op["threshold"]),
+            parse_metric_num(raw_op["now"]),
+        )
+
     if name == "fx":
         if keys != {"op", "cid", "flow", "key", "timeout", "now"}:
             fail(EXIT_INPUT, "INPUT")
@@ -4097,6 +4126,17 @@ def run(raw):
     # ci/cb/ca/cu 成功整体清空。dict 查找/写入 O(1)，额外空间 O(K)，K 为
     # 标识数。
     limit_alerts = {}
+    # 连续不可用时长告警（ua）：以 (id, reason) 唯一（reason ∈ drain/health/
+    # circuit/fault），各组合独立、未首评为缺键，否则为
+    # {"threshold","state","now","result"}——threshold 为首评固化阈值
+    # （1..10^9），state ∈ N/A 为上次成功评估后的告警态，now 为上次成功评
+    # 估时刻（同 id,reason,threshold,now 重报原样返回首评结果、不推进状
+    # 态），result 为该次结果。active/since/duration 只读 ru 同刻事实口径，
+    # 不随存储固化；active 且 duration>=threshold 为 A，首次以前态 N 起评
+    # （首次已超阈值即 changed=true）。remove 删除该 id 全部原因键，同 id
+    # 重加回到未首评，ci/cb/ca/cu 成功整体清空。dict 查找/写入 O(1)，每后
+    # 端至多四键，额外空间 O(B)。
+    unavail_alerts = {}
     # 配置提交历史（cl/cb）：(rev, 规范化 version=11 配置快照) 按 rev 升序，
     # 仅保留最近 16 条；rev 由 next_rev 从 1 起递增分配，只增不复用。ci/cb
     # 成功才分配并追加，失败不分配、不改历史；初始无提交。快照为
@@ -4627,6 +4667,31 @@ def run(raw):
         if k == "F":
             return "D" if ((now - a) // v) % 2 == 0 else "N"
         return "S"
+
+    def unavail_reason_fact(record, reason, now):
+        """ru/ua 共用的单原因连续不可用事实：返回 (active, since)。不生效为
+        (False, None)；生效时 since 为本次连续区间起点：health/drain/circuit
+        取各转换点维护的连续生效起点，不因更高优先级原因存在而遮蔽；fault
+        只读时间线——D 段 since=a，F 下线相位 [a+2jv,a+(2j+1)v) 的 since
+        对齐到 a+2jv，F 上线相位、S（仅变慢）、段间隙与未登记均不生效。
+        活动段查找 O(log T_b)，其余三因 dict 取键 O(1)。"""
+        if reason == "fault":
+            segment = active_fault(record, now)
+            if segment is None:
+                return False, None
+            kind, seg_a, _, seg_v = segment
+            if kind == "D":
+                # 整个 D 段均不可用。
+                return True, seg_a
+            if kind == "F" and ((now - seg_a) // seg_v) % 2 == 0:
+                # F 下线相位：[a+2jv, a+(2j+1)v)，相位起点对齐到偶数 v。
+                return True, seg_a + 2 * seg_v * (
+                    (now - seg_a) // (2 * seg_v)
+                )
+            # F 上线相位与 S（仅变慢）不阻断。
+            return False, None
+        reason_since = record["unavail_since"][reason]
+        return reason_since is not None, reason_since
 
     def simulate_fr(tokens, digests, key, timeout, max_attempts, now,
                     fault_view=None):
@@ -5200,7 +5265,7 @@ def run(raw):
         nonlocal hard_ttl_cfg
         nonlocal sticky_map, alert, alert_events, overload_hist, wait_hist, err_alerts
         nonlocal err_events, percent_alerts, percent_events, wait_alerts, retry_alerts, retry_events
-        nonlocal conc_alerts, limit_alerts
+        nonlocal conc_alerts, limit_alerts, unavail_alerts
         nonlocal mo_seq, mo_cache, queue_mode, dequeue_policy
         nonlocal full_mode, evict_count, evict_last, cap_overrides
         nonlocal limit_hist, aging_cfg
@@ -5387,6 +5452,9 @@ def run(raw):
         conc_alerts = {}
         # ci/cb/ca/cu 成功清空全部限流告警（le 各标识均回到未首评）。
         limit_alerts = {}
+        # ci/cb/ca/cu 成功清空全部连续不可用时长告警（ua 各 (id,reason)
+        # 均回到未首评）。
+        unavail_alerts = {}
         # ci/cb 成功清 mo 游标与缓存、seq 重置为 1（各后端基线随新记录
         # 清零）；失败时调用方根本不会进入本函数，天然回滚。
         mo_seq = 1
@@ -5404,7 +5472,7 @@ def run(raw):
             "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fd", "fc",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
-            "ru", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
+            "ru", "ua", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "na",
             "mu",
             "cp", "cq", "ca",
@@ -5587,6 +5655,10 @@ def run(raw):
             conc_alerts.pop(backend_id, None)
             # remove 删除该后端的 B 维限流告警；同 id 重加回到未首评。
             limit_alerts.pop(("B", backend_id), None)
+            # remove 删除该后端全部原因的连续不可用时长告警（四键）；同 id
+            # 重加各原因均回到未首评。
+            for unavail_reason in ("drain", "health", "circuit", "fault"):
+                unavail_alerts.pop((backend_id, unavail_reason), None)
             results.append({"op": "remove", "ok": True})
 
         elif op[0] == "pick":
@@ -8509,68 +8581,83 @@ def run(raw):
         elif op[0] == "ru":
             # 不可用时长查询：除共用时钟按 now 推进（批前通用时钟块）外只读，
             # 失败批次天然回滚。reasons 按 drain,health,circuit,fault 排序，
-            # 项键序 reason,since,duration，duration=now-since。health/drain/
-            # circuit 取各转换点维护的连续生效起点；fault 只读时间线：D 段
-            # since=a，F 下线相位 since=a+2*v*((now-a)//(2*v))，S 不列入。
+            # 项键序 reason,since,duration，duration=now-since；各原因事实取
+            # unavail_reason_fact（ua 同口径），仅列入生效原因。
             # 活动段查找 O(log T_b)，整体时间 O(log(T+1))、空间 O(1)。
             _, backend_id, now = op
             record = backends.get(backend_id)
             if record is None:
                 fail(EXIT_BACKEND, "BACKEND")
-            since_map = record["unavail_since"]
             reasons = []
-            drain_since = since_map["drain"]
-            if drain_since is not None:
-                reasons.append(
-                    {
-                        "reason": "drain",
-                        "since": drain_since,
-                        "duration": now - drain_since,
-                    }
-                )
-            health_since = since_map["health"]
-            if health_since is not None:
-                reasons.append(
-                    {
-                        "reason": "health",
-                        "since": health_since,
-                        "duration": now - health_since,
-                    }
-                )
-            circuit_since = since_map["circuit"]
-            if circuit_since is not None:
-                reasons.append(
-                    {
-                        "reason": "circuit",
-                        "since": circuit_since,
-                        "duration": now - circuit_since,
-                    }
-                )
-            segment = active_fault(record, now)
-            if segment is not None:
-                kind, seg_a, _, seg_v = segment
-                if kind == "D":
-                    # 整个 D 段均不可用。
-                    fault_since = seg_a
-                elif kind == "F" and ((now - seg_a) // seg_v) % 2 == 0:
-                    # F 下线相位：[a+2jv, a+(2j+1)v)，相位起点对齐到偶数 v。
-                    fault_since = seg_a + 2 * seg_v * (
-                        (now - seg_a) // (2 * seg_v)
-                    )
-                else:
-                    # F 上线相位与 S（仅变慢）均不阻断。
-                    fault_since = None
-                if fault_since is not None:
+            for reason in ("drain", "health", "circuit", "fault"):
+                active, since = unavail_reason_fact(record, reason, now)
+                if active:
                     reasons.append(
                         {
-                            "reason": "fault",
-                            "since": fault_since,
-                            "duration": now - fault_since,
+                            "reason": reason,
+                            "since": since,
+                            "duration": now - since,
                         }
                     )
             results.append(
                 {"op": "ru", "id": backend_id, "now": now, "reasons": reasons}
             )
+
+        elif op[0] == "ua":
+            # 连续不可用时长告警：按 (id,reason) 独立评估，除共用时钟按 now
+            # 推进与自身告警状态外只读，失败批次天然回滚。active/since/
+            # duration 沿用同一时刻 ru 的单原因事实口径（unavail_reason_fact），
+            # 不因更高优先级原因遮蔽；不生效取 false/null/0，生效时 since 为
+            # 本次连续区间起点、duration=now-since。active 且
+            # duration>=threshold 为 A 否则 N；changed 仅相对该组合上次成功
+            # 评估发生转换，首次以前态 N 起评（首次已超阈值即 changed=true）。
+            # 首评固化 threshold，此后改值报 STATE（INPUT 已在解析期判）；同
+            # id,reason,threshold,now 重报原样返回首评结果、不推进状态。fault
+            # 活动段查找 O(log T_b)，其余三因 O(1)，整体 O(log(T+1))、空间
+            # O(1)；状态总空间 O(B)（每后端至多四键）。
+            _, backend_id, reason, threshold, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                # 未知 id 先于一切告警状态判定。
+                fail(EXIT_BACKEND, "BACKEND")
+            key = (backend_id, reason)
+            entry = unavail_alerts.get(key)
+            if entry is not None:
+                if threshold != entry["threshold"]:
+                    # 已登记组合变更 threshold：STATE，不改状态。
+                    fail(EXIT_STATE, "STATE")
+                if now == entry["now"]:
+                    # 同 id,reason,threshold,now 重报：原样返回首评结果，
+                    # 不重复推进状态；此时刻之后的原因变化须更大 now 才可见。
+                    results.append(dict(entry["result"]))
+                    continue
+            active, since = unavail_reason_fact(record, reason, now)
+            if active:
+                duration = now - since
+                state = "A" if duration >= threshold else "N"
+            else:
+                duration = 0
+                state = "N"
+            prev_state = "N" if entry is None else entry["state"]
+            changed = state != prev_state
+            result = {
+                "op": "ua",
+                "id": backend_id,
+                "reason": reason,
+                "threshold": threshold,
+                "state": state,
+                "active": active,
+                "since": since,
+                "duration": duration,
+                "changed": changed,
+            }
+            unavail_alerts[key] = {
+                "threshold": threshold,
+                "state": state,
+                "now": now,
+                "result": dict(result),
+            }
+            results.append(result)
 
         elif op[0] == "hm":
             # H pick 记账只读查询：未知 id 报 BACKEND；不改变任何计数，失败
