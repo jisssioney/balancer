@@ -626,6 +626,28 @@ cv/cd/pd）；当前或候选任一 vnodes 为 null 或 backends 为空报 STATE
 hd 成功仅推进时钟且不改任何状态，失败批回滚。N 为两环令牌总数、K 为
 keys 长度，时间 O(N log N + K log N)，空间 O(N+K)，仅用标准库；紧凑
 UTF-8 固定键序 JSON、单换行及 record/replay 逐字节行为照常，其他子命令
+不变。
+hb 哈希分布预演，精确键序 op,config,keys,now（键须按此序出现）：config
+的结构、规范化、版本兼容及后端引用检查沿用 hd；keys 为 1..4096 项非空、
+可直接 UTF-8 编码的 route 键数组（沿用 route 的 key 校验），允许重复，
+重复键按出现次数计数；now ∈ [0,10^9] 非 bool 整数并进入共用非递减时钟。
+不应用候选配置：以当前与候选配置各自的 backends 加入序与 vnodes 分别建
+静态环，沿用 hd 的 SHA-256 规则，忽略健康、熔断、排空、故障时间线与粘
+性运行态，每个 key 在两侧独立映射。结果键序 op,base,target,backends,
+summary：base/target 为当前/候选规范化 version=11 配置的 ct 摘要字符串；
+backends 先按当前后端加入序排列，再按候选加入序补充仅在候选中存在的后
+端，项键序 id,before,after,delta，before/after 为该后端在对应侧的命中
+次数（该侧不存在为 0），delta=after-before；summary 键序
+total,stable,remapped,rate,before_min,before_max,after_min,after_max，
+total 为 keys 长度（含重复），stable/remapped 按两侧落点是否相同计数，
+rate=remapped/total 的百分比向下截断两位定点串，每侧 min/max 只统计该
+侧实际存在的后端。键序、字段集合、类型、范围、UTF-8 编码、keys 数量或
+时钟倒退报 INPUT/2；候选 B 限流/B 配额/faults/capacities 引用未知后端
+报 BACKEND/3；当前或候选任一 vnodes 为 null 或 backends 为空报 STATE/4
+（错误优先级同 hd）。hb 成功仅推进时钟且不改其他运行态，失败批回滚且不
+产生 stdout。N 为两环令牌总数、K 为 keys 长度、B 为两侧后端并集数，时间
+O(N log N + K log N)，额外空间 O(N+B)，仅用标准库；紧凑 UTF-8 固定键
+序 JSON、单换行及 run/record/replay 逐字节行为照常，hd 与其他子命令
 不变。ci 结果 op,ok=true；now 为非负非
 bool 整数并纳入共用非递减
 时钟（乐观并发形式的 now 仅收 0..10^9 非 bool 整数，否则 INPUT/2 且
@@ -2394,7 +2416,7 @@ def parse_op(raw_op):
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "na",
-        "ce", "ci", "cl", "al", "ai", "ad", "cb", "cu", "cv", "ct", "cd", "pd", "hd",
+        "ce", "ci", "cl", "al", "ai", "ad", "cb", "cu", "cv", "ct", "cd", "pd", "hd", "hb",
         "cp", "cq", "ca", "cx", "cy",
         "fs", "fx", "fr", "fi", "ft", "oi", "od",
         "fb", "fp", "fq", "fd", "fc",
@@ -3783,6 +3805,25 @@ def parse_op(raw_op):
         parse_warm_now(raw_op["now"])
         config = parse_config(raw_op["config"])
         return ("hd", config, keys, raw_op["now"])
+
+    if name == "hb":
+        # 哈希分布预演：精确键序 op,config,keys,now（键须按此序出现，乱序
+        # 报 INPUT）；config 校验与规范化同 hd（B 限流/配额、faults 与
+        # capacities 引用未知后端留执行期判 BACKEND）；keys 为 1..4096 项
+        # 非空、可直接 UTF-8 编码的字符串数组（沿用 route 的 key 校验），
+        # 允许重复（重复键按出现次数计数）；now ∈ [0,10^9] 非 bool 整数并
+        # 纳入共用非递减时钟（倒退在执行期与其余操作同序判 INPUT）。不应
+        # 用候选配置；任一 vnodes 为 null 或 backends 为空的 STATE 留执行
+        # 期判。
+        if list(raw_op) != ["op", "config", "keys", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        raw_keys = raw_op["keys"]
+        if not isinstance(raw_keys, list) or not 1 <= len(raw_keys) <= 4096:
+            fail(EXIT_INPUT, "INPUT")
+        keys = [parse_key(raw_key) for raw_key in raw_keys]
+        parse_warm_now(raw_op["now"])
+        config = parse_config(raw_op["config"])
+        return ("hb", config, keys, raw_op["now"])
 
     if name == "cp":
         # 配置预约：精确键序 op,config,at,now（键须按此序出现，乱序报
@@ -7857,7 +7898,7 @@ def run(raw):
             "oq", "lh", "lt", "le",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
-            "ci", "cb", "cu", "cv", "cd", "pd", "hd", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
+            "ci", "cb", "cu", "cv", "cd", "pd", "hd", "hb", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
             "fd", "fc",
             "fa", "fe", "ah", "oh", "wh", "wp", "wa", "br",
             "ru", "ua", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
@@ -10456,6 +10497,105 @@ def run(raw):
                         "total": total,
                         "stable": stable,
                         "remapped": total - stable,
+                    },
+                }
+            )
+
+        elif op[0] == "hb":
+            # 哈希分布预演（不应用配置）：以当前与候选配置各自的 backends
+            # 加入序与 vnodes 分别建静态环——哈希规则沿用 hd（SHA-256，忽略
+            # 健康、熔断、排空、故障时间线与粘性运行态），每个 key 在两侧独
+            # 立映射并按后端汇总命中次数，重复键按出现次数计数。B 限流/配额、
+            # faults 与 capacities 引用未知后端报 BACKEND（优先级同 hd，先于
+            # STATE）；任一 vnodes 为 null 或任一侧 backends 为空报 STATE。
+            # backends 报告先按当前加入序，再补候选独有后端；不存在于某侧时
+            # 该侧计数为 0。成功仅推进时钟（已在共用时钟块完成），不改其他
+            # 运行态；失败批次天然回滚且不产生 stdout。N 为两环令牌总数、K
+            # 为 keys 长度、B 为两侧后端并集数：两环各排序一次共 O(N log N)，
+            # 每键两次二分共 O(K log N)，计数汇总 O(K+B)，额外空间 O(N+B)。
+            _, config, keys, now = op
+            config_backend_ids = {entry[0] for entry in config["backends"]}
+            for scope, bucket_id, _, _ in config["limits"]:
+                if scope == "B" and bucket_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for scope, quota_id, _, _ in config["quotas"]:
+                if scope == "B" and quota_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for fault_id in config["faults"]:
+                if fault_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            for override_id in config["capacities"]:
+                if override_id not in config_backend_ids:
+                    fail(EXIT_BACKEND, "BACKEND")
+            candidate_export = export_normalized_config(config)
+            candidate_ids = [item["id"] for item in candidate_export["backends"]]
+            if config["vnodes"] is None or not candidate_ids:
+                # 候选未配环或候选后端为空：无法为候选建环。
+                fail(EXIT_STATE, "STATE")
+            current_export = export_config()
+            current_ids = [item["id"] for item in current_export["backends"]]
+            if ring_vnodes is None or not current_ids:
+                # 当前未 chash 或当前后端为空：无法为当前建环（初始空配置即
+                # 如此）。
+                fail(EXIT_STATE, "STATE")
+            target_tokens = build_static_ring(candidate_ids, config["vnodes"])
+            base_tokens = build_static_ring(current_ids, ring_vnodes)
+            target_digests = [token[0] for token in target_tokens]
+            base_digests = [token[0] for token in base_tokens]
+            before_counts = dict.fromkeys(current_ids, 0)
+            after_counts = dict.fromkeys(candidate_ids, 0)
+            stable = 0
+            for key in keys:
+                before = lookup_ring(base_tokens, base_digests, key)
+                after = lookup_ring(target_tokens, target_digests, key)
+                before_counts[before] += 1
+                after_counts[after] += 1
+                if before == after:
+                    stable += 1
+            # 报告后端先按当前加入序，再按候选加入序补充候选独有后端。
+            ordered_ids = list(current_ids)
+            present = set(current_ids)
+            for backend_id in candidate_ids:
+                if backend_id not in present:
+                    ordered_ids.append(backend_id)
+                    present.add(backend_id)
+            backends_report = []
+            for backend_id in ordered_ids:
+                before_count = before_counts.get(backend_id, 0)
+                after_count = after_counts.get(backend_id, 0)
+                backends_report.append(
+                    {
+                        "id": backend_id,
+                        "before": before_count,
+                        "after": after_count,
+                        "delta": after_count - before_count,
+                    }
+                )
+            total = len(keys)
+            remapped = total - stable
+            # rate 为 remapped/total 的百分比，向下截断两位定点串。
+            rate = remapped * 10000 // total
+            before_values = [
+                before_counts[backend_id] for backend_id in current_ids
+            ]
+            after_values = [
+                after_counts[backend_id] for backend_id in candidate_ids
+            ]
+            results.append(
+                {
+                    "op": "hb",
+                    "base": config_digest(current_export),
+                    "target": config_digest(candidate_export),
+                    "backends": backends_report,
+                    "summary": {
+                        "total": total,
+                        "stable": stable,
+                        "remapped": remapped,
+                        "rate": "%d.%02d" % divmod(rate, 100),
+                        "before_min": min(before_values),
+                        "before_max": max(before_values),
+                        "after_min": min(after_values),
+                        "after_max": max(after_values),
                     },
                 }
             )

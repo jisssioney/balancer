@@ -11848,6 +11848,513 @@ class HashDryRunTest(unittest.TestCase):
         self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
 
 
+class HashBalancePreviewTest(unittest.TestCase):
+    """哈希分布预演 hb：按当前/候选各自 backends 加入序与 vnodes 建静态环，
+    忽略运行态逐键映射并汇总每后端命中偏斜，不应用配置。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, raw, exit_code, label):
+        code, stdout, stderr = run_balancer("run", raw)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def backend(self, bid, **overrides):
+        item = {
+            "id": bid, "weight": 1, "d": 0, "fail": 3, "success": 2,
+            "circuit": None, "drain": None, "endpoint": None,
+        }
+        item.update(overrides)
+        return item
+
+    def make_config(self, ids, vnodes, backends=None, **overrides):
+        config = config_v11(1, **overrides)
+        config["backends"] = (
+            list(backends)
+            if backends is not None
+            else [self.backend(bid) for bid in ids]
+        )
+        config["vnodes"] = vnodes
+        return config
+
+    def hb(self, ids, vnodes, keys, now, backends=None):
+        return {"op": "hb", "config": self.make_config(ids, vnodes, backends),
+                "keys": list(keys), "now": now}
+
+    def load(self, ids, vnodes, now=0, pick="W"):
+        return {"op": "ci",
+                "config": self.make_config(ids, vnodes, scheduler={"pick": pick}),
+                "now": now}
+
+    @staticmethod
+    def reference_map(ids, vnodes, key):
+        tokens = []
+        for join_index, bid in enumerate(ids):
+            encoded = bid.encode("utf-8")
+            for i in range(vnodes):
+                digest = hashlib.sha256(
+                    encoded + b"\x00" + str(i).encode("ascii")
+                ).digest()
+                tokens.append(
+                    (int.from_bytes(digest, "big"), join_index, i, bid)
+                )
+        tokens.sort(key=lambda token: (token[0], token[1], token[2]))
+        digests = [token[0] for token in tokens]
+        key_hash = int.from_bytes(
+            hashlib.sha256(key.encode("utf-8")).digest(), "big"
+        )
+        index = bisect.bisect_left(digests, key_hash)
+        if index == len(tokens):
+            index = 0
+        return tokens[index][3]
+
+    def test_result_shape_and_key_order(self):
+        results = self.run_ops([
+            self.load(["a", "b", "c"], 4),
+            self.hb(["a", "b", "c", "d"], 8, ["k1", "k2", "k1"], 5),
+        ])
+        result = results[1]
+        self.assertEqual(
+            list(result), ["op", "base", "target", "backends", "summary"]
+        )
+        self.assertEqual(result["op"], "hb")
+        self.assertRegex(result["base"], r"^[0-9a-f]{64}$")
+        self.assertRegex(result["target"], r"^[0-9a-f]{64}$")
+        # 当前加入序 a,b,c 后补候选独有 d。
+        self.assertEqual(
+            [row["id"] for row in result["backends"]],
+            ["a", "b", "c", "d"],
+        )
+        for row in result["backends"]:
+            self.assertEqual(list(row), ["id", "before", "after", "delta"])
+            self.assertIsInstance(row["id"], str)
+            for field in ("before", "after", "delta"):
+                self.assertIsInstance(row[field], int)
+                self.assertNotIsInstance(row[field], bool)
+            self.assertEqual(row["delta"], row["after"] - row["before"])
+        # 候选独有后端 before=0。
+        self.assertEqual(result["backends"][-1]["before"], 0)
+        summary = result["summary"]
+        self.assertEqual(
+            list(summary),
+            ["total", "stable", "remapped", "rate",
+             "before_min", "before_max", "after_min", "after_max"],
+        )
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["stable"] + summary["remapped"], 3)
+        self.assertRegex(summary["rate"], r"^\d+\.\d{2}$")
+        for field in ("total", "stable", "remapped", "before_min",
+                      "before_max", "after_min", "after_max"):
+            self.assertIsInstance(summary[field], int)
+            self.assertNotIsInstance(summary[field], bool)
+
+    def test_counts_match_independent_reference(self):
+        keys = ["alpha", "beta", "gamma", "x", "y", "z", "k1", "k2",
+                "日本語", "Ω", "repeat", "repeat"]
+        results = self.run_ops([
+            self.load(["a", "b", "c", "e"], 6),
+            self.hb(["a", "b", "c", "d"], 9, keys, 1),
+        ])
+        result = results[1]
+        before = [self.reference_map(["a", "b", "c", "e"], 6, k) for k in keys]
+        after = [self.reference_map(["a", "b", "c", "d"], 9, k) for k in keys]
+        rows = {row["id"]: row for row in result["backends"]}
+        for bid in ("a", "b", "c", "d", "e"):
+            self.assertEqual(rows[bid]["before"], before.count(bid))
+            self.assertEqual(rows[bid]["after"], after.count(bid))
+        stable = sum(1 for x, y in zip(before, after) if x == y)
+        summary = result["summary"]
+        self.assertEqual(summary["stable"], stable)
+        self.assertEqual(summary["remapped"], len(keys) - stable)
+        # rate=100*remapped/total 下截两位。
+        scaled = (len(keys) - stable) * 10000 // len(keys)
+        self.assertEqual(summary["rate"], "%d.%02d" % divmod(scaled, 100))
+        # 每侧 min/max 只统计该侧实际存在的后端。
+        current = ("a", "b", "c", "e")
+        candidate = ("a", "b", "c", "d")
+        self.assertEqual(
+            summary["before_min"], min(rows[b]["before"] for b in current))
+        self.assertEqual(
+            summary["before_max"], max(rows[b]["before"] for b in current))
+        self.assertEqual(
+            summary["after_min"], min(rows[b]["after"] for b in candidate))
+        self.assertEqual(
+            summary["after_max"], max(rows[b]["after"] for b in candidate))
+
+    def test_backend_ordering_on_remove_and_add(self):
+        results = self.run_ops([
+            self.load(["a", "b", "c", "e"], 5),
+            self.hb(["b", "c", "d", "f"], 7, ["k%d" % i for i in range(60)], 1),
+        ])
+        result = results[1]
+        # 先按当前加入序 a,b,c,e，再按候选加入序补 d,f。
+        self.assertEqual(
+            [row["id"] for row in result["backends"]],
+            ["a", "b", "c", "e", "d", "f"],
+        )
+        rows = {row["id"]: row for row in result["backends"]}
+        # 仅当前存在的 a,e：after=0；仅候选存在的 d,f：before=0。
+        for bid in ("a", "e"):
+            self.assertEqual(rows[bid]["after"], 0)
+            self.assertEqual(rows[bid]["delta"], -rows[bid]["before"])
+        for bid in ("d", "f"):
+            self.assertEqual(rows[bid]["before"], 0)
+            self.assertEqual(rows[bid]["delta"], rows[bid]["after"])
+        # 两侧计数各自合计等于 keys 长度。
+        self.assertEqual(sum(r["before"] for r in result["backends"]), 60)
+        self.assertEqual(sum(r["after"] for r in result["backends"]), 60)
+
+    def test_identical_rings_all_stable(self):
+        results = self.run_ops([
+            self.load(["a", "b", "c"], 7),
+            self.hb(["a", "b", "c"], 7, ["q%d" % i for i in range(20)], 3),
+        ])
+        result = results[1]
+        self.assertEqual(result["base"], result["target"])
+        for row in result["backends"]:
+            self.assertEqual(row["delta"], 0)
+            self.assertEqual(row["before"], row["after"])
+        summary = result["summary"]
+        self.assertEqual(summary["stable"], 20)
+        self.assertEqual(summary["remapped"], 0)
+        self.assertEqual(summary["rate"], "0.00")
+        self.assertEqual(summary["before_min"], summary["after_min"])
+        self.assertEqual(summary["before_max"], summary["after_max"])
+
+    def test_rate_truncation(self):
+        # 7 键中若 3 键改派，100*3/7=42.857... 下截 42.85；构造用参考环找
+        # 恰有 3 个不同落点的键集，或直接对任意键集核对下截公式。
+        keys = ["p%d" % i for i in range(7)]
+        results = self.run_ops([
+            self.load(["a", "b", "c"], 4),
+            self.hb(["a", "b", "c", "d"], 7, keys, 1),
+        ])
+        remapped = results[1]["summary"]["remapped"]
+        expected = remapped * 10000 // 7
+        self.assertEqual(
+            results[1]["summary"]["rate"],
+            "%d.%02d" % divmod(expected, 100),
+        )
+        self.assertIn(results[1]["summary"]["rate"],
+                      ("0.00", "14.28", "28.57", "42.85", "57.14",
+                       "71.42", "85.71", "100.00"))
+
+    def test_single_backend_counts_all(self):
+        results = self.run_ops([
+            self.load(["solo"], 3),
+            self.hb(["solo"], 5, ["a", "b", "c", "a"], 0),
+        ])
+        result = results[1]
+        self.assertEqual(
+            result["backends"],
+            [{"id": "solo", "before": 4, "after": 4, "delta": 0}],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"total": 4, "stable": 4, "remapped": 0, "rate": "0.00",
+             "before_min": 4, "before_max": 4,
+             "after_min": 4, "after_max": 4},
+        )
+
+    def test_ignores_health_circuit_drain_runtime_state(self):
+        candidate = self.make_config(
+            None, 4,
+            backends=[
+                self.backend("a", fail=1, success=1),
+                self.backend("b", circuit={
+                    "n": 1, "m": 1, "r": 1, "w": 1, "q": 1}),
+                self.backend("c", drain=10),
+            ],
+        )
+        keys = ["z%d" % i for i in range(40)]
+        results = self.run_ops([
+            {"op": "ci", "config": candidate, "now": 0},
+            {"op": "hset", "id": "a", "fail": 1, "success": 1},
+            {"op": "probe", "id": "a", "ok": False, "now": 1},
+            {"op": "cs", "id": "b", "n": 1, "m": 1, "r": 1, "w": 1, "q": 1},
+            {"op": "cr", "id": "b", "ok": False, "now": 2},
+            {"op": "ds", "id": "c", "t": 10},
+            {"op": "dr", "id": "c", "now": 3},
+            {"op": "hb", "config": candidate, "keys": keys, "now": 4},
+        ])
+        result = results[-1]
+        self.assertEqual(result["base"], result["target"])
+        self.assertEqual([r["id"] for r in result["backends"]], ["a", "b", "c"])
+        self.assertTrue(all(r["delta"] == 0 for r in result["backends"]))
+        self.assertEqual(sum(r["before"] for r in result["backends"]), 40)
+        self.assertEqual(result["summary"]["remapped"], 0)
+
+    def test_does_not_apply_candidate(self):
+        results = self.run_ops([
+            self.load(["a", "b"], 2),
+            self.hb(["a", "b", "c"], 9, ["k"], 1),
+            {"op": "ce"},
+        ])
+        config = results[2]["config"]
+        self.assertEqual([b["id"] for b in config["backends"]], ["a", "b"])
+        self.assertEqual(config["vnodes"], 2)
+
+    def test_keys_size_boundaries(self):
+        results = self.run_ops([
+            self.load(["a", "b"], 2),
+            self.hb(["a", "b"], 2, ["only"], 0),
+            self.hb(["a", "b"], 2, ["k%d" % i for i in range(4096)], 10 ** 9),
+        ])
+        self.assertEqual(results[1]["summary"]["total"], 1)
+        self.assertEqual(results[2]["summary"]["total"], 4096)
+
+    def test_clock_regression_input_and_advances(self):
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hb(["a"], 2, ["k"], 10),
+                self.hb(["a"], 2, ["k"], 9),
+            ]),
+            2, "INPUT",
+        )
+        results = self.run_ops([
+            self.load(["a"], 2),
+            self.hb(["a"], 2, ["k"], 10),
+            self.hb(["a"], 2, ["k"], 10),
+        ])
+        self.assertEqual(len(results), 3)
+        # 成功 hb 推进共用时钟：其后旧时刻 br 报倒退。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hb(["a"], 2, ["k"], 10),
+                {"op": "br", "now": 9},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_input_errors(self):
+        base = [self.load(["a", "b"], 2)]
+        # 键序错误。
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "hb", "now": 1,
+                 "config": self.make_config(["a"], 2), "keys": ["k"]}]),
+            2, "INPUT",
+        )
+        # 多键 / 缺键。
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "hb", "config": self.make_config(["a"], 2),
+                 "keys": ["k"], "now": 1, "x": 1}]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "hb", "config": self.make_config(["a"], 2),
+                 "keys": ["k"]}]),
+            2, "INPUT",
+        )
+        # keys 非数组、空、超 4096。
+        self.assert_failure(
+            encode_ops(base + [
+                {"op": "hb", "config": self.make_config(["a"], 2),
+                 "keys": "k", "now": 1}]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops(base + [
+                self.hb(["a"], 2, [], 1)]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops(base + [
+                self.hb(["a"], 2, ["k"] * 4097, 1)]),
+            2, "INPUT",
+        )
+        # 元素空串/整数/bool/孤立代理。
+        self.assert_failure(
+            encode_ops(base + [self.hb(["a"], 2, [""], 1)]), 2, "INPUT")
+        self.assert_failure(
+            encode_ops(base + [self.hb(["a"], 2, [1], 1)]), 2, "INPUT")
+        self.assert_failure(
+            encode_ops(base + [self.hb(["a"], 2, [True], 1)]), 2, "INPUT")
+        self.assert_failure(
+            encode_ops(
+                '{"ops":[{"op":"ci","config":%s,"now":0},'
+                '{"op":"hb","config":%s,"keys":["\\ud800"],"now":1}]}'
+                % (json.dumps(self.make_config(["a"], 2)),
+                   json.dumps(self.make_config(["a"], 2)))),
+            2, "INPUT",
+        )
+        # now 类型/范围。
+        self.assert_failure(
+            encode_ops(base + [self.hb(["a"], 2, ["k"], True)]), 2, "INPUT")
+        self.assert_failure(
+            encode_ops(base + [self.hb(["a"], 2, ["k"], -1)]), 2, "INPUT")
+        self.assert_failure(
+            encode_ops(base + [self.hb(["a"], 2, ["k"], 10 ** 9 + 1)]),
+            2, "INPUT",
+        )
+
+    def test_state_errors(self):
+        # 初始空状态（当前无环）。
+        self.assert_failure(
+            encode_ops([self.hb(["a"], 2, ["k"], 0)]), 4, "STATE")
+        # 当前 vnodes 为 null（W 配置允许 vnodes=null）。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], None, pick="W"),
+                self.hb(["a"], 2, ["k"], 1),
+            ]),
+            4, "STATE",
+        )
+        # 候选 vnodes 为 null。
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                {"op": "hb",
+                 "config": self.make_config(
+                     ["a"], None, scheduler={"pick": "W"}),
+                 "keys": ["k"], "now": 1},
+            ]),
+            4, "STATE",
+        )
+        # 候选后端为空。
+        empty = self.make_config(["a"], 2)
+        empty["backends"] = []
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                {"op": "hb", "config": empty, "keys": ["k"], "now": 1},
+            ]),
+            4, "STATE",
+        )
+
+    def test_backend_dangling_references(self):
+        base = [self.load(["a"], 2)]
+
+        def candidate_with(**changes):
+            config = self.make_config(["a"], 2)
+            config.update(changes)
+            return {"op": "hb", "config": config, "keys": ["k"], "now": 1}
+
+        self.assert_failure(
+            encode_ops(base + [candidate_with(
+                capacities=[{"id": "ghost", "cap": 1}])]),
+            3, "BACKEND",
+        )
+        self.assert_failure(
+            encode_ops(base + [candidate_with(
+                quotas=[{"scope": "B", "id": "ghost",
+                         "limit": 5, "span": 1}])]),
+            3, "BACKEND",
+        )
+        self.assert_failure(
+            encode_ops(base + [candidate_with(
+                limits=[{"scope": "B", "id": "ghost", "r": 1, "b": 1}])]),
+            3, "BACKEND",
+        )
+        self.assert_failure(
+            encode_ops(base + [candidate_with(
+                faults=[{"id": "ghost", "k": "D",
+                         "a": 1, "z": 2, "v": 0}])]),
+            3, "BACKEND",
+        )
+        # C 维 id 不引用后端，合法。
+        results = self.run_ops(base + [candidate_with(
+            limits=[{"scope": "C", "id": "anything", "r": 1, "b": 1}])])
+        self.assertEqual(results[-1]["op"], "hb")
+
+    def test_error_priority(self):
+        # BACKEND 先于 STATE：候选 vnodes=null 且有悬空容量引用。
+        bad = self.make_config(["a"], None, scheduler={"pick": "W"})
+        bad["capacities"] = [{"id": "ghost", "cap": 1}]
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                {"op": "hb", "config": bad, "keys": ["k"], "now": 1},
+            ]),
+            3, "BACKEND",
+        )
+        # INPUT 先于 BACKEND：keys 非法且候选悬空引用。
+        bad2 = self.make_config(["a"], 2)
+        bad2["capacities"] = [{"id": "ghost", "cap": 1}]
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                {"op": "hb", "config": bad2, "keys": [], "now": 1},
+            ]),
+            2, "INPUT",
+        )
+
+    def test_failure_rolls_back_batch(self):
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hb(["a"], 2, ["k"], 1),
+                self.hb(["a"], 2, ["k"], "x"),
+            ]),
+            2, "INPUT",
+        )
+        self.assert_failure(
+            encode_ops([
+                self.load(["a"], 2),
+                self.hb(["a"], 2, ["k"], 1),
+                self.hb(["a"], None, ["k"], 2),
+            ]),
+            4, "STATE",
+        )
+
+    def test_non_ascii_keys_compact_single_newline(self):
+        # hb 不回显 keys，非 ASCII 后端 id 原样出现在 backends 报告中；keys 仍
+        # 正常参与映射（stable=3）。紧凑、无转义、单换行。
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([
+                self.load(["日本", "Ω"], 2),
+                self.hb(["日本", "Ω", "😀"], 2, ["a", "b", "c"], 1),
+            ]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out.count(b"\n"), 1)
+        self.assertIn("日本".encode("utf-8"), out)
+        self.assertIn("Ω".encode("utf-8"), out)
+        self.assertIn("😀".encode("utf-8"), out)
+        self.assertNotIn(b"\\u", out)
+        self.assertNotIn(b" ", out)
+
+    def test_record_replay_covers_hb(self):
+        ops = [
+            self.load(["a", "b"], 2),
+            self.hb(["a", "b", "c"], 9, ["k1", "k2", "k2"], 1),
+            {"op": "ct"},
+        ]
+        raw = encode_ops(ops)
+        run_code, run_stdout, run_stderr = run_balancer("run", raw)
+        rec_code, rec_stdout, rec_stderr = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_stderr), (0, b""))
+        record = json.loads(rec_stdout.decode("utf-8"))
+        rep_code, rep_stdout, rep_stderr = run_balancer(
+            "replay", rec_stdout
+        )
+        self.assertEqual(rep_code, record["exit"])
+        self.assertEqual(rep_code, run_code)
+        self.assertEqual(rep_stdout, base64.b64decode(record["stdout"]))
+        self.assertEqual(rep_stdout, run_stdout)
+        self.assertEqual(rep_stderr, base64.b64decode(record["stderr"]))
+        self.assertEqual(rep_stderr, run_stderr)
+        # 失败 hb（STATE）同样逐字节覆盖。
+        failing = encode_ops([self.hb(["a"], 2, ["k"], 0)])
+        _, rec_fail, _ = run_balancer("record", failing)
+        record = json.loads(rec_fail.decode("utf-8"))
+        rep_code, _, rep_stderr = run_balancer("replay", rec_fail)
+        self.assertEqual((rep_code, record["exit"]), (4, 4))
+        self.assertEqual(rep_stderr, b'{"error":"STATE"}\n')
+
+
 class PerBackendCapOverrideTest(unittest.TestCase):
     """pc/pg：每后端接纳容量覆盖；oa/ot 接纳与 oi/od/oq 投影用有效容量。"""
 
