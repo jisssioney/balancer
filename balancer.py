@@ -2384,7 +2384,7 @@ def parse_op(raw_op):
         "ru",
         "ua",
         "mu",
-        "se", "sd", "si", "sx",
+        "se", "sd", "si", "sx", "sm",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -3999,6 +3999,16 @@ def parse_op(raw_op):
         if list(raw_op) != ["op", "base", "target"]:
             fail(EXIT_INPUT, "INPUT")
         return ("sx", raw_op["base"], raw_op["target"])
+
+    if name == "sm":
+        # 检查点三方合并：精确键序 op,base,target，形状与 sx 完全一致；
+        # base/target 为按 version,digest,state 排列且不含 op 的检查点对
+        # 象。两对象的形状、version/digest 格式、state 全部校验（含错误
+        # 优先级）以及当前快照取得均留执行期，严格按 base、target、
+        # current 顺序逐一进行。操作不接受 now、不推进显式时钟。
+        if list(raw_op) != ["op", "base", "target"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("sm", raw_op["base"], raw_op["target"])
 
     # get
     if keys != {"op", "cid"}:
@@ -12891,6 +12901,152 @@ def run(raw):
                         "same": kind_counts["SAME"],
                         "conflict": kind_counts["CONFLICT"],
                     },
+                }
+            )
+
+        elif op[0] == "sm":
+            # 检查点三方合并：调用方提交基线检查点 base 与目标检查点
+            # target，把目标相对基线的无冲突变化按 se 规范化 state 顶层段
+            # 为最小单位原子合入执行到本操作时的当前运行态。不接受 now、
+            # 不推进显式时钟（合并结果自身携带的 now 段随 si 式整体替换
+            # 安装）。
+            #
+            # 校验顺序严格为 base、target、current，规则与错误优先级完全
+            # 沿用 sx/si：形状/键序/version/digest 格式 INPUT；紧凑编码
+            # 8MiB OVERLOAD；摘要不符 INPUT 先于语义；结构/类型/范围/
+            # UTF-8 INPUT；悬空引用/重复标识/矛盾计数/非法组合及规范化往
+            # 返偏差 STATE。
+            #
+            # 合并按顶层固定键序逐段：target 等于 base 时保留 current；
+            # target 不同于 base 且 current 等于 base 或 target 时采用
+            # target；其余为冲突，整次合并拒绝（STATE/4）且不安装任何
+            # 段。无冲突时组合结果仍须作为完整检查点通过大小（8MiB
+            # OVERLOAD/7）、语义与规范化往返校验（STATE/4），全部通过后
+            # 才原子安装；任何失败均无 stdout 并回滚整批（候选束为局部
+            # 对象，未安装前不触碰闭包运行态）。
+            _, raw_base, raw_target = op
+
+            def validate_cp(raw_cp):
+                # 与 sx 分支同规则：校验一份 version,digest,state 检查点
+                # 对象，返回 (digest, 规范化 state, 规范化 state 紧凑字
+                # 节)。摘要匹配先于语义；不安装候选束。
+                if (
+                    not isinstance(raw_cp, dict)
+                    or list(raw_cp) != ["version", "digest", "state"]
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                cp_version = raw_cp["version"]
+                if (
+                    not isinstance(cp_version, int)
+                    or isinstance(cp_version, bool)
+                    or cp_version != CHECKPOINT_VERSION
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                cp_digest = cp_hex_digest(raw_cp["digest"])
+                raw_state = raw_cp["state"]
+                try:
+                    state_bytes = json.dumps(
+                        raw_state, ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    envelope_bytes = json.dumps(
+                        {"version": cp_version, "state": raw_state},
+                        ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(EXIT_INPUT, "INPUT")
+                if len(state_bytes) > CHECKPOINT_LIMIT:
+                    fail(EXIT_OVERLOAD, "OVERLOAD")
+                if hashlib.sha256(envelope_bytes).hexdigest() != cp_digest:
+                    fail(EXIT_INPUT, "INPUT")
+                bundle = parse_checkpoint(raw_state)
+                # 规范化往返：重新规范化后的紧凑编码须与所给 state 逐字节
+                # 一致，强制所给 state 本身即规范化形态。
+                norm_state = export_bundle(bundle)
+                norm_bytes = json.dumps(
+                    norm_state, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                if norm_bytes != state_bytes:
+                    fail(EXIT_STATE, "STATE")
+                return cp_digest, norm_state, norm_bytes
+
+            _, base_state, _ = validate_cp(raw_base)
+            _, target_state, _ = validate_cp(raw_target)
+
+            # 两份检查点通过后按 se 规则取得当前规范化内存快照（before）。
+            current_state = export_bundle(current_bundle())
+            try:
+                current_bytes = json.dumps(
+                    current_state, ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                current_envelope = json.dumps(
+                    {"version": CHECKPOINT_VERSION, "state": current_state},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+            except UnicodeEncodeError:
+                fail(EXIT_INPUT, "INPUT")
+            if len(current_bytes) > CHECKPOINT_LIMIT:
+                fail(EXIT_OVERLOAD, "OVERLOAD")
+            before_digest = hashlib.sha256(current_envelope).hexdigest()
+
+            # —— 三方逐段合并，按 se 顶层固定键序处理 ——
+            merged_state = {}
+            changed_sections = []
+            for section in current_state:
+                cur_value = current_state[section]
+                base_value = base_state[section]
+                tgt_value = target_state[section]
+                if tgt_value == base_value:
+                    # 目标未改变该段：保留 current（current 自身的并发
+                    # 变化原样保留）。
+                    merged_value = cur_value
+                elif cur_value == base_value or cur_value == tgt_value:
+                    # 目标相对基线改变，且当前未独异（仍等于基线，或已
+                    # 经是目标）：采用 target。
+                    merged_value = tgt_value
+                else:
+                    # 三方两两不同：冲突，拒绝整次合并，不安装任何段。
+                    fail(EXIT_STATE, "STATE")
+                merged_state[section] = merged_value
+                if merged_value != cur_value:
+                    changed_sections.append(section)
+
+            # —— 组合结果作为完整检查点校验 ——
+            try:
+                merged_bytes = json.dumps(
+                    merged_state, ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                merged_envelope = json.dumps(
+                    {"version": CHECKPOINT_VERSION, "state": merged_state},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+            except UnicodeEncodeError:
+                fail(EXIT_INPUT, "INPUT")
+            if len(merged_bytes) > CHECKPOINT_LIMIT:
+                fail(EXIT_OVERLOAD, "OVERLOAD")
+            # 悬空引用、重复标识、矛盾计数、跨段非法组合在此判 STATE。
+            merged_bundle = parse_checkpoint(merged_state)
+            re_state = export_bundle(merged_bundle)
+            re_bytes = json.dumps(
+                re_state, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+            if re_bytes != merged_bytes:
+                fail(EXIT_STATE, "STATE")
+            after_digest = hashlib.sha256(merged_envelope).hexdigest()
+
+            # 原子安装（changed 为 0 时合并结果即当前状态，安装为幂等
+            # 空操作，after 等于当前摘要）。
+            install_bundle(merged_bundle)
+            results.append(
+                {
+                    "op": "sm",
+                    "before": before_digest,
+                    "after": after_digest,
+                    "changed": len(changed_sections),
+                    "sections": changed_sections,
+                    "ok": True,
                 }
             )
 
