@@ -1051,6 +1051,25 @@ faults，version7 在九键后追加 faults 且项按 fp 同款校验，成功�
 载入目标时间线、失败回滚。ep/fw
 为 O(1)，额外空间 O(B+C)，仅用标准库；其余子命令与既有操作行为不变。
 
+端点轮换存量查询与可控清理：eq 精确键序 op,id,now（键须按此序出现），
+now 为 0..10^9 非 bool 整数并进入共用非递减时钟；目标后端须存在且已通
+过 ep 配置当前端点。返回固定键序 op,id,now,current,total,fresh,stale,
+items：current 固定键序 host,port；total 为该后端活动连接总数，fresh 为
+快照与当前端点完全相同的连接数，stale 为其余（含无快照）连接数；items
+只列 stale 连接并按全局建连顺序排列，每项固定键序
+cid,host,port,opened,age，无快照者 host、port 为 null，age=now-opened；
+无活动连接时计数为零且 items 为空。eq 除推进时钟外不改变任何运行态。
+ec 精确键序 op,id,before,now（键须按此序出现），before/now 均为
+0..10^9 非 bool 整数且 before≤now；只关闭目标后端中快照不同于当前端点
+（含无快照）且 opened≤before 的活动连接，按全局建连顺序删除连接及快
+照、递减并发，返回固定键序 op,id,now,closed,cids，cids 保持关闭顺序；
+无符合项返回 closed=0 与空数组。清理使排空 D 状态后端失去最后连接时沿
+用 close 规则转 X 且 end=now；不扣减令牌或配额，也不触发排队接纳。字
+段、键序、编码、类型、范围、before 关系或时钟倒退报 INPUT/2，未知后端
+报 BACKEND/3，未配置端点报 STATE/4，并按此前顺序判定；失败无 stdout 且
+整批回滚。两操作时间 O(C)、额外空间 O(C)（C 为活动连接数），仅用标准
+库；ep/fw、检查点、run、record、replay 及既有固定键序 JSON 行为不变。
+
 不可用时长查询：ru 精确键序 op,id,now（键须按此序出现），id 为非空
 UTF-8 串，now 为 0..10^9 非 bool 整数并进入共用非递减时钟。结果键序
 op,id,now,reasons：reasons 列出该后端在 now 时刻的阻断原因，按
@@ -2449,7 +2468,7 @@ def parse_op(raw_op):
         "fa", "fe", "ah",
         "ea", "eh",
         "ts", "tm", "te", "tk", "tg", "tx",
-        "ep", "fw",
+        "ep", "fw", "eq", "ec",
         "ru",
         "ua",
         "mu",
@@ -4112,6 +4131,31 @@ def parse_op(raw_op):
         if keys != {"op", "cid"}:
             fail(EXIT_INPUT, "INPUT")
         return ("fw", parse_cid(raw_op["cid"]))
+
+    if name == "eq":
+        # 端点轮换存量查询：精确键序 op,id,now（键须按此序出现）；now 为
+        # 0..10^9 非 bool 整数并进入共用非递减时钟（倒退执行期判 INPUT）；
+        # 未知 id 与未配置端点留执行期判 BACKEND/STATE。
+        if list(raw_op) != ["op", "id", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "eq",
+            parse_backend_id(raw_op["id"]),
+            parse_warm_now(raw_op["now"]),
+        )
+
+    if name == "ec":
+        # 端点轮换可控清理：精确键序 op,id,before,now（键须按此序出现）；
+        # before/now 均为 0..10^9 非 bool 整数且 before≤now；now 进入共用
+        # 非递减时钟（倒退执行期判 INPUT）；未知 id 与未配置端点留执行期
+        # 判 BACKEND/STATE（INPUT 先于此二者）。
+        if list(raw_op) != ["op", "id", "before", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        before = parse_warm_now(raw_op["before"])
+        now = parse_warm_now(raw_op["now"])
+        if before > now:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ec", parse_backend_id(raw_op["id"]), before, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -7943,7 +7987,7 @@ def run(raw):
         if op[0] in (
             "open", "close", "probe", "add", "ws", "wg", "cr", "cg",
             "dr", "du", "dg", "dq", "dx", "ls", "la", "lg", "qs", "qg", "oa", "ot",
-            "oq", "lh", "lt", "le",
+            "oq", "lh", "lt", "le", "eq", "ec",
             "mr", "mg", "mh",
             "ms", "mx", "rh", "rt", "rr", "ra", "ma", "lp",
             "ci", "cb", "cb_cond", "cu", "cv", "cd", "pd", "hd", "hb", "fx", "fr", "fi", "ft", "oi", "od", "tk", "te", "tg", "tx", "route", "fq", "pick", "fh",
@@ -13080,6 +13124,90 @@ def run(raw):
                     "backend": connection[0],
                     "host": endpoint[0],
                     "port": endpoint[1],
+                }
+            )
+
+        elif op[0] == "eq":
+            # 端点轮换存量查询（只读，仅推进时钟）：current 为后端当前 ep
+            # 端点；total 为该后端活动连接总数，fresh 为快照与 current 完全
+            # 相同的连接数，stale 为其余（含无快照）连接数。items 只列
+            # stale，按全局建连序（dict 保序）；无快照者 host/port 为 null，
+            # age=now-opened。时间 O(C)、结果空间 O(C)。
+            _, backend_id, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = record["endpoint"]
+            if current is None:
+                fail(EXIT_STATE, "STATE")
+            total = fresh = stale = 0
+            items = []
+            for cid, connection in connections.items():
+                if connection[0] != backend_id:
+                    continue
+                total += 1
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == current:
+                    fresh += 1
+                else:
+                    stale += 1
+                    items.append(
+                        {
+                            "cid": cid,
+                            "host": None if snapshot is None else snapshot[0],
+                            "port": None if snapshot is None else snapshot[1],
+                            "opened": connection[2],
+                            "age": now - connection[2],
+                        }
+                    )
+            results.append(
+                {
+                    "op": "eq",
+                    "id": backend_id,
+                    "now": now,
+                    "current": {"host": current[0], "port": current[1]},
+                    "total": total,
+                    "fresh": fresh,
+                    "stale": stale,
+                    "items": items,
+                }
+            )
+
+        elif op[0] == "ec":
+            # 端点轮换可控清理：只关闭该后端快照不同于当前端点（含无快照）
+            # 且 opened<=before 的活动连接，按全局建连序删除连接及快照、递
+            # 减并发；不扣减令牌或配额，也不触发排队接纳。清理使排空 D 状态
+            # 后端失去最后连接时沿用 close 规则转 X、end=now。单遍遍历
+            # O(C)，cids 结果空间 O(C)。
+            _, backend_id, before, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = record["endpoint"]
+            if current is None:
+                fail(EXIT_STATE, "STATE")
+            closed_cids = []
+            for cid, connection in list(connections.items()):
+                if connection[0] != backend_id:
+                    continue
+                snapshot = conn_endpoints.get(cid)
+                if snapshot != current and connection[2] <= before:
+                    del connections[cid]
+                    conn_endpoints.pop(cid, None)
+                    record["conns"] -= 1
+                    closed_cids.append(cid)
+            drain = record["drain"]
+            if drain["state"] == "D" and record["conns"] == 0:
+                # D 态被本次清理清掉末连：沿用 close 规则转 X，end=now。
+                drain["state"] = "X"
+                drain["end"] = now
+            results.append(
+                {
+                    "op": "ec",
+                    "id": backend_id,
+                    "now": now,
+                    "closed": len(closed_cids),
+                    "cids": closed_cids,
                 }
             )
 
