@@ -190,6 +190,17 @@
 - 键集合、键序、`base` 格式、`rev` 或 `now` 的类型与范围、UTF-8 编码以及时钟倒退均返回 INPUT/2；目标修订不存在或已淘汰、`base` 不匹配、修订号耗尽、存在活动连接或等待队列均返回 STATE/4。任何失败都不产生 stdout，并回滚同批此前变化和逻辑时钟。
 - `se` 导出、`si` 恢复以及 `sd`、`sx`、`sm` 的后续观察结果与直接继续执行一致；`run`、`record`、`replay` 对成功与失败均保持固定键序紧凑 UTF-8 JSON、单末尾换行与逐字节确定性。身份比较为 O(1)，单次时间与额外空间上界保持 O(16N)，仅使用 Python 标准库；新增校验不改变 `cl`、`ct`、`ci`、`cu`、`ca`、三键 `cb` 及其他公开操作。
 
+## 端点轮换存量查询与可控清理：eq / ec
+
+在不改变 `ep` 覆盖登记与 `fw` 转发快照语义的前提下，让调用方先更新端点，再观察并按建连时间终止仍指向旧端点的连接；只读快照、显式时钟，不自动迁移连接，也不重新消费等待队列。
+
+- `eq`：精确键序 `op,id,now`（键须按此序出现）。`id` 沿用后端标识；`now` 为 0..10⁹ 的非 bool 整数并进入全局非递减时钟。目标后端须存在且已通过 `ep` 配置当前端点：未知后端报 BACKEND/3，未配置端点报 STATE/4。
+  - 返回固定键序 `op,id,now,current,total,fresh,stale,items`；`current` 固定键序 `host,port`，为当前端点。`total` 为该后端活动连接总数；`fresh` 为建连时转发快照与当前端点完全相同的连接数；`stale` 为其余连接数（含无快照连接）。
+  - `items` 只列 stale 连接，按全局建连顺序排列；每项固定键序 `cid,host,port,opened,age`。无快照连接的 `host`、`port` 为 null，`age=now-opened`。没有活动连接时计数为零且 `items=[]`。`eq` 除推进时钟外不改变任何运行态。
+- `ec`：精确键序 `op,id,before,now`（键须按此序出现）。`before` 与 `now` 均为 0..10⁹ 的非 bool 整数且 `before≤now`，`now` 进入全局非递减时钟。只关闭目标后端中快照不同于当前端点且 `opened≤before` 的活动连接，按全局建连顺序删除连接及快照、逐条递减并发；返回固定键序 `op,id,now,closed,cids`，`cids` 保持关闭顺序，无符合项时 `closed=0`、`cids=[]`。
+  - 清理使排空 D 状态后端失去最后连接时，沿用 `close` 规则转为 X 且 `end=now`；不扣减令牌或配额，也不触发排队接纳。
+- 字段、键序、编码、类型、范围、`before` 关系或时钟倒退报 INPUT/2，未知后端报 BACKEND/3，未配置端点报 STATE/4，并按此顺序判定；失败无 stdout 且整批回滚（含同批此前变化与逻辑时钟）。两项操作时间为 O(C)、额外空间不超过 O(C)（C 为活动连接数）；`ep`、`fw`、配置、检查点、run、record、replay 及既有固定键序 JSON 行为不变，仅用标准库。
+
 ## 测试
 
     python -m unittest discover
