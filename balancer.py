@@ -1071,6 +1071,31 @@ bytes_after，依次为顶层段总数、差异段数及两份 state 紧凑编�
 O(N)，changes 另占 O(S)，N 为两份 state 编码字节数之和、S 为顶层段
 数；仅用标准库，现有 se/si、配置、调度、连接、查询语义与 run/record/
 replay 逐字节契约不变。
+
+三方检查点只读预演 sx：以当前运行态（current）、基线检查点（base）与
+候选检查点（target）区分并发变化，供调用方在执行 si 前判断候选是否仍
+可安全使用；不合并/导入、不推进显式时钟、不改任何运行态或幂等缓存。
+sx 精确接受按 op,base,target 排列的三个键；base/target 都是按
+version,digest,state 排列且不含 op 的检查点对象（version 仅收 1、
+digest 小写 64 位十六进制）。先按 si 规则校验 base 再 target（各自沿
+用 8MiB、摘要匹配先于语义、完整结构/语义解析与规范化往返及 INPUT/2、
+STATE/4、OVERLOAD/7 优先级），再按 se 规则取得当前规范化快照；错误严
+格按 base、target、current 顺序判定，任一输入检查点或当前状态紧凑编码
+超 8388608 字节报 OVERLOAD/7。成功结果固定键序
+op,current,base,target,status,changes,summary：current/base/target 为
+各自检查点（version=1）的小写 SHA-256 摘要，依次对应当前、基线与候
+选。当前与候选规范化 state 紧凑编码逐字节相同时 status 为 SAME，否则
+存在冲突段时为 CONFLICT，其余为 CLEAN。changes 按 state 顶层键序列出
+三份状态不全相同的段（三份完全相同时为空；SAME 整体状态下基线独异段
+仍以 kind=SAME 列出），每项固定 section,base,current,target,kind，三
+个值为对应规范化段 JSON 的小写 SHA-256；当前等于基线而候选不同为
+TARGET，候选等于基线而当前不同为 CURRENT，当前等于候选而基线不同为
+SAME，其余为 CONFLICT。summary 固定
+sections,changed,target,current,same,conflict，四类计数之和等于
+changed。任何失败均无 stdout 并回滚整批；重复预演逐字节一致，run、
+record、replay 继续遵守紧凑 UTF-8 固定键序 JSON、单末尾换行。时间与额
+外空间 O(N)，N 为三份规范化状态紧凑编码总字节数；仅用标准库，现有
+se、sd、si 行为不变。
 """
 
 import base64
@@ -2359,7 +2384,7 @@ def parse_op(raw_op):
         "ru",
         "ua",
         "mu",
-        "se", "sd", "si",
+        "se", "sd", "si", "sx",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -3964,6 +3989,16 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("sd", version, digest, raw_op["state"])
+
+    if name == "sx":
+        # 三方检查点只读预演：精确键序 op,base,target。base/target 各为按
+        # version,digest,state 排列且不含 op 的检查点对象。两对象的形状、
+        # version/digest 格式、state 全部校验（含错误优先级）留执行期，按
+        # base、target、current 的顺序逐一进行，以免解析期先校验 target
+        # 而越过 base 的更早错误；外层 op 形状错误先于一切。
+        if list(raw_op) != ["op", "base", "target"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("sx", raw_op["base"], raw_op["target"])
 
     # get
     if keys != {"op", "cid"}:
@@ -12709,6 +12744,154 @@ def run(raw):
                 install_bundle(candidate)
             results.append(
                 {"op": "si", "digest": digest, "ok": True}
+            )
+
+        elif op[0] == "sx":
+            # 三方检查点只读预演：以当前运行态（current）、基线检查点
+            # （base）与候选检查点（target）区分并发变化，供调用方在执行 si
+            # 前判断候选是否仍可安全使用。不合并/导入、不推进显式时钟、不
+            # 改任何运行态或幂等缓存（候选束均为局部对象）。
+            #
+            # 校验顺序严格为 base、target、current：每份检查点各自沿用 si
+            # 的规则与错误优先级（形状/键序/version/digest 格式 INPUT；紧
+            # 凑编码 8MiB OVERLOAD；摘要不符 INPUT 先于语义；结构/类型/范
+            # 围/UTF-8 INPUT；悬空引用/重复标识/矛盾计数/非法组合及规范化
+            # 往返偏差 STATE）；两份检查点全部通过后再按 se 规则取当前规范
+            # 化快照，当前编码超限报 OVERLOAD/7。任何失败均无 stdout 并回
+            # 滚整批（本操作本不改状态）。
+            _, raw_base, raw_target = op
+
+            def validate_cp(raw_cp):
+                # 校验一份 version,digest,state 检查点对象，返回
+                # (digest, 规范化 state, 规范化 state 紧凑字节)。摘要匹配
+                # 先于语义；不安装候选束。
+                if (
+                    not isinstance(raw_cp, dict)
+                    or list(raw_cp) != ["version", "digest", "state"]
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                cp_version = raw_cp["version"]
+                if (
+                    not isinstance(cp_version, int)
+                    or isinstance(cp_version, bool)
+                    or cp_version != CHECKPOINT_VERSION
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                cp_digest = cp_hex_digest(raw_cp["digest"])
+                raw_state = raw_cp["state"]
+                try:
+                    state_bytes = json.dumps(
+                        raw_state, ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    envelope_bytes = json.dumps(
+                        {"version": cp_version, "state": raw_state},
+                        ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(EXIT_INPUT, "INPUT")
+                if len(state_bytes) > CHECKPOINT_LIMIT:
+                    fail(EXIT_OVERLOAD, "OVERLOAD")
+                if hashlib.sha256(envelope_bytes).hexdigest() != cp_digest:
+                    fail(EXIT_INPUT, "INPUT")
+                bundle = parse_checkpoint(raw_state)
+                # 规范化往返：重新规范化后的紧凑编码须与所给 state 逐字节
+                # 一致，强制所给 state 本身即规范化形态。
+                norm_state = export_bundle(bundle)
+                norm_bytes = json.dumps(
+                    norm_state, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                if norm_bytes != state_bytes:
+                    fail(EXIT_STATE, "STATE")
+                return cp_digest, norm_state, norm_bytes
+
+            base_digest, base_state, _ = validate_cp(raw_base)
+            target_digest, target_state, target_bytes = validate_cp(raw_target)
+
+            # 两份检查点通过后按 se 规则取得当前规范化内存快照。
+            current_state = export_bundle(current_bundle())
+            try:
+                current_bytes = json.dumps(
+                    current_state, ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                current_envelope = json.dumps(
+                    {"version": CHECKPOINT_VERSION, "state": current_state},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+            except UnicodeEncodeError:
+                fail(EXIT_INPUT, "INPUT")
+            if len(current_bytes) > CHECKPOINT_LIMIT:
+                fail(EXIT_OVERLOAD, "OVERLOAD")
+            current_digest = hashlib.sha256(current_envelope).hexdigest()
+
+            # changes：按 state 顶层键序列出三份状态不全相同的段；三份完全
+            # 相同时为空。即使当前与候选整体相同（SAME），基线独异的段仍以
+            # kind=SAME 列出。
+            changes = []
+            conflict_sections = set()
+            for section in current_state:
+                cur_value = current_state[section]
+                base_value = base_state[section]
+                tgt_value = target_state[section]
+                if cur_value == base_value:
+                    if base_value == tgt_value:
+                        # 三份完全相同：不列。
+                        continue
+                    # 当前等于基线而候选不同：候选单方面变更。
+                    kind = "TARGET"
+                elif tgt_value == base_value:
+                    # 候选等于基线而当前不同：当前相对基线变化。
+                    kind = "CURRENT"
+                elif cur_value == tgt_value:
+                    # 当前等于候选而基线不同。
+                    kind = "SAME"
+                else:
+                    kind = "CONFLICT"
+                    conflict_sections.add(section)
+                changes.append(
+                    {
+                        "section": section,
+                        "base": section_digest(base_value),
+                        "current": section_digest(cur_value),
+                        "target": section_digest(tgt_value),
+                        "kind": kind,
+                    }
+                )
+
+            # status：当前与候选规范化 state 逐字节相同为 SAME；否则有冲突
+            # 段为 CONFLICT；其余为 CLEAN。
+            if current_bytes == target_bytes:
+                status = "SAME"
+            elif conflict_sections:
+                status = "CONFLICT"
+            else:
+                status = "CLEAN"
+
+            # 段分类计数（仅统计三份不全相同的段，即 changes）；四类之和等
+            # 于 changed。
+            kind_counts = {"TARGET": 0, "CURRENT": 0, "SAME": 0,
+                           "CONFLICT": 0}
+            for change in changes:
+                kind_counts[change["kind"]] += 1
+
+            results.append(
+                {
+                    "op": "sx",
+                    "current": current_digest,
+                    "base": base_digest,
+                    "target": target_digest,
+                    "status": status,
+                    "changes": changes,
+                    "summary": {
+                        "sections": len(current_state),
+                        "changed": len(changes),
+                        "target": kind_counts["TARGET"],
+                        "current": kind_counts["CURRENT"],
+                        "same": kind_counts["SAME"],
+                        "conflict": kind_counts["CONFLICT"],
+                    },
+                }
             )
 
         else:  # get
