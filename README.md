@@ -201,6 +201,20 @@
   - 清理使排空 D 状态后端失去最后连接时，沿用 `close` 规则转为 X 且 `end=now`；不扣减令牌或配额，也不触发排队接纳。
 - 字段、键序、编码、类型、范围、`before` 关系或时钟倒退报 INPUT/2，未知后端报 BACKEND/3，未配置端点报 STATE/4，并按此顺序判定；失败无 stdout 且整批回滚（含同批此前变化与逻辑时钟）。两项操作时间为 O(C)、额外空间不超过 O(C)（C 为活动连接数）；`ep`、`fw`、配置、检查点、run、record、replay 及既有固定键序 JSON 行为不变，仅用标准库。
 
+## 全池端点轮换盘点与批量清理：er / ex
+
+在单后端 `eq`/`ec` 之外提供确定性的全池端点轮换盘点与批量执行；既有 `ep`、`fw`、`eq`、`ec` 语义与结果不变。
+
+- `er`：精确键序 `op,now`（键须按此序出现）。`now` 为 0..10⁹ 的非 bool 整数，进入全局非递减显式时钟（倒退报 INPUT/2）。除推进时钟外为只读，不改变任何状态。
+  - 返回固定键序 `op,now,items,summary`；`items` 按后端加入顺序列出已通过 `ep` 登记当前端点的后端，未登记端点的后端（即使存在连接）不列入。每项固定键序 `id,current,total,fresh,stale,connections`；`current` 固定键序 `host,port`，`total`/`fresh`/`stale` 口径同 `eq`（无快照连接算 stale）。
+  - `connections` 沿用 `eq` items 的 `cid,host,port,opened,age` 口径，只列该后端 stale 连接并按全局建连顺序排列；无快照连接 `host`/`port` 为 null，`age=now-opened`。
+  - `summary` 固定键序 `backends,total,fresh,stale`：`backends` 为列出的后端数，其余三项为跨列出后端的连接计数之和。空池或没有已登记端点的后端时 `items=[]` 且四项汇总全为 0，不报错。
+- `ex`：精确键序 `op,before,now`（键须按此序出现）。`before` 与 `now` 均为 0..10⁹ 的非 bool 整数且 `before≤now`，`now` 进入全局非递减显式时钟（倒退报 INPUT/2）。
+  - 处理集合为已登记当前端点的后端；按全局建连顺序关闭其中快照不同于当前端点且 `opened≤before` 的活动连接，删除连接与快照、逐条递减并发。`opened==before` 关闭，fresh 连接（快照与当前端点相同）永不关闭；未登记端点后端的连接（含无快照连接）不在处理集合内。
+  - 返回固定键序 `op,now,items,closed`；`items` 按后端加入顺序仅列本次有关闭项的后端，每项固定键序 `id,cids`，`cids` 保持全局关闭次序，`closed` 为总关闭数。无符合项时为成功的确定性空操作：`items=[]`、`closed=0`；同参或更大 `now` 重复执行不影响其他连接。
+  - 清理使排空 D 状态后端失去最后连接时沿用 `ec`/`close` 规则转 X 且 `end=now`，不改变 `forced`；不扣减令牌或配额、不消费等待队列，也不触发重新调度。
+- 字段集合、键序、数值类型、范围、`before` 关系或时钟倒退统一返回 INPUT/2，失败无 stdout，并原子回滚同批此前变化与逻辑时钟。两项操作单次时间与额外空间上界均为 O(B+C)（B 为后端数、C 为活动连接数）；`run`、`record`、`replay` 逐字节一致，`se` 导出后 `si` 恢复继续执行与直接继续一致。仅使用 Python 标准库，紧凑 UTF-8 固定键序 JSON、单末尾换行契约不变。
+
 ## 测试
 
     python -m unittest discover

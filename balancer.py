@@ -2471,6 +2471,7 @@ def parse_op(raw_op):
         "ts", "tm", "te", "tk", "tg", "tx",
         "ep", "fw",
         "eq", "ec",
+        "er", "ex",
         "ru",
         "ua",
         "mu",
@@ -4154,6 +4155,25 @@ def parse_op(raw_op):
         if before > now:
             fail(EXIT_INPUT, "INPUT")
         return ("ec", parse_backend_id(raw_op["id"]), before, now)
+
+    if name == "er":
+        # 全池端点轮换盘点：精确键序 op,now（键须按此序出现）；now 为
+        # 0..10^9 非 bool 整数并进入共用非递减时钟；除推进时钟外只读。
+        if list(raw_op) != ["op", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("er", parse_metric_num(raw_op["now"]))
+
+    if name == "ex":
+        # 全池端点轮换批量清理：精确键序 op,before,now（键须按此序出现）；
+        # before/now 均为 0..10^9 非 bool 整数且 before<=now，now 进入共用
+        # 非递减时钟。
+        if list(raw_op) != ["op", "before", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        before = parse_metric_num(raw_op["before"])
+        now = parse_metric_num(raw_op["now"])
+        if before > now:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ex", before, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -7996,6 +8016,7 @@ def run(raw):
             "mu",
             "cp", "cq", "ca", "ca_cond", "cx", "cy",
             "eq", "ec",
+            "er", "ex",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -13209,6 +13230,132 @@ def run(raw):
                     "now": now,
                     "closed": len(closed_cids),
                     "cids": closed_cids,
+                }
+            )
+
+        elif op[0] == "er":
+            # 全池端点轮换盘点（只读）：除推进时钟（已在循环开头完成）外不
+            # 改任何运行态。items 按后端加入顺序列出已通过 ep 登记当前端
+            # 点的后端；每后端的 connections 沿用 eq 口径，仅列 stale（快
+            # 照不同于当前端点，含无快照）连接并按全局建连顺序（dict 保
+            # 序）排列，无快照项 host/port 为 null，age=now-opened。先单
+            # 遍扫描连接按后端聚合计数与 stale 明细（O(C)），再按加入序
+            # 遍历后端（O(B)）输出，汇总跨后端计数。O(B+C)、O(B+C)。
+            _, now = op
+            # backend_id -> [total, fresh, stale_items]
+            per_backend = {}
+            for cid, connection in connections.items():
+                backend_id = connection[0]
+                record = backends[backend_id]
+                endpoint = record["endpoint"]
+                if endpoint is None:
+                    # 未登记端点的后端不计入盘点。
+                    continue
+                entry = per_backend.get(backend_id)
+                if entry is None:
+                    entry = [0, 0, []]
+                    per_backend[backend_id] = entry
+                entry[0] += 1
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == endpoint:
+                    entry[1] += 1
+                    continue
+                opened = connection[2]
+                entry[2].append(
+                    {
+                        "cid": cid,
+                        "host": None if snapshot is None else snapshot[0],
+                        "port": None if snapshot is None else snapshot[1],
+                        "opened": opened,
+                        "age": now - opened,
+                    }
+                )
+            items = []
+            sum_total = 0
+            sum_fresh = 0
+            for backend_id, record in backends.items():
+                endpoint = record["endpoint"]
+                if endpoint is None:
+                    continue
+                total, fresh, stale_items = per_backend.get(
+                    backend_id, (0, 0, [])
+                )
+                stale = total - fresh
+                items.append(
+                    {
+                        "id": backend_id,
+                        "current": {"host": endpoint[0], "port": endpoint[1]},
+                        "total": total,
+                        "fresh": fresh,
+                        "stale": stale,
+                        "connections": stale_items,
+                    }
+                )
+                sum_total += total
+                sum_fresh += fresh
+            results.append(
+                {
+                    "op": "er",
+                    "now": now,
+                    "items": items,
+                    "summary": {
+                        "backends": len(items),
+                        "total": sum_total,
+                        "fresh": sum_fresh,
+                        "stale": sum_total - sum_fresh,
+                    },
+                }
+            )
+
+        elif op[0] == "ex":
+            # 全池端点轮换批量清理：处理集合为已通过 ep 登记当前端点的后
+            # 端；按全局建连顺序单遍扫描，仅关闭快照不同于当前端点且
+            # opened<=before 的活动连接，删除连接及快照、逐条递减并发；
+            # cids 按全局关闭次序分组，items 仅列本次有关闭项的后端且按
+            # 后端加入顺序排列。不消费等待队列、令牌或配额，也不触发重新
+            # 调度。沿用 ec：排空 D 后端失去最后连接时转 X、end=now，不改
+            # forced。无符合项为成功的确定性空操作；处理无失败路径，天然
+            # 原子。O(B+C)、O(B+C)。
+            _, before, now = op
+            eligible = {
+                backend_id
+                for backend_id, record in backends.items()
+                if record["endpoint"] is not None
+            }
+            # backend_id -> 本次关闭 cids（保持全局建连顺序）
+            closed_groups = {}
+            for cid, connection in list(connections.items()):
+                backend_id = connection[0]
+                if backend_id not in eligible:
+                    continue
+                record = backends[backend_id]
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == record["endpoint"] or connection[2] > before:
+                    continue
+                del connections[cid]
+                conn_endpoints.pop(cid, None)
+                record["conns"] -= 1
+                closed_groups.setdefault(backend_id, []).append(cid)
+            items = []
+            closed_total = 0
+            for backend_id, record in backends.items():
+                cids = closed_groups.get(backend_id)
+                if not cids:
+                    continue
+                drain = record["drain"]
+                if drain["state"] == "D" and record["conns"] == 0:
+                    # 沿用 ec/close：排空中最后连接被清理即转 X，end 取本
+                    # 次 now；forced 维持原值不变。
+                    drain["state"] = "X"
+                    drain["end"] = now
+                items.append({"id": backend_id, "cids": cids})
+                closed_total += len(cids)
+            results.append(
+                {
+                    "op": "ex",
+                    "now": now,
+                    "items": items,
+                    "closed": closed_total,
                 }
             )
 
