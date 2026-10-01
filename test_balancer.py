@@ -5627,6 +5627,466 @@ class V11LifetimeHotReloadTest(unittest.TestCase):
         self.assertIn(b'"lifetime":{"ttl":5}', run_stdout)
 
 
+class ReservationCancelTest(unittest.TestCase):
+    """配置预约条件取消 cx：成功删除、空操作幂等、条件不匹配 STATE、
+    INPUT 校验、时钟、副作用边界、检查点与 record/replay。
+
+    每次 run_balancer 都是全新进程，故需要预约的批次都自带 cp；规范化
+    v11 配置的摘要确定，digest_of(config) 即 cp 返回的 digest。"""
+
+    FLOW = ["s", 1, "t", 2, "tcp"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def cp(self, config, at, now):
+        return {"op": "cp", "config": config, "at": at, "now": now}
+
+    def cx(self, digest, at, now):
+        return {"op": "cx", "digest": digest, "at": at, "now": now}
+
+    # ---- 成功取消与输出形状 ----
+
+    def test_cancel_matching_reservation(self):
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        results = self.run_ops([
+            self.cp(cfg, 10, 1),
+            self.cx(digest, 10, 2),
+            {"op": "cq", "now": 3},
+        ])
+        self.assertEqual(
+            results[1],
+            {"op": "cx", "cancelled": True, "digest": digest, "at": 10},
+        )
+        self.assertEqual(list(results[1]),
+                         ["op", "cancelled", "digest", "at"])
+        self.assertEqual(results[2],
+                         {"op": "cq", "pending": False,
+                          "digest": None, "at": None})
+
+    def test_ca_is_state_after_cancel(self):
+        # 取消后同批 ca 按无预约返回 STATE/4（整批失败、无 stdout）。
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        self.assert_failure(
+            [self.cp(cfg, 10, 1), self.cx(digest, 10, 10),
+             {"op": "ca", "now": 10}],
+            4, "STATE",
+        )
+
+    def test_cancel_output_is_single_line_compact_json(self):
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        code, out, err = run_balancer(
+            "run", encode_ops([self.cp(cfg, 10, 1), self.cx(digest, 10, 2)])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out.count(b"\n"), 1)
+        self.assertIn(
+            b'{"op":"cx","cancelled":true,"digest":"%s","at":10}'
+            % digest.encode("ascii"),
+            out,
+        )
+
+    # ---- 无预约幂等空操作 ----
+
+    def test_no_reservation_is_idempotent_noop(self):
+        digest = digest_of(config_v11(1))
+        results = self.run_ops([self.cx(digest, 10, 0)])
+        self.assertEqual(
+            results[0],
+            {"op": "cx", "cancelled": False, "digest": digest, "at": 10},
+        )
+        self.assertEqual(list(results[0]),
+                         ["op", "cancelled", "digest", "at"])
+
+    def test_repeat_cancel_after_success_is_noop(self):
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        results = self.run_ops([
+            self.cp(cfg, 10, 1),
+            self.cx(digest, 10, 2),
+            self.cx(digest, 10, 3),
+        ])
+        self.assertTrue(results[1]["cancelled"])
+        self.assertFalse(results[2]["cancelled"])
+        # 空操作同样回显请求 digest、at。
+        self.assertEqual(results[2]["digest"], digest)
+        self.assertEqual(results[2]["at"], 10)
+
+    def test_noop_creates_no_revision_or_audit(self):
+        digest = digest_of(config_v11(1))
+        results = self.run_ops([
+            self.cx(digest, 10, 0),
+            {"op": "cl"}, {"op": "al"},
+        ])
+        self.assertIsNone(results[1]["current"])
+        self.assertEqual(results[1]["commits"], [])
+        self.assertEqual(results[2]["events"], [])
+
+    def test_cancel_creates_no_revision_or_audit(self):
+        cfg = config_v11(1, lifetime=5)
+        pending = config_v11(1, lifetime=9)
+        digest = digest_of(pending)
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            self.cp(pending, 10, 1),
+            self.cx(digest, 10, 2),
+            {"op": "cl"}, {"op": "al"}, {"op": "ct"}, {"op": "ce"},
+        ])
+        # 取消不建 rev：current 仍为 1，审计仅 ci 一条，当前配置不变。
+        self.assertEqual(results[3]["current"], 1)
+        self.assertEqual(len(results[3]["commits"]), 1)
+        self.assertEqual(len(results[4]["events"]), 1)
+        self.assertEqual(results[4]["events"][0]["kind"], "ci")
+        self.assertEqual(results[5]["digest"], digest_of(cfg))
+        self.assertEqual(results[6]["config"], cfg)
+
+    # ---- 条件不匹配（STATE/4，保留预约）----
+
+    def test_digest_mismatch_is_state_and_keeps_reservation(self):
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        # 同批不匹配：STATE、无 stdout，cq 不产生输出。
+        self.assert_failure(
+            [self.cp(cfg, 10, 1), self.cx("f" * 64, 10, 2),
+             {"op": "cq", "now": 3}],
+            4, "STATE",
+        )
+        # 保留性跨进程观察：把带预约状态导出，失败的 cx 不改检查点状态，
+        # 再用同一检查点起一批，正确条件仍可取消、随后 cq pending=false。
+        cp = self.checkpoint(self.export([self.cp(cfg, 10, 1)]))
+        self.assert_failure([cp, self.cx("f" * 64, 10, 2)], 4, "STATE")
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([cp, self.cx(digest, 10, 2),
+                        {"op": "cq", "now": 3}]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        self.assertTrue(results[1]["cancelled"])
+        self.assertFalse(results[2]["pending"])
+
+    def test_at_mismatch_is_state_and_keeps_reservation(self):
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        self.assert_failure(
+            [self.cp(cfg, 10, 1), self.cx(digest, 11, 2)], 4, "STATE",
+        )
+        cp = self.checkpoint(self.export([self.cp(cfg, 10, 1)]))
+        self.assert_failure([cp, self.cx(digest, 11, 2)], 4, "STATE")
+        code, out, err = run_balancer(
+            "run", encode_ops([cp, self.cx(digest, 10, 2)])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertTrue(json.loads(out)["results"][1]["cancelled"])
+
+    def test_mismatched_cancel_does_not_block_later_ca(self):
+        # 经检查点持久化预约：不匹配的 cx 失败后预约仍保留，到点 ca 在
+        # 恢复同一状态的新进程中照常生效。
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        cp = self.checkpoint(self.export([self.cp(cfg, 10, 1)]))
+        self.assert_failure([cp, self.cx("9" * 64, 10, 2)], 4, "STATE")
+        code, out, err = run_balancer(
+            "run", encode_ops([cp, {"op": "ca", "now": 10}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        ca_result = json.loads(out)["results"][1]
+        self.assertEqual(
+            ca_result, {"op": "ca", "digest": digest, "rev": 1, "ok": True}
+        )
+
+    # ---- INPUT 校验（先于预约匹配）----
+
+    def test_input_shapes_are_input(self):
+        digest = digest_of(config_v11(1))
+        bad_ops = [
+            {"op": "cx", "digest": digest, "at": 10},  # 缺 now
+            {"op": "cx", "at": 10, "now": 1},          # 缺 digest
+            {"op": "cx", "digest": digest,
+             "at": 10, "now": 1, "x": 0},              # 多键
+            {"op": "cx", "at": 10,
+             "digest": digest, "now": 1},              # 乱序
+            {"op": "cx", "digest": digest,
+             "now": 1, "at": 10},                      # 乱序
+        ]
+        for bad in bad_ops:
+            with self.subTest(bad=bad):
+                self.assert_failure([bad], 2, "INPUT")
+        # JSON 层重复键同样判 INPUT（无法用 dict 字面量表达，走原始字节）。
+        code, out, err = run_balancer(
+            "run",
+            b'{"ops":[{"op":"cx","digest":"' + digest.encode()
+            + b'","at":10,"at":11,"now":1}]}',
+        )
+        self.assertEqual((code, out), (2, b""))
+        self.assertEqual(err, b'{"error":"INPUT"}\n')
+
+    def test_input_fields_are_input(self):
+        digest = digest_of(config_v11(1))
+        bad_values = [
+            ("digest", "ABCDEF" + "0" * 58),
+            ("digest", "0" * 63),
+            ("digest", "0" * 65),
+            ("digest", 123),
+            ("digest", None),
+            ("digest", True),
+            ("at", -1),
+            ("at", 10 ** 9 + 1),
+            ("at", True),
+            ("at", False),
+            ("at", 1.0),
+            ("at", "10"),
+            ("at", None),
+            ("now", -1),
+            ("now", 10 ** 9 + 1),
+            ("now", True),
+            ("now", 1.0),
+            ("now", None),
+        ]
+        for field, value in bad_values:
+            raw = {"op": "cx", "digest": digest, "at": 10, "now": 1}
+            raw[field] = value
+            with self.subTest(field=field, value=value):
+                self.assert_failure([raw], 2, "INPUT")
+
+    def test_boundary_values_accepted(self):
+        digest = digest_of(config_v11(1))
+        # at=0 / at=10^9、now=0 / now=10^9 均合法；at 仅匹配、不约束 now。
+        results = self.run_ops([
+            self.cx(digest, 0, 0),
+            self.cx(digest, 10 ** 9, 10 ** 9),
+        ])
+        self.assertEqual([r["cancelled"] for r in results], [False, False])
+
+    def test_input_precedes_reservation_match(self):
+        # 存在预约且 digest 不匹配（本应 STATE），但字段非法或时钟倒退时
+        # 一律先判 INPUT；INPUT 判定先于预约匹配。
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        self.assert_failure(
+            [self.cp(cfg, 10, 1),
+             {"op": "cx", "digest": "z" * 64, "at": 10, "now": 2}],
+            2, "INPUT",
+        )
+        self.assert_failure(
+            [self.cp(cfg, 10, 5), self.cx(digest, 10, 4)],
+            2, "INPUT",
+        )
+        # at 为 bool 时即使恰有同摘要预约也判 INPUT 而非 STATE。
+        self.assert_failure(
+            [self.cp(cfg, 10, 1),
+             {"op": "cx", "digest": digest, "at": True, "now": 2}],
+            2, "INPUT",
+        )
+
+    # ---- 时钟 ----
+
+    def test_now_advances_clock_even_on_noop(self):
+        digest = digest_of(config_v11(1))
+        # 空操作也推进时钟：其后 now=4 相对 now=5 倒退报 INPUT。
+        self.assert_failure(
+            [self.cx(digest, 10, 5), {"op": "cq", "now": 4}],
+            2, "INPUT",
+        )
+        # 同刻重报合法。
+        results = self.run_ops([
+            self.cx(digest, 10, 5), {"op": "cq", "now": 5},
+        ])
+        self.assertFalse(results[0]["cancelled"])
+
+    def test_at_does_not_advance_clock(self):
+        # at 仅匹配：at=100 不推动时钟，紧接 now=3（>cx.now=2）合法。
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        results = self.run_ops([
+            self.cp(cfg, 100, 1),
+            self.cx(digest, 100, 2),
+            {"op": "cq", "now": 3},
+        ])
+        self.assertTrue(results[1]["cancelled"])
+        self.assertFalse(results[2]["pending"])
+
+    # ---- 与其他清预约操作的关系 ----
+
+    def test_cp_after_cancel_stores_new_reservation(self):
+        first = config_v11(1, lifetime=5)
+        second = config_v11(1, lifetime=9)
+        d1, d2 = digest_of(first), digest_of(second)
+        results = self.run_ops([
+            self.cp(first, 10, 1),
+            self.cx(d1, 10, 2),
+            self.cp(second, 20, 3),
+            {"op": "cq", "now": 4},
+        ])
+        self.assertTrue(results[1]["cancelled"])
+        self.assertEqual(results[2]["digest"], d2)
+        self.assertEqual(results[3],
+                         {"op": "cq", "pending": True,
+                          "digest": d2, "at": 20})
+
+    def test_cx_after_ci_cb_cu_ca_is_noop(self):
+        # ci/cb/cu/ca 成功已清预约后，同一 cx 请求按无预约处理。
+        base = config_v11(1)
+        target = config_v11(1, lifetime=7)
+        base_d, target_d = digest_of(base), digest_of(target)
+        # ci 清预约。
+        results = self.run_ops([
+            self.cp(target, 10, 0),
+            {"op": "ci", "config": base, "now": 1},
+            self.cx(target_d, 10, 2),
+        ])
+        self.assertFalse(results[2]["cancelled"])
+        # ca 生效后清预约。
+        results = self.run_ops([
+            self.cp(target, 10, 0),
+            {"op": "ca", "now": 10},
+            self.cx(target_d, 10, 11),
+        ])
+        self.assertFalse(results[2]["cancelled"])
+        # cb 回滚后清预约。
+        results = self.run_ops([
+            {"op": "ci", "config": base, "now": 0},
+            self.cp(target, 10, 1),
+            {"op": "cb", "rev": 1, "now": 2},
+            self.cx(target_d, 10, 3),
+        ])
+        self.assertFalse(results[3]["cancelled"])
+        # cu 热加载后清预约。
+        results = self.run_ops([
+            {"op": "ci", "config": base, "now": 0},
+            self.cp(target, 10, 1),
+            {"op": "cu", "base": base_d, "section": "lifetime",
+             "value": {"ttl": 7}, "now": 2},
+            self.cx(target_d, 10, 3),
+        ])
+        self.assertFalse(results[3]["cancelled"])
+
+    def test_cancel_does_not_affect_connections_or_backends(self):
+        cfg = config_v11(1)
+        pending = config_v11(1, lifetime=5)
+        pending_d = digest_of(pending)
+        results = self.run_ops([
+            {"op": "ci", "config": cfg, "now": 0},
+            {"op": "open", "cid": "c", "flow": self.FLOW, "now": 1},
+            self.cp(pending, 10, 2),
+            self.cx(pending_d, 10, 3),
+            {"op": "get", "cid": "c"},
+        ])
+        # 取消不踢连接（cx 不像 ci/ca 那样受活动连接限制）。
+        self.assertTrue(results[3]["cancelled"])
+        self.assertEqual(results[4]["cid"], "c")
+        self.assertEqual(results[4]["backend"], "a")
+
+    # ---- 失败批回滚 ----
+
+    def test_failed_cancel_batch_has_no_stdout(self):
+        cfg = config_v11(1)
+        self.assert_failure(
+            [self.cp(cfg, 10, 1), self.cx("e" * 64, 10, 2),
+             {"op": "cq", "now": 3}],
+            4, "STATE",
+        )
+
+    # ---- 检查点 se/si ----
+
+    def export(self, ops):
+        code, out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "se"}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def checkpoint(self, result):
+        return {"op": "si", "version": result["version"],
+                "digest": result["digest"], "state": result["state"]}
+
+    def test_se_exports_null_after_cancel(self):
+        cfg = config_v11(1, lifetime=5)
+        reserved = self.export([self.cp(cfg, 10, 1)])
+        # 带预约的导出含固定键序 at,digest,config。
+        self.assertIsNotNone(reserved["state"]["reservation"])
+        self.assertEqual(
+            list(reserved["state"]["reservation"]),
+            ["at", "digest", "config"],
+        )
+        self.assertEqual(reserved["state"]["reservation"]["at"], 10)
+        # 取消后导出 reservation 为 null。
+        digest = reserved["state"]["reservation"]["digest"]
+        cancelled = self.export([
+            self.cp(cfg, 10, 1),
+            self.cx(digest, 10, 2),
+        ])
+        self.assertIsNone(cancelled["state"]["reservation"])
+
+    def test_si_restore_then_cancel_matches_direct_continuation(self):
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        cp = self.checkpoint(self.export([self.cp(cfg, 10, 1)]))
+        cont = [self.cx(digest, 10, 2), {"op": "cq", "now": 3}]
+        # 直接继续（自有 cp 建立预约）。
+        direct_code, direct_out, direct_err = run_balancer(
+            "run", encode_ops([self.cp(cfg, 10, 1)] + cont)
+        )
+        # 导出后在空实例恢复再继续。
+        restored_code, restored_out, restored_err = run_balancer(
+            "run", encode_ops([cp] + cont)
+        )
+        self.assertEqual((restored_code, restored_err),
+                         (direct_code, direct_err))
+        direct_results = json.loads(direct_out)["results"]
+        restored_results = json.loads(restored_out)["results"]
+        # 恢复批次首项为 si 结果；自 cx 起与直接继续逐值一致。
+        self.assertEqual(restored_results[1:], direct_results[1:])
+
+    def test_si_restore_canceled_state_cx_is_noop(self):
+        cfg = config_v11(1)
+        digest = digest_of(cfg)
+        cp = self.checkpoint(self.export([
+            self.cp(cfg, 10, 1),
+            self.cx(digest, 10, 2),
+        ]))
+        code, out, err = run_balancer(
+            "run", encode_ops([cp, self.cx(digest, 10, 3)])
+        )
+        self.assertEqual((code, err), (0, b""))
+        cx_result = json.loads(out)["results"][1]
+        self.assertFalse(cx_result["cancelled"])
+
+    # ---- record/replay ----
+
+    def test_record_replay_success_noop_failure(self):
+        cfg = config_v11(1, lifetime=5)
+        digest = digest_of(cfg)
+        for ops, code_expected in (
+            ([self.cp(cfg, 10, 1), self.cx(digest, 10, 2)], 0),
+            ([self.cx(digest, 10, 0)], 0),
+            ([self.cp(cfg, 10, 1), self.cx("a" * 64, 10, 2)], 4),
+            ([self.cx("g" * 64, 10, True)], 2),
+        ):
+            raw = encode_ops(ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual((run_code, rec_code, rec_err),
+                             (code_expected, 0, b""))
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual((rep_code, rep_out, rep_err),
+                             (run_code, run_out, run_err))
+
+
 class V7FaultNormalizationTest(unittest.TestCase):
     """v7 faults 规范化：乱序提交按 a 升序输出，重叠判定不变。"""
 
