@@ -17707,5 +17707,427 @@ class SxThreeWayPreviewTest(unittest.TestCase):
                          (2, bad_out, bad_err))
 
 
+class SmCheckpointMergeTest(unittest.TestCase):
+    """检查点三方合并 sm：按顶层段三方合并并原子安装、冲突拒绝、组合状态
+    校验、幂等（目标变化已存在/目标未改变）、base/target/current 校验顺
+    序、8MiB、不推进时钟、整批回滚、紧凑逐字节输出及 record/replay 契约。"""
+
+    SETUP = CheckpointTest.SETUP
+    CONFIG = CheckpointTest.CONFIG
+
+    def run_ops(self, ops):
+        return run_balancer("run", encode_ops(ops))
+
+    def export(self, ops):
+        code, out, err = self.run_ops(ops + [{"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def cp_obj(self, result):
+        return {"version": result["version"], "digest": result["digest"],
+                "state": result["state"]}
+
+    def cp_from_state(self, state):
+        envelope = json.dumps(
+            {"version": 1, "state": state}, ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")
+        return {"version": 1, "digest": hashlib.sha256(envelope).hexdigest(),
+                "state": state}
+
+    def sm(self, prefix, base_cp, target_cp):
+        return self.run_ops(
+            prefix + [{"op": "sm", "base": base_cp, "target": target_cp}])
+
+    def clone(self, value):
+        return json.loads(json.dumps(value))
+
+    def setUp(self):
+        # E 空状态；A 单后端 b1；B b1+b2；B3 为 b1+b2(weight=3)，与 B 在
+        # backends 段两两不同；N5 在 A 基础上把时钟推进到 5。
+        self.e = self.export([])
+        self.a = self.export([{"op": "add", "id": "b1", "weight": 1}])
+        self.b = self.export([
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 2},
+        ])
+        self.b3 = self.export([
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 3},
+        ])
+        self.prefix_a = [{"op": "add", "id": "b1", "weight": 1}]
+        self.prefix_b = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 2},
+        ]
+        self.prefix_b3 = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 3},
+        ]
+
+    # —— 成功合并与响应形状 ——
+
+    def test_clean_merge_installs_target(self):
+        # 当前=基线=A，目标=B：target 相对 base 的 backends 变化合入。
+        code, out, err = self.sm(self.prefix_a, self.cp_obj(self.a),
+                                 self.cp_obj(self.b))
+        self.assertEqual((code, err), (0, b""))
+        result = json.loads(out)["results"][-1]
+        self.assertEqual(list(result),
+                         ["op", "before", "after", "changed", "sections",
+                          "ok"])
+        self.assertEqual(result["op"], "sm")
+        self.assertEqual(result["before"], self.a["digest"])
+        self.assertEqual(result["after"], self.b["digest"])
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(result["sections"], ["backends"])
+        self.assertIs(result["ok"], True)
+        # 安装后 se 逐值复现 B。
+        installed = self.export(
+            self.prefix_a
+            + [{"op": "sm", "base": self.cp_obj(self.a),
+                "target": self.cp_obj(self.b)}])
+        self.assertEqual(installed["digest"], self.b["digest"])
+        self.assertEqual(installed["state"], self.b["state"])
+
+    def test_before_equals_preceding_se_and_after_equals_following_se(self):
+        ops = self.prefix_a + [
+            {"op": "se"},
+            {"op": "sm", "base": self.cp_obj(self.a),
+             "target": self.cp_obj(self.b)},
+            {"op": "se"},
+        ]
+        code, out, err = self.run_ops(ops)
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        # results[0] 为 add；se、sm、se 依次为 1、2、3。
+        self.assertEqual(results[2]["before"], results[1]["digest"])
+        self.assertEqual(results[2]["after"], results[3]["digest"])
+
+    def test_multi_section_merge_follows_top_level_order(self):
+        # 基线=当前=E，目标同时改 vnodes 与 backends：sections 按顶层键序
+        # （vnodes 在 backends 之前）。
+        tgt_st = self.clone(self.e["state"])
+        tgt_st["vnodes"] = 7
+        tgt_st["backends"] = self.clone(self.a["state"]["backends"])
+        target = self.cp_from_state(tgt_st)
+        top_order = list(self.e["state"])
+        expected = [s for s in top_order
+                    if s in ("vnodes", "backends")]
+        code, out, err = self.sm([], self.cp_obj(self.e), target)
+        self.assertEqual((code, err), (0, b""))
+        result = json.loads(out)["results"][-1]
+        self.assertEqual(result["sections"], expected)
+        self.assertEqual(result["changed"], 2)
+        self.assertEqual(result["after"], target["digest"])
+
+    def test_current_only_changes_are_preserved(self):
+        # 目标未改的段（now）保留 current；目标改的段（vnodes）采用 target。
+        base_st = self.clone(self.e["state"])
+        cur_st = self.clone(self.e["state"])
+        cur_st["now"] = 5
+        tgt_st = self.clone(self.e["state"])
+        tgt_st["vnodes"] = 7
+        expect_st = self.clone(cur_st)
+        expect_st["vnodes"] = 7
+        ops = [
+            {"op": "si", "version": 1,
+             "digest": self.cp_from_state(cur_st)["digest"],
+             "state": cur_st},
+            {"op": "sm", "base": self.cp_from_state(base_st),
+             "target": self.cp_from_state(tgt_st)},
+        ]
+        code, out, err = self.run_ops(ops)
+        self.assertEqual((code, err), (0, b""))
+        result = json.loads(out)["results"][-1]
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(result["sections"], ["vnodes"])
+        self.assertEqual(result["after"],
+                         self.cp_from_state(expect_st)["digest"])
+
+    # —— 幂等 ——
+
+    def test_idempotent_target_change_already_present(self):
+        # 当前=目标=B、基线=A：目标变化已在当前，after==当前，changed=0。
+        code, out, err = self.sm(self.prefix_b, self.cp_obj(self.a),
+                                 self.cp_obj(self.b))
+        self.assertEqual((code, err), (0, b""))
+        result = json.loads(out)["results"][-1]
+        self.assertEqual(result["before"], self.b["digest"])
+        self.assertEqual(result["after"], self.b["digest"])
+        self.assertEqual(result["changed"], 0)
+        self.assertEqual(result["sections"], [])
+        self.assertIs(result["ok"], True)
+
+    def test_idempotent_target_unchanged(self):
+        # 目标==基线==A 而当前=B：目标未改变，保留 current，changed=0。
+        code, out, err = self.sm(self.prefix_b, self.cp_obj(self.a),
+                                 self.cp_obj(self.a))
+        self.assertEqual((code, err), (0, b""))
+        result = json.loads(out)["results"][-1]
+        self.assertEqual(result["before"], self.b["digest"])
+        self.assertEqual(result["after"], self.b["digest"])
+        self.assertEqual(result["changed"], 0)
+        self.assertEqual(result["sections"], [])
+
+    def test_repeated_merge_byte_identical(self):
+        sm_op = {"op": "sm", "base": self.cp_obj(self.a),
+                 "target": self.cp_obj(self.b)}
+        code, out, err = self.run_ops(self.prefix_a + [sm_op, sm_op])
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        # 第二次为幂等重报：changed=0，但两次结果各自确定。
+        self.assertEqual(results[-2]["changed"], 1)
+        self.assertEqual(results[-1]["changed"], 0)
+        self.assertEqual(results[-2]["after"], results[-1]["after"])
+
+    # —— 冲突与组合状态非法 ——
+
+    def test_section_conflict_rejected_without_change(self):
+        # 基线=A，目标=B（b2/w2），当前=b2/w3：backends 三方两两不同 →
+        # STATE/4，无 stdout，运行态不变。
+        code, out, err = self.sm(self.prefix_b3, self.cp_obj(self.a),
+                                 self.cp_obj(self.b))
+        self.assertEqual((code, out, err),
+                         (4, b"", b'{"error":"STATE"}\n'))
+        # 同批后续 se 不产出（整批回滚）。
+        code, out, err = self.run_ops(self.prefix_b3 + [
+            {"op": "sm", "base": self.cp_obj(self.a),
+             "target": self.cp_obj(self.b)},
+            {"op": "se"},
+        ])
+        self.assertEqual((code, out), (4, b""))
+        # 另起一批：当前仍是 b2/w3。
+        self.assertEqual(self.export(self.prefix_b3)["digest"],
+                         self.b3["digest"])
+
+    def test_invalid_combined_dangling_reference_is_state(self):
+        # 组合本身可能悬空：目标仅在 buckets 段新增 B/b1 令牌桶（backends
+        # 沿用基线 A 的 b1），当前相对基线删除了 b1（=E）；各输入检查点
+        # 自身合法，合并无段冲突，但组合后 B 桶引用不存在的 b1 → STATE/4
+        # 且不安装。
+        tgt_st = self.clone(self.a["state"])
+        with_bucket = self.export([
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "ls", "scope": "B", "id": "b1", "r": 1, "b": 5,
+             "now": 0},
+        ])
+        tgt_st["buckets"] = self.clone(with_bucket["state"]["buckets"])
+        target = self.cp_from_state(tgt_st)
+        # 目标检查点自身合法。
+        code, out, err = self.run_ops([
+            {"op": "si", "version": 1, "digest": target["digest"],
+             "state": target["state"]},
+            {"op": "se"},
+        ])
+        self.assertEqual((code, err), (0, b""))
+        # 当前=E、基线=A：buckets 段采用 target，backends 段保留 current(E)。
+        code, out, err = self.sm([], self.cp_obj(self.a), target)
+        self.assertEqual((code, out, err),
+                         (4, b"", b'{"error":"STATE"}\n'))
+        self.assertEqual(self.export([])["digest"], self.e["digest"])
+
+    # —— INPUT：形状/键序/版本/摘要 ——
+
+    def test_input_shape_errors(self):
+        good = self.cp_obj(self.e)
+
+        def assert_input(ops):
+            code, out, err = self.run_ops(ops)
+            self.assertEqual((code, out, err),
+                             (2, b"", b'{"error":"INPUT"}\n'))
+
+        assert_input([{"op": "sm"}])
+        assert_input([{"op": "sm", "base": good}])
+        assert_input([{"op": "sm", "target": good, "base": good}])
+        # 不接受 now。
+        assert_input([{"op": "sm", "base": good, "target": good, "now": 1}])
+        # 检查点对象形状/键序/含 op/类型。
+        assert_input([{"op": "sm", "base": None, "target": good}])
+        assert_input([{"op": "sm", "target": good,
+                       "base": {"digest": self.e["digest"], "version": 1,
+                                "state": self.e["state"]}}])
+        assert_input([{"op": "sm", "target": good,
+                       "base": {"op": "se", "version": 1,
+                                "digest": self.e["digest"],
+                                "state": self.e["state"]}}])
+        assert_input([{"op": "sm", "target": good,
+                       "base": {"version": 2, "digest": "0" * 64,
+                                "state": {}}}])
+        assert_input([{"op": "sm", "target": good,
+                       "base": {"version": True, "digest": "0" * 64,
+                                "state": {}}}])
+        assert_input([{"op": "sm", "target": good,
+                       "base": {"version": 1, "digest": "0" * 63,
+                                "state": {}}}])
+        assert_input([{"op": "sm", "target": good,
+                       "base": {"version": 1,
+                                "digest": self.e["digest"].upper(),
+                                "state": self.e["state"]}}])
+        # base 合法而 target 形状非法仍报 INPUT。
+        assert_input([{"op": "sm", "base": good,
+                       "target": {"version": 2, "digest": "0" * 64,
+                                  "state": {}}}])
+
+    def test_digest_mismatch_is_input(self):
+        code, out, err = self.run_ops([
+            {"op": "sm",
+             "base": {"version": 1, "digest": "a" * 64,
+                      "state": self.e["state"]},
+             "target": self.cp_obj(self.b)}])
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+        code, out, err = self.run_ops([
+            {"op": "sm", "base": self.cp_obj(self.e),
+             "target": {"version": 1, "digest": "a" * 64,
+                        "state": self.b["state"]}}])
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+
+    # —— 错误顺序 base、target、current ——
+
+    def _contradiction_cp(self):
+        st = self.clone(self.a["state"])
+        st["backends"][0]["conns"] = 99
+        return self.cp_from_state(st)
+
+    def test_semantic_contradiction_is_state(self):
+        code, out, err = self.run_ops([
+            {"op": "sm", "base": self.cp_obj(self.e),
+             "target": self._contradiction_cp()}])
+        self.assertEqual((code, out, err),
+                         (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_base_error_precedes_target_error(self):
+        # base 语义 STATE（target 摘要不符本应 INPUT）：base 先判 → STATE。
+        code, out, err = self.run_ops([
+            {"op": "sm", "base": self._contradiction_cp(),
+             "target": {"version": 1, "digest": "0" * 64, "state": {}}}])
+        self.assertEqual((code, out, err),
+                         (4, b"", b'{"error":"STATE"}\n'))
+        # base 摘要不符（INPUT）先于 target 语义 STATE。
+        code, out, err = self.run_ops([
+            {"op": "sm",
+             "base": {"version": 1, "digest": "f" * 64,
+                      "state": self.e["state"]},
+             "target": self._contradiction_cp()}])
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_failure_rolls_back_whole_batch(self):
+        code, out, err = self.run_ops([
+            {"op": "add", "id": "ghost", "weight": 1},
+            {"op": "sm",
+             "base": {"version": 1, "digest": "f" * 64,
+                      "state": self.e["state"]},
+             "target": self.cp_obj(self.b)},
+            {"op": "se"},
+        ])
+        self.assertEqual((code, out), (2, b""))
+
+    # —— 时钟 ——
+
+    def test_does_not_advance_explicit_clock(self):
+        # 当前时钟为 5，目标仅改 vnodes（now 仍为 5）：合并后 now 不变，
+        # 紧接 now=5 的 probe 合法。
+        base_st = self.clone(self.a["state"])
+        base_st["now"] = 5
+        cur_st = self.clone(base_st)
+        tgt_st = self.clone(base_st)
+        tgt_st["vnodes"] = 7
+        ops = [
+            {"op": "si", "version": 1,
+             "digest": self.cp_from_state(cur_st)["digest"],
+             "state": cur_st},
+            {"op": "sm", "base": self.cp_from_state(base_st),
+             "target": self.cp_from_state(tgt_st)},
+            {"op": "probe", "id": "b1", "ok": True, "now": 5},
+        ]
+        code, out, err = self.run_ops(ops)
+        self.assertEqual((code, err), (0, b""))
+        merged = json.loads(out)["results"][-2]
+        self.assertEqual(merged["sections"], ["vnodes"])
+        # 合并后立即 se 的 now 仍为 5。
+        state = self.export(ops[:-1])["state"]
+        self.assertEqual(state["now"], 5)
+        self.assertEqual(state["vnodes"], 7)
+
+    # —— OVERLOAD ——
+
+    def _oversized_cp(self):
+        one = self.export([{"op": "add", "id": "x", "weight": 1}])
+        big = self.clone(one["state"])
+        template = self.clone(big["backends"][0])
+        big["backends"] += [
+            dict(template, id="z%07d" % i) for i in range(40000)]
+        return self.cp_from_state(big)
+
+    def test_overload_ordering(self):
+        good = self.cp_obj(self.e)
+        # base 超限（target 形状非法本应 INPUT）→ OVERLOAD 优先。
+        code, out, err = self.run_ops([
+            {"op": "sm", "base": self._oversized_cp(),
+             "target": {"version": 1, "digest": "0" * 64, "state": {}}}])
+        self.assertEqual((code, out, err),
+                         (7, b"", b'{"error":"OVERLOAD"}\n'))
+        # base 合法、target 超限。
+        code, out, err = self.run_ops([
+            {"op": "sm", "base": good, "target": self._oversized_cp()}])
+        self.assertEqual((code, out, err),
+                         (7, b"", b'{"error":"OVERLOAD"}\n'))
+        # 两份检查点合法但当前状态超限。
+        adds = [{"op": "add", "id": "b%07d" % i, "weight": 1}
+                for i in range(40000)]
+        code, out, err = self.sm(adds, good, good)
+        self.assertEqual((code, out, err),
+                         (7, b"", b'{"error":"OVERLOAD"}\n'))
+
+    # —— 紧凑逐字节输出 ——
+
+    def test_compact_output_single_newline(self):
+        code, out, err = self.sm(self.prefix_a, self.cp_obj(self.a),
+                                 self.cp_obj(self.b))
+        self.assertEqual((code, err), (0, b""))
+        self.assertTrue(out.endswith(b"\n") and not out.endswith(b"\n\n"))
+        self.assertEqual(
+            out,
+            json.dumps(json.loads(out), ensure_ascii=False,
+                       separators=(",", ":")).encode("utf-8") + b"\n")
+
+    # —— record / replay ——
+
+    def test_record_replay_success_idempotent_and_failure(self):
+        # 成功合并。
+        raw = encode_ops(self.prefix_a + [
+            {"op": "sm", "base": self.cp_obj(self.a),
+             "target": self.cp_obj(self.b)}])
+        code, direct, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, record, err = run_balancer("record", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(replayed, direct)
+        # 幂等结果（目标变化已存在）。
+        raw_idem = encode_ops(self.prefix_b + [
+            {"op": "sm", "base": self.cp_obj(self.a),
+             "target": self.cp_obj(self.b)}])
+        code, direct, err = run_balancer("run", raw_idem)
+        self.assertEqual((code, err), (0, b""))
+        code, record, err = run_balancer("record", raw_idem)
+        self.assertEqual((code, err), (0, b""))
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual((code, replayed, err), (0, direct, b""))
+        # 失败合并（段冲突 STATE/4）。
+        raw_bad = encode_ops(self.prefix_b3 + [
+            {"op": "sm", "base": self.cp_obj(self.a),
+             "target": self.cp_obj(self.b)}])
+        code, bad_out, bad_err = run_balancer("run", raw_bad)
+        self.assertEqual(code, 4)
+        code, rec, _ = run_balancer("record", raw_bad)
+        code, replayed, replayed_err = run_balancer("replay", rec)
+        self.assertEqual((code, replayed, replayed_err),
+                         (4, bad_out, bad_err))
+
+
 if __name__ == "__main__":
     unittest.main()

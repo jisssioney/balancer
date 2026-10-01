@@ -114,6 +114,17 @@
 - `summary` 固定键序 `sections,changed,target,current,same,conflict`，依次为顶层段总数、差异段数及四类 `kind` 计数，四类计数之和等于 `changed`。
 - 重复预演逐字节一致；run、record、replay 继续遵守紧凑 UTF-8 固定键序 JSON 与单末尾换行。时间与额外空间均为 O(N)，N 为三份规范化状态紧凑编码的总字节数，仅用标准库。
 
+## 检查点三方合并：sm
+
+调用方提交基线检查点与目标检查点，把目标相对基线的无冲突变化原子合入执行到该操作时的当前运行态。
+
+- `sm`：只接受按 `op,base,target` 排列的三个键（键须按此序出现），不接受 `now`，也不推进显式时钟。`base`、`target` 都沿用 `sx` 的 `version,digest,state` 检查点对象及规范化规则（version 仅收 1，digest 为小写 64 位十六进制）。
+- 校验顺序严格按 base、target、current：base 和 target 各自沿用 `si` 的 8MiB 上限、摘要匹配先于语义、完整结构/语义解析与规范化往返，及 INPUT/2、STATE/4、OVERLOAD/7 的错误优先级；两份检查点全部通过后再按 `se` 规则取当前规范化快照，当前 state 紧凑编码超过 8388608 字节报 OVERLOAD/7。失败无 stdout 并回滚同批此前变化。
+- 合并以 `se` 规范化 state 顶层段为最小单位，按其固定键序处理：某段 target 等于 base 时保留 current；target 不同于 base 且 current 等于 base 或 target 时采用 target；其余情况视为冲突。存在冲突即拒绝整次合并，不安装任何段（STATE/4）。
+- 没有冲突时把组合结果作为完整检查点再次校验：紧凑编码 8MiB 上限、悬空引用、重复标识、矛盾计数或跨段非法组合均拒绝且不改变状态（OVERLOAD/7 或 STATE/4），并以规范化往返兜底确定性；全部通过后才原子安装。
+- 成功返回固定键序 `op,before,after,changed,sections,ok`：`before`/`after` 为合并前后按 `se` 规则得到的摘要，`changed` 为实际改变的段数，`sections` 按顶层键序列出这些段名，`ok` 为 true。目标变化已经存在（current 等于 target）或目标未改变（target 等于 base）时幂等成功：`after` 等于当前摘要、`changed` 为 0、`sections` 为空数组。
+- 键集合、键序、类型、版本、摘要格式或摘要不符报 INPUT/2；输入状态语义非法、段冲突或组合状态非法报 STATE/4；任一受检或合并后状态超限报 OVERLOAD/7。失败不产生 stdout，并回滚同批此前变化。时间与额外空间上界 O(N+S)，N 是三份状态及合并结果规范化编码总字节数，S 是顶层段数；输出继续使用紧凑 UTF-8 固定键序 JSON 和单个末尾换行，run、record、replay 覆盖成功、幂等与失败结果，现有 se、sd、sx、si 及其他公开行为保持不变，仅用标准库。
+
 ## 测试
 
     python -m unittest discover
