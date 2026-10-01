@@ -2359,7 +2359,7 @@ def parse_op(raw_op):
         "ru",
         "ua",
         "mu",
-        "se", "sd", "si",
+        "se", "sd", "si", "sx",
     ):
         fail(EXIT_INPUT, "INPUT")
 
@@ -3964,6 +3964,37 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("sd", version, digest, raw_op["state"])
+
+    if name == "sx":
+        # 三方检查点预演：精确键序 op,base,target。base 与 target 均为不
+        # 含 op 的检查点对象（version,digest,state），各自按 si 规则在执行
+        # 期校验（8MiB、摘要匹配先于语义、完整语义解析与规范化往返）；
+        # 错误按 base、target、current 顺序判定。只读，不推进时钟、不改运
+        # 行态。
+        if list(raw_op) != ["op", "base", "target"]:
+            fail(EXIT_INPUT, "INPUT")
+
+        def checkpoint_part(part):
+            # 单个检查点对象：键须严格按 version,digest,state 排列；version
+            # 仅收 1（非 bool 整数）；digest 为小写 64 位十六进制。state 的
+            # 结构/类型/范围/UTF-8 与摘要匹配留执行期，沿用 si 规则。
+            if not isinstance(part, dict) or list(part) != [
+                "version", "digest", "state",
+            ]:
+                fail(EXIT_INPUT, "INPUT")
+            part_version = part["version"]
+            if (
+                not isinstance(part_version, int)
+                or isinstance(part_version, bool)
+                or part_version != 1
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            part_digest = cp_hex_digest(part["digest"])
+            return part_version, part_digest, part["state"]
+
+        base_tuple = checkpoint_part(raw_op["base"])
+        target_tuple = checkpoint_part(raw_op["target"])
+        return ("sx", base_tuple, target_tuple)
 
     # get
     if keys != {"op", "cid"}:
@@ -12630,6 +12661,162 @@ def run(raw):
                         "changed": len(changes),
                         "bytes_before": len(before_bytes),
                         "bytes_after": len(after_bytes),
+                    },
+                }
+            )
+
+        elif op[0] == "sx":
+            # 三方检查点只读预演：base 与 target 两份候选检查点先各自按 si
+            # 规则校验（紧凑编码 8MiB、摘要匹配先于语义、完整结构/语义解析
+            # 与规范化往返），再按 se 规则取得执行到本操作时的当前规范化快
+            # 照；错误按 base、target、current 顺序判定。全程不推进逻辑时
+            # 钟、不安装任何候选、不改变任何运行态或幂等缓存（候选束均为局
+            # 部对象）。任何失败均无 stdout 并回滚整批操作。
+            _, (base_version, base_digest, base_raw), (
+                target_version, target_digest, target_raw,
+            ) = op
+
+            def validate_checkpoint(version, digest, raw_state):
+                # 与 si 分支同款的错误优先级：编码失败 INPUT；state 紧凑编码
+                # 超 8MiB OVERLOAD；摘要不符 INPUT；语义（含规范化往返）
+                # STATE。返回 (规范化 state, 紧凑编码字节)。摘要仅认固定键
+                # 序 {version,state} 紧凑编码。
+                try:
+                    state_bytes = json.dumps(
+                        raw_state, ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    envelope_bytes = json.dumps(
+                        {"version": version, "state": raw_state},
+                        ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(EXIT_INPUT, "INPUT")
+                if len(state_bytes) > CHECKPOINT_LIMIT:
+                    fail(EXIT_OVERLOAD, "OVERLOAD")
+                if hashlib.sha256(envelope_bytes).hexdigest() != digest:
+                    fail(EXIT_INPUT, "INPUT")
+                bundle = parse_checkpoint(raw_state)
+                normalized = export_bundle(bundle)
+                normalized_bytes = json.dumps(
+                    normalized, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+                if normalized_bytes != state_bytes:
+                    fail(EXIT_STATE, "STATE")
+                return normalized, state_bytes
+
+            # —— 阶段一：base，阶段二：target（错误先 base 后 target）——
+            base_state, _ = validate_checkpoint(
+                base_version, base_digest, base_raw
+            )
+            target_state, target_bytes = validate_checkpoint(
+                target_version, target_digest, target_raw
+            )
+            # —— 阶段三：按 se 规则取得当前规范化快照 ——
+            current_state = export_bundle(current_bundle())
+            try:
+                current_bytes = json.dumps(
+                    current_state, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            except UnicodeEncodeError:
+                fail(EXIT_INPUT, "INPUT")
+            if len(current_bytes) > CHECKPOINT_LIMIT:
+                fail(EXIT_OVERLOAD, "OVERLOAD")
+            current_digest = hashlib.sha256(
+                json.dumps(
+                    {"version": CHECKPOINT_VERSION, "state": current_state},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+
+            # —— 逐段三方比较：仅列三份状态不全相同的顶层段，段序沿用 se
+            # 的规范化顶层键序；三份均为同一 version=1 规范，键集相同。
+            # 分类：current==base≠target 为 TARGET（仅候选变化）；
+            # target==base≠current 为 CURRENT（仅并发变化）；
+            # current==target≠base 为 SAME（两侧收敛）；其余为 CONFLICT。——
+            changes = []
+            target_kind = current_kind = same_kind = conflict_kind = 0
+            for section in current_state:
+                base_value = base_state[section]
+                current_value = current_state[section]
+                target_value = target_state[section]
+                if base_value == current_value == target_value:
+                    continue
+                if current_value == base_value:
+                    kind = "TARGET"
+                    target_kind += 1
+                elif target_value == base_value:
+                    kind = "CURRENT"
+                    current_kind += 1
+                elif current_value == target_value:
+                    kind = "SAME"
+                    same_kind += 1
+                else:
+                    kind = "CONFLICT"
+                    conflict_kind += 1
+                changes.append(
+                    {
+                        "section": section,
+                        "base": section_digest(base_value),
+                        "current": section_digest(current_value),
+                        "target": section_digest(target_value),
+                        "kind": kind,
+                    }
+                )
+
+            # status：当前与候选规范化 state 逐字节相同为 SAME；否则存在
+            # CONFLICT 段为 CONFLICT；其余（仅候选变化、仅并发变化或两侧
+            # 收敛）为 CLEAN。
+            if current_bytes == target_bytes:
+                status = "SAME"
+            elif conflict_kind > 0:
+                status = "CONFLICT"
+            else:
+                status = "CLEAN"
+
+            # 三个摘要分别对应当前、基线和候选，固定键序
+            # sections,changed,target,current,same,conflict，四类计数之和
+            # 等于 changed：
+            # - base 为比较基准，changes 各段按全局分类计数，changed 为全部；
+            # - current 相对 base 不同的段为 CURRENT/SAME/CONFLICT 三类；
+            # - target 相对 base 不同的段为 TARGET/SAME/CONFLICT 三类。
+            sections_total = len(current_state)
+            base_summary = {
+                "sections": sections_total,
+                "changed": len(changes),
+                "target": target_kind,
+                "current": current_kind,
+                "same": same_kind,
+                "conflict": conflict_kind,
+            }
+            current_summary = {
+                "sections": sections_total,
+                "changed": current_kind + same_kind + conflict_kind,
+                "target": 0,
+                "current": current_kind,
+                "same": same_kind,
+                "conflict": conflict_kind,
+            }
+            target_summary = {
+                "sections": sections_total,
+                "changed": target_kind + same_kind + conflict_kind,
+                "target": target_kind,
+                "current": 0,
+                "same": same_kind,
+                "conflict": conflict_kind,
+            }
+            results.append(
+                {
+                    "op": "sx",
+                    "current": current_digest,
+                    "base": base_digest,
+                    "target": target_digest,
+                    "status": status,
+                    "changes": changes,
+                    "summary": {
+                        "current": current_summary,
+                        "base": base_summary,
+                        "target": target_summary,
                     },
                 }
             )

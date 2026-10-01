@@ -102,6 +102,18 @@
 - `summary` 固定键序 `sections,changed,bytes_before,bytes_after`，依次为顶层段总数、差异段数及两份 state 紧凑编码的 UTF-8 字节数。状态相同时 `changes` 为空、`changed` 为零，重复查询逐字节一致。
 - 字段集合、键序、类型、UTF-8、版本、摘要格式与匹配、状态语义及 8MiB 上限沿用 `si` 的校验规则、错误优先级与 INPUT/2、STATE/4、OVERLOAD/7 分类。任何失败均无 stdout，并回滚整批操作（含此前操作的临时变化）。时间与额外空间 O(N)，`changes` 另占 O(S)，N 为两份 state 编码字节数之和、S 为顶层段数；现有 se/si、配置、调度、连接、查询语义及 run/record/replay 逐字节契约不变，仅用标准库。
 
+## 三方检查点预演：sx
+
+以当前运行态、基线检查点和候选检查点三方区分并发变化，让调用方在执行 `si` 前判断候选是否仍可安全使用。只读：不合并或导入、不推进显式时钟、不改变任何运行态或幂等缓存。
+
+- `sx`：精确接受依次排列的 `op,base,target` 三个键（键须按此序出现）；`base` 与 `target` 均为不含 `op` 的检查点对象，各自严格按 `version,digest,state` 排列（version 仅收 1 的非 bool 整数；digest 为小写 64 位十六进制 SHA-256；state 含义同 `si`）。
+- 先按 `si` 规则校验 `base` 再校验 `target`（紧凑编码 8MiB 上限、摘要匹配先于语义、完整结构/语义解析与规范化往返），再按 `se` 规则取得执行到本操作时的当前规范化快照；两份检查点均合法后当前紧凑编码超过 `se` 的 8MiB 上限同样报 OVERLOAD/7。
+- 返回固定键序 `op,current,base,target,status,changes,summary`；`current` 为按 `se` 计算的当前摘要，`base`/`target` 原样返回各自输入摘要。
+- `status`：当前与候选规范化 state 的紧凑 UTF-8 编码（`ensure_ascii=False`、分隔符 `,:`、无末尾换行）逐字节相同时为 `SAME`；否则存在冲突段时为 `CONFLICT`；其余为 `CLEAN`。
+- `changes` 按 state 顶层键序（沿用 `se`）只列三份状态不全相同的段，每项固定键序 `section,base,current,target,kind`，三个值为对应规范化段 JSON 的小写 SHA-256（编码规则同 `sd` 段指纹）。`kind`：当前等于基线而候选不同为 `TARGET`，候选等于基线而当前不同为 `CURRENT`，当前等于候选而基线不同为 `SAME`，其余为 `CONFLICT`；三份完全相同时 `changes` 为空。
+- `summary` 固定键序 `current,base,target`，三个摘要分别对应当前、基线和候选；每个摘要固定键序 `sections,changed,target,current,same,conflict`。基线摘要的四类计数按全局段分类（TARGET+CURRENT+SAME+CONFLICT=changed）；当前摘要 changed=CURRENT+SAME+CONFLICT（其 current/same/conflict 取全局计数，target 恒 0）；候选摘要 changed=TARGET+SAME+CONFLICT（其 target/same/conflict 取全局计数，current 恒 0）；`sections` 为规范化顶层段总数。
+- 键集合、键序、类型、UTF-8、版本、摘要格式或摘要不符报 INPUT/2；摘要正确但状态存在悬空引用、重复标识、矛盾计数或非法组合（含非规范化形态往返不符）报 STATE/4；任一输入检查点或当前状态紧凑编码超过 8388608（8MiB）字节报 OVERLOAD/7。错误按 base、target、current 顺序判定，失败无 stdout 并回滚整批操作。重复预演逐字节一致；时间与额外空间 O(N)，N 为三份规范化状态的总编码字节数；run、record、replay 继续遵守紧凑 UTF-8 固定键序 JSON 与单末尾换行；现有 se/sd/si 及其他操作行为不变，仅用标准库。
+
 ## 测试
 
     python -m unittest discover
