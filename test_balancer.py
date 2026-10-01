@@ -16583,5 +16583,305 @@ class CheckpointTest(unittest.TestCase):
                          json.loads(out_b)["results"][-1])
 
 
+class SdCheckpointDiffTest(unittest.TestCase):
+    """候选检查点只读差异 sd：键序、段差异与指纹、摘要与字节数、只读/不
+    推进时钟、错误优先级与整批回滚、record/replay 逐字节契约。"""
+
+    SETUP = CheckpointTest.SETUP
+    CONFIG = CheckpointTest.CONFIG
+
+    def run_ops(self, ops):
+        return run_balancer("run", encode_ops(ops))
+
+    def export(self, ops):
+        code, out, err = self.run_ops(ops + [{"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def sd_op(self, result):
+        return {"op": "sd", "version": result["version"],
+                "digest": result["digest"], "state": result["state"]}
+
+    def section_fp(self, value):
+        return hashlib.sha256(
+            json.dumps(value, ensure_ascii=False,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def test_equal_state_shape(self):
+        result = self.export(self.SETUP)
+        code, out, err = self.run_ops(self.SETUP + [self.sd_op(result)])
+        self.assertEqual((code, err), (0, b""))
+        sd = json.loads(out)["results"][-1]
+        self.assertEqual(
+            list(sd),
+            ["op", "before", "after", "equal", "changes", "summary"])
+        self.assertEqual(sd["op"], "sd")
+        self.assertEqual(sd["before"], result["digest"])
+        self.assertEqual(sd["after"], result["digest"])
+        self.assertTrue(sd["equal"])
+        self.assertEqual(sd["changes"], [])
+        state_bytes = json.dumps(
+            result["state"], ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")
+        self.assertEqual(
+            sd["summary"],
+            {"sections": len(result["state"]), "changed": 0,
+             "bytes_before": len(state_bytes),
+             "bytes_after": len(state_bytes)})
+        self.assertEqual(list(sd["summary"]),
+                         ["sections", "changed", "bytes_before",
+                          "bytes_after"])
+
+    def test_single_section_difference(self):
+        # 当前仅多一个无 now 的 add：与空候选相比只有 backends 段不同。
+        current = self.export([{"op": "add", "id": "b1", "weight": 1}])
+        candidate = self.export([])
+        code, out, err = self.run_ops(
+            [{"op": "add", "id": "b1", "weight": 1}, self.sd_op(candidate)])
+        self.assertEqual((code, err), (0, b""))
+        sd = json.loads(out)["results"][-1]
+        self.assertFalse(sd["equal"])
+        self.assertEqual([c["section"] for c in sd["changes"]], ["backends"])
+        change = sd["changes"][0]
+        self.assertEqual(list(change), ["section", "before", "after"])
+        self.assertEqual(change["before"],
+                         self.section_fp(current["state"]["backends"]))
+        self.assertEqual(change["after"],
+                         self.section_fp(candidate["state"]["backends"]))
+        self.assertEqual(sd["summary"]["sections"], len(current["state"]))
+        self.assertEqual(sd["summary"]["changed"], 1)
+        self.assertEqual(sd["summary"]["bytes_before"],
+                         len(json.dumps(current["state"], ensure_ascii=False,
+                                        separators=(",", ":")).encode()))
+        self.assertEqual(sd["summary"]["bytes_after"],
+                         len(json.dumps(candidate["state"], ensure_ascii=False,
+                                        separators=(",", ":")).encode()))
+
+    def test_changes_follow_se_top_level_order(self):
+        current = self.export(self.SETUP)
+        candidate = self.export([])
+        code, out, err = self.run_ops(self.SETUP + [self.sd_op(candidate)])
+        self.assertEqual((code, err), (0, b""))
+        sd = json.loads(out)["results"][-1]
+        expected = [
+            key for key in current["state"]
+            if current["state"][key] != candidate["state"][key]
+        ]
+        self.assertTrue(len(expected) > 1)
+        self.assertEqual([c["section"] for c in sd["changes"]], expected)
+        self.assertEqual(sd["summary"]["changed"], len(expected))
+        for change in sd["changes"]:
+            section = change["section"]
+            self.assertEqual(change["before"],
+                             self.section_fp(current["state"][section]))
+            self.assertEqual(change["after"],
+                             self.section_fp(candidate["state"][section]))
+        # 未列段必然逐值相等。
+        unchanged = set(current["state"]) - set(expected)
+        for section in unchanged:
+            self.assertEqual(current["state"][section],
+                             candidate["state"][section])
+
+    def test_equal_true_only_on_byte_identical_states(self):
+        # 值不同但指纹可能碰撞无关：equal 以两份紧凑编码逐字节为准。
+        current = self.export([])
+        code, out, err = self.run_ops([self.sd_op(current)])
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out)["results"][0]["equal"])
+        other = self.export([{"op": "add", "id": "b", "weight": 1}])
+        code, out, err = self.run_ops([self.sd_op(other)])
+        self.assertEqual(code, 0)
+        self.assertFalse(json.loads(out)["results"][0]["equal"])
+
+    def test_repeated_queries_byte_identical(self):
+        candidate = self.export([])
+        code, out, err = self.run_ops(
+            self.SETUP + [self.sd_op(candidate), self.sd_op(candidate)])
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        self.assertEqual(results[-1], results[-2])
+        # 输出整体为紧凑 JSON + 单末尾换行。
+        self.assertTrue(out.endswith(b"\n") and not out.endswith(b"\n\n"))
+        self.assertEqual(out, json.dumps(
+            json.loads(out), ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8") + b"\n")
+
+    def test_does_not_install_candidate_or_advance_clock(self):
+        # 候选 now=100；sd 后再报 now=5 必须仍合法，证明候选未安装、时钟
+        # 未推进。
+        candidate = self.export([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "probe", "id": "b", "ok": True, "now": 100},
+        ])
+        code, out, err = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "probe", "id": "b", "ok": True, "now": 5},
+            self.sd_op(candidate),
+            {"op": "probe", "id": "b", "ok": True, "now": 5},
+        ])
+        self.assertEqual((code, err), (0, b""))
+        # sd 前后 se 逐字节一致，运行态与幂等缓存均未改变。
+        code, out, err = self.run_ops([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "mo", "seq": 1, "now": 60},
+            {"op": "se"},
+            self.sd_op(self.export([])),
+            {"op": "mo", "seq": 1, "now": 60},
+            {"op": "se"},
+        ])
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        self.assertEqual(results[2]["digest"], results[5]["digest"])
+        self.assertEqual(results[2]["state"], results[5]["state"])
+
+    def test_input_key_version_digest_errors(self):
+        result = self.export(self.SETUP)
+        st, dg = result["state"], result["digest"]
+
+        def assert_input(ops):
+            code, out, err = self.run_ops(ops)
+            self.assertEqual((code, out, err),
+                             (2, b"", b'{"error":"INPUT"}\n'))
+
+        assert_input([{"op": "sd"}])
+        assert_input([{"op": "sd", "digest": dg, "version": 1,
+                       "state": st}])
+        assert_input([{"op": "sd", "version": 1, "digest": dg,
+                       "state": st, "now": 1}])
+        assert_input([{"op": "sd", "version": 2, "digest": dg, "state": st}])
+        assert_input([{"op": "sd", "version": "1", "digest": dg,
+                       "state": st}])
+        assert_input([{"op": "sd", "version": 1,
+                       "digest": "0" * 64, "state": st}])
+        assert_input([{"op": "sd", "version": 1,
+                       "digest": dg.upper(), "state": st}])
+
+    def test_digest_mismatch_precedes_semantics(self):
+        # 摘要不符一律 INPUT，即使 state 同时存在语义矛盾。
+        result = self.export([{"op": "add", "id": "b1", "weight": 1}])
+        st = json.loads(json.dumps(result["state"]))
+        st["backends"][0]["conns"] = 99
+        code, out, err = self.run_ops(
+            [{"op": "sd", "version": 1, "digest": "a" * 64, "state": st}])
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+        # 摘要相符但 state 非对象：INPUT（结构校验）。
+        code, out, err = self.run_ops(
+            [{"op": "sd", "version": 1, "digest": result["digest"],
+              "state": "not-an-object"}])
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_semantic_contradiction_is_state(self):
+        result = self.export([{"op": "add", "id": "b1", "weight": 1}])
+        st = json.loads(json.dumps(result["state"]))
+        st["backends"][0]["conns"] = 99
+        envelope = json.dumps(
+            {"version": 1, "state": st}, ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")
+        code, out, err = self.run_ops([{"op": "sd", "version": 1,
+                                        "digest": hashlib.sha256(
+                                            envelope).hexdigest(),
+                                        "state": st}])
+        self.assertEqual((code, out, err),
+                         (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_failure_rolls_back_whole_batch(self):
+        result = self.export(self.SETUP)
+        code, out, err = self.run_ops([
+            {"op": "add", "id": "ghost", "weight": 1},
+            {"op": "sd", "version": 1, "digest": "f" * 64,
+             "state": result["state"]},
+            {"op": "se"},
+        ])
+        self.assertEqual((code, out), (2, b""))
+        # 语义失败同样整批回滚、无 stdout（悬空引用 STATE/4）。
+        st = json.loads(json.dumps(result["state"]))
+        self.assertTrue(st["sticky"])
+        st["sticky"][0]["b"] = "ghost"
+        envelope = json.dumps(
+            {"version": 1, "state": st}, ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")
+        code, out, err = self.run_ops([
+            {"op": "add", "id": "ghost2", "weight": 1},
+            {"op": "sd", "version": 1,
+             "digest": hashlib.sha256(envelope).hexdigest(), "state": st},
+        ])
+        self.assertEqual((code, out), (4, b""))
+
+    def test_overload_candidate_and_current(self):
+        # 候选超 8MiB：OVERLOAD/7。
+        base = self.export([{"op": "add", "id": "x", "weight": 1}])
+        big = json.loads(json.dumps(base["state"]))
+        template = json.loads(json.dumps(big["backends"][0]))
+        big["backends"] += [
+            dict(template, id="z%07d" % i) for i in range(40000)]
+        envelope = json.dumps(
+            {"version": 1, "state": big}, ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")
+        code, out, err = self.run_ops([{"op": "sd", "version": 1,
+                                        "digest": hashlib.sha256(
+                                            envelope).hexdigest(),
+                                        "state": big}])
+        self.assertEqual((code, out, err),
+                         (7, b"", b'{"error":"OVERLOAD"}\n'))
+        # 候选合法但当前状态超限：候选校验成功后判 OVERLOAD/7。
+        small = self.export([])
+        adds = [{"op": "add", "id": "b%07d" % i, "weight": 1}
+                for i in range(40000)]
+        code, out, err = self.run_ops(
+            adds + [self.sd_op(small)])
+        self.assertEqual((code, out, err),
+                         (7, b"", b'{"error":"OVERLOAD"}\n'))
+
+    def test_utf8_fingerprints_and_bytes(self):
+        config = json.loads(json.dumps(self.CONFIG))
+        config["backends"] = [
+            {"id": "é", "weight": 1, "d": 0, "fail": 3, "success": 2,
+             "circuit": None, "drain": None, "endpoint": None},
+        ]
+        config["vnodes"] = None
+        config["limits"] = []
+        config["overload"] = None
+        config["sticky"] = None
+        config["backpressure"] = None
+        config["quotas"] = []
+        ops = [{"op": "ci", "config": config, "now": 0}]
+        current = self.export(ops)
+        candidate = self.export([])
+        code, out, err = self.run_ops(ops + [self.sd_op(candidate)])
+        self.assertEqual((code, err), (0, b""))
+        sd = json.loads(out)["results"][-1]
+        self.assertFalse(sd["equal"])
+        for change in sd["changes"]:
+            section = change["section"]
+            self.assertEqual(change["before"],
+                             self.section_fp(current["state"][section]))
+            self.assertEqual(change["after"],
+                             self.section_fp(candidate["state"][section]))
+
+    def test_record_replay_success_and_failure(self):
+        candidate = self.export([])
+        raw = encode_ops(self.SETUP + [self.sd_op(candidate)])
+        code, direct, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, record, err = run_balancer("record", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(replayed, direct)
+        # 失败 sd（摘要不符 INPUT/2）同样可 record/replay。
+        bad = encode_ops([{"op": "sd", "version": 1,
+                           "digest": "f" * 64,
+                           "state": candidate["state"]}])
+        code, bad_out, bad_err = run_balancer("run", bad)
+        self.assertEqual(code, 2)
+        code, record, _ = run_balancer("record", bad)
+        code, replayed, replayed_err = run_balancer("replay", record)
+        self.assertEqual((code, replayed, replayed_err),
+                         (2, bad_out, bad_err))
+
+
 if __name__ == "__main__":
     unittest.main()
