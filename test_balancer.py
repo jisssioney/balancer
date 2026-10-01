@@ -16883,5 +16883,368 @@ class SdCheckpointDiffTest(unittest.TestCase):
                          (2, bad_out, bad_err))
 
 
+class SiOptimisticImportTest(unittest.TestCase):
+    """si 五键乐观并发形式 op,base,version,digest,state：成功导入、幂等重
+    报、base 不匹配、错误优先级、时钟/回滚、与四键形式的逐字节等价及
+    record/replay 契约。"""
+
+    SETUP = CheckpointTest.SETUP
+    CONFIG = CheckpointTest.CONFIG
+
+    def run_ops(self, ops):
+        return run_balancer("run", encode_ops(ops))
+
+    def export(self, ops):
+        code, out, err = self.run_ops(ops + [{"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def four_key(self, result):
+        return {"op": "si", "version": result["version"],
+                "digest": result["digest"], "state": result["state"]}
+
+    def five_key(self, base, result):
+        return {"op": "si", "base": base, "version": result["version"],
+                "digest": result["digest"], "state": result["state"]}
+
+    def envelope_digest(self, state, version=1):
+        envelope = json.dumps(
+            {"version": version, "state": state}, ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(envelope).hexdigest()
+
+    def setUp(self):
+        # 空状态 E、当前状态 A（单个健康后端，时钟到 5）、富状态 B（SETUP）。
+        self.empty_cp = self.export([])
+        self.prefix_a = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "probe", "id": "b1", "ok": True, "now": 5},
+        ]
+        self.a_cp = self.export(self.prefix_a)
+        self.b_cp = self.export(self.SETUP)
+        self.d_empty = self.empty_cp["digest"]
+        self.d_a = self.a_cp["digest"]
+        self.d_b = self.b_cp["digest"]
+
+    # —— 成功导入 ——
+
+    def test_success_installs_candidate_and_reproduces_se(self):
+        code, out, err = self.run_ops(
+            [self.five_key(self.d_empty, self.b_cp), {"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        si_result = results[0]
+        self.assertEqual(list(si_result), ["op", "digest", "ok"])
+        self.assertEqual(si_result,
+                         {"op": "si", "digest": self.d_b, "ok": True})
+        # 受保护导入成功后立即 se：逐值复现候选 version/digest/state。
+        reexport = results[-1]
+        self.assertEqual(reexport["version"], self.b_cp["version"])
+        self.assertEqual(reexport["digest"], self.d_b)
+        self.assertEqual(reexport["state"], self.b_cp["state"])
+
+    def test_base_accepted_from_sd_before(self):
+        # sd 返回的 before 即当前状态摘要：先验证 before 与 se digest 相同，
+        # 再以它为 base 导入不同候选。
+        sd_op = {"op": "sd", "version": self.b_cp["version"],
+                 "digest": self.d_b, "state": self.b_cp["state"]}
+        code, out, err = self.run_ops(self.prefix_a + [sd_op])
+        self.assertEqual((code, err), (0, b""))
+        sd_result = json.loads(out)["results"][-1]
+        self.assertEqual(sd_result["before"], self.d_a)
+        # 用 sd 的 before 作为替换前提。
+        code, out, err = self.run_ops(
+            self.prefix_a + [self.five_key(sd_result["before"], self.b_cp),
+                             {"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][-1]["digest"], self.d_b)
+
+    def test_base_accepted_from_prior_se_digest(self):
+        # 当前为 A，base 用此前 se 返回的 d_a，候选为 B。
+        code, out, err = self.run_ops(
+            self.prefix_a + [self.five_key(self.d_a, self.b_cp),
+                             {"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][-1]["digest"], self.d_b)
+
+    # —— 幂等重报 ——
+
+    def test_idempotent_rereport_with_stale_base(self):
+        # 当前已等于候选（A）；base 给过期的空状态摘要仍成功且不再替换。
+        code, out, err = self.run_ops(
+            self.prefix_a
+            + [self.five_key(self.d_empty, self.a_cp), {"op": "se"}])
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        self.assertEqual(results[-2],
+                         {"op": "si", "digest": self.d_a, "ok": True})
+        self.assertEqual(results[-1]["digest"], self.d_a)
+        self.assertEqual(results[-1]["state"], self.a_cp["state"])
+
+    def test_idempotent_rereport_with_matching_base(self):
+        code, out, err = self.run_ops(
+            self.prefix_a + [self.five_key(self.d_a, self.a_cp)])
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][-1],
+                         {"op": "si", "digest": self.d_a, "ok": True})
+
+    def test_repeated_five_key_reports_identical(self):
+        op = self.five_key(self.d_a, self.a_cp)
+        code, out, err = self.run_ops(self.prefix_a + [op, op, op])
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out)["results"]
+        self.assertTrue(all(
+            r == {"op": "si", "digest": self.d_a, "ok": True}
+            for r in results[-3:]))
+
+    # —— base 不匹配 ——
+
+    def test_stale_base_is_state_without_stdout(self):
+        # 当前 A、base 空摘要、候选 B：STATE/4，无 stdout。
+        code, out, err = self.run_ops(
+            self.prefix_a + [self.five_key(self.d_empty, self.b_cp)])
+        self.assertEqual(code, 4)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b'{"error":"STATE"}\n')
+
+    def test_stale_base_leaves_state_untouched(self):
+        # 失败后另起同序列观察运行态：se 仍为 A（候选 B 未安装）。
+        code, out, err = self.run_ops(
+            self.prefix_a
+            + [self.five_key(self.d_empty, self.b_cp), {"op": "se"}])
+        self.assertEqual((code, out), (4, b""))
+        code, out, err = self.run_ops(self.prefix_a + [{"op": "se"}])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["results"][-1]["digest"], self.d_a)
+
+    # —— 键序、键集与 base 格式 ——
+
+    def test_key_order_and_key_set_errors(self):
+        b, st = self.d_a, self.b_cp
+
+        def assert_input(ops):
+            code, out, err = self.run_ops(ops)
+            self.assertEqual((code, out, err),
+                             (2, b"", b'{"error":"INPUT"}\n'))
+
+        # base 位置错误 / 键序错误。
+        assert_input([{"op": "si", "version": 1, "base": b,
+                       "digest": self.d_b, "state": st["state"]}])
+        assert_input([{"op": "si", "base": b, "digest": self.d_b,
+                       "version": 1, "state": st["state"]}])
+        # 五键缺键 / 多键。
+        assert_input([{"op": "si", "base": b, "version": 1,
+                       "digest": self.d_b}])
+        assert_input([{"op": "si", "base": b, "version": 1,
+                       "digest": self.d_b, "state": st["state"], "x": 1}])
+        # 四键形式混入 base 仍按旧键序判 INPUT。
+        assert_input([{"op": "si", "version": 1, "digest": self.d_b,
+                       "state": st["state"], "base": b}])
+
+    def test_base_format_is_input(self):
+        st = self.b_cp["state"]
+        for bad_base in (1, 1.0, None, True, [], "0" * 63, "0" * 65,
+                         "G" * 64, "a" * 63 + "A", "é" * 32):
+            op = {"op": "si", "base": bad_base, "version": 1,
+                  "digest": self.d_b, "state": st}
+            code, out, err = self.run_ops(self.prefix_a + [op])
+            self.assertEqual(
+                (code, out), (2, b""),
+                "base=%r should be INPUT" % (bad_base,))
+
+    def test_version_and_digest_format_still_input(self):
+        st = self.b_cp["state"]
+
+        def assert_input(op):
+            code, out, err = self.run_ops(self.prefix_a + [op])
+            self.assertEqual((code, out, err),
+                             (2, b"", b'{"error":"INPUT"}\n'))
+
+        assert_input({"op": "si", "base": self.d_a, "version": 2,
+                      "digest": self.d_b, "state": st})
+        assert_input({"op": "si", "base": self.d_a, "version": "1",
+                      "digest": self.d_b, "state": st})
+        assert_input({"op": "si", "base": self.d_a, "version": 1,
+                      "digest": "0" * 64, "state": st})
+        assert_input({"op": "si", "base": self.d_a, "version": 1,
+                      "digest": self.d_b.upper(), "state": st})
+
+    # —— 错误优先级 ——
+
+    def test_digest_mismatch_precedes_base_and_semantics(self):
+        # base 不匹配本应 STATE，但候选摘要不符优先 INPUT/2。
+        op = {"op": "si", "base": self.d_a, "version": 1,
+              "digest": "f" * 64, "state": self.b_cp["state"]}
+        code, out, err = self.run_ops(self.prefix_a + [op])
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+        # 摘要不符 + state 语义矛盾：仍 INPUT/2。
+        st = json.loads(json.dumps(self.a_cp["state"]))
+        st["backends"][0]["conns"] = 99
+        op = {"op": "si", "base": self.d_empty, "version": 1,
+              "digest": "a" * 64, "state": st}
+        code, out, err = self.run_ops([op])
+        self.assertEqual((code, out), (2, b""))
+
+    def test_semantic_invalid_candidate_is_state(self):
+        # base 与当前相符、候选摘要自洽但状态矛盾：STATE/4。
+        st = json.loads(json.dumps(self.a_cp["state"]))
+        st["backends"][0]["conns"] = 99
+        op = {"op": "si", "base": self.d_empty, "version": 1,
+              "digest": self.envelope_digest(st), "state": st}
+        code, out, err = self.run_ops([op])
+        self.assertEqual((code, out, err),
+                         (4, b"", b'{"error":"STATE"}\n'))
+
+    def test_idempotent_report_still_requires_valid_candidate(self):
+        # 当前摘要不可能等于一个语义非法候选的摘要；非法候选即使 base 随意
+        # 也按 STATE/4（语义校验先于当前摘要比较）。
+        st = json.loads(json.dumps(self.a_cp["state"]))
+        st["backends"][0]["conns"] = 99
+        op = {"op": "si", "base": "0" * 64, "version": 1,
+              "digest": self.envelope_digest(st), "state": st}
+        code, out, _ = self.run_ops(self.prefix_a + [op])
+        self.assertEqual((code, out), (4, b""))
+
+    def test_candidate_overload_is_overload(self):
+        # 候选超 8MiB：OVERLOAD/7，先于当前摘要与 base 判定。
+        base = self.export([{"op": "add", "id": "x", "weight": 1}])
+        big = json.loads(json.dumps(base["state"]))
+        template = json.loads(json.dumps(big["backends"][0]))
+        big["backends"] += [
+            dict(template, id="z%07d" % i) for i in range(40000)]
+        op = {"op": "si", "base": self.d_empty, "version": 1,
+              "digest": self.envelope_digest(big), "state": big}
+        code, out, err = self.run_ops([op])
+        self.assertEqual((code, out, err),
+                         (7, b"", b'{"error":"OVERLOAD"}\n'))
+
+    def test_current_overload_is_overload(self):
+        # 候选合法但当前状态超 8MiB：候选校验通过后当前规范化超限报
+        # OVERLOAD/7（base 不可能匹配，错误分类仍为 OVERLOAD）。
+        adds = [{"op": "add", "id": "b%07d" % i, "weight": 1}
+                for i in range(40000)]
+        op = self.five_key("0" * 64, self.empty_cp)
+        code, out, err = self.run_ops(adds + [op])
+        self.assertEqual((code, out, err),
+                         (7, b"", b'{"error":"OVERLOAD"}\n'))
+
+    # —— 时钟、回滚与输出契约 ——
+
+    def test_does_not_advance_clock(self):
+        # 幂等重报夹在两个同 now 操作之间：不推进时钟，now=5 仍合法。
+        code, out, err = self.run_ops(self.prefix_a + [
+            self.five_key("0" * 64, self.a_cp),
+            {"op": "probe", "id": "b1", "ok": True, "now": 5},
+        ])
+        self.assertEqual((code, err), (0, b""))
+        # 成功导入空候选后时钟随候选状态重置（se 显示 now=null），而非被
+        # 导入操作本身推进。
+        code, out, err = self.run_ops(self.prefix_a + [
+            self.five_key(self.d_a, self.empty_cp), {"op": "se"}])
+        self.assertEqual(code, 0)
+        self.assertIsNone(json.loads(out)["results"][-1]["state"]["now"])
+
+    def test_failure_rolls_back_whole_batch(self):
+        # 此前操作的临时变化随失败整批回滚：无 stdout。
+        code, out, err = self.run_ops([
+            {"op": "add", "id": "ghost", "weight": 1},
+            self.five_key(self.d_empty, self.b_cp),
+            {"op": "se"},
+        ])
+        self.assertEqual((code, out), (4, b""))
+
+    def test_compact_json_single_trailing_newline(self):
+        code, out, err = self.run_ops(
+            [self.five_key(self.d_empty, self.a_cp)])
+        self.assertEqual((code, err), (0, b""))
+        self.assertTrue(out.endswith(b"\n") and not out.endswith(b"\n\n"))
+        self.assertEqual(out, json.dumps(
+            json.loads(out), ensure_ascii=False,
+            separators=(",", ":")).encode("utf-8") + b"\n")
+
+    # —— 与四键形式恢复后的逐字节等价 ——
+
+    def test_continuation_byte_equivalent_to_four_key(self):
+        cont = [
+            {"op": "wg", "id": "b1", "now": 61},
+            {"op": "hget", "id": "b1"},
+            {"op": "route", "key": "k1", "now": 63},
+            {"op": "cl"}, {"op": "al"}, {"op": "ad", "rev": 1},
+            {"op": "ce"}, {"op": "ct"},
+            {"op": "get", "cid": "c0"},
+            {"op": "mg", "id": "b1", "now": 64},
+            {"op": "br", "now": 65}, {"op": "cq", "now": 66},
+            {"op": "qg", "scope": "S", "id": "s1", "now": 67},
+            {"op": "lg", "scope": "C", "id": "c1", "now": 68},
+            {"op": "ru", "id": "b1", "now": 69},
+            {"op": "rg"}, {"op": "bq"}, {"op": "og"},
+            {"op": "ai", "after": 0, "limit": 10},
+            {"op": "hm", "id": "b1"}, {"op": "fm", "id": "b1"},
+            {"op": "mh", "id": "b1", "from": 0, "to": 1, "now": 119},
+            {"op": "mx", "id": "b1", "from": 0, "to": 1, "now": 119},
+        ]
+        code_4, out_4, err_4 = self.run_ops(
+            [self.four_key(self.b_cp)] + cont)
+        code_5, out_5, err_5 = self.run_ops(
+            [self.five_key(self.d_empty, self.b_cp)] + cont)
+        self.assertEqual((code_4, err_4), (0, b""))
+        self.assertEqual((code_5, err_5), (code_4, err_4))
+        # 四键结果去掉导入应答后与五键逐值一致（两应答本身也同形）。
+        r4 = json.loads(out_4)["results"]
+        r5 = json.loads(out_5)["results"]
+        self.assertEqual(r4[0], r5[0])
+        self.assertEqual(r4[1:], r5[1:])
+        self.assertEqual(json.loads(out_4)["backends"],
+                         json.loads(out_5)["backends"])
+        self.assertEqual(out_4, out_5)
+
+    def test_mutation_after_protected_import_equivalent(self):
+        mutations = [
+            {"op": "probe", "id": "b1", "ok": True, "now": 70},
+            {"op": "route", "key": "k9", "now": 71},
+            {"op": "mr", "id": "b1", "ok": True, "ms": 3,
+             "retries": 0, "remaps": 0, "now": 72},
+            {"op": "se"},
+        ]
+        code_4, out_4, err_4 = self.run_ops(
+            [self.four_key(self.b_cp)] + mutations)
+        code_5, out_5, err_5 = self.run_ops(
+            [self.five_key(self.d_empty, self.b_cp)] + mutations)
+        self.assertEqual((code_4, code_5, err_4, err_5), (0, 0, b"", b""))
+        self.assertEqual(out_4, out_5)
+
+    # —— record / replay ——
+
+    def _assert_record_replay(self, ops, expected_code):
+        raw = encode_ops(ops)
+        code, direct, err = run_balancer("run", raw)
+        self.assertEqual(code, expected_code)
+        code, record, rec_err = run_balancer("record", raw)
+        self.assertEqual((code, rec_err), (0, b""))
+        code, replayed, rep_err = run_balancer("replay", record)
+        self.assertEqual(code, expected_code)
+        self.assertEqual((replayed, rep_err), (direct, err))
+        return direct, err
+
+    def test_record_replay_success(self):
+        self._assert_record_replay(
+            [self.five_key(self.d_empty, self.b_cp), {"op": "se"}], 0)
+
+    def test_record_replay_idempotent_rereport(self):
+        self._assert_record_replay(
+            self.prefix_a
+            + [self.five_key("9" * 64, self.a_cp), {"op": "se"}], 0)
+
+    def test_record_replay_state_failure(self):
+        self._assert_record_replay(
+            self.prefix_a + [self.five_key(self.d_empty, self.b_cp)], 4)
+
+    def test_record_replay_input_failure(self):
+        bad = {"op": "si", "base": 1, "version": 1,
+               "digest": self.d_b, "state": self.b_cp["state"]}
+        self._assert_record_replay([bad], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3917,12 +3917,19 @@ def parse_op(raw_op):
         return ("se",)
 
     if name == "si":
-        # 运行态检查点导入：精确键序 op,version,digest,state（键须按此序
-        # 出现）。version 仅收 1；digest 为小写 64 位十六进制；state 的
-        # 结构、类型、范围、UTF-8 编码与未知版本留执行期判 INPUT，悬空
-        # 引用、重复标识、矛盾计数或非法状态组合判 STATE；摘要不符先于
-        # state 结构校验判 INPUT。紧凑编码超 8MiB 报 OVERLOAD/7。
-        if list(raw_op) != ["op", "version", "digest", "state"]:
+        # 运行态检查点导入：两种严格键序形式。四键
+        # op,version,digest,state 为无条件原子替换；五键
+        # op,base,version,digest,state 为带基线摘要的乐观并发形式，base
+        # 为替换前提（sd 的 before 或此前 se 的 digest）。两形式 version 仅
+        # 收 1；digest/base 均为小写 64 位十六进制；state 的结构、类型、
+        # 范围、UTF-8 编码与未知版本留执行期判 INPUT，悬空引用、重复标
+        # 识、矛盾计数或非法状态组合判 STATE；摘要不符先于 state 结构校验
+        # 判 INPUT。紧凑编码超 8MiB 报 OVERLOAD/7。
+        if list(raw_op) == ["op", "version", "digest", "state"]:
+            base = None
+        elif list(raw_op) == ["op", "base", "version", "digest", "state"]:
+            base = cp_hex_digest(raw_op["base"])
+        else:
             fail(EXIT_INPUT, "INPUT")
         version = raw_op["version"]
         if (
@@ -3931,14 +3938,8 @@ def parse_op(raw_op):
             or version != 1
         ):
             fail(EXIT_INPUT, "INPUT")
-        digest = raw_op["digest"]
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(char not in "0123456789abcdef" for char in digest)
-        ):
-            fail(EXIT_INPUT, "INPUT")
-        return ("si", version, digest, raw_op["state"])
+        digest = cp_hex_digest(raw_op["digest"])
+        return ("si", base, version, digest, raw_op["state"])
 
     if name == "sd":
         # 候选检查点只读差异：精确键序 op,version,digest,state，后三项沿用
@@ -12634,12 +12635,18 @@ def run(raw):
             )
 
         elif op[0] == "si":
-            # 运行态检查点导入：精确 op,version,digest,state（parse_op 已校
-            # 键序、version=1 与 digest 格式）。先按规范化紧凑编码校验大小
-            # 与摘要（超限 OVERLOAD/7、不符 INPUT/2），再完整解析语义（悬空
-            # 引用/重复标识/矛盾计数/非法组合 STATE/4）；全部通过后原子替换
-            # 当前状态。任何失败均无 stdout、整批状态回滚。
-            _, version, digest, raw_state = op
+            # 运行态检查点导入：四键无条件替换；五键 op,base,version,digest,
+            # state 为乐观并发形式。parse_op 已校键序、version=1、digest/base
+            # 格式。两种形式都先按规范化紧凑编码校验候选大小与摘要（超限
+            # OVERLOAD/7、不符 INPUT/2），再完整解析语义（悬空引用/重复标
+            # 识/矛盾计数/非法组合 STATE/4）并做规范化往返。五键形式在此之
+            # 后再按 se 的规范化规则取得执行到本操作时的当前状态及摘要：当
+            # 前摘要等于候选 digest 时视为成功的幂等重报（即使 base 已不等于
+            # 当前摘要也不再替换）；否则仅当 base 等于当前摘要才原子导入，
+            # base 不匹配报 STATE/4。当前状态紧凑编码超 se 的 8MiB 上限报
+            # OVERLOAD/7。不推进显式时钟；任何失败均无 stdout、整批状态回
+            # 滚（候选束为局部对象，未安装前不触碰闭包运行态）。
+            _, base, version, digest, raw_state = op
             # 规范化摘要仅认固定键序的 {version,state} 紧凑编码：先把所给
             # state 紧凑编码（所给 state 必须本身即规范化形态；任何键序、
             # 类型或取值偏差都会令摘要不符判 INPUT）。
@@ -12670,7 +12677,36 @@ def run(raw):
             ).encode("utf-8")
             if re_bytes != state_bytes:
                 fail(EXIT_STATE, "STATE")
-            install_bundle(candidate)
+            if base is not None:
+                # 乐观并发形式：按 se 的规范化规则取得当前状态及摘要。
+                current_state = export_bundle(current_bundle())
+                try:
+                    current_bytes = json.dumps(
+                        current_state, ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    current_envelope = json.dumps(
+                        {"version": CHECKPOINT_VERSION, "state": current_state},
+                        ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")
+                except UnicodeEncodeError:
+                    fail(EXIT_INPUT, "INPUT")
+                if len(current_bytes) > CHECKPOINT_LIMIT:
+                    fail(EXIT_OVERLOAD, "OVERLOAD")
+                current_digest = hashlib.sha256(
+                    current_envelope
+                ).hexdigest()
+                if current_digest == digest:
+                    # 成功的幂等重报：当前即候选状态，即使 base 已过期（base
+                    # != 当前摘要）也不再次替换、不报冲突。
+                    pass
+                elif base != current_digest:
+                    # 预览后运行态已变化且非同一检查点重报：拒绝覆盖。
+                    fail(EXIT_STATE, "STATE")
+                else:
+                    install_bundle(candidate)
+            else:
+                install_bundle(candidate)
             results.append(
                 {"op": "si", "digest": digest, "ok": True}
             )
