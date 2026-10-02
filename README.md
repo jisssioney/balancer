@@ -303,6 +303,17 @@
 - 字段、键序、编码、摘要格式、容器、数量、重复后端、端点结构、整数范围、时间关系或时钟倒退非法统一返回 INPUT/2；候选引用未知后端返回 BACKEND/3，INPUT 优先于 BACKEND，身份不匹配不返回 STATE。失败无 stdout，并回滚同批此前变化和时钟。
 - `ew` 成功只推进 `now`：不写预约、不切换端点、不关闭连接，排空、队列、令牌、配额、指标、告警均不动；`se` 状态、`run`、`record`、`replay`、`si` 的确定性以及现有端点入口行为保持不变。单次时间与结果空间 O(N+C)，N 为候选项数、C 为活动连接数；相同初态与输入产生逐字节一致的固定键序紧凑 UTF-8 JSON 与单个末尾换行，只使用 Python 标准库且不读取系统时间。
 
+## 端点切换预约轮询到期处理：ed
+
+让轮询者无需先读预约身份：只提交 `op` 与 `now`，就原子检查并处理当前端点切换预约，避免查询与执行之间预约被 `es`/`eo` 替换。`es`、`en`、`eu`、`ei`、`eo`、`ev`、`ew`、`ej` 及所有既有入口行为不变。
+
+- `ed`：严格接受按键序 `op,now` 排列的两键（键须按此序出现，乱序报 INPUT）。`now` 为 0..10⁹ 的非 bool 整数，纳入共用非递减显式时钟（倒退报 INPUT/2）。
+- 没有预约时成功返回 `EMPTY`，不改端点、连接或预约。存在预约但 `now` 小于预约触发时刻 `at` 时返回 `WAITING`；这两种情况之外，到期后按**操作开始快照**和预约顺序检查后端及端点前提。`WAITING` 不改端点、连接或预约，但仍回显预约身份并给出完整影响。
+- 预约到期后逐项检查：每项固定键序 `id,exists,current,target,status,cids`。已删除后端标为 `MISSING`（`exists=false`、`current=null`、`cids=[]`）；现存后端的当前端点等于 `target`、等于 `base` 或均不等时，依次标为 `UNCHANGED`、`APPLICABLE`、`CONFLICT`。`cids` 按全局建连顺序列出 `opened` 不晚于预约 `before`（`opened==before` 列入）且建连端点快照不同于 `target` 的活动连接，无快照按 null 比较。整体状态优先取 `MISSING`，其次 `CONFLICT`；两者都成功返回完整影响，但保留预约且不改业务状态。
+- 全部项目可执行时返回 `APPLIED`：先按预约顺序切换需要变化的端点，再按全局建连顺序关闭列出的连接并删除预约。排空 D 状态后端若因此失去最后连接，沿用 `ei`/`ej` 的现有规则转为 X，`end` 取 `now`，`forced` 维持原值不变；不消费队列、令牌或配额，也不重新调度。
+- 结果固定键序为 `op,now,status,digest,at,items,affected,closed`。`EMPTY` 的 `digest` 与 `at` 为 null，`items` 为空数组且计数为零；其他状态回显预约身份（digest、at），`affected` 为各项 `cids` 总数，只有 `APPLIED` 的 `closed` 等于 `affected`，其余状态 `closed` 为 0。
+- 字段集合、键序、类型、范围、UTF-8 编码或时钟倒退报 INPUT/2；失败无 stdout 并回滚整批变化和时钟。`ed` 没有 BACKEND/STATE 错误路径：未到期、后端已删除与前提冲突都是成功结果的 `status`。`se` 与 `si` 继续保存预约（`ep_switch` 段），现有端点预约入口行为不变；`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节确定性。单次时间与结果额外空间均为 O(N+C)（N 为预约项数、C 为活动连接数），不新增持久状态，仅使用 Python 标准库。
+
 ## 测试
 
     python -m unittest discover
