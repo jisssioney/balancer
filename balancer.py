@@ -2562,7 +2562,7 @@ def parse_op(raw_op):
         "ey", "eb",
         "ez",
         "ej",
-        "es", "en", "eu", "ei", "eo",
+        "es", "en", "eu", "ei", "eo", "ev",
         "ru",
         "ua",
         "mu",
@@ -4462,6 +4462,21 @@ def parse_op(raw_op):
         if now > at or before > at:
             fail(EXIT_INPUT, "INPUT")
         return ("eo", base, base_at, items, before, at, now)
+
+    if name == "ev":
+        # 全池端点切换预约只读预演：严格按键序 op,digest,at,now 排列（乱
+        # 序报 INPUT）；digest 为小写 64 位十六进制 SHA-256（仅用于匹配预
+        # 约身份），at、now 均为 0..10^9 非 bool 整数，now 进入共用非递
+        # 减时钟（倒退在执行期判 INPUT），at 仅作预约身份、不推进时钟，
+        # 也不要求 now 与 at 的大小关系（未到期 EARLY 是预演结果而非错
+        # 误）。无预约或身份任一不符留执行期判 STATE；本函数只做形状、
+        # 摘要格式与字段类型/范围校验。
+        if list(raw_op) != ["op", "digest", "at", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        digest = cp_hex_digest(raw_op["digest"])
+        at = parse_metric_num(raw_op["at"])
+        now = parse_metric_num(raw_op["now"])
+        return ("ev", digest, at, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -8390,7 +8405,7 @@ def run(raw):
             "ey", "eb",
             "ez",
             "ej",
-            "es", "eu", "ei", "eo",
+            "es", "eu", "ei", "eo", "ev",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -14219,6 +14234,107 @@ def run(raw):
             results.append(
                 {"op": "eo", "base": base, "digest": digest,
                  "at": at, "ok": True}
+            )
+
+        elif op[0] == "ev":
+            # 全池端点切换预约只读预演：形状/字段类型/范围/摘要格式与时钟
+            # 倒退已在解析期及共用时钟块判 INPUT，INPUT 先于预约匹配。身份
+            # 判定：无预约或 digest、at 任一不符报 STATE 并保留预约。身份
+            # 匹配后按操作开始快照检查预约保存的 items 与 before：未到期
+            # （now<at）、后端已删除、当前端点既不等于 target 也不等于 base
+            # 都不是错误，而是成功预演中各 item/整体 status 的一种状态；
+            # 除共用块已推进的 now 外不改变任何运行态（端点、连接、排空、
+            # 预约、队列、令牌、配额、指标、告警均不动，不关闭连接）。为
+            # 现存预约后端建立 O(N) 槽，单遍扫描活动连接 O(C)：按全局建
+            # 连序列出 opened<=before 且建连端点快照不等于该项 target 的
+            # cids，无快照按 None 比较。整体不可执行时仍报告其余可计算
+            # 项。O(N+C) 时间、O(N+C) 结果空间，N 为预约项数、C 为活动
+            # 连接数。
+            _, digest, at, now = op
+            if ep_switch is None:
+                fail(EXIT_STATE, "STATE")
+            saved_items, saved_before, reserved_at, reserved_digest = ep_switch
+            if reserved_digest != digest or reserved_at != at:
+                fail(EXIT_STATE, "STATE")
+            # 预约顺序逐项快照：record 为 None 表示建立后后端已被删除。
+            item_records = []
+            for backend_id, _base, _target in saved_items:
+                item_records.append(backends.get(backend_id))
+            index_by_id = {}
+            groups = [[] for _ in saved_items]
+            for idx, ((backend_id, _base, _target), record) in enumerate(
+                zip(saved_items, item_records)
+            ):
+                # 删除项不可能再持有活动连接（remove 要求 conns==0），故
+                # 仅为现存后端建立连接扫描槽；删除项 cids 恒为空。
+                if record is not None:
+                    index_by_id[backend_id] = idx
+            for cid, connection in connections.items():
+                idx = index_by_id.get(connection[0])
+                if idx is None:
+                    continue
+                if connection[2] > saved_before:
+                    continue
+                target = saved_items[idx][2]
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == target:
+                    continue
+                groups[idx].append(cid)
+            result_items = []
+            any_missing = False
+            any_conflict = False
+            closed_total = 0
+            for (backend_id, base, target), record, cids in zip(
+                saved_items, item_records, groups
+            ):
+                if record is None:
+                    exists = False
+                    current = None
+                    status = "MISSING"
+                    any_missing = True
+                else:
+                    exists = True
+                    current = record["endpoint"]
+                    if current == target:
+                        status = "UNCHANGED"
+                    elif current == base:
+                        status = "APPLICABLE"
+                    else:
+                        status = "CONFLICT"
+                        any_conflict = True
+                closed_total += len(cids)
+                result_items.append(
+                    {
+                        "id": backend_id,
+                        "exists": exists,
+                        "current": endpoint_json(current),
+                        "target": endpoint_json(target),
+                        "status": status,
+                        "cids": cids,
+                    }
+                )
+            # 整体状态优先级：未到期 EARLY；否则存在删除后端 MISSING；再
+            # 否则存在端点冲突 CONFLICT；全部现存且当前端点等于各自 target
+            # 或 base 时 READY。ready 仅在 READY 时为 true。
+            if now < at:
+                overall = "EARLY"
+            elif any_missing:
+                overall = "MISSING"
+            elif any_conflict:
+                overall = "CONFLICT"
+            else:
+                overall = "READY"
+            results.append(
+                {
+                    "op": "ev",
+                    "digest": digest,
+                    "at": at,
+                    "now": now,
+                    "ready": overall == "READY",
+                    "status": overall,
+                    "items": result_items,
+                    "closed": closed_total,
+                }
             )
 
         elif op[0] == "se":
