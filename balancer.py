@@ -1822,6 +1822,20 @@ def parse_endpoint_port(value):
     return value
 
 
+def parse_optional_endpoint(value):
+    # ey 的 base/target：null 表示未登记端点，否则为精确键序 host,port 的
+    # 对象，校验沿用 ep（规范 IP 字面量、port ∈ [1,65535] 非 bool 整数）；
+    # 返回 None 或 (host, port)。
+    if value is None:
+        return None
+    if not isinstance(value, dict) or list(value) != ["host", "port"]:
+        fail(EXIT_INPUT, "INPUT")
+    return (
+        parse_endpoint_host(value["host"]),
+        parse_endpoint_port(value["port"]),
+    )
+
+
 def sort_fault_segments(segments):
     """按段起点 a 稳定升序：a ∈ [0,10^9] < 2^32，LSD 基数排序四轮 256
     桶共 O(T)，与比较排序的稳定结果一致（同 a 保持原相对序；同 a 段随后
@@ -2472,6 +2486,7 @@ def parse_op(raw_op):
         "ep", "fw",
         "eq", "ec",
         "er", "ex",
+        "ey",
         "ru",
         "ua",
         "mu",
@@ -4174,6 +4189,25 @@ def parse_op(raw_op):
         if before > now:
             fail(EXIT_INPUT, "INPUT")
         return ("ex", before, now)
+
+    if name == "ey":
+        # 单后端条件端点变更：精确键序 op,id,base,target,now（键须按此序
+        # 出现）；id 为非空 UTF-8 串（未知 id 留执行期判 BACKEND）；base、
+        # target 均为 null 或精确键序 host,port 的端点对象（null 表示未登
+        # 记端点，对象沿用 ep 的规范 IP 字面量与 1..65535 端口校验）；now
+        # 为 0..10^9 非 bool 整数并进入共用非递减时钟（倒退在执行期判
+        # INPUT）。当前端点与 target 相同为成功幂等重报；否则仅当当前端
+        # 点与 base 逐值相等才原子写入 target（target 为 null 即清除登
+        # 记）；其余比较失败留执行期判 STATE。
+        if list(raw_op) != ["op", "id", "base", "target", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        return (
+            "ey",
+            parse_backend_id(raw_op["id"]),
+            parse_optional_endpoint(raw_op["base"]),
+            parse_optional_endpoint(raw_op["target"]),
+            parse_metric_num(raw_op["now"]),
+        )
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -8017,6 +8051,7 @@ def run(raw):
             "cp", "cq", "ca", "ca_cond", "cx", "cy",
             "eq", "ec",
             "er", "ex",
+            "ey",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -13356,6 +13391,39 @@ def run(raw):
                     "now": now,
                     "items": items,
                     "closed": closed_total,
+                }
+            )
+
+        elif op[0] == "ey":
+            # 单后端原子条件端点变更：形状/字段/端点结构/编码与时钟倒退已
+            # 在解析期及共用时钟块判 INPUT（INPUT 先于后端存在性）。后端
+            # 不存在判 BACKEND。当前端点等于 target 时视为成功的幂等重报，
+            # 即使 base 已不匹配也不重写状态；否则仅当当前端点与 base 逐
+            # 值相等才原子写入 target（target 为 null 即清除登记）；其余
+            # 比较失败判 STATE。只改后端当前端点：不迁移、关闭或重新调度
+            # 活动连接，不消费令牌、配额或等待队列，建连快照保持不变，后
+            # 续连接仅在变更后仍有当前端点时固化新快照。O(1)、O(1)。
+            _, backend_id, base, target, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = record["endpoint"]
+            if current == target:
+                # 幂等重报：保留既有登记对象，不重写。
+                pass
+            elif current == base:
+                record["endpoint"] = target
+            else:
+                fail(EXIT_STATE, "STATE")
+            results.append(
+                {
+                    "op": "ey",
+                    "id": backend_id,
+                    "endpoint": (
+                        None if target is None
+                        else {"host": target[0], "port": target[1]}
+                    ),
+                    "ok": True,
                 }
             )
 

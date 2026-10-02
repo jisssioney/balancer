@@ -22125,5 +22125,530 @@ class EndpointRotationPoolTest(unittest.TestCase):
         self.assertEqual(again["state"], exported["state"])
 
 
+class EndpointConditionalUpdateTest(unittest.TestCase):
+    """单后端原子条件端点变更 ey。"""
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def run_raw(self, raw):
+        return run_balancer("run", raw)
+
+    def last_of(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def assert_failure(self, ops, exit_code=2, label="INPUT"):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(out, b"")
+        self.assertEqual(
+            err, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    @staticmethod
+    def ep_obj(host, port):
+        return {"host": host, "port": port}
+
+    def ey(self, backend_id, base, target, now):
+        return {"op": "ey", "id": backend_id, "base": base,
+                "target": target, "now": now}
+
+    def add_b(self):
+        return {"op": "add", "id": "b", "weight": 1}
+
+    # ---- 成功路径与输出形状 ----
+
+    def test_first_write_from_unregistered(self):
+        result = self.last_of([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+        ])
+        self.assertEqual(list(result), ["op", "id", "endpoint", "ok"])
+        self.assertEqual(result["op"], "ey")
+        self.assertEqual(result["id"], "b")
+        self.assertEqual(list(result["endpoint"]), ["host", "port"])
+        self.assertEqual(result["endpoint"],
+                         {"host": "10.0.0.1", "port": 80})
+        self.assertIs(result["ok"], True)
+
+    def test_conditional_change_with_matching_base(self):
+        result = self.last_of([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+        ])
+        self.assertEqual(result["endpoint"],
+                         {"host": "10.0.0.2", "port": 81})
+        # 当前端点确已写入：eq 的 current 为新端点。
+        current = self.last_of([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+            {"op": "eq", "id": "b", "now": 3},
+        ])["current"]
+        self.assertEqual(current, {"host": "10.0.0.2", "port": 81})
+
+    def test_change_host_or_port_only(self):
+        # 仅换 host。
+        self.assertEqual(
+            self.last_of([
+                self.add_b(),
+                self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+                self.ey("b", self.ep_obj("10.0.0.1", 80),
+                        self.ep_obj("10.0.0.2", 80), 2),
+            ])["endpoint"],
+            {"host": "10.0.0.2", "port": 80},
+        )
+        # 仅换 port。
+        self.assertEqual(
+            self.last_of([
+                self.add_b(),
+                self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+                self.ey("b", self.ep_obj("10.0.0.1", 80),
+                        self.ep_obj("10.0.0.1", 81), 2),
+            ])["endpoint"],
+            {"host": "10.0.0.1", "port": 81},
+        )
+
+    def test_ipv6_canonical_literal_accepted(self):
+        result = self.last_of([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("::1", 8080), 0),
+        ])
+        self.assertEqual(result["endpoint"], {"host": "::1", "port": 8080})
+
+    # ---- 幂等重报 ----
+
+    def test_idempotent_replay_with_stale_base(self):
+        ops = [
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+            # 当前已是 target；base 为更早的旧值，仍成功且不重写。
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[2], results[3])
+        self.assertEqual(results[3]["endpoint"],
+                         {"host": "10.0.0.2", "port": 81})
+
+    def test_first_write_and_replay_byte_identical(self):
+        ops = [
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+        ]
+        raw = encode_ops(ops)
+        code, first, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, second, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(second, first)
+        results = json.loads(first.decode("utf-8"))["results"]
+        first_change = json.dumps(
+            results[2], ensure_ascii=False, separators=(",", ":")).encode()
+        replay_change = json.dumps(
+            results[3], ensure_ascii=False, separators=(",", ":")).encode()
+        self.assertEqual(replay_change, first_change)
+        self.assertEqual(
+            first_change,
+            b'{"op":"ey","id":"b","endpoint":'
+            b'{"host":"10.0.0.2","port":81},"ok":true}',
+        )
+
+    def test_idempotent_clear_with_stale_base(self):
+        results = self.run_ops([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", self.ep_obj("10.0.0.1", 80), None, 2),
+            # 已清除（当前为 null）；base 已过期，重复清除仍成功。
+            self.ey("b", self.ep_obj("10.0.0.1", 80), None, 2),
+        ])
+        self.assertEqual(results[2], results[3])
+        self.assertEqual(results[3],
+                         {"op": "ey", "id": "b",
+                          "endpoint": None, "ok": True})
+
+    def test_write_equal_target_when_base_also_matches(self):
+        # 当前 == target 且 base 也匹配：按幂等重报成功，不重写。
+        result = self.last_of([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.1", 80), 2),
+        ])
+        self.assertEqual(result["endpoint"],
+                         {"host": "10.0.0.1", "port": 80})
+
+    # ---- 比较失败 ----
+
+    def test_stale_read_returns_state(self):
+        self.assert_failure([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            # 第三方先改成 (10.0.0.2,81)。
+            {"op": "ep", "id": "b", "host": "10.0.0.2", "port": 81},
+            # 持有旧读数的条件写入必须被拒。
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.3", 82), 2),
+        ], exit_code=4, label="STATE")
+
+    def test_base_null_but_registered_returns_state(self):
+        self.assert_failure([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", None, self.ep_obj("10.0.0.2", 81), 2),
+        ], exit_code=4, label="STATE")
+
+    def test_base_set_but_unregistered_returns_state(self):
+        # 后端存在但未登记端点：target 不同于 null，base 非 null → STATE。
+        self.assert_failure([
+            self.add_b(),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 1),
+        ], exit_code=4, label="STATE")
+
+    # ---- 清除与重登记的下游口径 ----
+
+    def test_target_null_clears_registration(self):
+        prefix = [
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 1},
+            self.ey("b", self.ep_obj("10.0.0.1", 80), None, 2),
+        ]
+        # 清除后 eq 报 STATE，er 不再列出该后端。
+        self.assert_failure(prefix + [{"op": "eq", "id": "b", "now": 3}],
+                            exit_code=4, label="STATE")
+        er = self.last_of(prefix + [{"op": "er", "now": 3}])
+        self.assertEqual(er["items"], [])
+        self.assertEqual(er["summary"],
+                         {"backends": 0, "total": 0,
+                          "fresh": 0, "stale": 0})
+        # 已有连接与其建连快照仍在，fw 照常返回旧快照。
+        fw = self.last_of(prefix + [{"op": "fw", "cid": "c1"}])
+        self.assertEqual(
+            fw, {"op": "fw", "cid": "c1", "backend": "b",
+                 "host": "10.0.0.1", "port": 80})
+        get = self.last_of(prefix + [{"op": "get", "cid": "c1"}])
+        self.assertEqual(get["backend"], "b")
+        # 清除后新建连接无快照：fw 报 STATE。
+        self.assert_failure(
+            prefix + [
+                {"op": "open", "cid": "c2", "flow": FLOW, "now": 2},
+                {"op": "fw", "cid": "c2"},
+            ], exit_code=4, label="STATE")
+
+    def test_reregister_makes_old_snapshot_stale(self):
+        prefix = [
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 1},
+            self.ey("b", self.ep_obj("10.0.0.1", 80), None, 2),
+            self.ey("b", None, self.ep_obj("10.0.0.2", 81), 3),
+        ]
+        eq = self.last_of(prefix + [{"op": "eq", "id": "b", "now": 4}])
+        self.assertEqual(eq["current"], {"host": "10.0.0.2", "port": 81})
+        self.assertEqual((eq["total"], eq["fresh"], eq["stale"]),
+                         (1, 0, 1))
+        self.assertEqual(eq["items"][0]["host"], "10.0.0.1")
+        # 重新登记后的新连接固化新快照，计为 fresh。
+        eq2 = self.last_of(prefix + [
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 3},
+            {"op": "eq", "id": "b", "now": 4},
+        ])
+        self.assertEqual((eq2["total"], eq2["fresh"], eq2["stale"]),
+                         (2, 1, 1))
+        self.assertEqual(self.last_of(prefix + [
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 3},
+            {"op": "fw", "cid": "c2"},
+        ])["host"], "10.0.0.2")
+
+    def test_change_does_not_touch_connections_or_queue(self):
+        ops = [
+            self.add_b(),
+            {"op": "chash", "vnodes": 4},
+            {"op": "os", "cap": 1, "q": 5, "ttl": 100},
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 0),
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "oa", "cid": "w", "flow": FLOW, "c": "c",
+             "s": "s", "key": "k", "now": 0},
+            # 条件换端点：不关闭、不迁移、不重新调度。
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 1),
+        ]
+        results = self.run_ops(ops + [{"op": "og"}])
+        # 等待队列原样保留。
+        self.assertEqual(results[-1]["queue"], ["w"])
+        # c1 仍在且 fw 仍返回建连时的旧快照。
+        fw = self.last_of(ops + [{"op": "fw", "cid": "c1"}])
+        self.assertEqual((fw["host"], fw["port"]), ("10.0.0.1", 80))
+        # 不消费令牌/配额：登记后查询仍为全额、used=0。
+        ops2 = [
+            self.add_b(),
+            {"op": "ls", "scope": "B", "id": "b", "r": 1,
+             "b": 10, "now": 0},
+            {"op": "qs", "scope": "B", "id": "b", "limit": 7,
+             "span": 60, "now": 0},
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 0),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 1),
+        ]
+        results2 = self.run_ops(ops2 + [
+            {"op": "lg", "scope": "B", "id": "b", "now": 1},
+            {"op": "qg", "scope": "B", "id": "b", "now": 1},
+        ])
+        self.assertEqual(results2[-2]["t"], 10)
+        self.assertEqual(results2[-1]["used"], 0)
+
+    # ---- ep 无条件覆盖语义保持 ----
+
+    def test_ep_still_unconditionally_overrides(self):
+        ops = [
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            {"op": "ep", "id": "b", "host": "10.0.0.9", "port": 99},
+        ]
+        result = self.last_of(ops + [{"op": "eq", "id": "b", "now": 2}])
+        self.assertEqual(result["current"],
+                         {"host": "10.0.0.9", "port": 99})
+        # ep 覆盖后，持有更早读数的 ey 失败；匹配新值则成功。
+        self.assert_failure(ops + [
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+        ], exit_code=4, label="STATE")
+        result = self.last_of(ops + [
+            self.ey("b", self.ep_obj("10.0.0.9", 99),
+                    self.ep_obj("10.0.0.2", 81), 2),
+        ])
+        self.assertEqual(result["endpoint"],
+                         {"host": "10.0.0.2", "port": 81})
+
+    # ---- 错误优先级 ----
+
+    def test_unknown_backend_is_backend(self):
+        self.assert_failure([
+            self.ey("nope", None, self.ep_obj("10.0.0.1", 80), 1),
+        ], exit_code=3, label="BACKEND")
+
+    def test_backend_precedes_state(self):
+        # 未知后端且 base 不可能匹配：仍报 BACKEND 而非 STATE。
+        self.assert_failure([
+            self.ey("nope", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 1),
+        ], exit_code=3, label="BACKEND")
+
+    def test_input_precedes_backend(self):
+        # 未知 id，但 now 非法 / 端点非法 / 键序错误：一律 INPUT。
+        self.assert_failure([
+            self.ey("nope", None, self.ep_obj("10.0.0.1", 80), -1),
+        ])
+        self.assert_failure([
+            self.ey("nope", None, self.ep_obj("10.0.0.1", 0), 1),
+        ])
+        self.assert_failure([
+            {"op": "ey", "id": "nope", "target": None,
+             "base": None, "now": 1},
+        ])
+
+    def test_input_precedes_state(self):
+        # 现存后端且 base 不匹配（本应 STATE），但时钟倒退：优先 INPUT。
+        self.assert_failure([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 5),
+            self.ey("b", self.ep_obj("9.9.9.9", 9),
+                    self.ep_obj("10.0.0.2", 81), 4),
+        ])
+
+    def test_clock_regression_precedes_backend(self):
+        # 时钟先由他 op 推进到 5；未知后端在 now=4 的 ey 报 INPUT 而非
+        # BACKEND（时钟校验先于后端存在性），同 now=5 则报 BACKEND。
+        advance = [self.add_b(), {"op": "er", "now": 5}]
+        self.assert_failure(advance + [
+            self.ey("nope", None, self.ep_obj("10.0.0.1", 80), 4),
+        ])
+        self.assert_failure(advance + [
+            self.ey("nope", None, self.ep_obj("10.0.0.1", 80), 5),
+        ], exit_code=3, label="BACKEND")
+
+    # ---- 形状、类型、范围、编码 ----
+
+    def test_strict_key_order_and_key_set(self):
+        for raw in (
+            b'{"ops":[{"op":"ey","id":"b","base":null,"target":null}]}',
+            b'{"ops":[{"op":"ey","id":"b","base":null,'
+            b'"target":{"host":"10.0.0.1","port":80}}]}',
+            b'{"ops":[{"op":"ey","id":"b","base":null,'
+            b'"target":{"host":"10.0.0.1","port":80},"now":1,"x":1}]}',
+            b'{"ops":[{"now":1,"op":"ey","id":"b","base":null,'
+            b'"target":{"host":"10.0.0.1","port":80}}]}',
+            b'{"ops":[{"op":"ey","id":"b","target":null,'
+            b'"base":null,"now":1}]}',
+        ):
+            code, out, err = self.run_raw(raw)
+            self.assertEqual((code, out, err), (
+                2, b"", b'{"error":"INPUT"}\n',
+            ), raw)
+
+    def test_endpoint_structure_validation(self):
+        bad_endpoints = (
+            {},
+            {"host": "10.0.0.1"},
+            {"host": "10.0.0.1", "port": 80, "x": 1},
+            {"port": 80, "host": "10.0.0.1"},
+            {"host": "010.0.0.1", "port": 80},
+            {"host": "10.0.0", "port": 80},
+            {"host": "10.0.0.1%eth0", "port": 80},
+            {"host": 0x0A000001, "port": 80},
+            {"host": "10.0.0.1", "port": 0},
+            {"host": "10.0.0.1", "port": 65536},
+            {"host": "10.0.0.1", "port": True},
+            {"host": "10.0.0.1", "port": "80"},
+            {"host": "10.0.0.1", "port": 80.0},
+            [],
+            "10.0.0.1:80",
+        )
+        for bad in bad_endpoints:
+            # base 与 target 两个位置都要校验。
+            self.assert_failure([
+                self.add_b(), self.ey("b", bad, None, 1),
+            ])
+            self.assert_failure([
+                self.add_b(), self.ey("b", None, bad, 1),
+            ])
+
+    def test_now_validation(self):
+        for value in (True, False, -1, 10 ** 9 + 1, 1.0, "1", None, []):
+            self.assert_failure([
+                self.add_b(),
+                self.ey("b", None, self.ep_obj("10.0.0.1", 80), value),
+            ])
+        # 边界值合法。
+        result = self.last_of([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 10 ** 9),
+        ])
+        self.assertEqual(result["endpoint"]["port"], 80)
+
+    def test_id_validation(self):
+        self.assert_failure([
+            self.ey("", None, self.ep_obj("10.0.0.1", 80), 1),
+        ])
+        self.assert_failure([
+            self.ey(7, None, self.ep_obj("10.0.0.1", 80), 1),
+        ])
+        # 非 ASCII 但可 UTF-8 编码的 id 合法。
+        result = self.last_of([
+            {"op": "add", "id": "后端α", "weight": 1},
+            self.ey("后端α", None, self.ep_obj("10.0.0.1", 80), 1),
+        ])
+        self.assertEqual(result["id"], "后端α")
+
+    def test_clock_advances_and_regresses(self):
+        # ey 推进时钟：后续更小 now 的操作报 INPUT。
+        self.assert_failure([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 5),
+            {"op": "eq", "id": "b", "now": 4},
+        ])
+        # 同一 now 重报不构成倒退。
+        result = self.last_of([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 5),
+            {"op": "eq", "id": "b", "now": 5},
+        ])
+        self.assertEqual(result["now"], 5)
+
+    def test_failure_no_stdout_and_batch_rollback(self):
+        # ey 成功后同批另一条 ey 比较失败：整批无 stdout。
+        self.assert_failure([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", self.ep_obj("9.9.9.9", 9), None, 2),
+        ], exit_code=4, label="STATE")
+        # 时钟倒退同样整批失败，此前端点变化不产生任何 stdout。
+        self.assert_failure([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 5),
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 4),
+        ])
+
+    # ---- record / replay ----
+
+    def test_record_replay_success_idempotent_and_failure(self):
+        ops = [
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 1},
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+            # 幂等重报（base 已过期）。
+            self.ey("b", self.ep_obj("10.0.0.1", 80),
+                    self.ep_obj("10.0.0.2", 81), 2),
+            {"op": "fw", "cid": "c1"},
+            {"op": "eq", "id": "b", "now": 3},
+        ]
+        raw = encode_ops(ops)
+        code, direct, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, record, err = run_balancer("record", raw)
+        self.assertEqual((code, err), (0, b""))
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual((code, replayed, err), (0, direct, b""))
+        # 失败批次同样可记录并重放。
+        fail_raw = encode_ops([
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            self.ey("b", self.ep_obj("9.9.9.9", 9), None, 2),
+        ])
+        code, out, err = run_balancer("run", fail_raw)
+        self.assertEqual((code, out), (4, b""))
+        code, record, err = run_balancer("record", fail_raw)
+        self.assertEqual((code, err), (0, b""))
+        code, replayed, err = run_balancer("replay", record)
+        self.assertEqual((code, replayed, err), (
+            4, b"", b'{"error":"STATE"}\n',
+        ))
+
+    # ---- se / si ----
+
+    def test_checkpoint_roundtrip(self):
+        prefix = [
+            self.add_b(),
+            self.ey("b", None, self.ep_obj("10.0.0.1", 80), 1),
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 1},
+            self.ey("b", self.ep_obj("10.0.0.1", 80), None, 2),
+            self.ey("b", None, self.ep_obj("10.0.0.2", 81), 3),
+        ]
+        cont = [
+            self.ey("b", self.ep_obj("10.0.0.2", 81),
+                    self.ep_obj("10.0.0.3", 82), 4),
+            {"op": "fw", "cid": "c1"},
+            {"op": "eq", "id": "b", "now": 5},
+            {"op": "er", "now": 5},
+        ]
+        results = self.run_ops(prefix + [{"op": "se"}] + cont)
+        exported = results[len(prefix)]
+        si_op = {"op": "si", "version": 1,
+                 "digest": exported["digest"], "state": exported["state"]}
+        direct = self.run_ops(prefix + cont)
+        resumed = self.run_ops([si_op] + cont)
+        self.assertEqual(resumed[1:], direct[len(prefix):])
+        # 恢复后再次导出逐字节一致。
+        again = self.last_of([si_op, {"op": "se"}])
+        self.assertEqual(again["digest"], exported["digest"])
+        self.assertEqual(again["state"], exported["state"])
+
+
 if __name__ == "__main__":
     unittest.main()
