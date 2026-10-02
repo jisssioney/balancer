@@ -234,6 +234,18 @@
 - 所有失败均不产生 stdout，并回滚本批此前变化、端点和逻辑时钟。成功后按输入顺序仅写入尚未满足的目标端点，固定返回键序 `op,items,ok`；`items` 按输入顺序排列，每项固定键序 `id,endpoint`，`endpoint` 为对应 `target` 对象或 `null`，`ok` 恒为 `true`。相同请求重报（含部分项已处于目标的重试）逐字节一致。
 - `eb` 只改变各后端当前端点：不迁移、关闭或重新调度活动连接，不消费令牌、配额或等待队列。已有连接继续由 `fw` 返回其建连时快照；后续连接沿用更新后的端点固化新快照。变更结果继续由 `ce`、`se` 导出并可由 `ci`、`si` 恢复（登记端点本就在配置与检查点内）。单次时间与额外空间上界均为 O(N)，N 为 `items` 项数，仅使用 Python 标准库；`run`、`record`、`replay` 对成功、幂等和失败保持固定键序紧凑 UTF-8 JSON、单末尾换行及逐字节确定性。
 
+## 批量端点切换只读预演：ez
+
+在 `eb` 批量原子条件变更之前，用一次只读预演同时识别条件冲突并预测旧端点连接影响：不写入任何端点，仅按操作起始快照给出逐项状态与连接新鲜度。`ep`、`ey`、`eb`、`eq`、`ec`、`er`、`ex` 及所有既有入口行为不变。
+
+- `ez`：输入严格按键序 `op,items,now` 排列（键须按此序出现）。`items` 为 1 至 1000 项数组；每项严格按键序 `id,base,target` 排列，`id` 沿用后端标识且同一 `id` 在数组中不得重复；`base` 与 `target` 逐项沿用 `eb`/`ey`（`null` 或按键序 `host,port` 排列的对象，对象沿用 `ep` 对规范 IP 字面量与 1 至 65535 非 bool 整数端口的校验）。`now` 为 0..10⁹ 的非 bool 整数并进入全局非递减显式时钟。
+- 处理顺序固定为：先完整校验整份输入（字段、键序、容器、数量、重复 id、端点结构、编码、数值范围），再按 `items` 顺序确认所有后端存在（任一未知报 BACKEND/3），最后统一按操作起始快照计算；除推进时钟外不改变任何运行态。判定优先级固定为 INPUT、BACKEND。
+- 成功固定返回键序 `op,now,ready,items,summary`；`items` 按请求顺序排列，每项固定键序 `id,current,target,status,total,fresh,stale`。`current` 为后端当前端点对象或 `null`；`target` 回显规范化候选值（对象或 `null`）。`current` 等于 `target` 时 `status` 为 `unchanged`，否则 `current` 等于 `base` 时为 `applicable`，其余为 `conflict`；仅当无 `conflict` 项时 `ready` 为 `true`。
+  - `total` 为该后端活动连接数；`fresh` 为建连时端点快照等于该项 `target` 的连接数（无快照按 `null` 比较，即 `target=null` 时无快照连接计 fresh），其余为 `stale`，恒有 `total=fresh+stale`。
+  - `summary` 固定键序 `total,applicable,unchanged,conflict,connections,stale`：前四项分别为 items 总数及三类 `status` 计数（四项满足 total=applicable+unchanged+conflict），`connections` 为各项 `total` 之和，`stale` 为各项 `stale` 之和。
+- 存在 `conflict` 仍返回 0 退出码下的完整预演明细（`ready=false`），不以 STATE 代替明细。字段、键序、容器、数量、重复 id、编码、端点结构、数值范围或时钟倒退返回 INPUT/2；后端未知返回 BACKEND/3，INPUT 优先于 BACKEND；任何失败均无 stdout 并整批回滚（含同批此前变化与逻辑时钟）。
+- `ez` 成功只推进 `now`：不改变端点、连接、粘性、调度、指标、告警或修订。同初态同输入产生逐字节一致的固定键序紧凑 UTF-8 JSON 与单末尾换行，`run`、`record`、`replay` 结果一致，`se` 导出后 `si` 恢复继续执行与直接继续一致。单次时间 O(N+C)、额外空间 O(N)，N 为 items 数、C 为活动连接数，仅使用 Python 标准库。
+
 ## 测试
 
     python -m unittest discover

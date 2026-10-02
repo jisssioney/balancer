@@ -2503,6 +2503,7 @@ def parse_op(raw_op):
         "eq", "ec",
         "er", "ex",
         "ey", "eb",
+        "ez",
         "ru",
         "ua",
         "mu",
@@ -4257,6 +4258,42 @@ def parse_op(raw_op):
             items.append((item_id, base, target))
         now = parse_metric_num(raw_op["now"])
         return ("eb", items, now)
+
+    if name == "ez":
+        # 批量后端端点切换只读预演：精确键序 op,items,now（键须按此序出
+        # 现，乱序报 INPUT）；items 形状、数量、重复 id 与 base/target 端点
+        # 校验逐项同 eb（1..1000 项，每项精确键序 id,base,target，id 不
+        # 重复；base/target 为 null 或精确键序 host,port 的对象，校验同
+        # ey/ep）；now 为 0..10^9 非 bool 整数并进入共用非递减时钟（倒退
+        # 在执行期判 INPUT）。未知 id 留执行期判 BACKEND；本函数只做形
+        # 状、字段、数量、重复 id 与时钟域校验，且整份输入先于任何状态检
+        # 查。ez 除推进时钟外为只读，不改任何运行态。
+        if list(raw_op) != ["op", "items", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        raw_items = raw_op["items"]
+        if (
+            not isinstance(raw_items, list)
+            or isinstance(raw_items, bool)
+            or not 1 <= len(raw_items) <= 1000
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        items = []
+        seen_ids = set()
+        for raw_item in raw_items:
+            if (
+                not isinstance(raw_item, dict)
+                or list(raw_item) != ["id", "base", "target"]
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            item_id = parse_backend_id(raw_item["id"])
+            if item_id in seen_ids:
+                fail(EXIT_INPUT, "INPUT")
+            seen_ids.add(item_id)
+            base = parse_endpoint_or_none(raw_item["base"])
+            target = parse_endpoint_or_none(raw_item["target"])
+            items.append((item_id, base, target))
+        now = parse_metric_num(raw_op["now"])
+        return ("ez", items, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -8101,6 +8138,7 @@ def run(raw):
             "eq", "ec",
             "er", "ex",
             "ey", "eb",
+            "ez",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -13520,6 +13558,100 @@ def run(raw):
                 )
             results.append(
                 {"op": "eb", "items": result_items, "ok": True}
+            )
+
+        elif op[0] == "ez":
+            # 批量后端端点切换只读预演：形状/字段/数量/重复 id/端点/编码
+            # 与时钟倒退已在解析期及共用时钟块判 INPUT，INPUT 先于
+            # BACKEND。执行期先按 items 顺序确认所有后端存在（首个未知报
+            # BACKEND），随后按操作起始快照计算预演——ez 除推进时钟（已
+            # 在循环开头完成）外不改变任何运行态，故直接读取当前登记与活
+            # 动连接即可。单遍扫描连接，仅按请求涉及的后端聚合 total 与
+            # 相对 target 的 fresh（建连时端点快照等于 target；无快照按
+            # null 比较），stale=total-fresh，O(N+C)、O(N)。
+            #
+            # status：current==target 为 unchanged；否则 current==base 为
+            # applicable；其余为 conflict。存在 conflict 仅令 ready=false，
+            # 仍返回完整预演明细（不以 STATE 代替）。summary 依次汇总
+            # total/applicable/unchanged/conflict 与跨项 connections/stale。
+            _, preview_items, now = op
+            records = []
+            for backend_id, _base, _target in preview_items:
+                record = backends.get(backend_id)
+                if record is None:
+                    fail(EXIT_BACKEND, "BACKEND")
+                records.append(record)
+            wanted = {backend_id for backend_id, _b, _t in preview_items}
+            # backend_id -> [total, fresh]，fresh 以各项自己的 target 为准，
+            # 故同一后端若在请求中出现即唯一（id 已在解析期去重）。
+            counts = {backend_id: [0, 0] for backend_id in wanted}
+            targets = {
+                backend_id: target
+                for backend_id, _base, target in preview_items
+            }
+            for cid, connection in connections.items():
+                backend_id = connection[0]
+                entry = counts.get(backend_id)
+                if entry is None:
+                    continue
+                entry[0] += 1
+                if conn_endpoints.get(cid) == targets[backend_id]:
+                    entry[1] += 1
+            result_items = []
+            n_applicable = 0
+            n_unchanged = 0
+            n_conflict = 0
+            sum_connections = 0
+            sum_stale = 0
+            for record, (backend_id, base, target) in zip(
+                records, preview_items
+            ):
+                current = record["endpoint"]
+                if current == target:
+                    status = "unchanged"
+                    n_unchanged += 1
+                elif current == base:
+                    status = "applicable"
+                    n_applicable += 1
+                else:
+                    status = "conflict"
+                    n_conflict += 1
+                total, fresh = counts[backend_id]
+                stale = total - fresh
+                sum_connections += total
+                sum_stale += stale
+                result_items.append(
+                    {
+                        "id": backend_id,
+                        "current": (
+                            None if current is None
+                            else {"host": current[0], "port": current[1]}
+                        ),
+                        "target": (
+                            None if target is None
+                            else {"host": target[0], "port": target[1]}
+                        ),
+                        "status": status,
+                        "total": total,
+                        "fresh": fresh,
+                        "stale": stale,
+                    }
+                )
+            results.append(
+                {
+                    "op": "ez",
+                    "now": now,
+                    "ready": n_conflict == 0,
+                    "items": result_items,
+                    "summary": {
+                        "total": len(result_items),
+                        "applicable": n_applicable,
+                        "unchanged": n_unchanged,
+                        "conflict": n_conflict,
+                        "connections": sum_connections,
+                        "stale": sum_stale,
+                    },
+                }
             )
 
         elif op[0] == "se":
