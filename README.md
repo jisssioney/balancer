@@ -291,6 +291,18 @@
 - `items` 保持预约顺序，每项固定键序 `id,exists,current,target,status,cids`。删除项取 `exists=false`、`current=null`、`status=MISSING`、`cids=[]`；其余项按当前端点等于 `target`、等于 `base` 或均不等分别取 `UNCHANGED`、`APPLICABLE`、`CONFLICT`。现存后端按全局建连顺序列出 `opened≤before` 且建连端点快照不等于该项 `target` 的 cids（无快照按 null 比较，故 `target` 为 null 时无快照连接不列入；`opened==before` 列入），`closed` 为全部 cids 数量。整体不可执行时仍报告其余可计算项。
 - `ev` 成功只推进 `now`：不改端点、连接、排空状态、预约、队列、令牌、配额、指标或告警，不关闭连接或删除预约，后续 `ei` 仍按执行时状态判定。单次时间与结果空间 O(N+C)（N 为预约项数、C 为活动连接数），仅使用 Python 标准库；相同初态和输入产生逐字节一致的固定键序紧凑 UTF-8 JSON 与单个末尾换行，`run`、`record`、`replay` 结果一致，`se` 导出后 `si` 恢复继续执行与直接继续一致。
 
+## 端点切换预约轮询到期处理：ed
+
+让轮询者只提交 `op` 与 `now` 即可原子检查并处理当前端点切换预约，无需先读身份再提交 `ei`，避免查询与执行之间预约被 `es`/`eo` 替换。`es`、`en`、`eu`、`ei`、`eo`、`ev`、`ew` 及所有既有入口行为不变。
+
+- `ed`：严格接受按键序 `op,now` 排列的两键（键须按此序出现，乱序报 INPUT）。`now` 为 0..10⁹ 的非 bool 整数并进入全局非递减显式时钟（倒退报 INPUT/2）。不携带预约身份；无预约、未到期、到期但前提不成立均为成功结果而非错误。
+  - 无预约时 `status` 为 `EMPTY`：`digest` 与 `at` 为 null，`items` 为空数组，除推进时钟外不改任何状态。
+  - 存在预约但 `now<at` 时 `status` 为 `WAITING`：回显预约身份并给出完整影响；不改端点、连接或预约。
+  - 预约到期（`now≥at`）后按**操作开始快照**和预约顺序检查后端及端点前提：已删除后端标为 `MISSING`（`exists=false`、`current=null`）；现存后端的当前端点等于 `target`、等于 `base` 或均不等时依次标为 `UNCHANGED`、`APPLICABLE`、`CONFLICT`。每项 `cids` 按全局建连顺序列出 `opened` 不晚于 `before`（`opened==before` 列入）且建连端点快照不同于该项 `target` 的活动连接，无快照按 null 比较。整体状态优先取 `MISSING`，其次 `CONFLICT`；两者都成功返回完整影响，但保留预约且不改业务状态。
+  - 全部项目可执行时 `status` 为 `APPLIED`：先按预约顺序切换需要变化的端点（已等于 `target` 的不重写），再关闭列出的连接并删除预约；排空 D 后端若因本次关闭失去最后连接，沿用 `ei`/`ej` 现有规则转为 X，`end` 取 `now`，`forced` 不变；不消费队列、令牌或配额，不重新调度。
+- 返回固定键序 `op,now,status,digest,at,items,affected,closed`。除 `EMPTY` 外回显预约身份（`digest`、`at`）；`items` 每项固定键序 `id,exists,current,target,status,cids`，含义同 `ev`。`affected` 为各项 `cids` 总数；只有 `APPLIED` 的 `closed` 等于 `affected`，其余状态为零。`EMPTY` 的两项计数均为零。
+- 字段集合、键序、类型、范围、UTF-8 编码或时钟倒退报 INPUT/2；失败无 stdout 并回滚整批变化和时钟。`ed` 不引入新的持久状态（预约仍为检查点 `ep_switch` 段），`se` 与 `si` 完整保存恢复、`sd`/`sx`/`sm` 观察方式不变。单次时间与结果额外空间均为 O(N+C)，N 为预约项数、C 为活动连接数；仅使用 Python 标准库；`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节确定性。
+
 ## 端点切换预约候选替换只读预演：ew
 
 在提交 `eo` 改期或换内容前，只读判断并发前提是否仍成立，并同时看到候选预约按当前状态会影响哪些连接；只读：只推进显式 `now`，不改变预约、端点、连接或其他运行态，调用方可据此决定是否原样提交 `eo`。`es`、`en`、`eu`、`ei`、`eo`、`ev`、`ej` 及所有既有入口行为不变。
