@@ -256,6 +256,18 @@
 - 成功返回固定键序 `op,now,items,closed,ok`；`items` 按请求顺序排列，每项固定键序 `id,endpoint,cids`，`endpoint` 为规范化后的 `target` 对象或 `null`，`cids` 按全局关闭次序列出该后端本次关闭的连接；`closed` 为全部 `cids` 数量，`ok` 恒为 `true`。首次提交与相同请求重报（含部分项已处于目标的重试）逐字节一致。
 - 字段、键序、编码、类型、范围、`before` 关系或时钟倒退返回 INPUT/2，未知后端返回 BACKEND/3，条件冲突返回 STATE/4；失败不产生 stdout，并回滚同批此前变化、时钟、端点和连接。单次时间与额外空间均为 O(N+C)（N 为 `items` 项数、C 为活动连接数），仅使用 Python 标准库；`run`、`record`、`replay`、`se`、`si` 与固定键序 JSON、单末尾换行和逐字节确定性保持兼容，既有操作行为不变。
 
+## 全池端点切换预约：es / en / eu / ei
+
+在 `ej` 的即时端点切换与旧连接清理之上，提供全池唯一的端点切换预约：先保存一批后端的基线与目标端点及旧连接时间边界，到点后凭摘要与触发时刻原子生效。`ep`、`ey`、`eb`、`eq`、`ec`、`er`、`ex`、`ez`、`ej`、`fw` 及所有既有入口行为不变。
+
+- `es`：精确键序 `op,items,before,at,now`（键须按此序出现）。`items` 为 1 至 1000 项数组，数量、顺序、唯一 id、`base` 与 `target` 规则全部沿用 `ej`（`null` 或精确键序 `host,port` 的对象，校验同 `ep`）。`before`、`at`、`now` 均为 0..10⁹ 的非 bool 整数，且 `now≤at`、`before≤at`（不要求 `before≤now`）。`now` 进入全局非递减显式时钟，`at` 仅为预约触发时刻、不推进时钟。
+  - 字段、键序、容器、数量、重复 id、编码、数值范围或时间关系（含时钟倒退）报 INPUT/2；全部后端引用按 `items` 顺序校验，首个未知后端报 BACKEND/3。后端全部存在后保存规范化快照：不检查端点条件、不切换端点、也不关闭连接。全池唯一，新预约整体替换旧预约。
+  - `digest` 为固定键序对象 `{"items":items,"before":before}` 的紧凑 UTF-8 JSON（`ensure_ascii=False`、分隔符 `,:`、无末尾换行）的 SHA-256 小写十六进制值；返回固定键序 `op,digest,at,ok`，`ok` 恒为 true，相同输入重报一致。时间 O(N)。
+- `en`：精确键序仅 `op`，不推进时钟、不改任何状态。返回固定键序 `op,pending,digest,at,before,items`；无预约时后四项依次为 `null`、`null`、`null`、空数组；有预约时回显身份（`digest`、`at`、`before`）与规范化 `items`（每项 `id,base,target` 固定键序）。时间 O(N)。
+- `eu`：精确键序 `op,digest,at,now`。`digest` 为小写 64 位十六进制 SHA-256（仅用于匹配）；`at`、`now` 均为 0..10⁹ 的非 bool 整数，`now` 进入全局非递减时钟，`at` 仅用于匹配、不推动时钟。无预约时成功返回固定键序 `op,digest,at,cancelled`，`cancelled=false`；预约的摘要与时刻同时匹配时删除预约并返回 `cancelled=true`；任一身份不符报 STATE/4 并保留预约。时间 O(1)。
+- `ei`：精确键序同 `eu` 的四字段。无预约、身份（`digest`、`at`）不符或 `now<at`（过早）报 STATE/4 并保留预约。身份匹配且 `now≥at` 时，按操作开始快照执行 `ej` 的端点前提、连接筛选与关闭顺序、排空末连接迁移：未知后端（如生效时已删除）报 BACKEND/3，端点条件冲突报 STATE/4，任一失败均保留预约；成功后删除预约。返回固定键序 `op,now,items,closed,ok`，各项与成功结果口径完全沿用 `ej`。错误优先级为 INPUT、BACKEND、STATE。时间 O(N+C)，C 为活动连接数。
+- 字段、键序、编码、摘要格式、容器、数量、重复 id、数值范围、时间关系或时钟倒退报 INPUT/2，建立时未知后端报 BACKEND/3；所有失败均无 stdout，并原子回滚时钟及全部业务状态。`se` 导出预约（state 顶层段 `endpoint_reservation`，无预约为 null），`si` 恢复后行为与直接继续一致；成功的 `ci`、`cb`、`cu`、`ca` 清除端点预约，其他操作（含 `cp`/`cx`/`cy` 与配置预约）不改变它，两类预约相互独立。`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，仅用 Python 标准库，不读系统时间、不联网。
+
 ## 测试
 
     python -m unittest discover

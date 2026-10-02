@@ -24110,5 +24110,635 @@ class EndpointBatchSwitchAndCleanupTest(unittest.TestCase):
         self.assertEqual(cids, set())
 
 
+class EndpointSwitchReservationTest(unittest.TestCase):
+    """es/en/eu/ei：全池唯一的端点切换预约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+    EP3 = {"host": "10.0.0.3", "port": 82}
+    EP4 = {"host": "10.0.0.4", "port": 83}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if code != 0:
+            raise AssertionError((code, out, err))
+        return json.loads(out)["results"]
+
+    def last_of(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def assert_failure(self, ops, exit_code=2, label="INPUT"):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(
+            (code, out, err),
+            (exit_code, b"", ('{"error":"%s"}\n' % label).encode()),
+        )
+
+    def setup_two_with_conns(self):
+        """b1=EP1（c1@0、c3@2），b2=EP2（c2@1），全局序 c1,c2,c3。"""
+        return [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 1},
+            {"op": "ep", "id": "b1", **self.EP1},
+            {"op": "ep", "id": "b2", **self.EP2},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 1},
+            {"op": "open", "cid": "c3", "flow": FLOW, "now": 2},
+        ]
+
+    def items(self, *entries):
+        return [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in entries
+        ]
+
+    def es(self, entries, before=1, at=20, now=10):
+        if entries and isinstance(entries[0], str):
+            # 单项三元组。
+            entries = [entries]
+        return {
+            "op": "es",
+            "items": self.items(*entries),
+            "before": before,
+            "at": at,
+            "now": now,
+        }
+
+    def digest_for(self, entries, before):
+        canonical = {"items": self.items(*entries), "before": before}
+        return hashlib.sha256(
+            json.dumps(canonical, ensure_ascii=False,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    # ---- en / es 基本路径 ----
+
+    def test_en_empty(self):
+        result = self.last_of(self.setup_two_with_conns() + [{"op": "en"}])
+        self.assertEqual(
+            list(result),
+            ["op", "pending", "digest", "at", "before", "items"],
+        )
+        self.assertEqual(result, {
+            "op": "en", "pending": False, "digest": None, "at": None,
+            "before": None, "items": [],
+        })
+
+    def test_es_returns_digest_and_en_reads_back(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        result = self.last_of(
+            self.setup_two_with_conns() + [self.es(entries)]
+        )
+        self.assertEqual(list(result), ["op", "digest", "at", "ok"])
+        digest = self.digest_for(entries, 1)
+        self.assertEqual(result, {"op": "es", "digest": digest,
+                                  "at": 20, "ok": True})
+        en = self.last_of(
+            self.setup_two_with_conns() + [self.es(entries), {"op": "en"}]
+        )
+        self.assertEqual(en["pending"], True)
+        self.assertEqual(en["digest"], digest)
+        self.assertEqual(en["at"], 20)
+        self.assertEqual(en["before"], 1)
+        self.assertEqual(en["items"], self.items(*entries))
+        # 每项固定键序 id,base,target。
+        for item in en["items"]:
+            self.assertEqual(list(item), ["id", "base", "target"])
+
+    def test_es_digest_ignores_at_and_now(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        d1 = self.last_of(self.setup_two_with_conns() + [
+            self.es(entries, before=4, at=20, now=10)
+        ])["digest"]
+        d2 = self.last_of(self.setup_two_with_conns() + [
+            self.es(entries, before=4, at=99, now=11)
+        ])["digest"]
+        self.assertEqual(d1, d2)
+        d3 = self.last_of(self.setup_two_with_conns() + [
+            self.es(entries, before=5, at=20, now=10)
+        ])["digest"]
+        self.assertNotEqual(d1, d3)
+
+    def test_es_does_not_switch_or_close(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        results = self.run_ops(self.setup_two_with_conns() + [
+            self.es(entries),
+            {"op": "fw", "cid": "c1"},
+            {"op": "eq", "id": "b1", "now": 10},
+        ])
+        self.assertEqual(results[-2]["host"], "10.0.0.1")
+        self.assertEqual(results[-2]["port"], 80)
+        self.assertEqual(results[-1]["current"], self.EP1)
+        self.assertEqual(results[-1]["total"], 2)
+
+    def test_es_identical_repeat_byte_identical(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        op = self.es(entries)
+        once = self.run_ops(self.setup_two_with_conns() + [op])
+        twice = self.run_ops(self.setup_two_with_conns() + [op, op])
+        self.assertEqual(once[-1], twice[-1])
+
+    def test_es_replaces_existing_reservation(self):
+        op1 = self.es(("b1", self.EP1, self.EP3), before=1, at=20, now=10)
+        op2 = self.es(("b2", self.EP2, self.EP4), before=0, at=30, now=11)
+        en = self.last_of(
+            self.setup_two_with_conns() + [op1, op2, {"op": "en"}]
+        )
+        self.assertEqual(en["at"], 30)
+        self.assertEqual(en["before"], 0)
+        self.assertEqual([item["id"] for item in en["items"]], ["b2"])
+
+    def test_es_unknown_backend_is_backend_and_no_reservation(self):
+        ops = self.setup_two_with_conns()
+        bad = self.es(("ghost", None, self.EP3))
+        self.assert_failure(ops + [bad], exit_code=3, label="BACKEND")
+        en = self.last_of(ops + [{"op": "en"}])
+        self.assertFalse(en["pending"])
+
+    # ---- eu ----
+
+    def test_eu_no_reservation_is_idempotent_noop(self):
+        result = self.last_of(self.setup_two_with_conns() + [
+            {"op": "eu", "digest": "0" * 64, "at": 20, "now": 5},
+        ])
+        self.assertEqual(list(result), ["op", "digest", "at", "cancelled"])
+        self.assertEqual(result, {
+            "op": "eu", "digest": "0" * 64, "at": 20,
+            "cancelled": False,
+        })
+
+    def test_eu_matching_identity_cancels(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        digest = self.digest_for(entries, 1)
+        results = self.run_ops(self.setup_two_with_conns() + [
+            self.es(entries),
+            {"op": "eu", "digest": digest, "at": 20, "now": 12},
+            {"op": "en"},
+        ])
+        self.assertTrue(results[-2]["cancelled"])
+        self.assertFalse(results[-1]["pending"])
+
+    def test_eu_mismatch_state_and_retains(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        digest = self.digest_for(entries, 1)
+        ops = self.setup_two_with_conns() + [self.es(entries)]
+        for op in (
+            {"op": "eu", "digest": "0" * 64, "at": 20, "now": 12},
+            {"op": "eu", "digest": digest, "at": 21, "now": 12},
+        ):
+            self.assert_failure(ops + [op], exit_code=4, label="STATE")
+        # 预约仍在（重放 es 前缀后 en 应 pending）。
+        en = self.last_of(ops + [{"op": "en"}])
+        self.assertTrue(en["pending"])
+
+    # ---- ei ----
+
+    def test_ei_too_early_state_and_retains(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        digest = self.digest_for(entries, 1)
+        ops = self.setup_two_with_conns()
+        es_op = self.es(entries)
+        self.assert_failure(
+            ops + [es_op, {"op": "ei", "digest": digest, "at": 20,
+                           "now": 19}],
+            exit_code=4, label="STATE",
+        )
+        en = self.last_of(ops + [es_op, {"op": "en"}])
+        self.assertTrue(en["pending"])
+
+    def test_ei_no_reservation_state(self):
+        self.assert_failure(
+            self.setup_two_with_conns() + [
+                {"op": "ei", "digest": "0" * 64, "at": 20, "now": 20},
+            ],
+            exit_code=4, label="STATE",
+        )
+
+    def test_ei_identity_mismatch_state(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        ops = self.setup_two_with_conns() + [self.es(entries)]
+        for op in (
+            {"op": "ei", "digest": "0" * 64, "at": 20, "now": 20},
+            {"op": "ei", "digest": self.digest_for(entries, 1),
+             "at": 21, "now": 20},
+        ):
+            self.assert_failure(ops + [op], exit_code=4, label="STATE")
+
+    def test_ei_executes_ej_and_deletes_reservation(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        digest = self.digest_for(entries, 1)
+        prefix = self.setup_two_with_conns() + [self.es(entries)]
+        result = self.last_of(prefix + [
+            {"op": "ei", "digest": digest, "at": 20, "now": 20},
+        ])
+        self.assertEqual(list(result), ["op", "now", "items", "closed", "ok"])
+        self.assertEqual(result["now"], 20)
+        # before=1（默认）：c1@0、c2@1 关闭，c3@2 保留。
+        self.assertEqual(result["closed"], 2)
+        self.assertIs(result["ok"], True)
+        self.assertEqual(result["items"], [
+            {"id": "b1", "endpoint": self.EP3, "cids": ["c1"]},
+            {"id": "b2", "endpoint": self.EP4, "cids": ["c2"]},
+        ])
+        en = self.last_of(prefix + [
+            {"op": "ei", "digest": digest, "at": 20, "now": 20},
+            {"op": "en"},
+        ])
+        self.assertFalse(en["pending"])
+        # 第二次同参 ei 按无预约报 STATE。
+        self.assert_failure(
+            prefix + [
+                {"op": "ei", "digest": digest, "at": 20, "now": 20},
+                {"op": "ei", "digest": digest, "at": 20, "now": 21},
+            ],
+            exit_code=4, label="STATE",
+        )
+
+    def test_ei_at_boundary_included(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        digest = self.digest_for(entries, 1)
+        # before=1：c1@0、c2@1 关闭，c3@2 保留。
+        result = self.last_of(self.setup_two_with_conns() + [
+            self.es(entries, before=1),
+            {"op": "ei", "digest": digest, "at": 20, "now": 20},
+        ])
+        self.assertEqual(result["items"], [
+            {"id": "b1", "endpoint": self.EP3, "cids": ["c1"]},
+            {"id": "b2", "endpoint": self.EP4, "cids": ["c2"]},
+        ])
+        self.assertEqual(result["closed"], 2)
+
+    def test_ei_endpoint_conflict_state_and_retains(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        digest = self.digest_for(entries, 1)
+        es_op = self.es(entries)
+        ops = self.setup_two_with_conns() + [
+            es_op,
+            {"op": "ep", "id": "b1", "host": "9.9.9.9", "port": 99},
+        ]
+        self.assert_failure(
+            ops + [{"op": "ei", "digest": digest, "at": 20, "now": 20}],
+            exit_code=4, label="STATE",
+        )
+        en = self.last_of(
+            self.setup_two_with_conns() + [es_op, {"op": "en"}]
+        )
+        self.assertTrue(en["pending"])
+
+    def test_ei_deleted_backend_is_backend_and_retains(self):
+        # b3 无连接，可 remove；ei 引用已删除后端报 BACKEND/3。
+        entries = [("b3", None, self.EP3)]
+        digest = self.digest_for(entries, 0)
+        setup = [
+            {"op": "add", "id": "b3", "weight": 1},
+            self.es(entries, before=0, at=20, now=10),
+            {"op": "remove", "id": "b3"},
+        ]
+        self.assert_failure(
+            setup + [{"op": "ei", "digest": digest, "at": 20, "now": 20}],
+            exit_code=3, label="BACKEND",
+        )
+
+    def test_ei_drain_last_connection_moves_to_x(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        digest = self.digest_for(entries, 10)
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "ep", "id": "b1", **self.EP1},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "ds", "id": "b1", "t": 50},
+            {"op": "dr", "id": "b1", "now": 5},
+            self.es(entries, before=10, at=20, now=10),
+            {"op": "ei", "digest": digest, "at": 20, "now": 20},
+            {"op": "dq", "now": 20},
+        ]
+        dq = self.run_ops(ops)[-1]
+        self.assertEqual(dq["items"][0]["state"], "X")
+        self.assertEqual(dq["items"][0]["end"], 20)
+
+    # ---- 时钟 ----
+
+    def test_en_does_not_advance_clock(self):
+        ops = self.setup_two_with_conns()
+        # 最后 open now=2；en 后以 now=2 的 es 合法（en 不推进时钟）。
+        result = self.run_ops(ops + [
+            {"op": "en"},
+            self.es(("b1", self.EP1, self.EP3), before=2, at=5, now=2),
+        ])
+        self.assertTrue(result[-1]["ok"])
+
+    def test_clock_rollback_is_input(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        # opens 到 now=2；eu now=1 即时钟倒退。
+        self.assert_failure(
+            self.setup_two_with_conns() + [
+                {"op": "eu", "digest": "0" * 64, "at": 20, "now": 1},
+            ],
+            exit_code=2, label="INPUT",
+        )
+        # es 到 now=10 后再 es now=9。
+        self.assert_failure(
+            self.setup_two_with_conns() + [
+                self.es(entries, at=20, now=10),
+                self.es(entries, at=20, now=9),
+            ],
+            exit_code=2, label="INPUT",
+        )
+
+    # ---- INPUT 校验 ----
+
+    def test_input_rejections(self):
+        entries = self.items(
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        )
+        es_op = {
+            "op": "es", "items": entries, "before": 1, "at": 20, "now": 10,
+        }
+        bad = [
+            {"op": "en", "now": 1},
+            {"op": "es", "items": entries, "before": 1, "at": 20},
+            {"op": "es", "items": entries, "at": 20, "now": 10},
+            {"op": "es", "items": [], "before": 1, "at": 20, "now": 10},
+            {"op": "es", "items": "x", "before": 1, "at": 20, "now": 10},
+            {
+                "op": "es",
+                "items": entries + [
+                    {"id": "b1", "base": self.EP1, "target": self.EP3},
+                ],
+                "before": 1, "at": 20, "now": 10,
+            },
+            {"op": "es", "items": entries, "before": 1, "at": 5,
+             "now": 10},                       # now>at
+            {"op": "es", "items": entries, "before": 9, "at": 5,
+             "now": 5},                        # before>at
+            {"op": "es", "items": entries, "before": True, "at": 20,
+             "now": 10},                       # bool
+            {"op": "es", "items": entries, "before": -1, "at": 20,
+             "now": 10},
+            {"op": "es", "items": entries, "before": 1, "at": 20,
+             "now": 10 ** 9 + 1},
+            {"op": "es", "items": entries, "before": 1, "at": "20",
+             "now": 10},
+            {
+                "op": "es",
+                "items": [{"base": self.EP1, "target": self.EP3}],
+                "before": 1, "at": 20, "now": 10,
+            },                                  # 缺 id
+            {
+                "op": "es",
+                "items": [{
+                    "id": "b1", "base": self.EP1, "target": self.EP3,
+                    "x": 1,
+                }],
+                "before": 1, "at": 20, "now": 10,
+            },                                  # 多项键
+            {
+                "op": "es",
+                "items": [{
+                    "id": "b1", "base": self.EP1,
+                    "target": {"host": "10.0.0.01", "port": 80},
+                }],
+                "before": 1, "at": 20, "now": 10,
+            },                                  # 非规范 IP
+            {"op": "eu", "digest": "g" + "0" * 63, "at": 20, "now": 10},
+            {"op": "eu", "digest": "0" * 63, "at": 20, "now": 10},
+            {"op": "eu", "digest": "0" * 64, "at": -1, "now": 10},
+            {"op": "ei", "digest": "0" * 64, "at": 20},
+        ]
+        for op in bad:
+            self.assert_failure(
+                self.setup_two_with_conns() + [op],
+                exit_code=2, label="INPUT",
+            )
+        # es 顶层键序错误（at 在 before 前）。
+        raw = (
+            b'{"ops":[{"op":"es","items":'
+            + json.dumps(entries).encode("utf-8")
+            + b',"at":20,"before":1,"now":10}]}'
+        )
+        code, out, err = run_balancer("run", raw)
+        self.assertEqual((code, out, err),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+        # 超过 1000 项。
+        big = [
+            {"id": "b%d" % i, "base": None, "target": self.EP3}
+            for i in range(1001)
+        ]
+        self.assert_failure(
+            [{"op": "es", "items": big, "before": 1, "at": 20,
+              "now": 10}],
+            exit_code=2, label="INPUT",
+        )
+        # es_op 本身合法（对照）。
+        self.assertEqual(self.run_ops(
+            self.setup_two_with_conns() + [es_op]
+        )[-1]["ok"], True)
+
+    # ---- 配置变更清除预约；两类预约独立 ----
+
+    def _v1_config(self):
+        return {
+            "version": 1,
+            "backends": [
+                {
+                    "id": backend_id, "weight": 1, "d": 0,
+                    "fail": 3, "success": 2,
+                    "circuit": None, "drain": None,
+                }
+                for backend_id in ("b1", "b2")
+            ],
+            "vnodes": None, "limits": [], "overload": None,
+        }
+
+    def test_ci_cb_cu_ca_clear_endpoint_reservation(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        digest = self.digest_for(entries, 1)
+        close_both = [
+            {"op": "close", "cid": "c1", "now": 20},
+            {"op": "close", "cid": "c2", "now": 20},
+            {"op": "close", "cid": "c3", "now": 20},
+        ]
+        base = self.setup_two_with_conns()
+
+        # ci
+        en = self.last_of(base + [
+            self.es(entries),
+        ] + close_both + [
+            {"op": "ci", "config": self._v1_config(), "now": 30},
+            {"op": "en"},
+        ])
+        self.assertFalse(en["pending"])
+
+        # cb
+        prefix = base + [self.es(entries)] + close_both + [
+            {"op": "ci", "config": self._v1_config(), "now": 30},
+            self.es(entries, before=1, at=40, now=35),
+        ]
+        en = self.last_of(prefix + [
+            {"op": "cb", "rev": 1, "now": 40}, {"op": "en"},
+        ])
+        self.assertFalse(en["pending"])
+
+        # cu：ci 后取 ct 摘要，cu 热加载 vnodes 段（值未变也成功）。
+        after_ci = base + close_both + [
+            {"op": "ci", "config": self._v1_config(), "now": 30},
+            {"op": "ct"},
+        ]
+        ct_digest = self.last_of(after_ci)["digest"]
+        # ci 已把登记端点规范化为 None，故 base 为 null。
+        en = self.last_of(after_ci[:-1] + [
+            self.es([("b1", None, self.EP3)], before=0, at=40, now=35),
+            {"op": "cu", "base": ct_digest, "section": "vnodes",
+             "value": None, "now": 38},
+            {"op": "en"},
+        ])
+        self.assertFalse(en["pending"])
+
+        # ca（配置预约生效同时清除端点预约）。
+        en = self.last_of(base + [
+            self.es(entries),
+            {"op": "cp", "config": self._v1_config(), "at": 50, "now": 40},
+        ] + [
+            {"op": "close", "cid": cid, "now": 45}
+            for cid in ("c1", "c2", "c3")
+        ] + [
+            {"op": "ca", "now": 50}, {"op": "en"},
+        ])
+        self.assertFalse(en["pending"])
+
+    def test_config_and_endpoint_reservations_are_independent(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        base = self.setup_two_with_conns() + [
+            self.es(entries),
+            {"op": "cp", "config": self._v1_config(), "at": 50, "now": 40},
+        ]
+        en = self.last_of(base + [{"op": "en"}])
+        cq = self.last_of(base + [{"op": "cq", "now": 42}])
+        self.assertTrue(en["pending"])
+        self.assertTrue(cq["pending"])
+        # eu 只取消端点预约：配置预约仍在。
+        digest = self.digest_for(entries, 1)
+        after = base + [
+            {"op": "eu", "digest": digest, "at": 20, "now": 41},
+            {"op": "en"}, {"op": "cq", "now": 42},
+        ]
+        results = self.run_ops(after)
+        self.assertFalse(results[-2]["pending"])
+        self.assertTrue(results[-1]["pending"])
+
+    # ---- 检查点与 record/replay ----
+
+    def test_checkpoint_roundtrip(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        digest = self.digest_for(entries, 1)
+        prefix = self.setup_two_with_conns() + [self.es(entries)]
+        exported = self.last_of(prefix + [{"op": "se"}])
+        state = exported["state"]
+        self.assertIn("endpoint_reservation", state)
+        self.assertEqual(
+            list(state["endpoint_reservation"]),
+            ["items", "before", "at", "digest"],
+        )
+        si_op = {"op": "si", "version": 1,
+                 "digest": exported["digest"], "state": state}
+        cont = [
+            {"op": "en"},
+            {"op": "ei", "digest": digest, "at": 20, "now": 20},
+        ]
+        direct = self.run_ops(prefix + cont)
+        resumed = self.run_ops([si_op] + cont)
+        self.assertEqual(resumed[1:], direct[len(prefix):])
+        # 恢复后再导出与原 state 逐字节一致。
+        re_export = self.run_ops([si_op, {"op": "se"}])[-1]
+        self.assertEqual(re_export["state"], state)
+
+    def test_checkpoint_empty_reservation_is_null(self):
+        state = self.last_of(
+            self.setup_two_with_conns() + [{"op": "se"}]
+        )["state"]
+        self.assertIsNone(state["endpoint_reservation"])
+
+    def test_sd_observes_section_change(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        before = self.last_of(
+            self.setup_two_with_conns() + [{"op": "se"}]
+        )
+        after = self.last_of(
+            self.setup_two_with_conns() + [
+                self.es(entries), {"op": "se"},
+            ]
+        )
+        sd = {
+            "op": "sd", "version": 1,
+            "digest": after["digest"], "state": after["state"],
+        }
+        result = self.last_of(
+            self.setup_two_with_conns() + [sd]
+        )
+        sections = [change["section"] for change in result["changes"]]
+        self.assertIn("endpoint_reservation", sections)
+        self.assertEqual(result["before"], before["digest"])
+        self.assertEqual(result["after"], after["digest"])
+
+    def test_record_replay_byte_identical(self):
+        entries = [
+            ("b1", self.EP1, self.EP3),
+            ("b2", self.EP2, self.EP4),
+        ]
+        digest = self.digest_for(entries, 1)
+        batches = [
+            self.setup_two_with_conns() + [
+                self.es(entries), {"op": "en"},
+            ],
+            self.setup_two_with_conns() + [
+                self.es(entries),
+                {"op": "eu", "digest": digest, "at": 20, "now": 12},
+            ],
+            self.setup_two_with_conns() + [
+                self.es(entries),
+                {"op": "ei", "digest": digest, "at": 20, "now": 20},
+            ],
+            self.setup_two_with_conns() + [
+                self.es(entries),
+                {"op": "ei", "digest": "0" * 64, "at": 20, "now": 20},
+            ],
+        ]
+        for ops in batches:
+            raw = encode_ops(ops)
+            code, record, err = run_balancer("record", raw)
+            self.assertEqual((code, err), (0, b""))
+            direct_code, direct, direct_err = run_balancer("run", raw)
+            code, replayed, err = run_balancer("replay", record)
+            self.assertEqual(
+                (code, replayed, err),
+                (direct_code, direct, direct_err),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
