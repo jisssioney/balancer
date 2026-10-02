@@ -22473,5 +22473,465 @@ class EndpointConditionalChangeTest(unittest.TestCase):
         self.assertEqual(resumed[1:], results[len(ops) + 1:])
 
 
+class EndpointBatchConditionalChangeTest(unittest.TestCase):
+    """eb：批量后端端点原子条件变更。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+    EP3 = {"host": "10.0.0.3", "port": 82}
+    EP4 = {"host": "10.0.0.4", "port": 83}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if code != 0:
+            raise AssertionError((code, out, err))
+        return json.loads(out)["results"]
+
+    def last_of(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def assert_failure(self, ops, exit_code=2, label="INPUT"):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(
+            (code, out, err),
+            (exit_code, b"", ('{"error":"%s"}\n' % label).encode()),
+        )
+
+    def run_raw(self, raw):
+        return run_balancer("run", raw)
+
+    def setup(self, endpoints=()):
+        """add 两个后端并按 mapping 登记端点；返回此前缀操作列表。"""
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 1},
+        ]
+        for backend_id, endpoint in endpoints:
+            ops.append({"op": "ep", "id": backend_id, **endpoint})
+        return ops
+
+    def eb(self, entries, now=5):
+        return {
+            "op": "eb",
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in entries
+            ],
+            "now": now,
+        }
+
+    # ---- 成功路径 ----
+
+    def test_batch_sets_multiple_backends(self):
+        result = self.last_of(self.setup() + [
+            self.eb([("b1", None, self.EP1), ("b2", None, self.EP2)]),
+        ])
+        self.assertEqual(list(result), ["op", "items", "ok"])
+        self.assertIs(result["ok"], True)
+        self.assertEqual(len(result["items"]), 2)
+        for item in result["items"]:
+            self.assertEqual(list(item), ["id", "endpoint"])
+        self.assertEqual(result, {
+            "op": "eb",
+            "items": [
+                {"id": "b1", "endpoint": self.EP1},
+                {"id": "b2", "endpoint": self.EP2},
+            ],
+            "ok": True,
+        })
+
+    def test_change_and_clear_mixed(self):
+        result = self.last_of(self.setup([("b1", self.EP1)]) + [
+            self.eb([("b1", self.EP1, self.EP2), ("b2", None, None)]),
+        ])
+        # b1 改到 EP2；b2 未登记且 target 为 null（当前==target，幂等）。
+        self.assertEqual(result["items"], [
+            {"id": "b1", "endpoint": self.EP2},
+            {"id": "b2", "endpoint": None},
+        ])
+        # b1 已切换；b2 仍未登记（eq 报 STATE）。
+        self.assert_failure(self.setup([("b1", self.EP1)]) + [
+            self.eb([("b1", self.EP1, self.EP2), ("b2", None, None)]),
+            {"op": "eq", "id": "b2", "now": 6},
+        ], exit_code=4, label="STATE")
+
+    def test_first_submit_full_repeat_byte_identical(self):
+        ops = self.setup() + [
+            self.eb([("b1", None, self.EP1), ("b2", None, self.EP2)]),
+        ]
+        first = self.run_ops(ops)
+        second = self.run_ops(ops)
+        self.assertEqual(encode_ops(first), encode_ops(second))
+
+    def test_partial_already_at_target_retry_succeeds(self):
+        # 首次仅 b1 到达目标（b2 的切换通过另一批 ep 模拟“其余仍在基线”）：
+        # 重试时 b1 当前==target（base 已不匹配）仍视为满足，b2 匹配 base，
+        # 整批成功且结果与首次完全一致。
+        entries = [("b1", None, self.EP1), ("b2", None, self.EP2)]
+        ops = self.setup() + [
+            self.eb([("b1", None, self.EP1)], now=5),
+            self.eb(entries, now=6),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(results[-1], {
+            "op": "eb",
+            "items": [
+                {"id": "b1", "endpoint": self.EP1},
+                {"id": "b2", "endpoint": self.EP2},
+            ],
+            "ok": True,
+        })
+        # 再次整批重报（两者均已在 target，base 全部失效）仍成功且同结果。
+        again = self.last_of(ops + [self.eb(entries, now=7)])
+        self.assertEqual(again, results[-1])
+
+    def test_already_target_does_not_require_base(self):
+        # b1 已登记为 EP2，提交 base=EP1,target=EP2：单项幂等，不写登记。
+        result = self.last_of(self.setup([("b1", self.EP2)]) + [
+            self.eb([("b1", self.EP1, self.EP2), ("b2", None, self.EP3)]),
+        ])
+        self.assertEqual(result["items"][0], {"id": "b1", "endpoint": self.EP2})
+        self.assertEqual(result["items"][1], {"id": "b2", "endpoint": self.EP3})
+
+    def test_items_preserve_input_order(self):
+        # 加入顺序 b1,b2，但 items 以 b2 在前：输出按输入顺序排列。
+        result = self.last_of(self.setup() + [
+            self.eb([("b2", None, self.EP3), ("b1", None, self.EP1)]),
+        ])
+        self.assertEqual(
+            [item["id"] for item in result["items"]], ["b2", "b1"],
+        )
+
+    def test_target_null_reports_null_endpoint(self):
+        result = self.last_of(self.setup([("b1", self.EP1)]) + [
+            self.eb([("b1", self.EP1, None)]),
+        ])
+        self.assertEqual(result["items"], [{"id": "b1", "endpoint": None}])
+
+    # ---- 拒绝路径与优先级 ----
+
+    def test_state_when_one_backend_matches_neither(self):
+        self.assert_failure(self.setup([("b1", self.EP1)]) + [
+            self.eb([
+                ("b1", self.EP3, self.EP2),   # 当前 EP1，既非 base EP3 也非 target
+                ("b2", None, self.EP4),
+            ]),
+        ], exit_code=4, label="STATE")
+        # 反过来：b2 失配同样整批 STATE。
+        self.assert_failure(self.setup([("b2", self.EP1)]) + [
+            self.eb([
+                ("b1", None, self.EP2),
+                ("b2", self.EP3, self.EP4),
+            ]),
+        ], exit_code=4, label="STATE")
+
+    def test_unknown_backend_is_backend(self):
+        self.assert_failure([
+            self.eb([("ghost", None, self.EP1)]),
+        ], exit_code=3, label="BACKEND")
+
+    def test_backend_existence_checked_before_conditions(self):
+        # b1 条件本不成立，但 b2/ghost 未知：存在性整批先于条件，报 BACKEND。
+        self.assert_failure(self.setup([("b1", self.EP1)]) + [
+            self.eb([
+                ("b1", self.EP3, self.EP2),
+                ("ghost", None, self.EP4),
+            ]),
+        ], exit_code=3, label="BACKEND")
+
+    def test_input_beats_backend_beats_state(self):
+        # 时钟倒退（INPUT）先于未知后端（BACKEND）。
+        self.assert_failure(self.setup([("b1", self.EP1)]) + [
+            {"op": "eq", "id": "b1", "now": 9},
+            self.eb([("ghost", None, self.EP2)], now=8),
+        ])
+        # 重复 id（INPUT）先于未知后端与条件。
+        self.assert_failure([
+            self.eb([
+                ("ghost", None, self.EP1),
+                ("ghost", None, self.EP2),
+            ]),
+        ])
+        # 未知后端（BACKEND）先于条件不匹配（STATE）。
+        self.assert_failure([
+            self.eb([
+                ("ghost", self.EP1, self.EP2),
+            ]),
+        ], exit_code=3, label="BACKEND")
+
+    # ---- 原子性与回滚 ----
+
+    def test_failure_writes_nothing_in_batch(self):
+        # eb 失败：同批此前 ep 与时钟随整批丢弃，新一批后端仍未登记。
+        self.assert_failure(self.setup([("b1", self.EP1)]) + [
+            {"op": "ep", "id": "b2", **self.EP3},
+            self.eb([
+                ("b1", self.EP1, self.EP2),
+                ("b2", self.EP4, None),      # 当前 EP3，失配
+            ], now=5),
+        ], exit_code=4, label="STATE")
+        pool = self.last_of(self.setup([("b1", self.EP1)]) + [
+            {"op": "ep", "id": "b2", **self.EP3},
+            {"op": "er", "now": 5},
+        ])
+        # 回滚后两后端端点停留在失败批之前的状态。
+        currents = {
+            item["id"]: item["current"] for item in pool["items"]
+        }
+        self.assertEqual(currents, {"b1": self.EP1, "b2": self.EP3})
+
+    def test_atomicity_all_or_nothing(self):
+        # 任一后端失配则所有后端（含本可写入者）均保持原端点。
+        self.assert_failure(self.setup([("b1", self.EP1)]) + [
+            self.eb([
+                ("b1", self.EP1, self.EP2),  # 本可切换
+                ("b2", self.EP3, self.EP4),  # 未登记，失配
+            ]),
+        ], exit_code=4, label="STATE")
+        result = self.last_of(self.setup([("b1", self.EP1)]) + [
+            {"op": "er", "now": 6},
+        ])
+        currents = {item["id"]: item["current"] for item in result["items"]}
+        self.assertEqual(currents, {"b1": self.EP1})
+
+    # ---- 不变量：快照、连接、检查点 ----
+
+    def test_only_current_endpoints_change(self):
+        # 单后端验证快照不迁移；b2 的落点由 er 单独确认，避免依赖调度选点。
+        results = self.run_ops(self.setup([("b1", self.EP1)]) + [
+            {"op": "open", "cid": "old", "flow": FLOW, "now": 0},
+            self.eb([
+                ("b1", self.EP1, self.EP2),
+                ("b2", None, self.EP3),
+            ], now=5),
+            {"op": "fw", "cid": "old"},
+            {"op": "open", "cid": "new", "flow": FLOW, "now": 6},
+            {"op": "er", "now": 7},
+        ])
+        # 旧连接不迁移：仍返回建连时 EP1 快照。
+        self.assertEqual(results[-3], {
+            "op": "fw", "cid": "old", "backend": "b1",
+            "host": "10.0.0.1", "port": 80,
+        })
+        currents = {item["id"]: item["current"] for item in results[-1]["items"]}
+        self.assertEqual(currents, {"b1": self.EP2, "b2": self.EP3})
+        # 新连接落在某后端，其 fw 快照必须是更新后的端点（EP2 或 EP3）。
+        new_backend = results[-2]["backend"]
+        snap = self.last_of(self.setup([("b1", self.EP1)]) + [
+            {"op": "open", "cid": "old", "flow": FLOW, "now": 0},
+            self.eb([
+                ("b1", self.EP1, self.EP2),
+                ("b2", None, self.EP3),
+            ], now=5),
+            {"op": "open", "cid": "new", "flow": FLOW, "now": 6},
+            {"op": "fw", "cid": "new"},
+        ])
+        self.assertEqual(
+            (snap["host"], snap["port"]),
+            (currents[new_backend]["host"], currents[new_backend]["port"]),
+        )
+
+    def test_does_not_close_or_reschedule_connections(self):
+        # eb 后活动连接总数不变（旧连接转为 stale 但不被关闭），仍可 get。
+        before = self.last_of(self.setup([("b1", self.EP1)]) + [
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "er", "now": 1},
+        ])
+        after = self.last_of(self.setup([("b1", self.EP1)]) + [
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            self.eb([("b1", self.EP1, self.EP2)], now=5),
+            {"op": "er", "now": 6},
+        ])
+        b = {item["id"]: item for item in before["items"]}
+        a = {item["id"]: item for item in after["items"]}
+        self.assertEqual(a["b1"]["total"], b["b1"]["total"])
+        self.assertEqual((a["b1"]["fresh"], a["b1"]["stale"]), (0, 1))
+        got = self.last_of(self.setup([("b1", self.EP1)]) + [
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            self.eb([("b1", self.EP1, self.EP2)], now=5),
+            {"op": "get", "cid": "c1"},
+        ])
+        self.assertEqual(got["cid"], "c1")
+
+    def test_exported_by_ce(self):
+        config = self.last_of(self.setup([("b1", self.EP1)]) + [
+            self.eb([
+                ("b1", self.EP1, self.EP2),
+                ("b2", None, self.EP3),
+            ]),
+            {"op": "ce"},
+        ])["config"]
+        endpoints = {
+            item["id"]: item["endpoint"] for item in config["backends"]
+        }
+        self.assertEqual(endpoints, {"b1": self.EP2, "b2": self.EP3})
+
+    def test_checkpoint_roundtrip(self):
+        ops = self.setup([("b1", self.EP1)]) + [
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            self.eb([
+                ("b1", self.EP1, self.EP2),
+                ("b2", None, self.EP3),
+            ], now=5),
+        ]
+        cont = [
+            self.eb([
+                ("b1", self.EP2, None),
+                ("b2", self.EP3, self.EP3),
+            ], now=6),
+            {"op": "fw", "cid": "c1"},
+            {"op": "er", "now": 7},
+        ]
+        results = self.run_ops(ops + [{"op": "se"}] + cont)
+        exported = results[len(ops)]
+        si_op = {"op": "si", "version": 1,
+                 "digest": exported["digest"], "state": exported["state"]}
+        resumed = self.run_ops([si_op] + cont)
+        self.assertEqual(resumed[1:], results[len(ops) + 1:])
+
+    # ---- 输入校验 ----
+
+    def test_strict_key_order_and_key_set(self):
+        raws = (
+            b'{"ops":[{"op":"eb","items":[]}]}',
+            b'{"ops":[{"op":"eb","now":1,"items":[]}]}',
+            b'{"ops":[{"op":"eb","items":[],"now":1,"x":1}]}',
+            b'{"ops":[{"op":"eb","items":[],"now":1}]}',
+        )
+        for raw in raws:
+            code, out, err = self.run_raw(raw)
+            self.assertEqual(
+                (code, out, err),
+                (2, b"", b'{"error":"INPUT"}\n'),
+            ), raw
+
+    def test_items_container_and_count(self):
+        bad_containers = (
+            None, True, False, 1, "x", {},
+        )
+        for value in bad_containers:
+            raw = json.dumps(
+                {"ops": [{"op": "eb", "items": value, "now": 5}]},
+                separators=(",", ":"),
+            ).encode()
+            code, out, err = self.run_raw(raw)
+            self.assertEqual(
+                (code, out, err),
+                (2, b"", b'{"error":"INPUT"}\n'),
+            ), value
+        # 0 项与 1001 项拒绝，1 项与 1000 项接受（存在性另算）。
+        self.assert_failure([
+            {"op": "eb", "items": [], "now": 5},
+        ])
+        self.assert_failure([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "eb", "items": [
+                {"id": "b", "base": None, "target": None}
+                for _ in range(1001)
+            ], "now": 5},
+        ])
+        one = self.last_of([
+            {"op": "add", "id": "b", "weight": 1},
+            {"op": "eb", "items": [
+                {"id": "b", "base": None, "target": None},
+            ], "now": 5},
+        ])
+        self.assertEqual(
+            one["items"], [{"id": "b", "endpoint": None}],
+        )
+
+    def test_item_shape_and_key_order(self):
+        bad_items = (
+            None, 1, "x", [], True,
+            {},
+            {"id": "b1"},
+            {"id": "b1", "base": None},
+            {"base": None, "target": None},
+            {"id": "b1", "target": None, "base": None},
+            {"id": "b1", "base": None, "target": None, "x": 1},
+            {"id": 1, "base": None, "target": None},
+            {"id": "", "base": None, "target": None},
+        )
+        for bad in bad_items:
+            raw = json.dumps(
+                {"ops": [{"op": "add", "id": "b1", "weight": 1},
+                         {"op": "eb", "items": [bad], "now": 5}]},
+                separators=(",", ":"),
+            ).encode()
+            code, out, err = self.run_raw(raw)
+            self.assertEqual(
+                (code, out, err),
+                (2, b"", b'{"error":"INPUT"}\n'),
+            ), bad
+
+    def test_duplicate_id_rejected(self):
+        self.assert_failure(self.setup() + [
+            self.eb([
+                ("b1", None, self.EP1),
+                ("b2", None, self.EP2),
+                ("b1", None, self.EP3),
+            ]),
+        ])
+
+    def test_endpoint_shape_and_values(self):
+        bad_endpoints = (
+            {}, {"host": "10.0.0.1"}, {"port": 80},
+            {"port": 80, "host": "10.0.0.1"},
+            {"host": "010.0.0.1", "port": 80},
+            {"host": "10.0.0.1%eth0", "port": 80},
+            {"host": "not-an-ip", "port": 80},
+            {"host": "10.0.0.1", "port": 0},
+            {"host": "10.0.0.1", "port": 65536},
+            {"host": "10.0.0.1", "port": True},
+            [], "x", 1,
+        )
+        for bad in bad_endpoints:
+            self.assert_failure(self.setup() + [
+                self.eb([("b1", None, bad)]),
+            ])
+            self.assert_failure(self.setup() + [
+                self.eb([("b1", bad, None)]),
+            ])
+
+    def test_now_type_and_range(self):
+        for value in (True, False, -1, 10 ** 9 + 1, 1.0, "1", None, []):
+            self.assert_failure(self.setup() + [
+                self.eb([("b1", None, None)], now=value),
+            ])
+        # 边界 0 与 10^9 合法。
+        self.last_of(self.setup() + [
+            self.eb([("b1", None, None)], now=0),
+        ])
+        result = self.last_of(self.setup() + [
+            self.eb([("b1", None, self.EP1)], now=10 ** 9),
+        ])
+        self.assertTrue(result["ok"])
+
+    def test_record_replay_success_idempotent_and_failure(self):
+        batches = (
+            self.setup() + [
+                self.eb([("b1", None, self.EP1), ("b2", None, self.EP2)]),
+                self.eb([
+                    ("b1", self.EP1, self.EP1),
+                    ("b2", self.EP2, self.EP3),
+                ], now=6),
+            ],
+            [self.eb([("ghost", None, self.EP1)])],
+            self.setup([("b1", self.EP1)]) + [
+                self.eb([("b1", self.EP2, None)]),  # 条件失配 STATE
+            ],
+        )
+        for ops in batches:
+            raw = encode_ops(ops)
+            direct_code, direct, direct_err = run_balancer("run", raw)
+            code, record, err = run_balancer("record", raw)
+            self.assertEqual((code, err), (0, b""))
+            code, replayed, err = run_balancer("replay", record)
+            self.assertEqual(
+                (code, replayed, err),
+                (direct_code, direct, direct_err),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

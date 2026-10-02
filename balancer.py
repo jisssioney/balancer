@@ -2502,7 +2502,7 @@ def parse_op(raw_op):
         "ep", "fw",
         "eq", "ec",
         "er", "ex",
-        "ey",
+        "ey", "eb",
         "ru",
         "ua",
         "mu",
@@ -4221,6 +4221,42 @@ def parse_op(raw_op):
         target = parse_endpoint_or_none(raw_op["target"])
         now = parse_metric_num(raw_op["now"])
         return ("ey", backend_id, base, target, now)
+
+    if name == "eb":
+        # 批量后端端点原子条件变更：精确键序 op,items,now（键须按此序出
+        # 现，乱序报 INPUT）；items 为 1..1000 项数组（bool 不是数组），
+        # 每项精确键序 id,base,target（键须按此序出现），同一 id 在数组
+        # 中不得重复；base/target 均沿用 parse_endpoint_or_none（null 或
+        # 精确键序 host,port 的对象，校验同 ey/ep）；now 为 0..10^9 非
+        # bool 整数并进入共用非递减时钟（倒退在执行期判 INPUT）。未知识
+        # 别与条件不匹配留执行期分别判 BACKEND/STATE；本函数只做形状、
+        # 字段、数量、重复 id 与时钟域校验，且整份输入先于任何状态检查。
+        if list(raw_op) != ["op", "items", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        raw_items = raw_op["items"]
+        if (
+            not isinstance(raw_items, list)
+            or isinstance(raw_items, bool)
+            or not 1 <= len(raw_items) <= 1000
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        items = []
+        seen_ids = set()
+        for raw_item in raw_items:
+            if (
+                not isinstance(raw_item, dict)
+                or list(raw_item) != ["id", "base", "target"]
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            item_id = parse_backend_id(raw_item["id"])
+            if item_id in seen_ids:
+                fail(EXIT_INPUT, "INPUT")
+            seen_ids.add(item_id)
+            base = parse_endpoint_or_none(raw_item["base"])
+            target = parse_endpoint_or_none(raw_item["target"])
+            items.append((item_id, base, target))
+        now = parse_metric_num(raw_op["now"])
+        return ("eb", items, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -8064,7 +8100,7 @@ def run(raw):
             "cp", "cq", "ca", "ca_cond", "cx", "cy",
             "eq", "ec",
             "er", "ex",
-            "ey",
+            "ey", "eb",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -13437,6 +13473,53 @@ def run(raw):
                     ),
                     "ok": True,
                 }
+            )
+
+        elif op[0] == "eb":
+            # 批量后端端点原子条件变更：形状/字段/数量/重复 id/端点/编码
+            # 与时钟倒退已在解析期及共用时钟块判 INPUT，INPUT 先于
+            # BACKEND、BACKEND 先于 STATE。执行期先按 items 顺序确认所有
+            # 后端存在（首个未知报 BACKEND），再统一检查条件，全部成立后
+            # 才按输入顺序写入——任何阶段都不提前写入。每项当前端点等于
+            # target 时视为已满足（不要求 base 仍匹配、不重写登记），否则
+            # 必须逐值等于 base 才可写入 target（target 为 null 即清除登
+            # 记）；任一后端既不等于 base 也不等于 target 报 STATE。只改
+            # 各后端当前端点：不迁移、关闭或重新调度活动连接，不消费令
+            # 牌、配额或等待队列，建连快照与其他运行态均不变，语义逐项同
+            # ey。失败随整批丢弃，时钟与此前操作一并回滚。O(N)、O(N)。
+            _, change_items, now = op
+            records = []
+            for backend_id, _base, _target in change_items:
+                record = backends.get(backend_id)
+                if record is None:
+                    fail(EXIT_BACKEND, "BACKEND")
+                records.append(record)
+            # 条件整批预检：全部成立才进入写入，保证原子性。
+            for record, (_backend_id, base, target) in zip(
+                records, change_items
+            ):
+                current = record["endpoint"]
+                if current == target or current == base:
+                    continue
+                fail(EXIT_STATE, "STATE")
+            result_items = []
+            for record, (backend_id, base, target) in zip(
+                records, change_items
+            ):
+                if record["endpoint"] != target:
+                    # 预检已保证此处旧值逐值等于 base，原子写入。
+                    record["endpoint"] = target
+                result_items.append(
+                    {
+                        "id": backend_id,
+                        "endpoint": (
+                            None if target is None
+                            else {"host": target[0], "port": target[1]}
+                        ),
+                    }
+                )
+            results.append(
+                {"op": "eb", "items": result_items, "ok": True}
             )
 
         elif op[0] == "se":
