@@ -1852,6 +1852,63 @@ def parse_endpoint_or_none(value):
     )
 
 
+def endpoint_json(endpoint):
+    """内部端点元组 (host, port) 的规范化 JSON 形态；None 为 null。"""
+    if endpoint is None:
+        return None
+    return {"host": endpoint[0], "port": endpoint[1]}
+
+
+def parse_endpoint_switch_items(raw_items):
+    """es/ei 预约 items 的形状校验（沿用 ej）：1..1000 项数组（bool 不是
+    数组），每项精确键序 id,base,target，同一 id 不得重复；base/target 均
+    为 null 或精确键序 host,port 的对象。返回规范化 (id, base, target)
+    元组列表，保持请求顺序。仅形状/数量/重复 id/端点结构校验；后端是否
+    现存留执行期判 BACKEND。"""
+    if (
+        not isinstance(raw_items, list)
+        or isinstance(raw_items, bool)
+        or not 1 <= len(raw_items) <= 1000
+    ):
+        fail(EXIT_INPUT, "INPUT")
+    items = []
+    seen_ids = set()
+    for raw_item in raw_items:
+        if (
+            not isinstance(raw_item, dict)
+            or list(raw_item) != ["id", "base", "target"]
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        item_id = parse_backend_id(raw_item["id"])
+        if item_id in seen_ids:
+            fail(EXIT_INPUT, "INPUT")
+        seen_ids.add(item_id)
+        base = parse_endpoint_or_none(raw_item["base"])
+        target = parse_endpoint_or_none(raw_item["target"])
+        items.append((item_id, base, target))
+    return items
+
+
+def endpoint_switch_digest(items, before):
+    """全池端点切换预约身份摘要：固定键序对象
+    {"items":items,"before":before} 的紧凑 UTF-8 JSON（非 ASCII 不转义、
+    分隔符 ,:、无末尾换行）的 SHA-256 小写十六进制。items 为规范化
+    (id, base, target) 元组列表，按保存顺序逐项输出固定键序
+    id,base,target，端点 null 或 host,port 对象。"""
+    canonical = {
+        "items": [
+            {"id": item_id, "base": endpoint_json(base),
+             "target": endpoint_json(target)}
+            for item_id, base, target in items
+        ],
+        "before": before,
+    }
+    encoded = json.dumps(
+        canonical, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def sort_fault_segments(segments):
     """按段起点 a 稳定升序：a ∈ [0,10^9] < 2^32，LSD 基数排序四轮 256
     桶共 O(T)，与比较排序的稳定结果一致（同 a 保持原相对序；同 a 段随后
@@ -2505,6 +2562,7 @@ def parse_op(raw_op):
         "ey", "eb",
         "ez",
         "ej",
+        "es", "en", "eu", "ei",
         "ru",
         "ua",
         "mu",
@@ -4337,6 +4395,47 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("ej", items, before, now)
 
+    if name == "es":
+        # 全池端点切换预约建立：精确键序 op,items,before,at,now（键须按此
+        # 序出现，乱序报 INPUT）；items 沿用 ej 的数量（1..1000）、顺序、
+        # 唯一 id、base/target（null 或精确键序 host,port 对象）规则；
+        # before、at、now 均为 0..10^9 非 bool 整数，now 进入共用非递减
+        # 时钟（倒退在执行期判 INPUT），at、before 不推进时钟，关系
+        # now<=at、before<=at 在此一并判 INPUT（at<now 先于后端引用
+        # BACKEND 检查，同全局优先级）。未知后端留执行期判 BACKEND；本函
+        # 数只做形状、字段、数量、重复 id、关系与时钟域校验。
+        if list(raw_op) != ["op", "items", "before", "at", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        items = parse_endpoint_switch_items(raw_op["items"])
+        before = parse_metric_num(raw_op["before"])
+        at = parse_metric_num(raw_op["at"])
+        now = parse_metric_num(raw_op["now"])
+        if now > at or before > at:
+            fail(EXIT_INPUT, "INPUT")
+        return ("es", items, before, at, now)
+
+    if name == "en":
+        # 全池端点切换预约查询：精确键序仅 op；不推进时钟、只读，O(N) 输
+        # 出预约快照。
+        if list(raw_op) != ["op"]:
+            fail(EXIT_INPUT, "INPUT")
+        return ("en",)
+
+    if name in ("eu", "ei"):
+        # 全池端点切换预约取消（eu）/条件生效（ei）：均严格按键序
+        # op,digest,at,now 排列（乱序报 INPUT）；digest 为小写 64 位十六
+        # 进制 SHA-256（仅用于匹配预约身份，不要求对应当前状态），at、
+        # now 均为 0..10^9 非 bool 整数，now 进入共用非递减时钟（倒退在
+        # 执行期判 INPUT），at 仅作预约身份、不推进时钟。无预约、身份不
+        # 符、过早（ei 的 now<at）、端点冲突或生效时后端已删除留执行期
+        # 分别判 STATE/BACKEND；本函数只做形状与字段校验。
+        if list(raw_op) != ["op", "digest", "at", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        digest = cp_hex_digest(raw_op["digest"])
+        at = parse_metric_num(raw_op["at"])
+        now = parse_metric_num(raw_op["now"])
+        return (name, digest, at, now)
+
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
         # 规范化全部状态并按 O(N) 计算摘要，state 紧凑编码超 8MiB 报
@@ -4765,6 +4864,18 @@ def run(raw):
     # 旧值/新值条件替换；其余操作不影响预约。额外空间 O(N)，N 为规范化
     # 配置大小。
     reservation = None
+    # 全池唯一端点切换预约（es/en/eu/ei）：无预约为 None，否则为
+    # (items, before, at, digest)——items 为 es 当时规范化的
+    # (id, base, target) 元组列表（保持请求顺序、id 互不重复；端点 None
+    # 表示未登记），before 为旧连接关闭的 opened 上界，at 为最早生效时
+    # 刻（只表示时刻、不推进时钟），digest 为固定键序对象
+    # {"items":...,"before":...} 紧凑 UTF-8 JSON 的小写 SHA-256。es 成功
+    # 即整体替换（同身份重报幂等、不重写），en 只读 O(N)，eu 在 digest、
+    # at 同时匹配时原子清除（无预约幂等空操作、不匹配报 STATE 且保留），
+    # ei 仅在身份匹配且 now>=at 时按操作开始快照执行 ej 同式切换与清理、
+    # 成功后删除；ci/cb/cu/ca 成功一并清除；其余操作不影响预约。额外空间
+    # O(N)，N 为预约项数。
+    ep_switch = None
     # 配置变更审计（al）：deque(maxlen=64) 按 rev 升序保留最近 64 条，追加
     # O(1) 且超额自动淘汰最旧项；初始为空，独立于 commit_history 的 16 条
     # 提交，成功配置变更（ci/cb/cu/ca 分配新 rev 时）不清空旧事件。每事件
@@ -6118,6 +6229,7 @@ def run(raw):
         audit_events = b["audit_events"]
         audit_sections = b["audit_sections"]
         reservation = b["reservation"]
+        ep_switch = b["ep_switch"]
         mo_cache = b["mo_cache"]
         last_now = b["last_now"]
         ring_vnodes = b["ring_vnodes"]
@@ -6574,6 +6686,23 @@ def run(raw):
             reservation_state = {"at": at, "digest": digest,
                                  "config": snapshot}
 
+        ep_switch_state = None
+        if ep_switch is not None:
+            switch_items, switch_before, switch_at, switch_digest = ep_switch
+            ep_switch_state = {
+                "digest": switch_digest,
+                "at": switch_at,
+                "before": switch_before,
+                "items": [
+                    {
+                        "id": item_id,
+                        "base": endpoint_json(base),
+                        "target": endpoint_json(target),
+                    }
+                    for item_id, base, target in switch_items
+                ],
+            }
+
         return {
             "now": last_now,
             "vnodes": ring_vnodes,
@@ -6625,6 +6754,7 @@ def run(raw):
             "next_rev": next_rev,
             "audit": audit_states,
             "reservation": reservation_state,
+            "ep_switch": ep_switch_state,
             "mo": {
                 "seq": mo_seq,
                 "cache": (
@@ -6648,7 +6778,7 @@ def run(raw):
         "retry_alerts", "retry_events", "conc_alerts", "limit_alerts",
         "unavail_alerts",
         "commit_history", "next_rev", "audit_events", "audit_sections",
-        "reservation", "mo_seq", "mo_cache",
+        "reservation", "ep_switch", "mo_seq", "mo_cache",
     )
 
     def current_bundle():
@@ -6698,6 +6828,7 @@ def run(raw):
             "audit_events": audit_events,
             "audit_sections": audit_sections,
             "reservation": reservation,
+            "ep_switch": ep_switch,
             "mo_seq": mo_seq,
             "mo_cache": mo_cache,
         }
@@ -6716,7 +6847,7 @@ def run(raw):
         nonlocal retry_alerts, retry_events, conc_alerts, limit_alerts
         nonlocal unavail_alerts
         nonlocal commit_history, next_rev, audit_events, audit_sections
-        nonlocal reservation, mo_seq, mo_cache
+        nonlocal reservation, ep_switch, mo_seq, mo_cache
         last_now = b["last_now"]
         ring_vnodes = b["ring_vnodes"]
         sticky_ttl = b["sticky_ttl"]
@@ -6761,6 +6892,7 @@ def run(raw):
         audit_events = b["audit_events"]
         audit_sections = b["audit_sections"]
         reservation = b["reservation"]
+        ep_switch = b["ep_switch"]
         mo_seq = b["mo_seq"]
         mo_cache = b["mo_cache"]
 
@@ -6882,7 +7014,7 @@ def run(raw):
             "backends", "connections", "sticky", "buckets", "quotas",
             "wait_queue", "capacities", "overload_hist", "wait_hist",
             "limit_hist", "alerts", "commits", "next_rev", "audit",
-            "reservation", "mo",
+            "reservation", "ep_switch", "mo",
         ))
 
         last_now = root["now"]
@@ -8043,6 +8175,54 @@ def run(raw):
                 cp_state_int()
             reservation = (snapshot, at, rdigest)
 
+        ep_switch_raw = root["ep_switch"]
+        if ep_switch_raw is None:
+            ep_switch = None
+        else:
+            esv = o(ep_switch_raw, ("digest", "at", "before", "items"))
+            es_digest = cp_hex_digest(esv["digest"])
+            es_at = ti(esv["at"])
+            es_before = ti(esv["before"])
+            es_items = []
+            es_seen = set()
+            for eitem in cp_list(esv["items"]):
+                eo = o(eitem, ("id", "base", "target"))
+                eid = ident(eo["id"])
+                if eid in es_seen:
+                    cp_state_int()
+                es_seen.add(eid)
+                # 注意：不做后端悬空引用校验——remove 可在预约生效前删除
+                # 后端，生效时由 ei 判 BACKEND/3。
+                ebase_raw = eo["base"]
+                if ebase_raw is None:
+                    ebase = None
+                else:
+                    eb = o(ebase_raw, ("host", "port"))
+                    ebase = (
+                        parse_endpoint_host(eb["host"]),
+                        parse_endpoint_port(eb["port"]),
+                    )
+                etarget_raw = eo["target"]
+                if etarget_raw is None:
+                    etarget = None
+                else:
+                    et = o(etarget_raw, ("host", "port"))
+                    etarget = (
+                        parse_endpoint_host(et["host"]),
+                        parse_endpoint_port(et["port"]),
+                    )
+                es_items.append((eid, ebase, etarget))
+            # 结构域校验先于语义：项数 1..1000 同 es/ej 形状约束。
+            if not 1 <= len(es_items) <= 1000:
+                fail(EXIT_INPUT, "INPUT")
+            # 语义校验：建立时强制 before<=at。
+            if es_before > es_at:
+                cp_state_int()
+            # 身份摘要须与按规范化快照重算值逐字一致，否则为非法状态组合。
+            if endpoint_switch_digest(es_items, es_before) != es_digest:
+                cp_state_int()
+            ep_switch = (es_items, es_before, es_at, es_digest)
+
         mo_raw = o(root["mo"], ("seq", "cache"))
         mo_seq = si2(mo_raw["seq"], 1, 10 ** 18)
         mo_cache = None
@@ -8110,6 +8290,7 @@ def run(raw):
             "audit_events": audit_events,
             "audit_sections": audit_sections,
             "reservation": reservation,
+            "ep_switch": ep_switch,
             "mo_seq": mo_seq,
             "mo_cache": mo_cache,
         }
@@ -8182,6 +8363,7 @@ def run(raw):
             "ey", "eb",
             "ez",
             "ej",
+            "es", "eu", "ei",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -10626,6 +10808,8 @@ def run(raw):
                 commit_history.pop(0)
             # ci 成功清除既有配置预约。
             reservation = None
+            # ci 成功同时清除全池端点切换预约。
+            ep_switch = None
             # 审计：成功并分配新 rev 时按 rev 升序追加（仅留最近 64 条），
             # section 恒 null；before 为操作前指纹，after 为新提交指纹。
             # 同一事件内固化段级差异（仅指纹，按顶层键序）。
@@ -11136,6 +11320,8 @@ def run(raw):
                 commit_history.pop(0)
             # cb 成功清除既有配置预约。
             reservation = None
+            # cb 成功同时清除全池端点切换预约。
+            ep_switch = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
             # null；before 为回滚前指纹，after 为目标快照指纹。同一事件内
             # 固化段级差异（仅指纹，按顶层键序）。
@@ -11210,6 +11396,8 @@ def run(raw):
                 commit_history.pop(0)
             # cu 成功清除既有配置预约。
             reservation = None
+            # cu 成功同时清除全池端点切换预约。
+            ep_switch = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 取被
             # 替换顶层字段；before/after 即响应中的 base/target 摘要（值未变
             # 两摘要相同仍记录）。同一事件内固化段级差异：按实际前后规范化
@@ -11329,6 +11517,8 @@ def run(raw):
             if len(commit_history) > 16:
                 commit_history.pop(0)
             reservation = None
+            # ca 成功同时清除全池端点切换预约。
+            ep_switch = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
             # null；before 为生效前指纹，after 为预约快照指纹（同响应 digest）。
             # 同一事件内固化段级差异（仅指纹，按顶层键序）。条件形态同样
@@ -13787,6 +13977,180 @@ def run(raw):
             results.append(
                 {
                     "op": "ej",
+                    "now": now,
+                    "items": result_items,
+                    "closed": closed_total,
+                    "ok": True,
+                }
+            )
+
+        elif op[0] == "es":
+            # 全池唯一端点切换预约建立：形状/字段/数量/重复 id/端点/编码、
+            # 时间范围与关系（now<=at、before<=at）及时钟倒退已在解析期及
+            # 共用时钟块判 INPUT，INPUT 先于 BACKEND、BACKEND 先于 STATE。
+            # 执行期仅按 items 顺序确认所有后端存在（首个未知报 BACKEND），
+            # 不检查端点条件、不切换端点、不关闭连接。全部后端引用有效后
+            # 保存规范化快照（解析期得到的 (id, base, target) 元组列表），
+            # 全池唯一：同身份（digest、at）重报幂等且不重写快照，其余情
+            # 形整体替换既有预约。O(N)，N 为预约项数。
+            _, switch_items, before, at, now = op
+            for backend_id, _base, _target in switch_items:
+                if backends.get(backend_id) is None:
+                    fail(EXIT_BACKEND, "BACKEND")
+            digest = endpoint_switch_digest(switch_items, before)
+            if ep_switch is None or (ep_switch[3], ep_switch[2]) != (
+                digest, at
+            ):
+                ep_switch = (switch_items, before, at, digest)
+            results.append(
+                {"op": "es", "digest": digest, "at": at, "ok": True}
+            )
+
+        elif op[0] == "en":
+            # 全池端点切换预约查询：只读、不推进时钟。无预约时 pending=
+            # false，digest/at/before 依次为 null、items 为空数组；有预约
+            # 时按保存顺序回显规范化项（固定键序 id,base,target，端点 null
+            # 或 host,port 对象）。O(N) 输出。
+            if ep_switch is None:
+                results.append(
+                    {
+                        "op": "en",
+                        "pending": False,
+                        "digest": None,
+                        "at": None,
+                        "before": None,
+                        "items": [],
+                    }
+                )
+            else:
+                q_items, q_before, q_at, q_digest = ep_switch
+                results.append(
+                    {
+                        "op": "en",
+                        "pending": True,
+                        "digest": q_digest,
+                        "at": q_at,
+                        "before": q_before,
+                        "items": [
+                            {
+                                "id": item_id,
+                                "base": endpoint_json(base),
+                                "target": endpoint_json(target),
+                            }
+                            for item_id, base, target in q_items
+                        ],
+                    }
+                )
+
+        elif op[0] == "eu":
+            # 全池端点切换预约取消：形状/字段类型/范围/UTF-8 与时钟倒退已
+            # 在解析期及共用时钟块判 INPUT，INPUT 先于预约匹配。无预约为
+            # 幂等空操作：cancelled=false 并回显请求 digest、at，不改任何
+            # 状态；有预约且 digest、at 同时匹配时原子删除，cancelled=true；
+            # 有预约但任一身份不符报 STATE 并保留预约。取消只影响预约本
+            # 身，不切换端点、不动连接。O(1)。
+            _, digest, at, now = op
+            if ep_switch is None:
+                results.append(
+                    {"op": "eu", "digest": digest, "at": at,
+                     "cancelled": False}
+                )
+            else:
+                _, _, reserved_at, reserved_digest = ep_switch
+                if reserved_digest != digest or reserved_at != at:
+                    fail(EXIT_STATE, "STATE")
+                ep_switch = None
+                results.append(
+                    {"op": "eu", "digest": digest, "at": at,
+                     "cancelled": True}
+                )
+
+        elif op[0] == "ei":
+            # 全池端点切换预约条件生效：形状/字段类型/范围/UTF-8 与时钟倒
+            # 退已在解析期及共用时钟块判 INPUT。按序判定：无预约、身份
+            # （digest、at）任一不符或 now<at（过早）报 STATE 且保留预约；
+            # 进入生效后按 items 顺序确认后端仍全部存在（建立后被 remove
+            # 删除报 BACKEND/3，优先于端点条件判定，同 ej 的 BACKEND 先于
+            # STATE）；再按操作开始时快照统一预检端点条件（当前端点等于
+            # target 视为已满足，否则须逐值等于 base，任一冲突报 STATE 且
+            # 保留预约）。全部成立后沿用 ej：按输入顺序写入尚未到达 target
+            # 的端点，按全局建连顺序单遍关闭 items 后端中 opened<=before
+            # 且建连快照不等于该项 target 的连接，逐条递减并发；排空 D 后
+            # 端因本次关闭失去最后连接时转 X、end=now，forced 维持原值；
+            # 不消费队列、令牌、配额，不触发重新调度。成功后删除预约。
+            # O(N+C)，N 为预约项数、C 为活动连接数。
+            _, digest, at, now = op
+            if ep_switch is None:
+                fail(EXIT_STATE, "STATE")
+            saved_items, saved_before, reserved_at, reserved_digest = ep_switch
+            if reserved_digest != digest or reserved_at != at:
+                fail(EXIT_STATE, "STATE")
+            if now < at:
+                # 过早：now 仅到达后才允许生效。
+                fail(EXIT_STATE, "STATE")
+            records = []
+            for backend_id, _base, _target in saved_items:
+                record = backends.get(backend_id)
+                if record is None:
+                    # 生效时后端已删除：BACKEND，先于端点条件判定。
+                    fail(EXIT_BACKEND, "BACKEND")
+                records.append(record)
+            # 条件整批预检（操作开始时快照），与 ej 同式；预检不写登记。
+            for record, (_backend_id, base, target) in zip(
+                records, saved_items
+            ):
+                current = record["endpoint"]
+                if current == target or current == base:
+                    continue
+                fail(EXIT_STATE, "STATE")
+            # 条件全部成立：先按输入顺序原子更新尚未到达 target 的端点。
+            for record, (_backend_id, base, target) in zip(
+                records, saved_items
+            ):
+                if record["endpoint"] != target:
+                    record["endpoint"] = target
+            index_by_id = {}
+            for idx, (backend_id, _base, _target) in enumerate(saved_items):
+                index_by_id[backend_id] = idx
+            closed_groups = [[] for _ in saved_items]
+            for cid, connection in list(connections.items()):
+                idx = index_by_id.get(connection[0])
+                if idx is None:
+                    continue
+                if connection[2] > saved_before:
+                    continue
+                target = saved_items[idx][2]
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == target:
+                    continue
+                record = records[idx]
+                del connections[cid]
+                conn_endpoints.pop(cid, None)
+                record["conns"] -= 1
+                closed_groups[idx].append(cid)
+            result_items = []
+            closed_total = 0
+            for (backend_id, _base, target), record, cids in zip(
+                saved_items, records, closed_groups
+            ):
+                if cids:
+                    drain = record["drain"]
+                    if drain["state"] == "D" and record["conns"] == 0:
+                        drain["state"] = "X"
+                        drain["end"] = now
+                result_items.append(
+                    {
+                        "id": backend_id,
+                        "endpoint": endpoint_json(target),
+                        "cids": cids,
+                    }
+                )
+                closed_total += len(cids)
+            # 成功后删除预约；失败路径均在任何写入之前 fail，预约保留。
+            ep_switch = None
+            results.append(
+                {
+                    "op": "ei",
                     "now": now,
                     "items": result_items,
                     "closed": closed_total,

@@ -108,7 +108,7 @@
 
 在现有 JSON 操作流中新增 `se`、`si`，使一次调用导出的状态能在另一条全新调用中恢复并继续处理公开操作；不依赖文件、网络或进程时间。对任意合法后续操作序列，直接继续与“导出后在空实例恢复再继续”所得退出码、stdout、stderr 逐字节一致。
 
-- `se` 只接受 `op` 一个键，不推进显式时钟、不修改状态；返回固定键序 `op,version,digest,state`。`version` 初始为 1（非 bool 整数）；`state` 为规范化 JSON 对象，逐层键序固定，有业务顺序的集合（后端加入序、连接建连序、等待队列 FIFO、提交/审计 rev 序、告警转换事件窗序、分钟窗时序）保持原序，其余集合（粘性键、桶/配额与池级告警标识、老化服务类等）沿用 UTF-8 字节排序（复合键 scope 先按 B/C/S）。`state` 包含全部影响后续公开行为的状态：逻辑时钟、纯登记配置与待生效计划（vnodes、sticky/idle/lifetime、scheduler、overload、backpressure、queue 策略、aging、faults、quotas、capacities）、后端顺序及健康/权重预热/熔断/排空/不可用起点/登记端点、令牌桶（含当前令牌与补充时刻）、固定窗口配额（window、used）、活动连接与建连时端点快照、粘性映射、等待队列、限流配额与各类分钟历史、故障计划/统计/恢复基线、请求与采样指标及 mo 增量游标缓存、全部告警状态机（fe/ea/pa/xa/na/le/ua/wa）及其转换历史、配置提交历史与 next_rev、审计事件与段级差异、配置预约。
+- `se` 只接受 `op` 一个键，不推进显式时钟、不修改状态；返回固定键序 `op,version,digest,state`。`version` 初始为 1（非 bool 整数）；`state` 为规范化 JSON 对象，逐层键序固定，有业务顺序的集合（后端加入序、连接建连序、等待队列 FIFO、提交/审计 rev 序、告警转换事件窗序、分钟窗时序）保持原序，其余集合（粘性键、桶/配额与池级告警标识、老化服务类等）沿用 UTF-8 字节排序（复合键 scope 先按 B/C/S）。`state` 包含全部影响后续公开行为的状态：逻辑时钟、纯登记配置与待生效计划（vnodes、sticky/idle/lifetime、scheduler、overload、backpressure、queue 策略、aging、faults、quotas、capacities）、后端顺序及健康/权重预热/熔断/排空/不可用起点/登记端点、令牌桶（含当前令牌与补充时刻）、固定窗口配额（window、used）、活动连接与建连时端点快照、粘性映射、等待队列、限流配额与各类分钟历史、故障计划/统计/恢复基线、请求与采样指标及 mo 增量游标缓存、全部告警状态机（fe/ea/pa/xa/na/le/ua/wa）及其转换历史、配置提交历史与 next_rev、审计事件与段级差异、配置预约、全池端点切换预约。
 - `digest` 为对紧凑 UTF-8 编码的 `{"version":1,"state":...}`（`ensure_ascii=False`、分隔符 `,:`、无末尾换行）计算的小写 SHA-256 十六进制；相同状态逐字节导出相同结果。
 - `si` 接受两种严格键序形式（键须按各自次序出现）：四键 `op,version,digest,state` 为无条件原子替换；五键 `op,base,version,digest,state` 为带基线摘要的乐观并发形式，调用方把 `sd` 返回的 `before` 或此前 `se` 返回的 `digest` 作为替换前提，避免预览后运行态已变化时覆盖新状态。两形式 `version` 仅收 1（非 bool 整数）；五键的 `base` 与两形式的 `digest` 均为小写 64 位十六进制 SHA-256；`state` 含义、检查点版本与 8MiB 限制沿用四键形式。
 - 五键形式先按现有规则校验键序、字段类型、UTF-8、版本、候选编码大小、候选摘要与状态语义（错误优先级同四键），再按 `se` 的规范化规则取得执行到该操作时的当前状态及摘要。若当前摘要等于候选 `digest`，视为成功的幂等重报——即使 `base` 已不等于当前摘要也不再次替换；否则只有 `base` 等于当前摘要时才原子导入，`base` 不匹配报 STATE/4。成功后原子替换当前状态，返回固定键序 `op,digest,ok`（`ok=true`，`digest` 为候选摘要）；连续重报（含 `base` 已过期的幂等重报）逐字节返回同一结果。
@@ -255,6 +255,20 @@
 - 清理使排空状态 D 的后端因本次关闭失去最后连接时，沿用 `ec`/`ex`/`close` 规则转为 X、`end=now`，`forced` 维持原值不变；不消费令牌、配额或等待队列，也不触发重新调度。无符合连接时为成功的确定性空操作。
 - 成功返回固定键序 `op,now,items,closed,ok`；`items` 按请求顺序排列，每项固定键序 `id,endpoint,cids`，`endpoint` 为规范化后的 `target` 对象或 `null`，`cids` 按全局关闭次序列出该后端本次关闭的连接；`closed` 为全部 `cids` 数量，`ok` 恒为 `true`。首次提交与相同请求重报（含部分项已处于目标的重试）逐字节一致。
 - 字段、键序、编码、类型、范围、`before` 关系或时钟倒退返回 INPUT/2，未知后端返回 BACKEND/3，条件冲突返回 STATE/4；失败不产生 stdout，并回滚同批此前变化、时钟、端点和连接。单次时间与额外空间均为 O(N+C)（N 为 `items` 项数、C 为活动连接数），仅使用 Python 标准库；`run`、`record`、`replay`、`se`、`si` 与固定键序 JSON、单末尾换行和逐字节确定性保持兼容，既有操作行为不变。
+
+## 全池唯一端点切换预约：es / en / eu / ei
+
+在既有即时端点切换及旧连接清理（`ep`/`ey`/`eb`/`ej` 等）之上，提供全池唯一、可查询、可取消、到期条件生效的端点切换预约：先保存一份规范化切换快照，之后仅凭预约身份（摘要与触发时刻）在指定时刻原子执行 `ej` 同式的切换与清理。
+
+- `es`：严格接收按键序 `op,items,before,at,now` 排列的五键（键须按此序出现，乱序报 INPUT）。`items` 沿用 `ej` 的全部规则：1..1000 项数组，每项严格按键序 `id,base,target` 排列，同一 `id` 不得重复，`base`/`target` 均为 `null` 或按键序 `host,port` 排列的对象（`null` 表示未登记端点，对象沿用 `ep` 的规范 IP 字面量与 1..65535 非 bool 整数端口校验）。`before`、`at`、`now` 均为 0..10⁹ 的非 bool 整数，且 `now≤at`、`before≤at`；`now` 进入全局非递减显式时钟（倒退报 INPUT/2），`at` 与 `before` 不推进时钟。
+  - 先完成整份输入校验，再按 `items` 顺序确认全部后端当前存在（首个未知后端报 BACKEND/3）；校验全部后端引用后保存规范化快照，**不**检查端点条件、**不**切换端点、**不**关闭连接。全池至多一个预约：保存时整体替换既有预约；相同身份（同摘要、同 `at`）重报为幂等空操作、不重写快照，相同输入逐字节一致。
+  - `digest` 为固定键序对象 `{"items":items,"before":before}`（项键序 `id,base,target`，端点为 `null` 或 `host,port` 对象）的紧凑 UTF-8 JSON（`ensure_ascii=False`、分隔符 `,:`、无末尾换行）的 SHA-256 小写十六进制值。成功固定返回键序 `op,digest,at,ok`，`ok` 恒为 `true`。
+- `en`：仅接收 `op` 一个键，不推进时钟、为只读查询。固定返回键序 `op,pending,digest,at,before,items`；有预约时回显身份与按保存顺序排列的规范化项，无预约时 `pending=false`，其后四项依次为 `null`、`null`、`null`、空数组。
+- `eu`：严格接收按键序 `op,digest,at,now` 排列的四键。`digest` 为小写 64 位十六进制 SHA-256（仅用于匹配预约身份，不要求对应当前端点）；`at`、`now` 均为 0..10⁹ 非 bool 整数，`now` 进入全局非递减时钟，`at` 仅作身份、不推进时钟。无预约时为成功的幂等空操作，固定返回 `op,digest,at,cancelled` 且 `cancelled=false`；身份（摘要与 `at`）匹配时删除预约并返回 `cancelled=true`；有预约但身份不符报 STATE/4 并保留预约。取消只删除预约，不切换端点、不动连接。
+- `ei`：使用与 `eu` 相同的四字段。仅在身份匹配且 `now≥at` 时，按**操作开始快照**执行：端点前提、连接筛选与关闭顺序、排空 D 末连接迁移（转 X、`end=now`、`forced` 维持原值）和成功结果全部沿用 `ej`——按输入顺序写入尚未到达 `target` 的端点，再按全局建连顺序单遍关闭 `items` 后端中 `opened≤before` 且建连快照不等于该项 `target` 的连接，不消费等待队列、令牌或配额，也不触发重新调度。成功固定返回键序 `op,now,items,closed,ok`（项键序 `id,endpoint,cids`，与 `ej` 同构，仅 `op` 为 `ei`），并删除预约。
+  - `now<at`（过早）、无预约、身份不符或端点前提冲突（某后端当前端点既不等于其 `base` 也不等于 `target`）均报 STATE/4 且保留预约；身份与时刻校验通过后，若快照中的后端在生效时已被删除，报 BACKEND/3（BACKEND 先于端点条件 STATE）。
+- 字段集合、键序、编码、摘要格式、容器、数量、重复 id、数值范围、时间关系或时钟倒退统一报 INPUT/2；建立时引用未知后端报 BACKEND/3；错误优先级固定为 INPUT、BACKEND、STATE。任何失败均无 stdout，并原子回滚逻辑时钟及全部业务状态（预约、端点、连接等）。
+- `se` 导出端点切换预约（顶层段 `ep_switch`，无预约为 `null`；有预约时键序 `digest,at,before,items`），`si` 恢复后的行为与直接继续逐字节一致；`sd`、`sx`、`sm` 按既有检查点规则观察该段差异。成功的 `ci`、`cb`、`cu`、`ca` 清除端点预约，其他操作不改变它。`es`、`en` 为 O(N)，`eu` 为 O(1)，`ei` 为 O(N+C)（N 为预约项数、C 为活动连接数）。仅用 Python 标准库，不读系统时间、不联网；`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，既有公开行为不变。
 
 ## 测试
 
