@@ -22933,5 +22933,479 @@ class EndpointBatchConditionalChangeTest(unittest.TestCase):
             )
 
 
+class EndpointBatchSwitchPreviewTest(unittest.TestCase):
+    """ez：批量端点切换只读预演。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+    EP3 = {"host": "10.0.0.3", "port": 82}
+    EP4 = {"host": "10.0.0.4", "port": 83}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        if code != 0:
+            raise AssertionError((code, out, err))
+        return json.loads(out)["results"]
+
+    def last_of(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def assert_failure(self, ops, exit_code=2, label="INPUT"):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(
+            (code, out, err),
+            (exit_code, b"", ('{"error":"%s"}\n' % label).encode()),
+        )
+
+    def run_raw(self, raw):
+        return run_balancer("run", raw)
+
+    def setup(self, endpoints=(), conns=()):
+        """add 两个后端、按 mapping 登记端点、按 (cid, now) 建连。"""
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 1},
+        ]
+        for backend_id, endpoint in endpoints:
+            ops.append({"op": "ep", "id": backend_id, **endpoint})
+        for cid, now in conns:
+            ops.append({"op": "open", "cid": cid, "flow": FLOW, "now": now})
+        return ops
+
+    def ez(self, entries, now=5):
+        return {
+            "op": "ez",
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in entries
+            ],
+            "now": now,
+        }
+
+    # ---- 成功路径：状态分类与汇总 ----
+
+    def test_statuses_and_summary(self):
+        # b1 当前 EP1（一条建连时快照 EP1 的连接，对 target EP2 为 stale）；
+        # b2 未登记、无连接；再加一个 target=null 的未登记后端 b3。
+        ops = self.setup(
+            endpoints=[("b1", self.EP1)],
+            conns=[("c1", 0)],
+        ) + [{"op": "add", "id": "b3", "weight": 1}]
+        result = self.last_of(ops + [
+            self.ez([
+                ("b1", self.EP1, self.EP2),       # applicable
+                ("b2", None, self.EP3),            # applicable
+                ("b3", None, None),                # unchanged
+            ]),
+        ])
+        self.assertEqual(
+            list(result), ["op", "now", "ready", "items", "summary"]
+        )
+        self.assertIs(result["ready"], True)
+        self.assertEqual(result["now"], 5)
+        self.assertEqual(len(result["items"]), 3)
+        for item in result["items"]:
+            self.assertEqual(
+                list(item),
+                ["id", "current", "target", "status",
+                 "total", "fresh", "stale"],
+            )
+        self.assertEqual(result["items"][0], {
+            "id": "b1",
+            "current": self.EP1,
+            "target": self.EP2,
+            "status": "applicable",
+            "total": 1, "fresh": 0, "stale": 1,
+        })
+        self.assertEqual(result["items"][1], {
+            "id": "b2",
+            "current": None,
+            "target": self.EP3,
+            "status": "applicable",
+            "total": 0, "fresh": 0, "stale": 0,
+        })
+        self.assertEqual(result["items"][2], {
+            "id": "b3",
+            "current": None,
+            "target": None,
+            "status": "unchanged",
+            "total": 0, "fresh": 0, "stale": 0,
+        })
+        self.assertEqual(list(result["summary"]), [
+            "total", "applicable", "unchanged",
+            "conflict", "connections", "stale",
+        ])
+        self.assertEqual(result["summary"], {
+            "total": 3, "applicable": 2, "unchanged": 1,
+            "conflict": 0, "connections": 1, "stale": 1,
+        })
+
+    def test_unchanged_when_current_equals_target_regardless_of_base(self):
+        result = self.last_of(self.setup([("b1", self.EP2)]) + [
+            self.ez([("b1", self.EP1, self.EP2)]),
+        ])
+        self.assertEqual(result["items"][0]["status"], "unchanged")
+        self.assertIs(result["ready"], True)
+
+    def test_conflict_full_preview_with_ready_false(self):
+        # b1 既不匹配 base(EP3) 也不匹配 target(EP2)：conflict；b2 仍可应用。
+        result = self.last_of(self.setup([("b1", self.EP1)]) + [
+            self.ez([
+                ("b1", self.EP3, self.EP2),
+                ("b2", None, self.EP4),
+            ]),
+        ])
+        self.assertIs(result["ready"], False)
+        self.assertEqual(
+            [item["status"] for item in result["items"]],
+            ["conflict", "applicable"],
+        )
+        # 存在 conflict 仍返回完整预演与汇总，而不是错误。
+        self.assertEqual(result["summary"]["conflict"], 1)
+        self.assertEqual(result["summary"]["applicable"], 1)
+        self.assertEqual(result["summary"]["total"], 2)
+
+    def test_items_preserve_request_order(self):
+        result = self.last_of(self.setup() + [
+            self.ez([
+                ("b2", None, self.EP3),
+                ("b1", None, self.EP1),
+            ]),
+        ])
+        self.assertEqual(
+            [item["id"] for item in result["items"]], ["b2", "b1"]
+        )
+
+    def test_target_echo_is_normalized_candidate(self):
+        result = self.last_of(self.setup([("b1", self.EP1)]) + [
+            self.ez([("b1", self.EP1, None)]),
+        ])
+        self.assertIsNone(result["items"][0]["target"])
+
+    # ---- fresh/stale：按建连时快照相对 target 划分 ----
+
+    def test_fresh_compares_snapshot_to_target_not_current(self):
+        # 建连时端点为 EP2，之后改登记回 EP1；预演 target=EP2：该连接对
+        # target 为 fresh，status 为 applicable（current=EP1==base）。
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "ep", "id": "b1", **self.EP2},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "ep", "id": "b1", **self.EP1},
+        ]
+        item = self.last_of(ops + [
+            self.ez([("b1", self.EP1, self.EP2)]),
+        ])["items"][0]
+        self.assertEqual(item["status"], "applicable")
+        self.assertEqual((item["total"], item["fresh"], item["stale"]),
+                         (1, 1, 0))
+
+    def test_no_snapshot_compared_as_null(self):
+        # 未登记端点的连接无快照；target=null 时按 None 比较计 fresh。
+        result = self.last_of(self.setup(conns=[("c1", 0)]) + [
+            self.ez([("b1", None, None)]),
+        ])
+        item = result["items"][0]
+        self.assertEqual(item["status"], "unchanged")
+        self.assertEqual((item["total"], item["fresh"], item["stale"]),
+                         (1, 1, 0))
+        # 同一条无快照连接对非 null target 为 stale。
+        result = self.last_of(self.setup(conns=[("c1", 0)]) + [
+            self.ez([("b1", None, self.EP1)]),
+        ])
+        item = result["items"][0]
+        self.assertEqual((item["total"], item["fresh"], item["stale"]),
+                         (1, 0, 1))
+
+    def test_counts_cover_only_active_connections_and_total_eq_parts(self):
+        ops = self.setup(
+            endpoints=[("b1", self.EP1)],
+            conns=[("c1", 0), ("c2", 1)],
+        ) + [
+            {"op": "ep", "id": "b1", **self.EP2},
+            {"op": "open", "cid": "c3", "flow": FLOW, "now": 2},
+            {"op": "close", "cid": "c2", "now": 3},
+        ]
+        result = self.last_of(ops + [
+            self.ez([("b1", self.EP2, self.EP1)]),
+        ])
+        item = result["items"][0]
+        # 活动连接仅 c1（快照 EP1，对 target EP1 fresh）与 c3（快照 EP2，
+        # stale）；已关闭的 c2 不计。
+        self.assertEqual((item["total"], item["fresh"], item["stale"]),
+                         (2, 1, 1))
+        self.assertEqual(
+            result["summary"]["connections"], item["total"]
+        )
+        self.assertEqual(result["summary"]["stale"], item["stale"])
+
+    def test_connections_outside_requested_backends_ignored(self):
+        ops = self.setup(
+            endpoints=[("b1", self.EP1), ("b2", self.EP2)],
+            conns=[("c1", 0)],
+        )
+        landed = self.last_of(ops + [{"op": "fw", "cid": "c1"}])[
+            "backend"
+        ]
+        other = "b2" if landed == "b1" else "b1"
+        # 仅预演连接所在后端：计数为 1。
+        result = self.last_of(ops + [
+            self.ez([(landed, self.EP1, self.EP3)] if landed == "b1"
+                    else [(landed, self.EP2, self.EP3)]),
+        ])
+        self.assertEqual(result["summary"]["connections"], 1)
+        # 只预演另一后端：其连接不列入。
+        result = self.last_of(ops + [
+            self.ez([(other, self.EP2, self.EP3)] if other == "b2"
+                    else [(other, self.EP1, self.EP3)]),
+        ])
+        self.assertEqual(result["summary"]["connections"], 0)
+
+    # ---- 只读与时钟 ----
+
+    def test_only_advances_clock(self):
+        ops = self.setup(
+            endpoints=[("b1", self.EP1)], conns=[("c1", 0)]
+        )
+        before = self.last_of(ops + [{"op": "er", "now": 4}])
+        self.last_of(ops + [self.ez([("b1", self.EP1, self.EP2)])])
+        after = self.last_of(ops + [
+            self.ez([("b1", self.EP1, self.EP2)], now=5),
+            {"op": "er", "now": 6},
+        ])
+        # 端点未切换：b1 的盘点仍是 current=EP1、c1 为 fresh。
+        self.assertEqual(before["items"], after["items"])
+        self.assertEqual(before["summary"], after["summary"])
+
+    def test_clock_advances_on_success_and_regression_is_input(self):
+        ops = self.setup()
+        self.last_of(ops + [self.ez([("b1", None, None)], now=9)])
+        self.assert_failure(ops + [
+            self.ez([("b1", None, None)], now=9),
+            self.ez([("b1", None, None)], now=8),
+        ])
+
+    def test_conflict_does_not_mutate(self):
+        ops = self.setup([("b1", self.EP1)])
+        self.last_of(ops + [
+            self.ez([("b1", self.EP3, self.EP2)]),
+        ])
+        current = self.last_of(ops + [{"op": "er", "now": 6}])
+        self.assertEqual(
+            current["items"][0]["current"], self.EP1
+        )
+
+    # ---- 错误优先级与回滚 ----
+
+    def test_unknown_backend_is_backend(self):
+        self.assert_failure([
+            self.ez([("ghost", None, self.EP1)]),
+        ], exit_code=3, label="BACKEND")
+
+    def test_input_beats_backend(self):
+        # 重复 id（INPUT）先于未知后端（BACKEND）。
+        self.assert_failure([
+            self.ez([
+                ("ghost", None, self.EP1),
+                ("ghost", None, self.EP2),
+            ]),
+        ])
+        # 时钟倒退（INPUT）先于未知后端。
+        self.assert_failure(self.setup() + [
+            {"op": "er", "now": 9},
+            self.ez([("ghost", None, self.EP2)], now=8),
+        ])
+
+    def test_existence_checked_for_all_items(self):
+        # 首项条件本会冲突，但整批存在性先算：未知后端报 BACKEND。
+        self.assert_failure(self.setup([("b1", self.EP1)]) + [
+            self.ez([
+                ("b1", self.EP3, self.EP2),
+                ("ghost", None, self.EP4),
+            ]),
+        ], exit_code=3, label="BACKEND")
+
+    def test_failure_rolls_back_batch(self):
+        # ez 失败：同批此前 ep 与时钟随整批丢弃。
+        self.assert_failure(self.setup([("b1", self.EP1)]) + [
+            {"op": "ep", "id": "b2", **self.EP3},
+            self.ez([("ghost", None, None)], now=5),
+        ], exit_code=3, label="BACKEND")
+        result = self.last_of(self.setup([("b1", self.EP1)]) + [
+            {"op": "ep", "id": "b2", **self.EP3},
+            {"op": "er", "now": 5},
+        ])
+        self.assertEqual(
+            [item["id"] for item in result["items"]], ["b1", "b2"]
+        )
+
+    # ---- 输入校验 ----
+
+    def test_strict_key_order_and_key_set(self):
+        raws = (
+            b'{"ops":[{"op":"ez","items":[]}]}',
+            b'{"ops":[{"op":"ez","now":1,"items":[]}]}',
+            b'{"ops":[{"op":"ez","items":[],"now":1,"x":1}]}',
+            b'{"ops":[{"op":"ez","items":[],"now":1}]}',
+        )
+        for raw in raws:
+            self.assertEqual(
+                self.run_raw(raw),
+                (2, b"", b'{"error":"INPUT"}\n'),
+            )
+
+    def test_items_container_and_count(self):
+        for value in (None, True, False, 1, "x", {}):
+            raw = json.dumps(
+                {"ops": [{"op": "ez", "items": value, "now": 5}]},
+                separators=(",", ":"),
+            ).encode()
+            self.assertEqual(
+                self.run_raw(raw),
+                (2, b"", b'{"error":"INPUT"}\n'),
+            ), value
+        self.assert_failure([{"op": "ez", "items": [], "now": 5}])
+        adds = [
+            {"op": "add", "id": "b%d" % i, "weight": 1}
+            for i in range(1000)
+        ]
+        self.assert_failure(adds + [
+            self.ez([("b%d" % i, None, None) for i in range(1000)] +
+                    [("zzz", None, None)]),
+        ])
+        result = self.last_of(adds + [
+            self.ez([("b%d" % i, None, None) for i in range(1000)], now=5),
+        ])
+        self.assertEqual(len(result["items"]), 1000)
+
+    def test_item_shape_and_key_order(self):
+        bad_items = (
+            None, 1, "x", [], True,
+            {},
+            {"id": "b1"},
+            {"id": "b1", "base": None},
+            {"base": None, "target": None},
+            {"id": "b1", "target": None, "base": None},
+            {"id": "b1", "base": None, "target": None, "x": 1},
+            {"id": 1, "base": None, "target": None},
+            {"id": "", "base": None, "target": None},
+        )
+        for bad in bad_items:
+            raw = json.dumps(
+                {"ops": [{"op": "add", "id": "b1", "weight": 1},
+                         {"op": "ez", "items": [bad], "now": 5}]},
+                separators=(",", ":"),
+            ).encode()
+            self.assertEqual(
+                self.run_raw(raw),
+                (2, b"", b'{"error":"INPUT"}\n'),
+            ), bad
+
+    def test_duplicate_id_rejected(self):
+        self.assert_failure(self.setup() + [
+            self.ez([
+                ("b1", None, self.EP1),
+                ("b2", None, self.EP2),
+                ("b1", None, self.EP3),
+            ]),
+        ])
+
+    def test_endpoint_shape_and_values(self):
+        bad_endpoints = (
+            {}, {"host": "10.0.0.1"}, {"port": 80},
+            {"port": 80, "host": "10.0.0.1"},
+            {"host": "010.0.0.1", "port": 80},
+            {"host": "10.0.0.1%eth0", "port": 80},
+            {"host": "not-an-ip", "port": 80},
+            {"host": "10.0.0.1", "port": 0},
+            {"host": "10.0.0.1", "port": 65536},
+            {"host": "10.0.0.1", "port": True},
+            [], "x", 1,
+        )
+        for bad in bad_endpoints:
+            self.assert_failure(self.setup() + [
+                self.ez([("b1", None, bad)]),
+            ])
+            self.assert_failure(self.setup() + [
+                self.ez([("b1", bad, None)]),
+            ])
+
+    def test_now_type_and_range(self):
+        for value in (True, False, -1, 10 ** 9 + 1, 1.0, "1", None, []):
+            self.assert_failure(self.setup() + [
+                self.ez([("b1", None, None)], now=value),
+            ])
+        self.last_of(self.setup() + [
+            self.ez([("b1", None, None)], now=0),
+        ])
+        self.last_of(self.setup() + [
+            self.ez([("b1", None, self.EP1)], now=10 ** 9),
+        ])
+
+    # ---- 确定性与检查点 ----
+
+    def test_byte_deterministic(self):
+        ops = self.setup(
+            endpoints=[("b1", self.EP1)], conns=[("c1", 0)]
+        ) + [
+            self.ez([
+                ("b1", self.EP1, self.EP2),
+                ("b2", None, self.EP3),
+            ]),
+        ]
+        raw = encode_ops(ops)
+        first = run_balancer("run", raw)
+        second = run_balancer("run", raw)
+        self.assertEqual(first, second)
+        self.assertTrue(first[1].endswith(b"\n"))
+        self.assertFalse(first[1].endswith(b"\n\n"))
+
+    def test_checkpoint_roundtrip_keeps_clock(self):
+        ops = self.setup(
+            endpoints=[("b1", self.EP1)], conns=[("c1", 0)]
+        ) + [self.ez([("b1", self.EP1, self.EP2)], now=5)]
+        results = self.run_ops(ops + [{"op": "se"}])
+        exported = results[-1]
+        si_op = {"op": "si", "version": 1,
+                 "digest": exported["digest"], "state": exported["state"]}
+        cont = [
+            {"op": "er", "now": 7},
+            self.ez([("b1", self.EP1, self.EP2)], now=8),
+        ]
+        direct = self.run_ops(ops + cont)
+        resumed = self.run_ops([si_op] + cont)
+        self.assertEqual(resumed[1:], direct[len(ops):])
+        # 恢复后时钟为 5：now=4 的 ez 报时钟倒退。
+        self.assert_failure(
+            [si_op, self.ez([("b1", self.EP1, self.EP2)], now=4)]
+        )
+
+    def test_record_replay_success_conflict_and_failure(self):
+        batches = (
+            self.setup(
+                endpoints=[("b1", self.EP1)], conns=[("c1", 0)]
+            ) + [
+                self.ez([
+                    ("b1", self.EP1, self.EP2),
+                    ("b2", None, self.EP3),
+                ]),
+            ],
+            self.setup([("b1", self.EP1)]) + [
+                self.ez([("b1", self.EP3, self.EP2)]),  # conflict 预演成功
+            ],
+            [self.ez([("ghost", None, self.EP1)])],     # BACKEND 失败
+        )
+        for ops in batches:
+            raw = encode_ops(ops)
+            direct_code, direct, direct_err = run_balancer("run", raw)
+            code, record, err = run_balancer("record", raw)
+            self.assertEqual((code, err), (0, b""))
+            code, replayed, err = run_balancer("replay", record)
+            self.assertEqual(
+                (code, replayed, err),
+                (direct_code, direct, direct_err),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

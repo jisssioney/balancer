@@ -234,6 +234,17 @@
 - 所有失败均不产生 stdout，并回滚本批此前变化、端点和逻辑时钟。成功后按输入顺序仅写入尚未满足的目标端点，固定返回键序 `op,items,ok`；`items` 按输入顺序排列，每项固定键序 `id,endpoint`，`endpoint` 为对应 `target` 对象或 `null`，`ok` 恒为 `true`。相同请求重报（含部分项已处于目标的重试）逐字节一致。
 - `eb` 只改变各后端当前端点：不迁移、关闭或重新调度活动连接，不消费令牌、配额或等待队列。已有连接继续由 `fw` 返回其建连时快照；后续连接沿用更新后的端点固化新快照。变更结果继续由 `ce`、`se` 导出并可由 `ci`、`si` 恢复（登记端点本就在配置与检查点内）。单次时间与额外空间上界均为 O(N)，N 为 `items` 项数，仅使用 Python 标准库；`run`、`record`、`replay` 对成功、幂等和失败保持固定键序紧凑 UTF-8 JSON、单末尾换行及逐字节确定性。
 
+## 批量后端端点切换只读预演：ez
+
+在不执行 `eb` 的前提下，一次预演整批条件切换：既识别条件冲突，又预测切换对旧端点活动连接的影响。只读：除推进时钟外不改变任何运行态；即使存在冲突也返回完整预演明细。`ep`、`ey`、`eb`、`eq`、`er`、`ex`、`fw` 及所有既有入口行为不变。
+
+- `ez`：输入严格按键序 `op,items,now` 排列（键须按此序出现）。`items` 为 1 至 1000 项数组；每项严格按键序 `id,base,target` 排列，`id` 沿用后端标识且同一 `id` 在数组中不得重复。`base` 与 `target` 均为 `null` 或按键序 `host,port` 排列的对象，含义与校验逐项沿用 `eb`/`ey`（`null` 表示未登记端点，对象沿用 `ep` 对规范 IP 字面量与 1 至 65535 非 bool 整数端口的校验）。`now` 为 0..10⁹ 的非 bool 整数并进入全局非递减显式时钟。
+- 处理顺序固定为：先完整校验整份输入（字段、键序、容器、数量、重复 id、端点结构、编码、数值范围），再按 `items` 顺序确认所有后端存在，最后按操作起始快照计算；任一字段错误报 INPUT/2，任一未知后端报 BACKEND/3，INPUT 优先于 BACKEND。存在冲突不是错误：除时钟外不写入任何状态。
+- 返回固定键序 `op,now,ready,items,summary`。`items` 按请求顺序排列，每项固定键序 `id,current,target,status,total,fresh,stale`：`current` 为该后端当前端点（`null` 或 `host,port` 对象），`target` 回显规范化候选值；`current` 等于 `target` 时 `status` 为 `unchanged`，否则等于 `base` 时为 `applicable`，其余为 `conflict`。仅当整批无 `conflict` 时 `ready` 为 `true`。
+- `total` 为该后端活动连接数；`fresh` 与 `stale` 按建连时端点快照是否等于 `target` 划分，连接无快照时按 `null` 比较（故 `target` 为 `null` 时无快照连接计入 `fresh`），恒有 `total=fresh+stale`。
+- `summary` 固定键序 `total,applicable,unchanged,conflict,connections,stale`：前四项为 `items` 项数及三种状态计数，`connections` 为各项 `total` 之和，`stale` 为各项 `stale` 之和。
+- 字段、键序、容器、数量、重复 id、编码、端点结构、范围或时钟倒退返回 INPUT/2；后端未知返回 BACKEND/3，INPUT 优先于 BACKEND。失败无 stdout 且整批回滚（含同批此前变化与逻辑时钟）。`ez` 成功只推进 `now`，不改变端点、连接、粘性、调度、指标、告警或修订。单次时间 O(N+C)、额外空间 O(N)，N 为 `items` 项数、C 为活动连接数；相同初态相同输入产生逐字节一致的固定键序紧凑 UTF-8 JSON，`run`、`record`、`replay` 结果一致，`se` 和 `si` 保持时钟恢复语义，仅使用 Python 标准库。
+
 ## 测试
 
     python -m unittest discover
