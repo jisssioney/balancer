@@ -2503,6 +2503,7 @@ def parse_op(raw_op):
         "eq", "ec",
         "er", "ex",
         "ey",
+        "eb",
         "ru",
         "ua",
         "mu",
@@ -4221,6 +4222,36 @@ def parse_op(raw_op):
         target = parse_endpoint_or_none(raw_op["target"])
         now = parse_metric_num(raw_op["now"])
         return ("ey", backend_id, base, target, now)
+
+    if name == "eb":
+        # 后端端点批量原子条件变更：精确键序 op,items,now（键须按此序出
+        # 现，乱序报 INPUT）；items 为 1..1000 项数组，每项精确键序
+        # id,base,target（乱序、多缺键报 INPUT），同一 id 在数组中不得
+        # 重复（重复报 INPUT）；base/target 沿用 ey 的 null 或 host,port
+        # 端点校验；now 为 0..10^9 非 bool 整数并进入共用非递减时钟（倒
+        # 退在执行期判 INPUT）。整份输入先在此完整校验，未知 id 与条件
+        # 不匹配留执行期分别判 BACKEND/STATE。
+        if list(raw_op) != ["op", "items", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        raw_items = raw_op["items"]
+        if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= 1000:
+            fail(EXIT_INPUT, "INPUT")
+        items = []
+        seen_ids = set()
+        for item in raw_items:
+            if not isinstance(item, dict) or list(item) != [
+                "id", "base", "target"
+            ]:
+                fail(EXIT_INPUT, "INPUT")
+            item_id = parse_backend_id(item["id"])
+            if item_id in seen_ids:
+                fail(EXIT_INPUT, "INPUT")
+            seen_ids.add(item_id)
+            base = parse_endpoint_or_none(item["base"])
+            target = parse_endpoint_or_none(item["target"])
+            items.append((item_id, base, target))
+        now = parse_metric_num(raw_op["now"])
+        return ("eb", items, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -8065,6 +8096,7 @@ def run(raw):
             "eq", "ec",
             "er", "ex",
             "ey",
+            "eb",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -13437,6 +13469,48 @@ def run(raw):
                     ),
                     "ok": True,
                 }
+            )
+
+        elif op[0] == "eb":
+            # 后端端点批量原子条件变更：形状/字段/编码/数量/重复 id 与时
+            # 钟倒退已在解析期及共用时钟块判 INPUT，INPUT 先于 BACKEND、
+            # BACKEND 先于 STATE。按 items 顺序先确认所有后端存在（任一未
+            # 知报 BACKEND），再逐项检查条件：当前端点等于 target 视为已
+            # 满足（不要求 base 仍匹配），否则必须逐值等于 base；任一后
+            # 端既不等于 base 也不等于 target 报 STATE。全部前提成立后才
+            # 按输入顺序写入尚未满足的 target，任何阶段都不提前写入，失
+            # 败随整批丢弃，端点、时钟与此前操作一并回滚。只改后端当前
+            # 端点：不迁移、关闭或重新调度活动连接，不消费令牌、配额或等
+            # 待队列，建连快照与其他运行态均不变。O(N)、O(N)。
+            _, items, now = op
+            records = []
+            for item_id, _base, _target in items:
+                record = backends.get(item_id)
+                if record is None:
+                    fail(EXIT_BACKEND, "BACKEND")
+                records.append(record)
+            # 条件全量检查通过后才写入，保证失败不留任何部分切换。
+            for record, (_item_id, base, target) in zip(records, items):
+                current = record["endpoint"]
+                if current == target:
+                    continue
+                if current != base:
+                    fail(EXIT_STATE, "STATE")
+            out_items = []
+            for record, (item_id, base, target) in zip(records, items):
+                if record["endpoint"] != target:
+                    record["endpoint"] = target
+                out_items.append(
+                    {
+                        "id": item_id,
+                        "endpoint": (
+                            None if target is None
+                            else {"host": target[0], "port": target[1]}
+                        ),
+                    }
+                )
+            results.append(
+                {"op": "eb", "items": out_items, "ok": True}
             )
 
         elif op[0] == "se":
