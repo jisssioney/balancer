@@ -24110,5 +24110,627 @@ class EndpointBatchSwitchAndCleanupTest(unittest.TestCase):
         self.assertEqual(cids, set())
 
 
+def switch_digest(entries, before):
+    """与 balancer.endpoint_switch_digest 同款：{"items","before"} 紧凑
+    UTF-8 JSON 的小写 SHA-256；entries 为 (id, base, target)，端点为 dict
+    或 None。"""
+    canonical = {
+        "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in entries
+        ],
+        "before": before,
+    }
+    encoded = json.dumps(
+        canonical, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class EndpointSwitchReplaceTest(unittest.TestCase):
+    """eo：全池端点切换预约条件替换——旧身份替换、新身份幂等重报、
+    STATE/BACKEND/INPUT 优先级、旧凭据轮换、无副作用边界、检查点与
+    record/replay。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+    EP3 = {"host": "10.0.0.3", "port": 82}
+    EP4 = {"host": "10.0.0.4", "port": 83}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual(err, b"")
+        self.assertEqual(code, 0)
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def assert_failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(
+            (code, stdout, stderr),
+            (exit_code, b"", ('{"error":"%s"}\n' % label).encode("utf-8")),
+        )
+
+    def base_setup(self):
+        return [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 1},
+            {"op": "ep", "id": "b1", **self.EP1},
+            {"op": "ep", "id": "b2", **self.EP2},
+        ]
+
+    def setup_with_conns(self):
+        """b1=EP1（c1@0、c3@2），b2=EP2（c2@1）。"""
+        return self.base_setup() + [
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            {"op": "open", "cid": "c2", "flow": FLOW, "now": 1},
+            {"op": "open", "cid": "c3", "flow": FLOW, "now": 2},
+        ]
+
+    @staticmethod
+    def es(entries, before, at, now):
+        return {
+            "op": "es",
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in entries
+            ],
+            "before": before,
+            "at": at,
+            "now": now,
+        }
+
+    @staticmethod
+    def eo(base, base_at, entries, before, at, now):
+        return {
+            "op": "eo",
+            "base": base,
+            "base_at": base_at,
+            "items": [
+                {"id": backend_id, "base": base_ep, "target": target}
+                for backend_id, base_ep, target in entries
+            ],
+            "before": before,
+            "at": at,
+            "now": now,
+        }
+
+    @staticmethod
+    def eu(digest, at, now):
+        return {"op": "eu", "digest": digest, "at": at, "now": now}
+
+    @staticmethod
+    def ei(digest, at, now):
+        return {"op": "ei", "digest": digest, "at": at, "now": now}
+
+    # ---- 成功替换与输出形状 ----
+
+    def test_replace_matching_old_identity(self):
+        old = [("b1", self.EP1, self.EP3), ("b2", None, None)]
+        new = [("b1", self.EP1, self.EP3)]
+        d_old = switch_digest(old, 5)
+        d_new = switch_digest(new, 7)
+        results = self.run_ops(self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.eo(d_old, 10, new, 7, 20, 2),
+            {"op": "en"},
+        ])
+        self.assertEqual(
+            results[-2],
+            {"op": "eo", "base": d_old, "digest": d_new,
+             "at": 20, "ok": True},
+        )
+        self.assertEqual(
+            list(results[-2]), ["op", "base", "digest", "at", "ok"]
+        )
+        en = results[-1]
+        self.assertTrue(en["pending"])
+        self.assertEqual(en["digest"], d_new)
+        self.assertEqual(en["at"], 20)
+        self.assertEqual(en["before"], 7)
+        self.assertEqual(en["items"], [
+            {"id": "b1", "base": self.EP1, "target": self.EP3},
+        ])
+
+    def test_replace_output_is_single_line_compact_json(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        d_new = switch_digest(new, 5)
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.eo(d_old, 10, new, 5, 20, 2),
+            ]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out.count(b"\n"), 1)
+        self.assertIn(
+            b'{"op":"eo","base":"%s","digest":"%s","at":20,"ok":true}'
+            % (d_old.encode("ascii"), d_new.encode("ascii")),
+            out,
+        )
+
+    def test_reschedule_same_content(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        digest = switch_digest(entries, 5)
+        results = self.run_ops(self.base_setup() + [
+            self.es(entries, 5, 10, 1),
+            self.eo(digest, 10, entries, 5, 30, 2),
+            {"op": "en"},
+        ])
+        self.assertEqual(results[-2]["digest"], digest)
+        self.assertEqual(results[-2]["at"], 30)
+        self.assertEqual(results[-1]["at"], 30)
+        self.assertEqual(results[-1]["digest"], digest)
+
+    def test_change_content_same_at(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_new = switch_digest(new, 5)
+        results = self.run_ops(self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.eo(switch_digest(old, 5), 10, new, 5, 10, 2),
+            {"op": "en"},
+        ])
+        self.assertEqual(results[-2]["at"], 10)
+        self.assertEqual(results[-2]["digest"], d_new)
+        self.assertEqual(results[-1]["digest"], d_new)
+
+    def test_replace_when_base_at_already_passed(self):
+        # 旧触发时刻已过不影响旧身份匹配：now>base_at 仍可替换，新 at≥now。
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        results = self.run_ops(self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.eo(switch_digest(old, 5), 10, new, 7, 20, 15),
+        ])
+        self.assertTrue(results[-1]["ok"])
+
+    def test_equal_content_request_is_idempotent(self):
+        entries = [("b1", self.EP1, self.EP3)]
+        digest = switch_digest(entries, 5)
+        request = self.eo(digest, 10, entries, 5, 10, 2)
+        results = self.run_ops(self.base_setup() + [
+            self.es(entries, 5, 10, 1), request, request,
+        ])
+        self.assertEqual(results[-1], results[-2])
+
+    # ---- 幂等重报（旧凭据已失效）----
+
+    def test_idempotent_replay_with_stale_base_credentials(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        d_new = switch_digest(new, 7)
+        first = self.eo(d_old, 10, new, 7, 20, 2)
+        # 第二次重报持任意过期 base/base_at，只要候选新身份匹配即成功。
+        retry = self.eo("f" * 64, 99, new, 7, 20, 3)
+        results = self.run_ops(self.base_setup() + [
+            self.es(old, 5, 10, 1), first, retry, {"op": "en"},
+        ])
+        self.assertEqual(
+            results[-2],
+            {"op": "eo", "base": "f" * 64, "digest": d_new,
+             "at": 20, "ok": True},
+        )
+        self.assertEqual(results[-1]["digest"], d_new)
+
+    def test_first_replace_and_replay_are_byte_identical(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        d_new = switch_digest(new, 7)
+        request = self.eo(d_old, 10, new, 7, 20, 5)
+        prefix = self.base_setup() + [self.es(old, 5, 10, 1)]
+        _, once, _ = run_balancer("run", encode_ops(prefix + [request]))
+        _, twice, _ = run_balancer(
+            "run", encode_ops(prefix + [request, request])
+        )
+        eo_line = (
+            b'{"op":"eo","base":"%s","digest":"%s","at":20,"ok":true}'
+            % (d_old.encode("ascii"), d_new.encode("ascii"))
+        )
+        self.assertEqual(once.count(eo_line), 1)
+        self.assertEqual(twice.count(eo_line), 2)
+
+    # ---- STATE：无预约 / 身份不符 ----
+
+    def test_no_reservation_is_state(self):
+        new = [("b1", self.EP1, self.EP4)]
+        self.assert_failure(
+            self.base_setup() + [self.eo("0" * 64, 10, new, 7, 20, 1)],
+            4, "STATE",
+        )
+
+    def test_neither_identity_matches_is_state_and_preserved(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        d_new = switch_digest(new, 7)
+        for bad_base, bad_base_at in (
+            ("0" * 64, 10),       # 摘要不符
+            (d_old, 99),          # 时刻不符
+            (d_new, 20),          # 持新候选摘要但预约仍是旧值
+        ):
+            self.assert_failure(
+                self.base_setup() + [
+                    self.es(old, 5, 10, 1),
+                    self.eo(bad_base, bad_base_at, new, 7, 20, 2),
+                ],
+                4, "STATE",
+            )
+        # 原预约保留。
+        results = self.run_ops(
+            self.base_setup() + [self.es(old, 5, 10, 1), {"op": "en"}]
+        )
+        self.assertEqual(results[-1]["digest"], d_old)
+        self.assertEqual(results[-1]["at"], 10)
+
+    def test_third_writer_wins_and_stale_reader_gets_state(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new_a = [("b1", self.EP1, self.EP4)]
+        new_b = [("b2", self.EP2, self.EP3)]
+        d_old = switch_digest(old, 5)
+        d_b = switch_digest(new_b, 5)
+        # es 无条件覆盖为 new_b 后，持 old 凭据提交 new_a 的读者失败。
+        self.assert_failure(
+            self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.es(new_b, 5, 10, 2),
+                self.eo(d_old, 10, new_a, 7, 20, 3),
+            ],
+            4, "STATE",
+        )
+        results = self.run_ops(self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.es(new_b, 5, 10, 2),
+            {"op": "en"},
+        ])
+        self.assertEqual(results[-1]["digest"], d_b)
+
+    # ---- BACKEND：候选引用未知后端 ----
+
+    def test_unknown_backend_is_backend(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("zz", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        self.assert_failure(
+            self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.eo(d_old, 10, new, 7, 20, 2),
+            ],
+            3, "BACKEND",
+        )
+
+    def test_first_unknown_backend_reported_in_items_order(self):
+        old = [("b1", self.EP1, self.EP3)]
+        # b2 存在、zz 不存在：首个未知即报 BACKEND。
+        new = [("b2", self.EP2, self.EP3), ("zz", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        self.assert_failure(
+            self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.eo(d_old, 10, new, 7, 20, 2),
+            ],
+            3, "BACKEND",
+        )
+
+    def test_backend_priority_over_state(self):
+        # 无预约 + 候选含未知后端：BACKEND 先于 STATE。
+        new = [("zz", self.EP1, self.EP4)]
+        self.assert_failure(
+            self.base_setup() + [self.eo("0" * 64, 10, new, 7, 20, 1)],
+            3, "BACKEND",
+        )
+        # 身份也不匹配 + 未知后端：仍报 BACKEND。
+        old = [("b1", self.EP1, self.EP3)]
+        self.assert_failure(
+            self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.eo("0" * 64, 10, new, 7, 20, 2),
+            ],
+            3, "BACKEND",
+        )
+
+    # ---- INPUT：字段、键序、范围、关系、时钟倒退 ----
+
+    def test_input_variants(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new_good = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        prefix = self.base_setup() + [self.es(old, 5, 10, 1)]
+
+        def raw(base=d_old, base_at=10, items=None, before=7, at=20, now=2):
+            return {
+                "op": "eo", "base": base, "base_at": base_at,
+                "items": [
+                    {"id": i, "base": b, "target": t}
+                    for i, b, t in (new_good if items is None else items)
+                ],
+                "before": before, "at": at, "now": now,
+            }
+
+        good = raw()
+        bads = [
+            # 键序乱序
+            {"op": "eo", "base": d_old, "items": good["items"],
+             "base_at": 10, "before": 7, "at": 20, "now": 2},
+            # 多键 / 缺键
+            {**good, "x": 1},
+            {"op": "eo", "base": d_old, "base_at": 10,
+             "items": good["items"], "before": 7, "at": 20},
+            # base 摘要格式
+            raw(base="XYZ"),
+            raw(base="A" * 64),          # 大写非十六进制
+            raw(base="0" * 63),
+            raw(base=10),
+            # base_at 类型/范围
+            raw(base_at=True),
+            raw(base_at=-1),
+            raw(base_at=10 ** 9 + 1),
+            raw(base_at="10"),
+            # items 容器/数量/重复 id/结构
+            raw(items=[]),
+            raw(items=[("b1", self.EP1, self.EP4),
+                       ("b1", self.EP1, self.EP4)]),
+            # 时间关系 now>at、before>at
+            raw(now=21),
+            raw(before=21),
+            # 数值范围
+            raw(at=10 ** 9 + 1),
+            raw(now=True),
+        ]
+        for bad in bads:
+            self.assert_failure(prefix + [bad], 2, "INPUT")
+
+    def test_clock_rollback_is_input(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        self.assert_failure(
+            self.base_setup() + [
+                self.es(old, 5, 10, 5),
+                self.eo(d_old, 10, new, 7, 20, 4),
+            ],
+            2, "INPUT",
+        )
+
+    def test_input_priority_over_backend(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new_unknown = [("zz", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        # now>at 且后端未知：INPUT 优先。
+        self.assert_failure(
+            self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.eo(d_old, 10, new_unknown, 7, 1, 2),
+            ],
+            2, "INPUT",
+        )
+
+    # ---- 副作用边界：只改预约 ----
+
+    def test_replace_does_not_touch_endpoints_or_connections(self):
+        old = [("b1", self.EP1, self.EP3)]
+        # 候选 base 与当前端点不同也无所谓：eo 不检查端点条件。
+        new = [("b1", self.EP4, self.EP3)]
+        d_old = switch_digest(old, 5)
+        results = self.run_ops(self.setup_with_conns() + [
+            self.es(old, 5, 10, 3),
+            self.eo(d_old, 10, new, 7, 20, 4),
+            {"op": "er", "now": 5},
+            {"op": "fw", "cid": "c1"},
+        ])
+        er = results[-2]
+        # 全部连接仍在，端点仍为 EP1/EP2：eo 未切换，故连接快照仍 fresh。
+        summary = er["summary"]
+        self.assertEqual(summary["backends"], 2)
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["fresh"], 3)
+        self.assertEqual(summary["stale"], 0)
+        currents = {item["id"]: item["current"] for item in er["items"]}
+        self.assertEqual(
+            currents, {"b1": self.EP1, "b2": self.EP2}
+        )
+        # 建连快照仍是旧 EP1。
+        self.assertEqual(results[-1], {"op": "fw", "cid": "c1",
+                                       "backend": "b1",
+                                       "host": "10.0.0.1", "port": 80})
+
+    def test_replace_does_not_require_endpoint_preconditions(self):
+        # 与 ei/ej 不同：当前端点既不等于候选 base 也不等于 target 仍可替换。
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP4, self.EP3)]
+        d_old = switch_digest(old, 5)
+        results = self.run_ops(self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.eo(d_old, 10, new, 7, 20, 2),
+        ])
+        self.assertTrue(results[-1]["ok"])
+
+    def test_es_still_overwrites_unconditionally(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_new = switch_digest(new, 7)
+        results = self.run_ops(self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.es(new, 7, 20, 2),
+            {"op": "en"},
+        ])
+        self.assertEqual(results[-2]["digest"], d_new)
+        self.assertEqual(results[-1]["digest"], d_new)
+        self.assertEqual(results[-1]["at"], 20)
+
+    # ---- 凭据轮换：eu/ei 只认新身份 ----
+
+    def test_old_credentials_invalid_new_credentials_valid(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        d_new = switch_digest(new, 7)
+        prefix = self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.eo(d_old, 10, new, 7, 20, 2),
+        ]
+        # 旧凭据 eu 失败。
+        self.assert_failure(
+            prefix + [self.eu(d_old, 10, 3)], 4, "STATE"
+        )
+        # 旧凭据 ei 失败（即使 now 已到旧时刻）。
+        self.assert_failure(
+            prefix + [self.ei(d_old, 10, 20)], 4, "STATE"
+        )
+        # 新凭据 eu 成功删除。
+        results = self.run_ops(prefix + [self.eu(d_new, 20, 3)])
+        self.assertTrue(results[-1]["cancelled"])
+
+    def test_ei_fires_replaced_reservation_with_new_credentials(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        d_new = switch_digest(new, 7)
+        # 持新身份在 now>=at 生效：b1 端点改到 EP4。
+        results = self.run_ops(self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.eo(d_old, 10, new, 7, 20, 2),
+            self.ei(d_new, 20, 20),
+            {"op": "en"},
+        ])
+        self.assertTrue(results[-2]["ok"])
+        self.assertEqual(results[-2]["items"], [
+            {"id": "b1", "endpoint": self.EP4, "cids": []},
+        ])
+        self.assertFalse(results[-1]["pending"])
+
+    # ---- 检查点 se/si/sd ----
+
+    def export(self, ops):
+        code, out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "se"}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out)["results"][-1]
+
+    def checkpoint(self, result):
+        return {"op": "si", "version": result["version"],
+                "digest": result["digest"], "state": result["state"]}
+
+    def test_se_exports_replaced_reservation(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_new = switch_digest(new, 7)
+        se = self.export(self.base_setup() + [
+            self.es(old, 5, 10, 1),
+            self.eo(switch_digest(old, 5), 10, new, 7, 20, 2),
+        ])
+        ep_switch = se["state"]["ep_switch"]
+        self.assertEqual(
+            list(ep_switch), ["digest", "at", "before", "items"]
+        )
+        self.assertEqual(ep_switch["digest"], d_new)
+        self.assertEqual(ep_switch["at"], 20)
+        self.assertEqual(ep_switch["before"], 7)
+        self.assertEqual(ep_switch["items"], [
+            {"id": "b1", "base": self.EP1, "target": self.EP4},
+        ])
+
+    def test_si_restore_continuation_matches_direct(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        d_new = switch_digest(new, 7)
+        request = self.eo(d_old, 10, new, 7, 20, 2)
+        prefix = self.base_setup() + [self.es(old, 5, 10, 1)]
+        cont = [
+            request,
+            {"op": "en"},
+            # 恢复后持过期旧 base 重报仍幂等成功。
+            self.eo(d_old, 10, new, 7, 20, 5),
+            self.eu(d_new, 20, 6),
+        ]
+        _, direct, direct_err = run_balancer(
+            "run", encode_ops(prefix + cont)
+        )
+        cp = self.checkpoint(self.export(prefix))
+        _, restored, restored_err = run_balancer(
+            "run", encode_ops([cp] + cont)
+        )
+        self.assertEqual(restored_err, direct_err)
+        direct_results = json.loads(direct)["results"]
+        restored_results = json.loads(restored)["results"]
+        self.assertEqual(
+            restored_results[1:], direct_results[len(prefix):]
+        )
+
+    def test_sd_observes_ep_switch_difference(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        prefix = self.base_setup() + [self.es(old, 5, 10, 1)]
+        after = self.export(
+            prefix + [self.eo(d_old, 10, new, 7, 20, 2)]
+        )
+        sd = {"op": "sd", "version": after["version"],
+              "digest": after["digest"], "state": after["state"]}
+        code, out, err = run_balancer(
+            "run", encode_ops(prefix + [sd])
+        )
+        self.assertEqual((code, err), (0, b""))
+        sections = [c["section"]
+                    for c in json.loads(out)["results"][-1]["changes"]]
+        self.assertIn("ep_switch", sections)
+
+    # ---- record/replay ----
+
+    def test_record_replay_success_idempotent_and_failures(self):
+        old = [("b1", self.EP1, self.EP3)]
+        new = [("b1", self.EP1, self.EP4)]
+        d_old = switch_digest(old, 5)
+        request = self.eo(d_old, 10, new, 7, 20, 2)
+        cases = (
+            self.base_setup() + [self.es(old, 5, 10, 1), request],
+            # 首次替换 + 同请求重报（含旧凭据已过期）。
+            self.base_setup() + [
+                self.es(old, 5, 10, 1), request,
+                self.eo(d_old, 10, new, 7, 20, 3),
+            ],
+            # 无预约 STATE。
+            self.base_setup() + [request],
+            # 身份不符 STATE。
+            self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.eo("f" * 64, 10, new, 7, 20, 2),
+            ],
+            # 未知后端 BACKEND。
+            self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.eo(d_old, 10, [("zz", self.EP1, self.EP4)],
+                        7, 20, 2),
+            ],
+            # now>at INPUT；时钟倒退 INPUT。
+            self.base_setup() + [
+                self.es(old, 5, 10, 1),
+                self.eo(d_old, 10, new, 7, 1, 2),
+            ],
+            self.base_setup() + [
+                self.es(old, 5, 10, 5),
+                self.eo(d_old, 10, new, 7, 20, 4),
+            ],
+        )
+        for ops in cases:
+            raw = encode_ops(ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual((rec_code, rec_err), (0, b""))
+            rep_code, rep_out, rep_err = run_balancer(
+                "replay", rec_out
+            )
+            self.assertEqual(
+                (rep_code, rep_out, rep_err),
+                (run_code, run_out, run_err),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

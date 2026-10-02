@@ -2562,7 +2562,7 @@ def parse_op(raw_op):
         "ey", "eb",
         "ez",
         "ej",
-        "es", "en", "eu", "ei",
+        "es", "en", "eu", "ei", "eo",
         "ru",
         "ua",
         "mu",
@@ -4436,6 +4436,39 @@ def parse_op(raw_op):
         now = parse_metric_num(raw_op["now"])
         return (name, digest, at, now)
 
+    if name == "eo":
+        # 全池端点切换预约条件替换（并发安全的改期/换内容）：精确键序
+        # op,base,base_at,items,before,at,now（键须按此序出现，乱序报
+        # INPUT）。base 为调用方依据 en 读到的旧预约小写 64 位十六进制
+        # SHA-256 摘要（仅格式校验，是否对得上预约留执行期判 STATE），
+        # base_at 为旧触发时刻；items、before、at、now 沿用 es 的校验与
+        # 含义（items 1..1000 项、逐项 id,base,target、同一 id 不重复、
+        # 端点 null 或 host,port 对象；三项均为 0..10^9 非 bool 整数），
+        # now 进入共用非递减时钟（倒退在执行期判 INPUT），at、before 不
+        # 推进时钟，关系 now<=at、before<=at 在此一并判 INPUT（同 es，
+        # 先于后端引用 BACKEND 检查）。无预约、旧值/新值均不匹配留执行
+        # 期判 STATE，未知后端留执行期判 BACKEND；本函数只做形状、字段、
+        # 数量、重复 id、关系与时钟域校验。
+        if list(raw_op) != [
+            "op", "base", "base_at", "items", "before", "at", "now"
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        base = parse_base(raw_op["base"])
+        base_at = raw_op["base_at"]
+        if (
+            not isinstance(base_at, int)
+            or isinstance(base_at, bool)
+            or not 0 <= base_at <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        items = parse_endpoint_switch_items(raw_op["items"])
+        before = parse_metric_num(raw_op["before"])
+        at = parse_metric_num(raw_op["at"])
+        now = parse_metric_num(raw_op["now"])
+        if now > at or before > at:
+            fail(EXIT_INPUT, "INPUT")
+        return ("eo", base, base_at, items, before, at, now)
+
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
         # 规范化全部状态并按 O(N) 计算摘要，state 紧凑编码超 8MiB 报
@@ -4864,7 +4897,7 @@ def run(raw):
     # 旧值/新值条件替换；其余操作不影响预约。额外空间 O(N)，N 为规范化
     # 配置大小。
     reservation = None
-    # 全池唯一端点切换预约（es/en/eu/ei）：无预约为 None，否则为
+    # 全池唯一端点切换预约（es/en/eu/ei/eo）：无预约为 None，否则为
     # (items, before, at, digest)——items 为 es 当时规范化的
     # (id, base, target) 元组列表（保持请求顺序、id 互不重复；端点 None
     # 表示未登记），before 为旧连接关闭的 opened 上界，at 为最早生效时
@@ -4873,7 +4906,9 @@ def run(raw):
     # 即整体替换（同身份重报幂等、不重写），en 只读 O(N)，eu 在 digest、
     # at 同时匹配时原子清除（无预约幂等空操作、不匹配报 STATE 且保留），
     # ei 仅在身份匹配且 now>=at 时按操作开始快照执行 ej 同式切换与清理、
-    # 成功后删除；ci/cb/cu/ca 成功一并清除；其余操作不影响预约。额外空间
+    # 成功后删除，eo 仅在旧身份（base、base_at）匹配时原子替换候选快照
+    # （已等于新身份时幂等重报、不重写；无预约或两身份均不匹配报 STATE
+    # 且保留）；ci/cb/cu/ca 成功一并清除；其余操作不影响预约。额外空间
     # O(N)，N 为预约项数。
     ep_switch = None
     # 配置变更审计（al）：deque(maxlen=64) 按 rev 升序保留最近 64 条，追加
@@ -8363,7 +8398,7 @@ def run(raw):
             "ey", "eb",
             "ez",
             "ej",
-            "es", "eu", "ei",
+            "es", "eu", "ei", "eo",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -14156,6 +14191,43 @@ def run(raw):
                     "closed": closed_total,
                     "ok": True,
                 }
+            )
+
+        elif op[0] == "eo":
+            # 全池端点切换预约条件替换（并发安全的改期/换内容）：形状/字段
+            # 类型/范围/UTF-8、数量、重复 id、端点结构、时间关系（now<=at、
+            # before<=at）及时钟倒退已在解析期及共用时钟块判 INPUT，INPUT
+            # 先于 BACKEND、BACKEND 先于 STATE。执行期先按 items 顺序确认
+            # 候选引用的后端全部现存（首个未知报 BACKEND，同 es，先于预约
+            # 匹配），再计算候选摘要并读取当前预约做条件判定。无预约为
+            # STATE；当前预约既不等于旧身份（base、base_at）也不等于新身
+            # 份（候选摘要、at）时为 STATE 并保留原预约。旧身份匹配时原
+            # 子替换为候选快照；当前已等于新身份时视为幂等重报——即使旧
+            # 身份已过期（预约已被另一条 es/eo 改成新值）也成功，且不重
+            # 写预约状态（保留既有快照对象）。只改待生效预约：不切换端
+            # 点、不关闭或调度连接，不消费队列、令牌或配额。失败随整批
+            # 丢弃，时钟与此前操作一并回滚。O(N)，N 为 items 项数与规范
+            # 化编码长度之和。
+            _, base, base_at, switch_items, before, at, now = op
+            for backend_id, _base, _target in switch_items:
+                if backends.get(backend_id) is None:
+                    fail(EXIT_BACKEND, "BACKEND")
+            digest = endpoint_switch_digest(switch_items, before)
+            if ep_switch is None:
+                fail(EXIT_STATE, "STATE")
+            _, _, reserved_at, reserved_digest = ep_switch
+            matches_old = reserved_digest == base and reserved_at == base_at
+            matches_new = reserved_digest == digest and reserved_at == at
+            if not matches_old and not matches_new:
+                fail(EXIT_STATE, "STATE")
+            if matches_old and not matches_new:
+                # 原子替换为候选快照；幂等重报（matches_new）不重写状态。
+                ep_switch = (switch_items, before, at, digest)
+            # 旧值匹配完成替换与新值幂等重报逐字节同输出：回显请求 base、
+            # 候选摘要与新 at，ok 恒 true。
+            results.append(
+                {"op": "eo", "base": base, "digest": digest,
+                 "at": at, "ok": True}
             )
 
         elif op[0] == "se":
