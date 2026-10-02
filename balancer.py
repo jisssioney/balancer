@@ -1071,6 +1071,23 @@ cids，cids 保持关闭顺序，无符合项为 closed=0 与空数组；不扣�
 （C 为活动连接数），紧凑 UTF-8 固定键序 JSON、单末尾换行及 run、record、
 replay 与检查点逐字节契约不变，仅用标准库。
 
+后端端点原子条件变更 ey：精确键序 op,id,base,target,now（键须按此序出
+现）；base 与 target 均为 null 或精确键序 host,port 的对象，null 表示未
+登记端点，对象沿用 ep 的规范化 IP 字面量与 1..65535 非 bool 端口校验；
+now 为 0..10^9 非 bool 整数并进入共用非递减时钟。请求先完整校验字段、
+键序、端点结构、编码和时钟，再确认后端存在；当前端点等于 target 时无论
+base 是否仍匹配均视为成功的幂等重报，否则只有当前端点与 base 逐值相等
+时才原子写入 target（target 为 null 即清除登记），其余比较失败报
+STATE/4，未知后端报 BACKEND/3，输入或时钟错误报 INPUT/2，优先级依次为
+INPUT、BACKEND、STATE。成功固定返回键序 op,id,endpoint,ok，endpoint 为
+规范化后的 target 或 null，ok 恒 true；首次写入与相同请求重报逐字节一
+致。ey 只改后端当前端点，不迁移、关闭或重新调度活动连接，也不消费令牌、
+配额或等待队列：已有连接继续由 fw 返回其建连快照，后续连接仅在变更后仍
+有当前端点时固化新快照；清除后该后端沿用未登记端点行为（eq 报 STATE/4、
+er 不列出，已有快照仍可由 fw 查询），重新登记后旧快照自然成为 stale。任
+何失败不产生 stdout 并回滚同批此前变化、端点与逻辑时钟。时间与额外空间
+均 O(1)，仅用标准库；ep 的无条件覆盖语义与所有既有入口行为不变。
+
 不可用时长查询：ru 精确键序 op,id,now（键须按此序出现），id 为非空
 UTF-8 串，now 为 0..10^9 非 bool 整数并进入共用非递减时钟。结果键序
 op,id,now,reasons：reasons 列出该后端在 now 时刻的阻断原因，按
@@ -1822,6 +1839,19 @@ def parse_endpoint_port(value):
     return value
 
 
+def parse_endpoint_or_none(value):
+    # ey 的 base/target：null 表示未登记端点，否则为精确键序 host,port 的
+    # 对象，校验沿用 ep（规范化 IP 字面量与 1..65535 非 bool 端口）。
+    if value is None:
+        return None
+    if not isinstance(value, dict) or list(value) != ["host", "port"]:
+        fail(EXIT_INPUT, "INPUT")
+    return (
+        parse_endpoint_host(value["host"]),
+        parse_endpoint_port(value["port"]),
+    )
+
+
 def sort_fault_segments(segments):
     """按段起点 a 稳定升序：a ∈ [0,10^9] < 2^32，LSD 基数排序四轮 256
     桶共 O(T)，与比较排序的稳定结果一致（同 a 保持原相对序；同 a 段随后
@@ -2472,6 +2502,7 @@ def parse_op(raw_op):
         "ep", "fw",
         "eq", "ec",
         "er", "ex",
+        "ey",
         "ru",
         "ua",
         "mu",
@@ -4174,6 +4205,22 @@ def parse_op(raw_op):
         if before > now:
             fail(EXIT_INPUT, "INPUT")
         return ("ex", before, now)
+
+    if name == "ey":
+        # 后端端点原子条件变更：精确键序 op,id,base,target,now（键须按此
+        # 序出现，乱序报 INPUT）；base/target 均为 null 或精确键序
+        # host,port 的对象，null 表示未登记端点，对象沿用 ep 的规范化 IP
+        # 字面量与 1..65535 非 bool 端口校验；now 为 0..10^9 非 bool 整
+        # 数并进入共用非递减时钟（倒退在执行期判 INPUT）。未知 id 与当
+        # 前端点不匹配留执行期分别判 BACKEND/STATE；本函数只做形状、字
+        # 段与时钟域校验。
+        if list(raw_op) != ["op", "id", "base", "target", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        backend_id = parse_backend_id(raw_op["id"])
+        base = parse_endpoint_or_none(raw_op["base"])
+        target = parse_endpoint_or_none(raw_op["target"])
+        now = parse_metric_num(raw_op["now"])
+        return ("ey", backend_id, base, target, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -8017,6 +8064,7 @@ def run(raw):
             "cp", "cq", "ca", "ca_cond", "cx", "cy",
             "eq", "ec",
             "er", "ex",
+            "ey",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -13356,6 +13404,38 @@ def run(raw):
                     "now": now,
                     "items": items,
                     "closed": closed_total,
+                }
+            )
+
+        elif op[0] == "ey":
+            # 后端端点原子条件变更：形状/字段/编码与时钟倒退已在解析期及
+            # 共用时钟块判 INPUT，INPUT 先于 BACKEND、BACKEND 先于 STATE。
+            # 后端不存在报 BACKEND；当前端点等于 target 时无论 base 是否
+            # 仍匹配均视为成功的幂等重报且不重写登记；否则只有当前端点与
+            # base 逐值相等时才原子写入 target（target 为 null 即清除登
+            # 记）；其余比较失败报 STATE。只改后端当前端点：不迁移、关闭
+            # 或重新调度活动连接，不消费令牌、配额或等待队列，建连快照与
+            # 其他运行态均不变。失败随整批丢弃，时钟与此前操作一并回滚。
+            # O(1)、O(1)。
+            _, backend_id, base, target, now = op
+            record = backends.get(backend_id)
+            if record is None:
+                fail(EXIT_BACKEND, "BACKEND")
+            current = record["endpoint"]
+            if current != target:
+                if current != base:
+                    fail(EXIT_STATE, "STATE")
+                # 条件匹配：原子写入（清除或改登记）。
+                record["endpoint"] = target
+            results.append(
+                {
+                    "op": "ey",
+                    "id": backend_id,
+                    "endpoint": (
+                        None if target is None
+                        else {"host": target[0], "port": target[1]}
+                    ),
+                    "ok": True,
                 }
             )
 
