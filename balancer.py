@@ -2562,7 +2562,7 @@ def parse_op(raw_op):
         "ey", "eb",
         "ez",
         "ej",
-        "es", "en", "eu", "ei", "eo", "ev",
+        "es", "en", "eu", "ei", "eo", "ev", "ew",
         "ru",
         "ua",
         "mu",
@@ -4477,6 +4477,34 @@ def parse_op(raw_op):
         at = parse_metric_num(raw_op["at"])
         now = parse_metric_num(raw_op["now"])
         return ("ev", digest, at, now)
+
+    if name == "ew":
+        # 端点切换预约候选替换只读预演（提交 eo 前的并发前提与影响预
+        # 估）：精确键序 op,base,base_at,items,before,at,now（键须按此序
+        # 出现，乱序报 INPUT）。base 为 en 读到的旧预约小写 64 位十六进制
+        # SHA-256 摘要（仅格式校验，是否匹配留执行期归类，不报错）；
+        # base_at 为旧触发时刻；items、before、at、now 沿用 eo/es 的数量
+        # （1..1000）、顺序、唯一 id、base/target（null 或精确键序 host,
+        # port 对象）规则，均为 0..10^9 非 bool 整数，关系 now<=at、
+        # before<=at 在此一并判 INPUT（先于候选后端引用 BACKEND 检查，同
+        # eo 与全局优先级）。now 进入共用非递减时钟（倒退在执行期判
+        # INPUT），at、before 不推进时钟。候选后端是否现存留执行期判
+        # BACKEND；预约身份（无预约/已等于候选/等于旧身份/其余）不报错，
+        # 作为成功预演的 status 返回。本函数只做形状、字段、数量、重复
+        # id、关系与时钟域校验。
+        if list(raw_op) != [
+            "op", "base", "base_at", "items", "before", "at", "now",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        base = cp_hex_digest(raw_op["base"])
+        base_at = parse_metric_num(raw_op["base_at"])
+        items = parse_endpoint_switch_items(raw_op["items"])
+        before = parse_metric_num(raw_op["before"])
+        at = parse_metric_num(raw_op["at"])
+        now = parse_metric_num(raw_op["now"])
+        if now > at or before > at:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ew", base, base_at, items, before, at, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -8405,7 +8433,7 @@ def run(raw):
             "ey", "eb",
             "ez",
             "ej",
-            "es", "eu", "ei", "eo", "ev",
+            "es", "eu", "ei", "eo", "ev", "ew",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -14332,6 +14360,92 @@ def run(raw):
                     "now": now,
                     "ready": overall == "READY",
                     "status": overall,
+                    "items": result_items,
+                    "closed": closed_total,
+                }
+            )
+
+        elif op[0] == "ew":
+            # 端点切换预约候选替换只读预演：形状/字段/数量/重复 id/端点/
+            # 编码、时间范围与关系（now<=at、before<=at）及时钟倒退已在解
+            # 析期及共用时钟块判 INPUT，INPUT 先于候选后端引用 BACKEND。执
+            # 行期先按 items 顺序确认候选引用的后端全部存在（首个未知报
+            # BACKEND），随后只读取当前预约做身份归类——任何身份（含无预
+            # 约 MISSING 与冲突 CONFLICT）都是成功预演结果而非错误，身份不
+            # 匹配不返回 STATE。除共用块已推进的 now 外不改变任何运行态：
+            # 不写预约、不切换端点、不关闭连接，排空、队列、令牌、配额、指
+            # 标、告警均不动。候选摘要、规范化与时间关系沿用 eo/es；现存后
+            # 端按当前端点等于 target、等于 base 或均不等依次标为
+            # UNCHANGED/APPLICABLE/CONFLICT，并单遍扫描活动连接 O(C)：按全
+            # 局建连序列出 opened<=before 且建连端点快照不等于该项 target
+            # 的 cids，无快照按 None 比较；ALREADY 也按当前快照重新计算。
+            # O(N+C) 时间、O(N+C) 结果空间，N 为候选项数、C 为活动连接
+            # 数。
+            _, base, base_at, switch_items, before, at, now = op
+            for backend_id, _b, _t in switch_items:
+                if backends.get(backend_id) is None:
+                    fail(EXIT_BACKEND, "BACKEND")
+            digest = endpoint_switch_digest(switch_items, before)
+            if ep_switch is None:
+                status = "MISSING"
+            else:
+                _, _, reserved_at, reserved_digest = ep_switch
+                if reserved_digest == digest and reserved_at == at:
+                    # 已等于候选摘要与 at：按当前快照重新计算影响。
+                    status = "ALREADY"
+                elif reserved_digest == base and reserved_at == base_at:
+                    status = "READY"
+                else:
+                    status = "CONFLICT"
+            replaceable = status in ("READY", "ALREADY")
+            # 候选项顺序逐项快照；删除后端不可能进入本分支（引用未知已
+            # BACKEND），所有候选后端当前必然现存。
+            index_by_id = {}
+            groups = [[] for _ in switch_items]
+            for idx, (backend_id, _base, _target) in enumerate(switch_items):
+                index_by_id[backend_id] = idx
+            for cid, connection in connections.items():
+                idx = index_by_id.get(connection[0])
+                if idx is None:
+                    continue
+                if connection[2] > before:
+                    continue
+                target = switch_items[idx][2]
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == target:
+                    continue
+                groups[idx].append(cid)
+            result_items = []
+            closed_total = 0
+            for (backend_id, item_base, target), cids in zip(
+                switch_items, groups
+            ):
+                current = backends[backend_id]["endpoint"]
+                if current == target:
+                    item_status = "UNCHANGED"
+                elif current == item_base:
+                    item_status = "APPLICABLE"
+                else:
+                    item_status = "CONFLICT"
+                closed_total += len(cids)
+                result_items.append(
+                    {
+                        "id": backend_id,
+                        "current": endpoint_json(current),
+                        "target": endpoint_json(target),
+                        "status": item_status,
+                        "cids": cids,
+                    }
+                )
+            results.append(
+                {
+                    "op": "ew",
+                    "base": base,
+                    "digest": digest,
+                    "at": at,
+                    "now": now,
+                    "replaceable": replaceable,
+                    "status": status,
                     "items": result_items,
                     "closed": closed_total,
                 }

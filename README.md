@@ -291,6 +291,18 @@
 - `items` 保持预约顺序，每项固定键序 `id,exists,current,target,status,cids`。删除项取 `exists=false`、`current=null`、`status=MISSING`、`cids=[]`；其余项按当前端点等于 `target`、等于 `base` 或均不等分别取 `UNCHANGED`、`APPLICABLE`、`CONFLICT`。现存后端按全局建连顺序列出 `opened≤before` 且建连端点快照不等于该项 `target` 的 cids（无快照按 null 比较，故 `target` 为 null 时无快照连接不列入；`opened==before` 列入），`closed` 为全部 cids 数量。整体不可执行时仍报告其余可计算项。
 - `ev` 成功只推进 `now`：不改端点、连接、排空状态、预约、队列、令牌、配额、指标或告警，不关闭连接或删除预约，后续 `ei` 仍按执行时状态判定。单次时间与结果空间 O(N+C)（N 为预约项数、C 为活动连接数），仅使用 Python 标准库；相同初态和输入产生逐字节一致的固定键序紧凑 UTF-8 JSON 与单个末尾换行，`run`、`record`、`replay` 结果一致，`se` 导出后 `si` 恢复继续执行与直接继续一致。
 
+## 端点切换预约候选替换只读预演：ew
+
+在提交 `eo` 改期或换内容前，只读判断并发前提是否仍成立，并同时看到候选预约按当前状态会影响哪些连接；只读：只推进显式 `now`，不改变预约、端点、连接或其他运行态，调用方可据此决定是否原样提交 `eo`。`es`、`en`、`eu`、`ei`、`eo`、`ev`、`ej` 及所有既有入口行为不变。
+
+- `ew`：严格接受固定顺序 `op,base,base_at,items,before,at,now` 七键（键须按此序出现，乱序报 INPUT）。旧预约身份字段 `base`、`base_at` 与候选内容 `items`、`before`、`at`、`now` 的规范化、摘要、后端引用与时间关系校验全部沿用 `eo` 与 `es`：`base` 为小写 64 位十六进制 SHA-256（仅格式校验）；items 为 1..1000 项、每项键序 `id,base,target`、同一 id 不重复，base/target 为 `null` 或 `host,port` 对象；各时间为 0..10⁹ 非 bool 整数且 `now≤at`、`before≤at`；`now` 进入全局非递减显式时钟（倒退报 INPUT/2），`at` 与 `before` 不推进时钟。
+- 先完整校验输入，再按 `items` 顺序确认候选引用的后端当前存在（首个未知后端报 BACKEND/3）；随后只读取当前预约做身份归类，任何身份都是成功预演结果而非错误，身份不匹配不返回 STATE：
+  - 无预约为 `MISSING`；当前预约摘要与触发时刻已等于候选摘要和 `at` 为 `ALREADY`；等于 `base` 和 `base_at` 为 `READY`；其余为 `CONFLICT`。
+  - `replaceable` 仅在 `READY` 或 `ALREADY` 时为 true。
+- 返回固定键序 `op,base,digest,at,now,replaceable,status,items,closed`；`base` 回显请求的旧摘要，`digest` 为候选摘要（与 `eo`/`es` 同式对规范化 items 与 before 计算的 SHA-256），`at` 回显候选触发时刻。`items` 按候选顺序排列，每项固定键序 `id,current,target,status,cids`：`current` 为该后端当前端点（`null` 或 `host,port` 对象），`target` 回显规范化候选值；现存后端按当前端点等于 `target`、等于 `base` 或均不等，依次标为 `UNCHANGED`、`APPLICABLE`、`CONFLICT`。`cids` 按全局建连顺序列出 `opened` 不晚于 `before`（`opened==before` 列入）且建连端点快照不同于 `target` 的活动连接，连接无快照时按 `null` 比较（故 `target` 为 `null` 时无快照连接不列入），`closed` 为全部 cids 总数。预约身份为 `MISSING` 或 `CONFLICT` 时仍成功返回完整影响，`ALREADY` 也按当前快照重新计算。
+- 字段、键序、编码、摘要格式、容器、数量、重复后端、端点结构、整数范围、时间关系或时钟倒退非法统一返回 INPUT/2；候选引用未知后端返回 BACKEND/3，INPUT 优先于 BACKEND，身份不匹配不返回 STATE。失败无 stdout，并回滚同批此前变化和时钟。
+- `ew` 成功只推进 `now`：不写预约、不切换端点、不关闭连接，排空、队列、令牌、配额、指标、告警均不动；`se` 状态、`run`、`record`、`replay`、`si` 的确定性以及现有端点入口行为保持不变。单次时间与结果空间 O(N+C)，N 为候选项数、C 为活动连接数；相同初态与输入产生逐字节一致的固定键序紧凑 UTF-8 JSON 与单个末尾换行，只使用 Python 标准库且不读取系统时间。
+
 ## 测试
 
     python -m unittest discover
