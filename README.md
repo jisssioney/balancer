@@ -245,6 +245,16 @@
 - `summary` 固定键序 `total,applicable,unchanged,conflict,connections,stale`：前四项为 `items` 项数及三种状态计数，`connections` 为各项 `total` 之和，`stale` 为各项 `stale` 之和。
 - 字段、键序、容器、数量、重复 id、编码、端点结构、范围或时钟倒退返回 INPUT/2；后端未知返回 BACKEND/3，INPUT 优先于 BACKEND。失败无 stdout 且整批回滚（含同批此前变化与逻辑时钟）。`ez` 成功只推进 `now`，不改变端点、连接、粘性、调度、指标、告警或修订。单次时间 O(N+C)、额外空间 O(N)，N 为 `items` 项数、C 为活动连接数；相同初态相同输入产生逐字节一致的固定键序紧凑 UTF-8 JSON，`run`、`record`、`replay` 结果一致，`se` 和 `si` 保持时钟恢复语义，仅使用 Python 标准库。
 
+## 批量后端端点切换并原子清理旧连接：ej
+
+把一批后端的条件端点切换与指定时间边界内的旧连接清理合并为一次原子操作：先按操作开始时的快照统一判定全部前提，仅当整批可切换时才同时完成端点更新与旧连接关闭。`ep`、`ey`、`eb`、`ez`、`eq`、`ec`、`er`、`ex`、`fw` 及所有既有入口行为不变。
+
+- `ej`：输入严格按键序 `op,items,before,now` 排列（键须按此序出现）。`items` 为 1 至 1000 项数组；每项严格按键序 `id,base,target` 排列，端点规范与同一 `id` 不得重复的限制逐项沿用 `eb`/`ey`（`base`/`target` 均为 `null` 或按键序 `host,port` 排列的对象，`null` 表示未登记端点，对象沿用 `ep` 对规范 IP 字面量与 1 至 65535 非 bool 整数端口的校验）。`before`、`now` 均为 0..10⁹ 的非 bool 整数且 `before≤now`；`now` 进入全局非递减显式时钟。
+- 处理顺序固定为：先完整校验整份输入（字段、键序、容器、数量、重复 id、端点结构、编码、数值范围、`before` 关系），再按 `items` 顺序确认所有后端存在，最后按操作开始时的快照统一判定条件；任何阶段都不得提前写入。某一项当前端点等于 `target` 时视为已满足（不要求 `base` 仍匹配、不重写登记）；否则只有当前端点逐值等于 `base` 才可切换，`target` 为 `null` 时清除登记。任一项既不等于 `base` 也不等于 `target` 时整批返回 STATE/4；任一未知后端返回 BACKEND/3。判定优先级固定为 INPUT、BACKEND、STATE。
+- 条件全部成立后，先将尚未到达 `target` 的后端原子更新到 `target`，再只处理 `items` 所列后端中 `opened≤before`（`opened==before` 关闭）且建连端点快照不等于该项 `target` 的活动连接；无快照按 `null` 比较，因此 `target` 为 `null` 时无快照连接保留，快照与 `target` 相同的连接永不关闭。连接按全局建连顺序关闭并删除快照、逐条递减并发。清理使排空状态 D 的后端因此失去最后连接时沿用 `ec`/`ex`/`close` 规则转为 X、`end=now` 且 `forced` 维持原值；不消费令牌、配额或等待队列，也不重新调度。
+- 成功固定返回键序 `op,now,items,closed,ok`；`items` 按请求顺序排列，每项固定键序 `id,endpoint,cids`，`endpoint` 为规范化 `target` 对象或 `null`，`cids` 按全局关闭次序列出该后端本次关闭的连接（无关闭为 `[]`）；`closed` 为全部 `cids` 数量，`ok=true`。无符合连接也成功：`closed=0`、各项 `cids=[]`。相同请求重报（含部分项已处于目标、旧连接已清理的重试）逐字节一致。
+- 字段、键序、编码、类型、范围、关系或时钟倒退返回 INPUT/2，未知后端返回 BACKEND/3，条件冲突返回 STATE/4；失败不产生 stdout，并回滚同批此前变化、时钟、端点和连接。单次时间与额外空间为 O(N+C)（N 为 `items` 项数、C 为活动连接数），仅使用 Python 标准库；`run`、`record`、`replay`、`se`、`si` 与固定键序 JSON、单末尾换行和逐字节确定性保持兼容，既有操作行为不变。
+
 ## 测试
 
     python -m unittest discover

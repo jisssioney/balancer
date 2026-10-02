@@ -2504,6 +2504,7 @@ def parse_op(raw_op):
         "er", "ex",
         "ey", "eb",
         "ez",
+        "ej",
         "ru",
         "ua",
         "mu",
@@ -4294,6 +4295,46 @@ def parse_op(raw_op):
             items.append((item_id, base, target))
         now = parse_metric_num(raw_op["now"])
         return ("ez", items, now)
+
+    if name == "ej":
+        # 批量后端端点条件切换并清理旧连接（原子）：精确键序
+        # op,items,before,now（键须按此序出现，乱序报 INPUT）；items 为
+        # 1..1000 项数组（bool 不是数组），每项精确键序 id,base,target（键
+        # 须按此序出现），同一 id 在数组中不得重复；base/target 均沿用
+        # parse_endpoint_or_none（null 或精确键序 host,port 的对象，校验同
+        # eb/ey/ep）；before/now 均为 0..10^9 非 bool 整数且 before<=now，
+        # now 进入共用非递减时钟（倒退在执行期判 INPUT）。未知识别与条件不
+        # 匹配留执行期分别判 BACKEND/STATE；本函数只做形状、字段、数量、重
+        # 复 id、端点、before 关系与时钟域校验，且整份输入先于任何状态检查。
+        if list(raw_op) != ["op", "items", "before", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        raw_items = raw_op["items"]
+        if (
+            not isinstance(raw_items, list)
+            or isinstance(raw_items, bool)
+            or not 1 <= len(raw_items) <= 1000
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        items = []
+        seen_ids = set()
+        for raw_item in raw_items:
+            if (
+                not isinstance(raw_item, dict)
+                or list(raw_item) != ["id", "base", "target"]
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            item_id = parse_backend_id(raw_item["id"])
+            if item_id in seen_ids:
+                fail(EXIT_INPUT, "INPUT")
+            seen_ids.add(item_id)
+            base = parse_endpoint_or_none(raw_item["base"])
+            target = parse_endpoint_or_none(raw_item["target"])
+            items.append((item_id, base, target))
+        before = parse_metric_num(raw_op["before"])
+        now = parse_metric_num(raw_op["now"])
+        if before > now:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ej", items, before, now)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -8139,6 +8180,7 @@ def run(raw):
             "er", "ex",
             "ey", "eb",
             "ez",
+            "ej",
         ):
             now = op[-1]
             # 三键 add 的 now 占位为 None，不参与时钟。
@@ -13651,6 +13693,97 @@ def run(raw):
                         "connections": sum_connections,
                         "stale": sum_stale,
                     },
+                }
+            )
+
+        elif op[0] == "ej":
+            # 批量端点条件切换并原子清理旧连接：形状/字段/数量/重复 id/端点/
+            # before 关系/编码与时钟倒退已在解析期及共用时钟块判 INPUT，
+            # INPUT 先于 BACKEND、BACKEND 先于 STATE。执行期先按 items 顺序
+            # 确认所有后端存在（首个未知报 BACKEND），再按操作开始时的快照
+            # 统一判定条件——任何阶段都不提前写入。每项当前端点等于 target
+            # 时视为已满足（不要求 base 仍匹配、不重写登记），否则必须逐值
+            # 等于 base 才可切换；任一项既不等于 base 也不等于 target，整批
+            # 报 STATE。条件全部成立后，先把尚未到达 target 的后端原子更新
+            # 到 target（target=null 即清除登记），再只处理 items 所列后端中
+            # opened<=before 且建连端点快照不等于该项 target 的活动连接；无
+            # 快照按 None 比较，故 target=null 时无快照连接保留。连接按全局
+            # 建连顺序（dict 保序）单遍扫描关闭并删除快照、逐条递减并发；
+            # cids 按全局关闭次序分组，items 按请求顺序输出。清理使排空 D
+            # 状态后端因此失去最后连接时沿用 ec/ex/close 转 X、end=now 且
+            # forced 不变；不消费令牌、配额或等待队列，也不重新调度。无符合
+            # 连接也成功。失败随整批丢弃，时钟、端点与连接一并回滚。
+            # O(N+C)、O(N+C)。
+            _, change_items, before, now = op
+            records = []
+            for backend_id, _base, _target in change_items:
+                record = backends.get(backend_id)
+                if record is None:
+                    fail(EXIT_BACKEND, "BACKEND")
+                records.append(record)
+            # 条件整批预检（操作开始快照：此前列阶段均不改端点），全部成立
+            # 才进入写入，保证原子性。
+            for record, (_backend_id, _base, target) in zip(
+                records, change_items
+            ):
+                current = record["endpoint"]
+                if current == target or current == _base:
+                    continue
+                fail(EXIT_STATE, "STATE")
+            # 先原子更新尚未到达 target 的端点。
+            for record, (_backend_id, _base, target) in zip(
+                records, change_items
+            ):
+                if record["endpoint"] != target:
+                    record["endpoint"] = target
+            # 请求 id -> 该项 target（id 已在解析期保证互不重复；target 可以
+            # 合法为 None，故成员判定不能用 get 的 None 兜底）。
+            target_by_id = {item[0]: item[2] for item in change_items}
+            # backend_id -> 本次关闭 cids（组内保持全局建连顺序）。
+            closed_groups = {}
+            for cid, connection in list(connections.items()):
+                backend_id = connection[0]
+                if backend_id not in target_by_id:
+                    continue
+                target = target_by_id[backend_id]
+                snapshot = conn_endpoints.get(cid)
+                if snapshot == target or connection[2] > before:
+                    continue
+                del connections[cid]
+                conn_endpoints.pop(cid, None)
+                backends[backend_id]["conns"] -= 1
+                closed_groups.setdefault(backend_id, []).append(cid)
+            result_items = []
+            closed_total = 0
+            for (backend_id, _base, target), record in zip(
+                change_items, records
+            ):
+                cids = closed_groups.get(backend_id, [])
+                if cids:
+                    drain = record["drain"]
+                    if drain["state"] == "D" and record["conns"] == 0:
+                        # 沿用 ec/ex/close：排空中最后连接被清理即转 X，
+                        # end 取本次 now；forced 维持原值不变。
+                        drain["state"] = "X"
+                        drain["end"] = now
+                result_items.append(
+                    {
+                        "id": backend_id,
+                        "endpoint": (
+                            None if target is None
+                            else {"host": target[0], "port": target[1]}
+                        ),
+                        "cids": cids,
+                    }
+                )
+                closed_total += len(cids)
+            results.append(
+                {
+                    "op": "ej",
+                    "now": now,
+                    "items": result_items,
+                    "closed": closed_total,
+                    "ok": True,
                 }
             )
 
