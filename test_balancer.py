@@ -24580,5 +24580,562 @@ class EpSwitchConditionalReplaceTest(unittest.TestCase):
                              (run_code, run_out, run_err))
 
 
+class EpSwitchPreviewTest(unittest.TestCase):
+    """ev：全池端点切换预约只读预演——凭预约身份（摘要+触发时刻）在操作
+    开始快照上判定可执行性（EARLY/MISSING/CONFLICT/READY）并报告每项当前
+    端点状态与 opened<=before 且快照不等于 target 的连接；除推进 now 外不
+    改任何运行态。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+    EP3 = {"host": "10.0.0.3", "port": 82}
+    EP4 = {"host": "10.0.0.4", "port": 83}
+    EP5 = {"host": "10.0.0.5", "port": 85}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def last_of(self, ops):
+        return self.run_ops(ops)[-1]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        # 与实现同式：{"items":...,"before":...} 紧凑 UTF-8 的 SHA-256。
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        encoded = json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def ev(self, digest, at, now):
+        return {"op": "ev", "digest": digest, "at": at, "now": now}
+
+    def setup_two(self, endpoints=True):
+        """两后端等权：默认登记 EP1/EP2；c1@0 落 b1、c2@1 落 b2、c3@2 落
+        b1，全局建连序 c1,c2,c3（建连时端点已登记，快照随建连固化）。"""
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 1},
+        ]
+        if endpoints:
+            ops += [
+                {"op": "ep", "id": "b1", **self.EP1},
+                {"op": "ep", "id": "b2", **self.EP2},
+                {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+                {"op": "open", "cid": "c2", "flow": FLOW, "now": 1},
+                {"op": "open", "cid": "c3", "flow": FLOW, "now": 2},
+            ]
+        return ops
+
+    # ---- 输出形状与 READY ----
+
+    def test_ready_shape_and_key_order(self):
+        items = [("b1", self.EP1, self.EP3), ("b2", self.EP2, self.EP4)]
+        digest = self.switch_digest(items, 5)
+        result = self.last_of(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+        ])
+        self.assertEqual(
+            list(result),
+            ["op", "digest", "at", "now", "ready", "status", "items",
+             "closed"],
+        )
+        self.assertEqual(result["op"], "ev")
+        self.assertEqual(result["digest"], digest)
+        self.assertEqual(result["at"], 100)
+        self.assertEqual(result["now"], 100)
+        self.assertEqual(result["status"], "READY")
+        self.assertIs(result["ready"], True)
+        self.assertEqual(result["closed"], 3)
+        self.assertEqual(
+            [list(item) for item in result["items"]],
+            [["id", "exists", "current", "target", "status", "cids"],
+             ["id", "exists", "current", "target", "status", "cids"]],
+        )
+        self.assertEqual(result["items"], [
+            {"id": "b1", "exists": True, "current": self.EP1,
+             "target": self.EP3, "status": "APPLICABLE",
+             "cids": ["c1", "c3"]},
+            {"id": "b2", "exists": True, "current": self.EP2,
+             "target": self.EP4, "status": "APPLICABLE",
+             "cids": ["c2"]},
+        ])
+
+    def test_cids_follow_global_order_before_boundary_inclusive(self):
+        # items 以 b2 在前：cids 各组内仍按全局建连序；before=1 时
+        # opened<=1 命中 c1、c2，c3@2 不列入。
+        items = [("b2", self.EP2, self.EP4), ("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 1)
+        result = self.last_of(self.setup_two() + [
+            self.es(items, 1, 100, 10),
+            self.ev(digest, 100, 100),
+        ])
+        self.assertEqual([i["id"] for i in result["items"]], ["b2", "b1"])
+        self.assertEqual(result["items"][0]["cids"], ["c2"])
+        self.assertEqual(result["items"][1]["cids"], ["c1"])
+        self.assertEqual(result["closed"], 2)
+
+    def test_unchanged_when_current_equals_target(self):
+        # 当前端点已等于 target：项状态 UNCHANGED；cids 仅按建连快照口径，
+        # 与 ei 一致——即使不切换端点，快照不等于 target 的旧连接仍会在生效
+        # 时被关闭，故 c1/c3（快照 EP1）仍列出。
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        result = self.last_of(self.setup_two() + [
+            {"op": "ey", "id": "b1", "base": self.EP1,
+             "target": self.EP3, "now": 20},
+            self.es(items, 5, 100, 21),
+            self.ev(digest, 100, 100),
+        ])
+        self.assertEqual(result["status"], "READY")
+        item = result["items"][0]
+        self.assertEqual(item["current"], self.EP3)
+        self.assertEqual(item["status"], "UNCHANGED")
+        self.assertEqual(item["cids"], ["c1", "c3"])
+        self.assertEqual(result["closed"], 2)
+
+    def test_unchanged_with_target_snapshots_has_empty_cids(self):
+        # 建连时端点已为 target（快照==target），current==target：UNCHANGED
+        # 且无连接被列入 cids（base 与 current 不同不影响该判定）。
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "ep", "id": "b1", **self.EP3},
+            {"op": "open", "cid": "c1", "flow": FLOW, "now": 0},
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+        ]
+        result = self.last_of(ops)
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["items"][0]["status"], "UNCHANGED")
+        self.assertEqual(result["items"][0]["cids"], [])
+        self.assertEqual(result["closed"], 0)
+
+    def test_conflict_item_status(self):
+        items = [("b1", self.EP1, self.EP3), ("b2", self.EP2, self.EP4)]
+        digest = self.switch_digest(items, 5)
+        result = self.last_of(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            {"op": "ey", "id": "b1", "base": self.EP1,
+             "target": self.EP5, "now": 20},
+            self.ev(digest, 100, 100),
+        ])
+        self.assertEqual(result["status"], "CONFLICT")
+        self.assertIs(result["ready"], False)
+        self.assertEqual(result["items"][0]["status"], "CONFLICT")
+        self.assertEqual(result["items"][0]["current"], self.EP5)
+        self.assertEqual(result["items"][1]["status"], "APPLICABLE")
+        # 冲突项的 cids 仍按快照口径报告（不受冲突影响）。
+        self.assertEqual(result["items"][0]["cids"], ["c1", "c3"])
+
+    # ---- 整体 status 优先级 ----
+
+    def test_early_takes_precedence_over_conflict(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        result = self.last_of(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            {"op": "ey", "id": "b1", "base": self.EP1,
+             "target": self.EP5, "now": 20},
+            self.ev(digest, 100, 50),
+        ])
+        self.assertEqual(result["status"], "EARLY")
+        self.assertIs(result["ready"], False)
+        # 未到期不影响逐项可计算状态。
+        self.assertEqual(result["items"][0]["status"], "CONFLICT")
+
+    def test_early_takes_precedence_over_missing(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        ops = self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            {"op": "close", "cid": "c1", "now": 20},
+            {"op": "close", "cid": "c3", "now": 21},
+            {"op": "remove", "id": "b1"},
+            self.ev(digest, 100, 50),
+        ]
+        result = self.last_of(ops)
+        self.assertEqual(result["status"], "EARLY")
+        self.assertEqual(result["items"][0]["status"], "MISSING")
+
+    def test_missing_takes_precedence_over_conflict(self):
+        # b1 删除（MISSING）、b2 端点漂移（CONFLICT）：now>=at 时整体
+        # MISSING。
+        items = [("b1", self.EP1, self.EP3), ("b2", self.EP2, self.EP4)]
+        digest = self.switch_digest(items, 5)
+        ops = self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            {"op": "close", "cid": "c1", "now": 20},
+            {"op": "close", "cid": "c3", "now": 21},
+            {"op": "remove", "id": "b1"},
+            {"op": "ey", "id": "b2", "base": self.EP2,
+             "target": self.EP5, "now": 22},
+            self.ev(digest, 100, 100),
+        ]
+        result = self.last_of(ops)
+        self.assertEqual(result["status"], "MISSING")
+        self.assertIs(result["ready"], False)
+        self.assertEqual(result["items"][0]["status"], "MISSING")
+        self.assertEqual(result["items"][1]["status"], "CONFLICT")
+
+    def test_missing_item_shape(self):
+        items = [("b1", self.EP1, self.EP3), ("b2", self.EP2, self.EP4)]
+        digest = self.switch_digest(items, 5)
+        ops = self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            {"op": "close", "cid": "c1", "now": 20},
+            {"op": "close", "cid": "c3", "now": 21},
+            {"op": "remove", "id": "b1"},
+            self.ev(digest, 100, 100),
+        ]
+        result = self.last_of(ops)
+        self.assertEqual(result["items"][0], {
+            "id": "b1", "exists": False, "current": None,
+            "target": self.EP3, "status": "MISSING", "cids": [],
+        })
+        # 删除项不贡献 closed；b2 的 c2 仍报告。
+        self.assertEqual(result["closed"], 1)
+        self.assertEqual(result["items"][1]["cids"], ["c2"])
+
+    def test_at_equals_now_is_not_early(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        result = self.last_of(self.setup_two() + [
+            self.es(items, 5, 100, 100),
+            self.ev(digest, 100, 100),
+        ])
+        self.assertEqual(result["status"], "READY")
+
+    # ---- 快照口径（无快照按 null 比较）----
+
+    def test_snapshot_equal_target_not_listed(self):
+        # 建连时快照即 EP3，其后 ep 改回 EP1：ev 切回 EP3 时该连接快照
+        # 等于 target，不列入 cids。
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "ep", "id": "b1", **self.EP3},
+            {"op": "open", "cid": "fresh", "flow": FLOW, "now": 0},
+            {"op": "ep", "id": "b1", **self.EP1},
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+        ]
+        result = self.last_of(ops)
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["items"][0]["cids"], [])
+        self.assertEqual(result["closed"], 0)
+
+    def test_snapshotless_listed_for_object_target(self):
+        # 先建连后 ep：连接无快照；对象 target 时 None!=target，列入 cids；
+        # base 取登记后的当前端点 EP1，故项状态 APPLICABLE。
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "open", "cid": "n1", "flow": FLOW, "now": 0},
+            {"op": "ep", "id": "b1", **self.EP1},
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+        ]
+        result = self.last_of(ops)
+        self.assertEqual(result["items"][0]["status"], "APPLICABLE")
+        self.assertEqual(result["items"][0]["current"], self.EP1)
+        self.assertEqual(result["items"][0]["cids"], ["n1"])
+        self.assertEqual(result["closed"], 1)
+
+    def test_snapshotless_retained_when_target_null(self):
+        # target=null、current=null：无快照按 None 比较，None==None 不列入；
+        # 项状态 UNCHANGED，整体 READY。
+        items = [("b1", None, None)]
+        digest = self.switch_digest(items, 5)
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "open", "cid": "n1", "flow": FLOW, "now": 0},
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+        ]
+        result = self.last_of(ops)
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["items"][0]["current"], None)
+        self.assertEqual(result["items"][0]["status"], "UNCHANGED")
+        self.assertEqual(result["items"][0]["cids"], [])
+        self.assertEqual(result["closed"], 0)
+
+    def test_connections_after_before_are_excluded(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 0)
+        result = self.last_of(self.setup_two() + [
+            self.es(items, 0, 100, 10),
+            self.ev(digest, 100, 100),
+        ])
+        # before=0：仅 c1@0；c3@2 不列入。
+        self.assertEqual(result["items"][0]["cids"], ["c1"])
+        self.assertEqual(result["closed"], 1)
+
+    # ---- 只读：成功 ev 只推进 now ----
+
+    def test_preview_does_not_mutate_and_ei_still_executes(self):
+        items = [("b1", self.EP1, self.EP3), ("b2", self.EP2, self.EP4)]
+        digest = self.switch_digest(items, 5)
+        results = self.run_ops(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+            {"op": "en"},
+            {"op": "ei", "digest": digest, "at": 100, "now": 100},
+            {"op": "eq", "id": "b1", "now": 101},
+        ])
+        ev_res, en_res, ei_res, eq_res = results[-4:]
+        self.assertEqual(ev_res["status"], "READY")
+        # 预约仍在，en 回显原身份。
+        self.assertEqual(
+            (en_res["pending"], en_res["digest"], en_res["at"]),
+            (True, digest, 100),
+        )
+        # ei 随后按执行时状态真正切换并关闭全部 3 条连接。
+        self.assertEqual(ei_res["closed"], 3)
+        self.assertEqual(eq_res["total"], 0)
+
+    def test_early_preview_does_not_block_later_execution(self):
+        # 未到期预演（EARLY）只推进时钟：其后同批可在 now>=at 时再次预演
+        # 为 READY 并由 ei 真正生效。
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        results = self.run_ops(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 50),                 # EARLY
+            self.ev(digest, 100, 100),                # READY
+            {"op": "ei", "digest": digest, "at": 100, "now": 100},
+            {"op": "en"},
+        ])
+        early, ready, ei_res, en_after = results[-4:]
+        self.assertEqual(early["status"], "EARLY")
+        self.assertEqual(ready["status"], "READY")
+        self.assertEqual(ei_res["closed"], 2)
+        # ei 成功后预约已删除。
+        self.assertEqual(en_after["pending"], False)
+
+    def test_same_request_replays_byte_identical(self):
+        items = [("b1", self.EP1, self.EP3), ("b2", self.EP2, self.EP4)]
+        digest = self.switch_digest(items, 5)
+        ops = self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+        ]
+        once = self.last_of(ops)
+        twice = self.last_of(ops + [self.ev(digest, 100, 100)])
+        self.assertEqual(once, twice)
+
+    def test_output_is_single_line_compact_json(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        code, out, err = run_balancer(
+            "run",
+            encode_ops(self.setup_two() + [
+                self.es(items, 5, 100, 10),
+                self.ev(digest, 100, 100),
+            ]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(out.count(b"\n"), 1)
+        self.assertTrue(out.startswith(b'{"results":'))
+
+    # ---- 身份与状态错误 ----
+
+    def test_no_reservation_is_state(self):
+        self.failure(
+            self.setup_two() + [self.ev("f" * 64, 100, 100)], 4, "STATE"
+        )
+
+    def test_digest_mismatch_is_state(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        self.failure(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev("0" * 64, 100, 100),
+        ], 4, "STATE")
+        # 身份不符保留预约。
+        en = self.last_of(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            {"op": "en"},
+        ])
+        self.assertEqual((en["digest"], en["at"]), (digest, 100))
+
+    def test_at_mismatch_is_state(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        self.failure(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 101, 100),
+        ], 4, "STATE")
+
+    def test_identity_mismatch_rolls_back_whole_batch(self):
+        # STATE 失败不产生 stdout：即使同批此前已有成功操作（es 建约、ev
+        # EARLY 推进时钟），整批回滚后这些结果与时钟变化都不留存。
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        code, stdout, stderr = run_balancer("run", encode_ops(
+            self.setup_two() + [
+                self.es(items, 5, 100, 10),
+                self.ev(digest, 100, 50),
+                self.ev("0" * 64, 100, 100),   # 身份不符
+            ]
+        ))
+        self.assertEqual(code, 4)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(stderr, b'{"error":"STATE"}\n')
+
+    # ---- INPUT：键序、字段、摘要格式、范围、时钟 ----
+
+    def test_input_shapes(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        setup = self.setup_two() + [self.es(items, 5, 100, 10)]
+
+        def bad(ev_op):
+            self.failure(setup + [ev_op], 2, "INPUT")
+
+        # 键序错误（at/digest 交换）。
+        bad({"op": "ev", "at": 100, "digest": digest, "now": 100})
+        # 缺键 / 多键。
+        bad({"op": "ev", "digest": digest, "now": 100})
+        bad({"op": "ev", "digest": digest, "at": 100, "now": 100,
+             "x": 1})
+        # 摘要非小写 64 位十六进制。
+        bad(self.ev("A" * 64, 100, 100))          # 大写
+        bad(self.ev("g" * 64, 100, 100))          # 非十六进制
+        bad(self.ev("0" * 63, 100, 100))          # 长度不足
+        bad(self.ev(0, 100, 100))                 # 非字符串
+        # at / now 类型与范围。
+        bad(self.ev(digest, True, 100))
+        bad(self.ev(digest, 100, False))
+        bad(self.ev(digest, -1, 100))
+        bad(self.ev(digest, 100, -1))
+        bad(self.ev(digest, 10 ** 9 + 1, 100))
+        bad(self.ev(digest, 100, 10 ** 9 + 1))
+        bad(self.ev(digest, "100", 100))
+        bad(self.ev(digest, 100, 100.0))
+        # op 非 ev 形状（顶层非对象已由别处覆盖）。
+        bad({"op": "ev", "digest": digest, "at": 100})
+
+    def test_clock_regression_is_input(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        # 建预约用 now=10；ev 以 now=9 调用为时鐘倒退。
+        self.failure(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 9),
+        ], 2, "INPUT")
+
+    def test_input_precedes_state(self):
+        # 无预约且输入本身非法：INPUT 先于 STATE。
+        self.failure(
+            self.setup_two() + [{"op": "ev", "digest": "X", "at": 1,
+                                  "now": 1}],
+            2, "INPUT",
+        )
+
+    # ---- 检查点：ev 不改变 ep_switch；se/si 后行为一致 ----
+
+    def test_checkpoint_unchanged_by_preview(self):
+        items = [("b1", self.EP1, self.EP3)]
+        digest = self.switch_digest(items, 5)
+        exported = self.run_ops(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+            {"op": "se"},
+        ])[-1]
+        self.assertEqual(
+            exported["state"]["ep_switch"],
+            {"digest": digest, "at": 100, "before": 5, "items": [
+                {"id": "b1", "base": self.EP1, "target": self.EP3}]},
+        )
+        # 恢复后再预演，结果与直接继续逐值一致。
+        resumed = self.run_ops([
+            {"op": "si", "version": 1, "digest": exported["digest"],
+             "state": exported["state"]},
+            self.ev(digest, 100, 100),
+        ])[-1]
+        direct = self.last_of(self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            self.ev(digest, 100, 100),
+        ])
+        self.assertEqual(resumed, direct)
+
+    # ---- record / replay 逐字节契约 ----
+
+    def test_record_replay_covers_ev(self):
+        items = [("b1", self.EP1, self.EP3), ("b2", self.EP2, self.EP4)]
+        digest = self.switch_digest(items, 5)
+        # MISSING：建约后关闭 b1 全部连接再 remove，ev 仍成功输出。
+        missing_ops = self.setup_two() + [
+            self.es(items, 5, 100, 10),
+            {"op": "close", "cid": "c1", "now": 20},
+            {"op": "close", "cid": "c3", "now": 21},
+            {"op": "remove", "id": "b1"},
+            self.ev(digest, 100, 100),
+        ]
+        cases = [
+            # READY。
+            (self.setup_two() + [
+                self.es(items, 5, 100, 10),
+                self.ev(digest, 100, 100)], 0),
+            # EARLY。
+            (self.setup_two() + [
+                self.es(items, 5, 100, 10),
+                self.ev(digest, 100, 50)], 0),
+            # MISSING（后端删除，仍成功）。
+            (missing_ops, 0),
+            # CONFLICT（仍成功输出）。
+            (self.setup_two() + [
+                self.es(items, 5, 100, 10),
+                {"op": "ey", "id": "b1", "base": self.EP1,
+                 "target": self.EP5, "now": 20},
+                self.ev(digest, 100, 100)], 0),
+            # 无预约 STATE。
+            (self.setup_two() + [self.ev(digest, 100, 100)], 4),
+            # 身份不符 STATE。
+            (self.setup_two() + [
+                self.es(items, 5, 100, 10),
+                self.ev("0" * 64, 100, 100)], 4),
+            # 时钟倒退 INPUT。
+            (self.setup_two() + [
+                self.es(items, 5, 100, 10),
+                self.ev(digest, 100, 9)], 2),
+        ]
+        for ops, code in cases:
+            raw = encode_ops(ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual((run_code, rec_code, rec_err),
+                             (code, 0, b""))
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual((rep_code, rep_out, rep_err),
+                             (run_code, run_out, run_err))
+
+
 if __name__ == "__main__":
     unittest.main()

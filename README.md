@@ -281,6 +281,18 @@
 - `eo` 只改变待生效预约：不切换端点、不关闭或调度连接，也不消费队列、令牌或配额。替换后 `en` 展示新内容，`eu` 与 `ei` 只能凭新摘要与新触发时刻操作，旧身份不再有效。
 - 字段集合、键序、编码、摘要格式、容器、数量、重复 id、端点结构、数值范围、时间关系或时钟倒退统一返回 INPUT/2；候选中首个未知后端返回 BACKEND/3，优先级固定为 INPUT、BACKEND、STATE。任何失败都无 stdout，并回滚同批此前变化和逻辑时钟。`se` 与 `si` 完整保存和恢复替换结果（仍为 `ep_switch` 段），`sd`、`sx`、`sm` 继续按既有 `ep_switch` 段观察差异。单次时间与额外空间上界 O(N)，N 为 items 项数与规范化编码长度之和；仅使用 Python 标准库；`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和确定性结果，其他公开入口及错误优先级不变。
 
+## 全池端点切换预约只读预演：ev
+
+在 `ei` 真正生效前，让调用方仅凭预约身份（摘要与触发时刻）在操作开始快照上查看预约的可执行性与切换将影响的连接：未到期、后端删除和端点冲突都作为成功预演的状态而非错误。只读：除推进 `now` 外不改变任何运行态；`es`、`en`、`eu`、`ei`、`eo`、`ej` 及所有既有入口行为不变。
+
+- `ev`：只接受严格键序 `op,digest,at,now`（键须按此序出现）。`digest` 为小写 64 位十六进制 SHA-256（格式同 `eu.digest`，仅用于匹配预约身份，不要求对应当前端点）；`at`、`now` 均为 0..10⁹ 的非 bool 整数，`now` 进入全局非递减显式时钟（倒退报 INPUT/2），`at` 仅作预约身份、不推进时钟。
+- 字段集合、键序、编码、摘要格式、类型、范围或时钟倒退统一返回 INPUT/2，且 INPUT 判定先于预约匹配；当前无预约，或摘要、触发时刻任一不匹配返回 STATE/4。失败无 stdout 并回滚整批（含同批此前变化与逻辑时钟）。
+- 身份匹配后，ev 按操作开始快照检查预约保存的 `items` 和 `before`：即使整体不可执行也返回完整预演明细。返回固定键序 `op,digest,at,now,ready,status,items,closed`。
+  - 整体 `status` 在 `now<at` 时为 `EARLY`；否则存在已删除后端时为 `MISSING`；再否则存在端点冲突时为 `CONFLICT`；仅全部后端存在且当前端点等于各自 `target` 或 `base` 时为 `READY`。`ready` 仅在 `READY` 时为 `true`。
+  - `items` 保持预约顺序，每项固定键序 `id,exists,current,target,status,cids`。删除项取 `exists=false`、`current=null`、`status=MISSING` 和空 `cids`；其余按当前端点等于 `target`、等于 `base` 或均不等分别取 `UNCHANGED`、`APPLICABLE`、`CONFLICT`。
+  - 存在的后端按全局建连顺序列出 `opened≤before`（`opened==before` 计入）且建连端点快照不等于该项 `target` 的 cids，无快照按 `null` 比较（故 `target` 为 `null` 时无快照连接不计入）；`closed` 为全部 cids 数量。整体不可执行时仍报告其余可计算项。
+- `ev` 成功只推进 `now`：不改端点、连接、排空状态、预约、队列、令牌、配额、指标或告警，不关闭连接或删除预约；后续 `ei` 仍按执行时状态判定。相同初态和输入产生逐字节一致的固定键序紧凑 UTF-8 JSON 与单个末尾换行，`run`、`record`、`replay` 结果一致。单次时间和结果空间为 O(N+C)，N 为预约项数、C 为活动连接数；`se`、`si` 保持预约与时钟恢复语义；仅使用 Python 标准库，其他公开入口保持原有行为。
+
 ## 测试
 
     python -m unittest discover
