@@ -29348,5 +29348,497 @@ class EpSwitchAuditIntervalFoldTest(unittest.TestCase):
         )
 
 
+class EpSwitchAuditTimeSnapshotBatchTest(unittest.TestCase):
+    """et：端点切换预约审计业务时间快照批量查询（只读）——以一批严格递增
+    的显式业务时间查询按 seq 升序处理完全部 event.now<=time 的事件后的
+    预约快照。同一 now 整组处理、终态取该组最大 seq 的 after、seq 回显
+    最后应用事件序号；完整历史首条事件前与空历史为 EMPTY/seq=0；窗口已
+    淘汰前缀且 time 早于最旧保留事件 now 时 UNKNOWN/seq=null，否则以最
+    旧事件 before 为起点应用保留事件。truncated 仅在至少一项 UNKNOWN 时
+    true；任一 time 晚于操作开始时全局逻辑时钟报 STATE/4，INPUT 优先。
+    不推进时钟、不写审计；键序/类型/范围/数量/递增校验、se/si 与
+    record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def et(self, times):
+        return {"op": "et", "times": list(times)}
+
+    def snapshot(self, results):
+        return [r for r in results if r["op"] == "et"][-1]
+
+    def item_tuple(self, item):
+        return (
+            item["time"], item["seq"], item["state"],
+            item["digest"], item["at"],
+        )
+
+    def item_tuples(self, result):
+        return [self.item_tuple(item) for item in result["items"]]
+
+    def timeline_ops(self):
+        """同 ee/eg/ef 用例的七事件三身份时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def replace_chain_ops(self, count):
+        """count 条交替身份的 SET/REPLACE 链：now=10+i、at=1000+i，所有
+        事件 after 非空、身份两两不同。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            target = items1 if i % 2 == 0 else items2
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    # ---- 空历史与输出形状 ----
+
+    def test_empty_history_compact_bytes(self):
+        # 空历史但时钟已推进（add 至 now=5）：所有合法 time 均为首条事件
+        # 之前，EMPTY、seq=0。
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.et([0, 5]),
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"add","ok":true},{"op":"et",'
+            b'"latest":0,"truncated":false,"items":['
+            b'{"time":0,"seq":0,"state":"EMPTY","digest":null,"at":null},'
+            b'{"time":5,"seq":0,"state":"EMPTY","digest":null,"at":null}'
+            b']}],"backends":[{"id":"a","weight":100}]}\n',
+        )
+
+    def test_empty_history_without_clock_is_state(self):
+        # 时钟从未推进（last_now 为 None）：任何 time 都晚于时钟，STATE。
+        self.failure([self.et([0])], 4, "STATE")
+        self.failure([self.et([0, 10 ** 9])], 4, "STATE")
+
+    def test_response_and_item_key_order(self):
+        ops, _ = self.timeline_ops()
+        result = self.snapshot(self.run_ops(ops + [self.et([5, 11])]))
+        self.assertEqual(list(result), ["op", "latest", "truncated", "items"])
+        self.assertEqual(result["latest"], 7)
+        self.assertEqual(len(result["items"]), 2)
+        for item in result["items"]:
+            self.assertEqual(
+                list(item), ["time", "seq", "state", "digest", "at"]
+            )
+
+    def test_items_match_input_order_and_length(self):
+        ops, _ = self.timeline_ops()
+        result = self.snapshot(self.run_ops(
+            ops + [self.et([1, 4, 6, 9, 11])]
+        ))
+        self.assertEqual(
+            [item["time"] for item in result["items"]],
+            [1, 4, 6, 9, 11],
+        )
+
+    # ---- 完整历史快照口径 ----
+
+    def test_full_timeline_snapshots(self):
+        ops, ids = self.timeline_ops()
+        # 覆盖：首条事件前、各事件 now、相邻事件之间、最后事件之后。
+        result = self.snapshot(self.run_ops(
+            ops + [self.et([1, 4, 5, 6, 7, 8, 9, 10, 11])]
+        ))
+        d1, at1 = ids["A"]
+        d2, at2 = ids["B"]
+        d3, at3 = ids["C"]
+        self.assertEqual(
+            self.item_tuples(result),
+            [
+                (1, 0, "EMPTY", None, None),    # seq1 之前
+                (4, 0, "EMPTY", None, None),    # 紧邻 seq1 之前
+                (5, 1, "ACTIVE", d1, at1),     # SET A
+                (6, 2, "ACTIVE", d2, at2),     # REPLACE B
+                (7, 3, "EMPTY", None, None),   # CANCEL
+                (8, 4, "ACTIVE", d1, at1),     # SET A
+                (9, 5, "EMPTY", None, None),   # CLEAR
+                (10, 6, "ACTIVE", d3, at3),    # SET C
+                (11, 7, "EMPTY", None, None),  # APPLY
+            ],
+        )
+        self.assertFalse(result["truncated"])
+
+    def test_time_between_event_nows_keeps_last_applied_seq(self):
+        ops, ids = self.timeline_ops()
+        d2, at2 = ids["B"]
+        # 整段无事件区间：now=6 之后到 now=7 之前保持 seq2=B。
+        result = self.snapshot(self.run_ops(
+            ops + [self.et([6])]
+        ))
+        self.assertEqual(
+            self.item_tuples(result), [(6, 2, "ACTIVE", d2, at2)]
+        )
+
+    def test_same_now_events_applied_as_group(self):
+        # seq1 SET@10 A、seq2 REPLACE@10 B、seq3 CANCEL@13：
+        # time=9 EMPTY/seq0；time=10 整组处理 seq1、seq2，终态 B/seq2；
+        # time=11、12 无新事件仍 B/seq2；time=13 EMPTY/seq3。
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 10),
+            self.es(items2, 0, 101, 10),
+            {"op": "eu", "digest": d2, "at": 101, "now": 13},
+            self.et([9, 10, 11, 12, 13]),
+        ]
+        result = self.snapshot(self.run_ops(ops))
+        self.assertEqual(
+            self.item_tuples(result),
+            [
+                (9, 0, "EMPTY", None, None),
+                (10, 2, "ACTIVE", d2, 101),
+                (11, 2, "ACTIVE", d2, 101),
+                (12, 2, "ACTIVE", d2, 101),
+                (13, 3, "EMPTY", None, None),
+            ],
+        )
+        self.assertFalse(result["truncated"])
+
+    def test_time_equal_oldest_now_applies_whole_group(self):
+        # 最旧保留事件（seq1）与其同刻事件必须整组处理，不得停在 seq1。
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 10),
+            self.es(items2, 0, 101, 10),
+            self.et([10]),
+        ]
+        result = self.snapshot(self.run_ops(ops))
+        self.assertEqual(
+            self.item_tuples(result), [(10, 2, "ACTIVE", d2, 101)]
+        )
+
+    def test_latest_time_matches_current_reservation(self):
+        # time=当前时钟 的快照与现存预约身份一致（ACTIVE）。
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 10),
+            self.et([10]),
+            {"op": "en"},
+        ]
+        results = self.run_ops(ops)
+        result = self.snapshot(results)
+        self.assertEqual(result["latest"], 1)
+        self.assertEqual(
+            self.item_tuples(result), [(10, 1, "ACTIVE", d1, 100)]
+        )
+        en = [r for r in results if r["op"] == "en"][-1]
+        self.assertEqual((en["digest"], en["at"]), (d1, 100))
+
+    # ---- 淘汰窗口与 UNKNOWN/truncated ----
+
+    def test_evicted_window_unknown_before_oldest_now(self):
+        ops70, identities = self.replace_chain_ops(70)
+        # 保留 seq7..70，最旧保留事件 now=16；time=15 前缀已淘汰。
+        result = self.snapshot(self.run_ops(
+            ops70 + [self.et([15, 16, 17, 79])]
+        ))
+        self.assertEqual(result["latest"], 70)
+        d7seq, at7 = identities[6]
+        d8seq, at8 = identities[7]
+        d70, at70 = identities[69]
+        self.assertEqual(
+            self.item_tuples(result),
+            [
+                (15, None, "UNKNOWN", None, None),
+                (16, 7, "ACTIVE", d7seq, at7),
+                (17, 8, "ACTIVE", d8seq, at8),
+                (79, 70, "ACTIVE", d70, at70),
+            ],
+        )
+        self.assertTrue(result["truncated"])
+
+    def test_evicted_window_all_known_not_truncated(self):
+        ops70, identities = self.replace_chain_ops(70)
+        d70, at70 = identities[69]
+        result = self.snapshot(self.run_ops(
+            ops70 + [self.et([16, 79])]
+        ))
+        self.assertFalse(result["truncated"])
+        self.assertEqual(
+            self.item_tuples(result),
+            [
+                (16, 7, "ACTIVE", identities[6][0], identities[6][1]),
+                (79, 70, "ACTIVE", d70, at70),
+            ],
+        )
+
+    def test_full_64_window_prehistory_is_empty_not_unknown(self):
+        # 恰好 64 条事件：最旧保留仍是 seq1，首条事件之前为 EMPTY/seq0，
+        # 不是 UNKNOWN。
+        ops64, _ = self.replace_chain_ops(64)
+        result = self.snapshot(self.run_ops(
+            ops64 + [self.et([0, 9, 10])]
+        ))
+        self.assertEqual(result["latest"], 64)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(
+            self.item_tuples(result)[:2],
+            [(0, 0, "EMPTY", None, None), (9, 0, "EMPTY", None, None)],
+        )
+        self.assertEqual(result["items"][2]["seq"], 1)
+        self.assertEqual(result["items"][2]["state"], "ACTIVE")
+
+    def test_truncated_mixed_known_and_unknown(self):
+        ops70, _ = self.replace_chain_ops(70)
+        result = self.snapshot(self.run_ops(
+            ops70 + [self.et([0, 15, 16])]
+        ))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(
+            [item["state"] for item in result["items"]],
+            ["UNKNOWN", "UNKNOWN", "ACTIVE"],
+        )
+        self.assertEqual(
+            [item["seq"] for item in result["items"]],
+            [None, None, 7],
+        )
+
+    # ---- 时钟与状态只读 ----
+
+    def test_does_not_advance_clock_or_write_audit(self):
+        # et 前后的 se 逐字节一致：逻辑时钟、审计窗口与下一 seq 均不变。
+        ops, _ = self.timeline_ops()
+        without = self.run_ops(ops + [{"op": "se"}])
+        with_et = self.run_ops(
+            ops + [self.et([4, 7, 11]), {"op": "se"}]
+        )
+        se_without = [r for r in without if r["op"] == "se"][-1]
+        se_with = [r for r in with_et if r["op"] == "se"][-1]
+        self.assertEqual(se_with, se_without)
+        self.assertEqual(se_with["state"]["now"], 11)
+        # 审计窗口仍为原 7 条，et 不产生事件。
+        results = self.run_ops(
+            ops + [self.et([5]), {"op": "ek", "after": 0, "limit": 64}]
+        )
+        ek = [r for r in results if r["op"] == "ek"][-1]
+        self.assertEqual([e["seq"] for e in ek["events"]], list(range(1, 8)))
+
+    def test_repeated_query_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        results = self.run_ops(
+            ops + [self.et([4, 7, 11]), self.et([4, 7, 11])]
+        )
+        ets = [r for r in results if r["op"] == "et"]
+        self.assertEqual(ets[0], ets[1])
+
+    # ---- INPUT 校验 ----
+
+    def test_input_validation(self):
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        bad = [
+            {"op": "et"},
+            {"op": "et", "times": [0], "now": 1},
+            {"op": "et", "now": 1, "times": [0]},
+            {"times": [0], "op": "et"},
+            {"op": "et", "times": []},
+            {"op": "et", "times": tuple()},
+            {"op": "et", "times": 0},
+            {"op": "et", "times": "0"},
+            {"op": "et", "times": [0] * 65},
+            {"op": "et", "times": [[0]]},
+            {"op": "et", "times": [True]},
+            {"op": "et", "times": [0, False]},
+            {"op": "et", "times": [1.0]},
+            {"op": "et", "times": ["1"]},
+            {"op": "et", "times": [None]},
+            {"op": "et", "times": [-1]},
+            {"op": "et", "times": [10 ** 9 + 1]},
+            {"op": "et", "times": [1, 1]},
+            {"op": "et", "times": [2, 1]},
+            {"op": "et", "times": [0, 0]},
+            {"op": "et", "times": [5, 3, 4]},
+            {"op": "et", "times": [None, 6]},
+        ]
+        for request in bad:
+            self.failure(clock + [request], 2, "INPUT")
+
+    def test_sixty_four_times_accepted(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 10 ** 9},
+            self.et(range(0, 64)),
+        ]
+        result = self.snapshot(self.run_ops(ops))
+        self.assertEqual(len(result["items"]), 64)
+        self.assertEqual(
+            [item["time"] for item in result["items"]],
+            list(range(0, 64)),
+        )
+
+    def test_input_precedence_over_state(self):
+        # 同时具备形状错误与未来时间：INPUT 优先。
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        self.failure(
+            clock + [{"op": "et", "times": [True, 999]}], 2, "INPUT"
+        )
+        self.failure(
+            clock + [{"op": "et", "times": [6, 6]}], 2, "INPUT"
+        )
+        self.failure(
+            clock + [{"op": "et", "times": [10 ** 9 + 1]}], 2, "INPUT"
+        )
+
+    # ---- STATE 失败与回滚 ----
+
+    def test_future_time_state_no_stdout(self):
+        ops, _ = self.timeline_ops()
+        self.failure(ops + [self.et([11, 12])], 4, "STATE")
+        self.failure(ops + [self.et([10 ** 9])], 4, "STATE")
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        # 同批此前 es 与 et STATE 失败一并回滚：新进程审计窗口为空。
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.et([6]),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    # ---- se/si 与 record/replay ----
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        query_full = self.et([1, 4, 7, 11])
+        results = self.run_ops(ops + [{"op": "se"}, query_full])
+        se = next(r for r in results if r["op"] == "se")
+        before = self.snapshot(results)
+        results = self.run_ops([
+            {"op": "si", "version": se["version"], "digest": se["digest"],
+             "state": se["state"]},
+            query_full,
+        ])
+        self.assertEqual(self.snapshot(results), before)
+
+        # 淘汰窗口（含 UNKNOWN）同样逐字节一致。
+        ops70, _ = self.replace_chain_ops(70)
+        query_evicted = self.et([15, 16, 79])
+        results = self.run_ops(ops70 + [{"op": "se"}, query_evicted])
+        se = next(r for r in results if r["op"] == "se")
+        before = self.snapshot(results)
+        results = self.run_ops([
+            {"op": "si", "version": se["version"], "digest": se["digest"],
+             "state": se["state"]},
+            query_evicted,
+        ])
+        after = self.snapshot(results)
+        self.assertEqual(after, before)
+        self.assertTrue(after["truncated"])
+
+    def test_record_replay_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        ops += [
+            self.et([1, 4, 11]),
+            self.et([5, 10]),
+        ]
+        raw = encode_ops(ops)
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (0, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+        # 含 UNKNOWN 的淘汰窗口查询同样逐字节复现。
+        ops70, _ = self.replace_chain_ops(70)
+        raw = encode_ops(ops70 + [self.et([15, 16, 79])])
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (0, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+        # 失败批（STATE：未来时间）逐字节复现。
+        raw = encode_ops(self.timeline_ops()[0] + [self.et([12])])
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (4, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
