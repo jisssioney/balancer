@@ -2563,6 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
+        "eg",
         "ru",
         "ua",
         "mu",
@@ -4645,6 +4646,45 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("em", digest, at, side, after, limit)
+
+    if name == "eg":
+        # 端点切换预约身份区间汇总（只读）：精确键序
+        # op,digest,at,after,until（键须按此序出现，乱序报 INPUT）。
+        # digest、at 沿用 em 校验（digest 为 64 位小写十六进制 SHA-256；
+        # at 为 0..10^9 的非 bool 整数），未知身份按无匹配处理。after、
+        # until 为 seq 左开右闭区间端点：0..10^18 的非 bool 整数且
+        # after<=until。字段集合、键序、编码、摘要格式、整数类型/范围或
+        # 区间关系非法统一判 INPUT，且先于游标状态判断；until 大于已分配
+        # 最大 seq 留执行期判 STATE。
+        if list(raw_op) != [
+            "op", "digest", "at", "after", "until",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        digest = cp_hex_digest(raw_op["digest"])
+        at = raw_op["at"]
+        if (
+            not isinstance(at, int)
+            or isinstance(at, bool)
+            or not 0 <= at <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        after = raw_op["after"]
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or not 0 <= after <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        until = raw_op["until"]
+        if (
+            not isinstance(until, int)
+            or isinstance(until, bool)
+            or not 0 <= until <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if after > until:
+            fail(EXIT_INPUT, "INPUT")
+        return ("eg", digest, at, after, until)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -15125,6 +15165,140 @@ def run(raw):
                         for seq, event_now, action, before, after_identity
                         in picked
                     ],
+                }
+            )
+
+        elif op[0] == "eg":
+            # 端点切换预约身份区间汇总（只读，不推进时钟、不改预约、审计窗
+            # 口、下一 seq 或连接）：以 digest、at 组成预约身份，在
+            # ep_audit 六十四条保留窗口内汇总左开右闭区间 (after,until] 的
+            # 进出与终态。latest 为已分配最大 seq（初始 0），until>latest
+            # 报 STATE；空历史只允许 until=0（latest=0 时 until>0 已被上
+            # 一条判 STATE），返回 INACTIVE、空 events、全零 summary、
+            # truncated=false。
+            #
+            # truncated 口径同 ek/el/em：历史非空且 after 小于最旧保留事件
+            # seq 减一为 true，表示 after 与最旧事件之间已有事件被淘汰；与
+            # events 是否为空无关。
+            #
+            # events 取 after<seq<=until 且 before 或 after 引用目标身份的
+            # 保留事件，按 seq 升序、同一事件只列一次（结构同 ek）。
+            # summary：total 为事件数；entered 统计 after==目标而
+            # before!=目标，left 统计相反变化；其余五项按 action 计数。
+            #
+            # state 表示处理完 seq<=until 的事件后目标是否为当前预约：
+            # 1. 区间内存在引用目标的事件——以末条事件 after 判定
+            #    （ACTIVE/INACTIVE），即使此前前缀已淘汰，末条 after 仍直
+            #    接决定终态；
+            # 2. 区间无引用事件且 after==0（窗口始于 seq 1）且前缀完整
+            #    （truncated=false，即最旧事件恰为 seq1）——seq1 之前无预
+            #    约，窗口内又无目标变化，INACTIVE；
+            # 3. 区间无引用事件但前缀完整（after>=最旧 seq-1）——seq=after
+            #    处理后的身份可由保留事件确定（after 恰为最旧 seq-1 时取
+            #    最旧事件的 before，否则取 seq=after 事件的 after），窗口
+            #    内无目标事件故终态不变，逐值比较目标得 ACTIVE/INACTIVE；
+            # 4. 所需前缀已淘汰（truncated=true）且无事件足以判定——
+            #    UNKNOWN。
+            _, digest, at, after, until = op
+            target_identity = (digest, at)
+            latest = ep_audit_seq - 1
+            if until > latest:
+                fail(EXIT_STATE, "STATE")
+            action_counts = {
+                "SET": 0, "REPLACE": 0, "CANCEL": 0, "APPLY": 0,
+                "CLEAR": 0,
+            }
+            picked = []
+            entered = 0
+            left = 0
+            if not ep_audit_events:
+                # 空历史：latest=0，能走到这里必有 until=0。
+                truncated = False
+                state = "INACTIVE"
+            else:
+                oldest_seq = ep_audit_events[0][0]
+                truncated = after < oldest_seq - 1
+                last_match_after = None
+                for event in ep_audit_events:
+                    seq = event[0]
+                    if seq <= after:
+                        continue
+                    if seq > until:
+                        break
+                    _, event_now, action, before_identity, after_identity = event
+                    referenced = (
+                        before_identity == target_identity
+                        or after_identity == target_identity
+                    )
+                    if not referenced:
+                        continue
+                    picked.append(event)
+                    action_counts[action] += 1
+                    if (
+                        after_identity == target_identity
+                        and before_identity != target_identity
+                    ):
+                        entered += 1
+                    elif (
+                        before_identity == target_identity
+                        and after_identity != target_identity
+                    ):
+                        left += 1
+                    last_match_after = after_identity
+                if last_match_after is not None:
+                    state = (
+                        "ACTIVE"
+                        if last_match_after == target_identity
+                        else "INACTIVE"
+                    )
+                elif not truncated:
+                    # 窗口 (after,until] 内无引用事件，且判定 seq=after 处
+                    # 状态所需的前缀完整保留：after==0 时 seq1 之前无预约；
+                    # after==最旧 seq-1 时取最旧事件 before；否则取
+                    # seq=after 事件的 after。终态在窗口内不变。
+                    if after == 0:
+                        identity_at_after = None
+                    elif after == oldest_seq - 1:
+                        identity_at_after = ep_audit_events[0][3]
+                    else:
+                        identity_at_after = ep_audit_events[after - oldest_seq][4]
+                    state = (
+                        "ACTIVE"
+                        if identity_at_after == target_identity
+                        else "INACTIVE"
+                    )
+                else:
+                    state = "UNKNOWN"
+            results.append(
+                {
+                    "op": "eg",
+                    "digest": digest,
+                    "at": at,
+                    "after": after,
+                    "until": until,
+                    "truncated": truncated,
+                    "state": state,
+                    "events": [
+                        {
+                            "seq": seq,
+                            "now": event_now,
+                            "action": action,
+                            "before": ep_identity_json(before),
+                            "after": ep_identity_json(after_identity),
+                        }
+                        for seq, event_now, action, before, after_identity
+                        in picked
+                    ],
+                    "summary": {
+                        "total": len(picked),
+                        "entered": entered,
+                        "left": left,
+                        "set": action_counts["SET"],
+                        "replace": action_counts["REPLACE"],
+                        "cancel": action_counts["CANCEL"],
+                        "apply": action_counts["APPLY"],
+                        "clear": action_counts["CLEAR"],
+                    },
                 }
             )
 
