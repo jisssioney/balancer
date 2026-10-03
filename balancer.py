@@ -2548,7 +2548,7 @@ def parse_op(raw_op):
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "na",
         "ce", "ci", "cl", "al", "ai", "ad", "ag", "cb", "cu", "cv", "ct", "cd", "pd", "hd", "hb",
-        "cp", "cq", "ca", "cx", "cy",
+        "cp", "cq", "ca", "cx", "cy", "cz",
         "fs", "fx", "fr", "fi", "ft", "oi", "od",
         "fb", "fp", "fq", "fd", "fc",
         "br",
@@ -4072,6 +4072,27 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         now = parse_warm_now(raw_op["now"])
         return ("cy", base, base_at, config, at, now)
+
+    if name == "cz":
+        # 配置预约生效预检（只读）：精确键序 op,digest,at,now（键须按此序
+        # 出现，乱序报 INPUT）；digest 为小写 64 位十六进制 SHA-256
+        # （格式同 cx.digest，仅用于匹配预约身份），at、now 均为 0..10^9
+        # 非 bool 整数，now 进入共用非递减时钟（倒退在执行期判 INPUT），
+        # at 仅作预约身份、不推进时钟，也不要求 now 与 at 的大小关系
+        # （未到期 EARLY 是预检结果而非错误）。无预约或身份任一不符留执
+        # 行期判 STATE；本函数只做形状、摘要格式与字段类型/范围校验。
+        if list(raw_op) != ["op", "digest", "at", "now"]:
+            fail(EXIT_INPUT, "INPUT")
+        digest = parse_base(raw_op["digest"])
+        at = raw_op["at"]
+        if (
+            not isinstance(at, int)
+            or isinstance(at, bool)
+            or not 0 <= at <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        now = parse_warm_now(raw_op["now"])
+        return ("cz", digest, at, now)
 
     if name == "ct":
         # 配置指纹查询：精确键序仅 op，只读且不推进时钟。
@@ -8879,7 +8900,7 @@ def run(raw):
             "ru", "ua", "ea", "eh", "pa", "ph", "xa", "xh", "xg", "xp",
             "na",
             "mu",
-            "cp", "cq", "ca", "ca_cond", "cx", "cy",
+            "cp", "cq", "ca", "ca_cond", "cx", "cy", "cz",
             "eq", "ec",
             "er", "ex",
             "ey", "eb",
@@ -12244,6 +12265,52 @@ def run(raw):
             results.append(
                 {"op": "cy", "base": base, "digest": digest,
                  "at": at, "ok": True}
+            )
+
+        elif op[0] == "cz":
+            # 配置预约生效预检（只读）：形状/字段类型/范围/UTF-8、摘要格式
+            # 与时钟倒退已在解析期及共用时钟块判 INPUT，且 INPUT 先于预约
+            # 身份判定。当前没有预约，或预约的规范化配置摘要、触发时刻任
+            # 一不等于请求 digest、at 时报 STATE 并保留预约。身份匹配后只
+            # 生成当下可执行性快照，不应用或清除预约、不分配修订、不写配
+            # 置审计，也不改变后端、连接、队列、粘性、限流、指标与告警；
+            # 唯一状态效果是共用块已推进的 now。
+            # status 按 EARLY（now<at）、BUSY（活动连接或等待队列任一非
+            # 空）、EXHAUSTED（下一修订号 next_rev>10^18）、READY 的优先
+            # 级唯一确定，ready 仅在 READY 时为 true；即使 EARLY/BUSY 也
+            # 同时返回两组阻塞快照与 rev。connections 按全局建连序、queued
+            # 按当前等待队列 FIFO 列出全部 cid；rev 为下一修订号，耗尽时
+            # 为 null。快照构造 O(C+Q) 时间与额外空间。
+            _, digest, at, now = op
+            if (
+                reservation is None
+                or reservation[2] != digest
+                or reservation[1] != at
+            ):
+                fail(EXIT_STATE, "STATE")
+            active_cids = list(connections)
+            queued_cids = list(wait_queue)
+            exhausted = next_rev > 10 ** 18
+            if now < at:
+                status = "EARLY"
+            elif active_cids or queued_cids:
+                status = "BUSY"
+            elif exhausted:
+                status = "EXHAUSTED"
+            else:
+                status = "READY"
+            results.append(
+                {
+                    "op": "cz",
+                    "digest": digest,
+                    "at": at,
+                    "now": now,
+                    "ready": status == "READY",
+                    "status": status,
+                    "connections": active_cids,
+                    "queued": queued_cids,
+                    "rev": None if exhausted else next_rev,
+                }
             )
 
         elif op[0] == "fs":
