@@ -345,6 +345,17 @@
 - 游标与截断沿用 `ek`/`el`：令 `latest` 为已分配最大 seq（初始 0），`after>latest` 报 STATE/4；历史非空且 `after` 小于最旧保留事件 seq 减一时，从最旧事件开始筛选并置 `truncated=true`，即使没有任何匹配项也保留该标志；`after` 等于最旧 seq 减一或更大时 `truncated=false`，只取 seq 大于 `after` 的事件。空历史配 `after=0` 或窗口内无匹配时返回空 events、`next=after`、`more=false`。
 - 字段集合、键序、UTF-8 编码、摘要格式、side 枚举、整数类型或范围非法时返回 INPUT/2，并先于游标状态判断。失败不产生 stdout，并回滚同批先前变化。单次时间上界 O(64)，结果额外空间 O(limit)，仅使用 Python 标准库；`ek`、`el`、端点预约入口以及 `se`/`si`/`sd`/`sx`/`sm` 的状态结构不变，`run`、`record`、`replay` 继续输出固定键序紧凑 UTF-8 JSON 和单个末尾换行。
 
+## 端点切换预约身份进出与终态汇总：eg
+
+在 `ek`/`el`/`em` 的六十四条保留窗口之上提供按身份与 seq 区间的只读汇总：以 `digest` 与 `at` 组成预约身份，在左开右闭区间 `(after,until]` 内列出 before 或 after 引用该身份的保留事件，并统计进出变化、动作计数与处理完不晚于 `until` 的事件后目标是否为当前预约。只读：不推进时钟，不改变预约、审计窗口、下一 seq 或连接状态；相同初态和输入产生逐字节一致的结果。
+
+- `eg`：字段严格按 `op,digest,at,after,until` 排列（键须按此序出现，乱序报 INPUT）。`digest`、`at` 沿用 `em` 校验（64 位小写十六进制 SHA-256；`at` 为 0..10⁹ 的非 bool 整数），未知身份不报错、按无匹配处理；`after`、`until` 均为 0..10¹⁸ 的非 bool 整数且 `after≤until`。
+- 返回固定键序 `op,digest,at,after,until,truncated,state,events,summary`。`events` 按 seq 升序列出 `after<seq≤until` 且 before 或 after 任一侧等于目标身份的保留事件，同一事件至多一次，条目与 `ek` 同构（固定键序 `seq,now,action,before,after`，身份为 null 或 `digest,at`）。
+- `summary` 固定键序 `total,entered,left,set,replace,cancel,apply,clear`：`total` 为列出的事件数；`entered` 统计 after 等于目标而 before 不等于目标的事件，`left` 统计 before 等于目标而 after 不等于目标的事件；后五项按事件 action 计数。
+- `state` 取 `ACTIVE`、`INACTIVE` 或 `UNKNOWN`，表示处理完 `seq≤until` 的事件后目标是否为当前预约：窗口内若有不晚于 `until` 且任一侧引用目标的事件，以其中末条的 after 判定（等于目标为 ACTIVE，否则 INACTIVE）；无引用但存在 `seq≤until` 的保留事件时为 INACTIVE；窗口始于 seq 1 且此前无匹配时为 INACTIVE；所需前缀已淘汰且无事件足以判定时为 UNKNOWN。
+- `truncated` 沿用 `ek`：历史非空且 `after` 小于最旧保留事件 seq 减一时为 true，否则为 false；`events` 为空不改变该值。令 `latest` 为已分配最大 seq（初始 0），`until>latest` 报 STATE/4。空历史只允许 `until=0`，返回 `state=INACTIVE`、空 events、全零 summary 与 `truncated=false`；空历史 `until>0` 报 STATE/4。
+- 字段集合、键序、UTF-8 编码、摘要格式、整数类型、范围或 `after≤until` 关系非法时返回 INPUT/2，并先于游标状态判断。失败无 stdout，并回滚同批先前变化。单次时间与额外空间均为 O(64)，仅使用 Python 标准库；`se`、`si`、`sd`、`sx`、`sm` 及 `ek`、`el`、`em`、端点预约入口的状态结构与结果不变，`run`、`record`、`replay` 继续输出固定键序紧凑 UTF-8 JSON 和单个末尾换行。
+
 ## 测试
 
     python -m unittest discover

@@ -27616,5 +27616,419 @@ class EpSwitchLifecycleAuditIdentityTest(unittest.TestCase):
         )
 
 
+class EpSwitchIdentitySummaryTest(unittest.TestCase):
+    """eg：按 digest+at 身份与左开右闭 seq 区间 (after,until] 汇总保留事
+    件（before/after 任一侧命中、每事件一次），核对 events 口径、
+    entered/left 与动作计数、state（ACTIVE/INACTIVE/UNKNOWN）、
+    truncated（events 为空不改值）、空历史 until=0 形态、until>latest 与
+    空历史 until>0 的 STATE、INPUT 键序/范围/关系校验及其先于 STATE 的优
+    先级、只读不推进时钟不占 seq、同批回滚、record/replay 逐字节。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def eg(self, digest, at, after=0, until=7):
+        return {"op": "eg", "digest": digest, "at": at,
+                "after": after, "until": until}
+
+    def summary_row(self, results):
+        return [r for r in results if r["op"] == "eg"][-1]
+
+    def timeline_ops(self):
+        """与 em 测试同构的七事件、三身份 A/B/C 时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        config = config_v11(1)
+        ops = [
+            {"op": "ci", "config": config, "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config, "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    # ---- 空历史与输出形状 ----
+
+    def test_empty_history_until_zero_compact_bytes(self):
+        code, out, err = run_balancer(
+            "run", encode_ops([self.eg("0" * 64, 0, 0, 0)])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"eg","digest":"' + b"0" * 64
+            + b'","at":0,"after":0,"until":0,"truncated":false,'
+            b'"state":"INACTIVE","events":[],"summary":{"total":0,'
+            b'"entered":0,"left":0,"set":0,"replace":0,"cancel":0,'
+            b'"apply":0,"clear":0}}],"backends":[]}\n',
+        )
+
+    def test_empty_history_positive_until_is_state(self):
+        self.failure([self.eg("0" * 64, 0, 0, 1)], 4, "STATE")
+
+    def test_response_and_event_key_order(self):
+        ops, ids = self.timeline_ops()
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg(ids["A"][0], ids["A"][1])]
+        ))
+        self.assertEqual(
+            list(row),
+            ["op", "digest", "at", "after", "until", "truncated",
+             "state", "events", "summary"],
+        )
+        self.assertEqual(
+            list(row["summary"]),
+            ["total", "entered", "left", "set", "replace", "cancel",
+             "apply", "clear"],
+        )
+        self.assertEqual(
+            list(row["events"][0]),
+            ["seq", "now", "action", "before", "after"],
+        )
+        self.assertEqual(list(row["events"][0]["after"]), ["digest", "at"])
+
+    # ---- events 区间与身份口径 ----
+
+    def test_events_in_open_closed_interval_either_side_once(self):
+        ops, ids = self.timeline_ops()
+        # 身份 A 全窗口：seq1/4 为进入，seq2/5 为离开，各列一次。
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg(ids["A"][0], ids["A"][1], 0, 7)]
+        ))
+        self.assertEqual(
+            [(e["seq"], e["action"]) for e in row["events"]],
+            [(1, "SET"), (2, "REPLACE"), (4, "SET"), (5, "CLEAR")],
+        )
+        self.assertEqual(row["summary"], {
+            "total": 4, "entered": 2, "left": 2,
+            "set": 2, "replace": 1, "cancel": 0, "apply": 0, "clear": 1,
+        })
+        self.assertFalse(row["truncated"])
+
+    def test_interval_left_open_right_closed(self):
+        ops, ids = self.timeline_ops()
+        # (2,5]：seq2 排除（左开），seq5 包含（右闭）。
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg(ids["A"][0], ids["A"][1], 2, 5)]
+        ))
+        self.assertEqual([e["seq"] for e in row["events"]], [4, 5])
+        self.assertEqual(row["summary"]["total"], 2)
+        self.assertEqual(row["summary"]["entered"], 1)
+        self.assertEqual(row["summary"]["left"], 1)
+        self.assertEqual(row["summary"]["clear"], 1)
+
+    def test_unknown_identity_is_no_match(self):
+        ops, _ = self.timeline_ops()
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg("f" * 64, 3, 0, 7)]
+        ))
+        self.assertEqual(row["events"], [])
+        self.assertEqual(
+            row["summary"],
+            {"total": 0, "entered": 0, "left": 0, "set": 0,
+             "replace": 0, "cancel": 0, "apply": 0, "clear": 0},
+        )
+        # 存在不晚于 until 的事件：当前预约不等于目标，INACTIVE。
+        self.assertEqual(row["state"], "INACTIVE")
+        self.assertFalse(row["truncated"])
+
+    # ---- state 终态 ----
+
+    def test_state_active_on_last_reference_after(self):
+        ops, ids = self.timeline_ops()
+        # until=4：末条引用 A 的事件为 seq4（after=A），ACTIVE。
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg(ids["A"][0], ids["A"][1], 0, 4)]
+        ))
+        self.assertEqual(row["state"], "ACTIVE")
+        self.assertEqual([e["seq"] for e in row["events"]], [1, 2, 4])
+        # until=6：C 为当前预约。
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg(ids["C"][0], ids["C"][1], 0, 6)]
+        ))
+        self.assertEqual(row["state"], "ACTIVE")
+        self.assertEqual([e["seq"] for e in row["events"]], [6])
+
+    def test_state_inactive_after_leave(self):
+        ops, ids = self.timeline_ops()
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg(ids["A"][0], ids["A"][1], 0, 7)]
+        ))
+        self.assertEqual(row["state"], "INACTIVE")
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg(ids["B"][0], ids["B"][1], 0, 7)]
+        ))
+        self.assertEqual(row["state"], "INACTIVE")
+
+    def test_state_uses_prefix_not_listed_events(self):
+        # 目标仅在 seq<=after 进入、窗口内无事件，但 until 时仍为当前预约：
+        # state 须依据前缀事件判定为 ACTIVE。
+        ops, ids = self.timeline_ops()
+        row = self.summary_row(self.run_ops(
+            # 身份 C 自 seq6 成为当前预约；区间 (6,6] 为空但 until=6。
+            ops + [self.eg(ids["C"][0], ids["C"][1], 6, 6)]
+        ))
+        self.assertEqual(row["events"], [])
+        self.assertEqual(row["summary"]["total"], 0)
+        self.assertEqual(row["state"], "ACTIVE")
+
+    def test_until_beyond_latest_is_state(self):
+        ops, ids = self.timeline_ops()
+        self.failure(
+            ops + [self.eg(ids["A"][0], ids["A"][1], 0, 8)],
+            4, "STATE",
+        )
+
+    # ---- 淘汰、truncated 与 UNKNOWN ----
+
+    def _eviction_ops(self):
+        """65 条连续 SET/REPLACE 事件，保留窗口为 seq2..65；身份
+        k=(digest_k,100+k) 出现在 seq k（after）与 seq k+1（before）。"""
+        ops = [{"op": "ci", "config": config_v11(1), "now": 1}]
+        digests = []
+        for k in range(65):
+            at = 100 + k
+            items = [("a", None, {"host": "10.0.0.1", "port": 80})]
+            digest = self.switch_digest(items, at)
+            digests.append(digest)
+            ops.append(self.es(items, at, at, 5 + k))
+        return ops, digests
+
+    def test_unknown_when_prefix_evicted(self):
+        ops, digests = self._eviction_ops()
+        # until 早于最旧保留 seq（2）：所需前缀已淘汰，UNKNOWN。
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg("f" * 64, 1, 0, 1)]
+        ))
+        self.assertEqual(row["state"], "UNKNOWN")
+        self.assertEqual(row["events"], [])
+        self.assertTrue(row["truncated"])
+        # 已淘汰身份（仅存在于 seq1）同样 UNKNOWN。
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg(digests[0], 100, 0, 1)]
+        ))
+        self.assertEqual(row["state"], "UNKNOWN")
+        self.assertTrue(row["truncated"])
+
+    def test_truncated_stays_true_with_empty_events(self):
+        ops, _ = self._eviction_ops()
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg("f" * 64, 400, 0, 30)]
+        ))
+        self.assertEqual(row["events"], [])
+        self.assertTrue(row["truncated"])
+        # after 等于最旧 seq 减一（1）：缺口恰为淘汰区，不截断。
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg("f" * 64, 400, 1, 30)]
+        ))
+        self.assertFalse(row["truncated"])
+        self.assertEqual(row["state"], "INACTIVE")
+
+    def test_retained_window_full_prefix_is_inactive(self):
+        # 完整历史始于 seq1（未淘汰），until=0 此前无匹配，INACTIVE。
+        ops, _ = self.timeline_ops()
+        row = self.summary_row(self.run_ops(
+            ops + [self.eg("f" * 64, 500, 0, 0)]
+        ))
+        self.assertEqual(row["state"], "INACTIVE")
+        self.assertFalse(row["truncated"])
+
+    # ---- INPUT 校验 ----
+
+    def test_bad_inputs(self):
+        d = "a" * 64
+        good = self.eg(d, 5, 0, 0)
+        code, _, err = run_balancer("run", encode_ops([good]))
+        self.assertEqual((code, err), (0, b""))
+        bad = [
+            # 键集合与键序。
+            {"op": "eg", "at": 5, "after": 0, "until": 10},
+            {"op": "eg", "digest": d, "at": 5, "after": 0,
+             "until": 10, "x": 1},
+            {"op": "eg", "digest": d, "at": 5, "until": 10, "after": 0},
+            # digest 格式沿用 em。
+            self.eg("A" * 64, 5, 0, 10),
+            self.eg("0" * 63, 5, 0, 10),
+            self.eg("g" * 64, 5, 0, 10),
+            self.eg(0, 5, 0, 10),
+            self.eg(None, 5, 0, 10),
+            # at：范围、bool、浮点、字符串。
+            self.eg(d, -1, 0, 10),
+            self.eg(d, 10 ** 9 + 1, 0, 10),
+            self.eg(d, True, 0, 10),
+            self.eg(d, 5.0, 0, 10),
+            self.eg(d, "5", 0, 10),
+            # after：范围、bool、浮点、字符串。
+            self.eg(d, 5, -1, 10),
+            self.eg(d, 5, 10 ** 18 + 1, 10),
+            self.eg(d, 5, True, 10),
+            self.eg(d, 5, 0.0, 10),
+            self.eg(d, 5, "0", 10),
+            # until：范围、bool、浮点、字符串。
+            self.eg(d, 5, 0, -1),
+            self.eg(d, 5, 0, 10 ** 18 + 1),
+            self.eg(d, 5, 0, True),
+            self.eg(d, 5, 0, 10.0),
+            self.eg(d, 5, 0, "10"),
+            # after>until。
+            self.eg(d, 5, 11, 10),
+        ]
+        for op in bad:
+            self.failure([op], 2, "INPUT")
+
+    def test_input_precedes_cursor_state(self):
+        ops, ids = self.timeline_ops()
+        # 非法 at（INPUT）即使 until 越过 latest 也先报 INPUT。
+        self.failure(
+            ops + [self.eg(ids["A"][0], -1, 0, 99)], 2, "INPUT"
+        )
+        # after>until 的关系非法先于 until>latest 的 STATE。
+        self.failure(
+            ops + [self.eg(ids["A"][0], ids["A"][1], 9, 8)], 2, "INPUT"
+        )
+        # 空历史 until 非 0 本应 STATE，但关系非法仍先报 INPUT。
+        self.failure([self.eg("0" * 64, 0, 5, 3)], 2, "INPUT")
+
+    # ---- 只读 / 确定性 / 回滚 ----
+
+    def test_readonly_repeat_byte_identical_and_state_untouched(self):
+        ops, ids = self.timeline_ops()
+        query = self.eg(ids["A"][0], ids["A"][1], 0, 4)
+        results1 = self.run_ops(ops + [query])
+        results2 = self.run_ops(ops + [query, query])
+        pages = [r for r in results2 if r["op"] == "eg"]
+        self.assertEqual(pages[0], pages[1])
+        self.assertEqual(
+            [r for r in results1 if r["op"] == "eg"][-1], pages[0]
+        )
+        # eg 前后 se 摘要逐字节一致：不改变任何运行态（含 next_seq）。
+        results = self.run_ops(
+            self.timeline_ops()[0] + [{"op": "se"}, query, {"op": "se"}]
+        )
+        ses = [r for r in results if r["op"] == "se"]
+        self.assertEqual(ses[0]["digest"], ses[1]["digest"])
+        self.assertEqual(ses[0]["state"], ses[1]["state"])
+        # eg 不占 seq：其后新事件续接 seq8。
+        ops2, _ = self.timeline_ops()
+        ops2.append(query)
+        ops2.append(self.es([("a", None, self.EP2)], 0, 200, 12))
+        ops2.append({"op": "ek", "after": 0, "limit": 64})
+        results = self.run_ops(ops2)
+        ek_row = [r for r in results if r["op"] == "ek"][-1]
+        self.assertEqual(ek_row["events"][-1]["seq"], 8)
+        self.assertEqual(ek_row["events"][-1]["action"], "SET")
+
+    def test_does_not_advance_clock(self):
+        # eg 后以同刻 now=5 提交身份不符的 eu：STATE 而非时钟倒退 INPUT。
+        ops, ids = self.timeline_ops()
+        ops = ops[:2]
+        ops += [
+            self.eg(ids["A"][0], ids["A"][1], 0, 1),
+            {"op": "eu", "digest": "0" * 64, "at": 100, "now": 5},
+        ]
+        self.failure(ops, 4, "STATE")
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        ops, ids = self.timeline_ops()
+        # 同批先成功建立预约 A（seq1，SET），随后 eg STATE 失败：整批回滚。
+        ops = ops[:2]
+        ops.append(self.eg(ids["A"][0], ids["A"][1], 0, 99))
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        self.assertIn(b"STATE", stderr)
+        # 新批：状态已回到初始空实例——无预约、审计窗口为空。
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([
+                {"op": "en"},
+                {"op": "ek", "after": 0, "limit": 64},
+            ]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        rows = json.loads(out)["results"]
+        self.assertFalse(rows[0]["pending"])
+        self.assertEqual(rows[1]["events"], [])
+
+    # ---- record/replay 逐字节 ----
+
+    def test_record_replay_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        ops += [
+            self.eg(ids["A"][0], ids["A"][1], 0, 4),
+            self.eg(ids["B"][0], ids["B"][1], 2, 7),
+            self.eg(ids["C"][0], ids["C"][1], 6, 6),
+            self.eg("f" * 64, 1, 0, 7),
+        ]
+        raw = encode_ops(ops)
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (0, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+        # 失败批（until>latest 与空历史 until>0）同样逐字节复现。
+        for failing in (
+            self.timeline_ops()[0]
+            + [self.eg(ids["A"][0], ids["A"][1], 0, 99)],
+            [self.eg("0" * 64, 0, 0, 5)],
+        ):
+            raw = encode_ops(failing)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual((run_code, rec_code, rec_err), (4, 0, b""))
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual(
+                (rep_code, rep_out, rep_err),
+                (run_code, run_out, run_err),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
