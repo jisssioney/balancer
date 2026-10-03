@@ -2562,7 +2562,7 @@ def parse_op(raw_op):
         "ey", "eb",
         "ez",
         "ej",
-        "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el",
+        "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
         "ru",
         "ua",
         "mu",
@@ -4605,6 +4605,41 @@ def parse_op(raw_op):
         if since > until:
             fail(EXIT_INPUT, "INPUT")
         return ("el", after, limit, tuple(actions), since, until)
+
+    if name == "em":
+        # 端点切换预约生命周期审计的只读身份追查查询：精确键序
+        # op,digest,at,side,after,limit（键须按此序出现，乱序报 INPUT），
+        # 只读、不推进时钟、不改预约、事件生成/淘汰窗口/下一 seq或连接状
+        # 态。digest 为 64 位小写十六进制 SHA-256，与 at（0..10^9 非 bool
+        # 整数）组成预约身份；side 限 BEFORE/AFTER/EITHER，分别匹配事件
+        # 变更前、变更后或任一侧；after 为 0..10^18、limit 为 1..64 的非
+        # bool 整数（同 ek/el）。字段集合、键序、UTF-8 编码、摘要格式、
+        # side 枚举、整数类型或范围非法统一判 INPUT，且先于游标状态判
+        # 断；after 大于已分配最大 seq 留执行期判 STATE。
+        if list(raw_op) != [
+            "op", "digest", "at", "side", "after", "limit",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        digest = cp_hex_digest(raw_op["digest"])
+        at = parse_metric_num(raw_op["at"])
+        side = raw_op["side"]
+        if side not in ("BEFORE", "AFTER", "EITHER"):
+            fail(EXIT_INPUT, "INPUT")
+        after = raw_op["after"]
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or not 0 <= after <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        limit = raw_op["limit"]
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 64
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("em", digest, at, side, after, limit)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -15013,6 +15048,79 @@ def run(raw):
                         "apply": summary_counts["APPLY"],
                         "clear": summary_counts["CLEAR"],
                     },
+                }
+            )
+
+        elif op[0] == "em":
+            # 端点切换预约生命周期审计只读身份追查查询：在 ek 同口径的游标
+            # 与 64 条保留窗口之上，按预约身份（digest,at）与 side 筛选。
+            # side=BEFORE 匹配事件变更前身份、AFTER 匹配变更后身份、EITHER
+            # 匹配任一侧（两侧同时命中也只返回该事件一次）；null 一侧永不
+            # 等于身份。不推进时钟、不改预约、审计窗口、下一 seq 或连接状
+            # 态，相同初态与输入逐字节一致。游标与截断规则同 ek/el：
+            # latest 为已分配最大 seq（初始 0），after>latest 报 STATE；历
+            # 史非空且 after 小于最旧保留事件 seq 减一时截断为 true 并自最
+            # 旧事件读取（即使无任何匹配也保留 truncated=true），否则只取
+            # seq>after。候选再要求身份与 side 命中，按 seq 升序至多取
+            # limit 项；more 仅在末项之后仍有同样命中的保留事件时为
+            # true，不匹配事件不置 more。next 取末条 seq、无结果等于
+            # after。响应固定键序 op,digest,at,side,after,next,truncated,
+            # more,events；事件项与 ek 逐值同构。空历史 after=0 或窗口内
+            # 无匹配返回空 events、next=after、more=false。单次时间
+            # O(64)、结果额外空间 O(limit)；失败批次回滚且无 stdout。
+            _, digest, at, side, after, limit = op
+            target = (digest, at)
+            latest = ep_audit_seq - 1
+            if after > latest:
+                fail(EXIT_STATE, "STATE")
+
+            def em_matches(event):
+                before = event[3]
+                after_identity = event[4]
+                if side == "BEFORE":
+                    return before == target
+                if side == "AFTER":
+                    return after_identity == target
+                return before == target or after_identity == target
+
+            truncated = False
+            if ep_audit_events and after < ep_audit_events[0][0] - 1:
+                truncated = True
+                candidates = ep_audit_events
+            else:
+                candidates = (
+                    event for event in ep_audit_events if event[0] > after
+                )
+            picked = []
+            more = False
+            for event in candidates:
+                if em_matches(event):
+                    if len(picked) < limit:
+                        picked.append(event)
+                    else:
+                        more = True
+                        break
+            results.append(
+                {
+                    "op": "em",
+                    "digest": digest,
+                    "at": at,
+                    "side": side,
+                    "after": after,
+                    "next": picked[-1][0] if picked else after,
+                    "truncated": truncated,
+                    "more": more,
+                    "events": [
+                        {
+                            "seq": seq,
+                            "now": event_now,
+                            "action": action,
+                            "before": ep_identity_json(before),
+                            "after": ep_identity_json(after_identity),
+                        }
+                        for seq, event_now, action, before, after_identity
+                        in picked
+                    ],
                 }
             )
 

@@ -336,6 +336,17 @@
 - 空历史且 `after=0`，或窗口内无任何匹配时，`events` 为空、`summary` 全零、`next=after`、`more=false`（截断情形下 `truncated` 仍可能为 true）。
 - 字段集合、键序、编码、类型、范围、actions 枚举、重复、次序、空数组或时间关系非法时只返回 INPUT/2，且 INPUT 判定先于游标状态；失败无 stdout，并回滚同批先前变化。单次时间上界 O(64)，结果额外空间 O(limit)，仅使用 Python 标准库；现有 `ek`、端点预约入口以及 `se`、`si`、`sd`、`sx`、`sm` 的结果和检查点结构不变，`run`、`record`、`replay` 继续输出固定键序紧凑 UTF-8 JSON 和单个末尾换行。
 
+## 端点切换预约审计身份追查：em
+
+在 `ek` 的六十四条保留窗口与游标之上提供按预约身份的只读追查：以 `digest` 与 `at` 组成预约身份，筛选变更前或变更后引用了该身份的保留事件，不推进时钟，不改变预约、审计窗口、下一 seq 或连接状态。
+
+- `em`：字段严格按 `op,digest,at,side,after,limit` 排列（键须按此序出现，乱序报 INPUT）。`digest` 为 64 位小写十六进制 SHA-256；`at` 为 0..10⁹ 的非 bool 整数；`side` 限 `BEFORE`、`AFTER`、`EITHER`；`after` 为 0..10¹⁸、`limit` 为 1..64 的非 bool 整数（口径同 `ek`）。
+- 匹配条件为 `seq>after` 且事件相应侧身份等于 `(digest,at)`：`BEFORE` 只匹配变更前身份，`AFTER` 只匹配变更后身份，`EITHER` 匹配任一侧；`null` 一侧不匹配任何身份，两侧同时命中 `EITHER` 时该事件只返回一次。
+- 返回固定键序 `op,digest,at,side,after,next,truncated,more,events`：`events` 按 seq 升序至多 `limit` 项，条目与 `ek` 逐值同构（固定键序 `seq,now,action,before,after`，身份为 null 或 `digest,at`）。
+- 游标与截断沿用 `ek`：令 `latest` 为已分配最大 seq（初始 0），`after>latest` 报 STATE/4；历史非空且 `after` 小于最旧保留事件 seq 减一时，从最旧事件筛选并返回 `truncated=true`，即使没有任何匹配项也保留该标志，否则为 `false`。`next` 有结果时取末条 seq，无结果时保持 `after`；`more` 仅在该页末项之后仍有命中相同身份与 side 条件的保留事件时为 true，不匹配事件不置 true。
+- 空历史且 `after=0`，或窗口内无任何匹配时，`events` 为空、`next=after`、`more=false`（截断情形下 `truncated` 仍可能为 true）。
+- 字段集合、键序、UTF-8 编码、摘要格式、side 枚举、整数类型或范围非法时只返回 INPUT/2，且 INPUT 判定先于游标状态；失败无 stdout，并回滚同批先前变化。单次时间上界 O(64)，结果额外空间 O(limit)，仅使用 Python 标准库；现有 `ek`、`el`、端点预约入口以及 `se`、`si`、`sd`、`sx`、`sm` 的结果和检查点结构不变，`run`、`record`、`replay` 继续输出固定键序紧凑 UTF-8 JSON、单个末尾换行和确定性行为。
+
 ## 测试
 
     python -m unittest discover
