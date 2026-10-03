@@ -2563,7 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
-        "eg", "ee", "ef", "et", "etg", "eti",
+        "eg", "ee", "ef", "et", "etg", "eti", "etm",
         "ru",
         "ua",
         "mu",
@@ -4902,6 +4902,60 @@ def parse_op(raw_op):
         if first > last:
             fail(EXIT_INPUT, "INPUT")
         return ("eti", digest, at, first, last)
+
+    if name == "etm":
+        # 端点切换预约审计业务时间多身份占用区段批量查询（只读）：精确键序
+        # op,items,first,last（键须按此序出现，乱序报 INPUT）。items 为
+        # 1..64 项数组，每项精确键序 digest,at；digest 为六十四位小写十六
+        # 进制 SHA-256，at 为 0..10^9 的非 bool 整数；(digest,at) 身份不
+        # 得重复。first、last 为 0..10^9 的非 bool 整数且 first<=last，共
+        # 同给出业务时间闭区间 [first,last]。不接受 now、不推进显式时钟。
+        # 字段集合、键序、UTF-8 编码、容器数量、重复身份、摘要格式、整数
+        # 类型（排除 bool）、范围或区间关系非法统一判 INPUT；last 晚于操
+        # 作开始时的全局逻辑时钟留执行期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "items", "first", "last"]:
+            fail(EXIT_INPUT, "INPUT")
+        items = raw_op["items"]
+        if not isinstance(items, list) or not 1 <= len(items) <= 64:
+            fail(EXIT_INPUT, "INPUT")
+        normalized_items = []
+        seen_identities = set()
+        for raw_item in items:
+            if (
+                not isinstance(raw_item, dict)
+                or list(raw_item) != ["digest", "at"]
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            item_digest = cp_hex_digest(raw_item["digest"])
+            item_at = raw_item["at"]
+            if (
+                not isinstance(item_at, int)
+                or isinstance(item_at, bool)
+                or not 0 <= item_at <= 10 ** 9
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            item_identity = (item_digest, item_at)
+            if item_identity in seen_identities:
+                fail(EXIT_INPUT, "INPUT")
+            seen_identities.add(item_identity)
+            normalized_items.append(item_identity)
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        return ("etm", tuple(normalized_items), first, last)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -16359,6 +16413,158 @@ def run(raw):
                         "inactive": inactive,
                         "active": active,
                         "segments": len(segments),
+                    },
+                }
+            )
+
+        elif op[0] == "etm":
+            # 端点切换预约审计业务时间多身份占用区段批量查询（只读，不接受
+            # now、不推进时钟、不写审计，不改预约、连接、后端、审计窗口或
+            # 下一 seq）：在同一业务时间闭区间 [first,last] 内一次返回至多
+            # 64 个预约身份（digest,at）各自处于 ACTIVE 的点数与全部最大连
+            # 续闭区间；items 保持输入顺序，未出现的合法身份返回零和空数
+            # 组。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟整项报 STATE；时钟从未推进
+            # （last_now 为 None）时任何请求均属未来，一律 STATE（形状类
+            # INPUT 已在解析期先行判过；INPUT 先于状态）。
+            #
+            # 逐时刻口径与 et/etg/eti 完全一致：完整历史首事件前及空历史
+            # （时钟已推进）恒为 EMPTY；已淘汰且无法判定的前缀为
+            # UNKNOWN；同一 now 的事件按 seq 升序整组生效，以组末事件
+            # after 为终态身份；仅终态身份命中查询集合的时刻计入该身份
+            # points，并像 eti 一样把时间相邻的命中合并为最大闭区间。
+            #
+            # summary.points=last-first+1；matched 为各查询身份 points 之
+            # 和；unmatched 含 EMPTY 与未查询身份的 ACTIVE 点；三者与
+            # unknown 之和恒等于 points。truncated 仅 unknown>0 为 true。
+            #
+            # 恒值区域构造同 et/etg/eti（区域数 ≤ A+1，A≤64）：区域只过
+            # 一遍，查询身份以 O(P) 字典索引，输出区段数 S 上界 O(A·P)
+            # 但实际 S 为返回段总数；时间 O(A+P+S)、额外空间 O(P+S)，不
+            # 随区间跨度（可达 10^9）逐点扫描。
+            _, target_identities, first, last = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            regions = []
+            if not window:
+                # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY。
+                regions.append((0, last_now, "EMPTY", None))
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                prefix_evicted = oldest_seq > 1
+                # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，不入
+                # 列）：完整历史 EMPTY；前缀已淘汰则 UNKNOWN。
+                if oldest_now >= 1:
+                    if prefix_evicted:
+                        regions.append(
+                            (0, oldest_now - 1, "UNKNOWN", None)
+                        )
+                    else:
+                        regions.append(
+                            (0, oldest_now - 1, "EMPTY", None)
+                        )
+                # 同 now 事件整组为一个恒值区域：终态取组内最大 seq 事
+                # 件的 after（事件按 seq 升序，即组末事件）。
+                index = 0
+                event_count = len(window)
+                while index < event_count:
+                    group_now = window[index][1]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_identity = window[index][4]
+                        index += 1
+                    group_end = (
+                        window[index][1] - 1
+                        if index < event_count
+                        else last_now
+                    )
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    regions.append(
+                        (group_now, group_end, group_state, group_identity)
+                    )
+            points_total = last - first + 1
+            unknown = 0
+            matched = 0
+            # 每查询身份以 [points, 段列表] 累积；字典 O(P)，身份元组与事
+            # 件 after 身份按 (digest,at) 等值命中。未命中的合法身份保持
+            # 0 与空段列表。
+            per_identity = {
+                identity: [0, []] for identity in target_identities
+            }
+            for region_lo, region_hi, state, identity in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first > overlap_last:
+                    continue
+                length = overlap_last - overlap_first + 1
+                if state == "UNKNOWN":
+                    unknown += length
+                elif state == "ACTIVE":
+                    stats = per_identity.get(identity)
+                    if stats is not None:
+                        stats[0] += length
+                        matched += length
+                        identity_segments = stats[1]
+                        # 区域首尾相接：与该身份上一命中段时间相邻则合并
+                        # （同 now 整组前后身份相同的连续覆盖亦然）；中间
+                        # 夹入 EMPTY、UNKNOWN 或其他身份 ACTIVE 后另起。
+                        if (
+                            identity_segments
+                            and identity_segments[-1][1] + 1
+                            == overlap_first
+                        ):
+                            identity_segments[-1][1] = overlap_last
+                        else:
+                            identity_segments.append(
+                                [overlap_first, overlap_last]
+                            )
+            items = []
+            for target_identity in target_identities:
+                target_digest, target_at = target_identity
+                identity_points, identity_segments = (
+                    per_identity[target_identity]
+                )
+                items.append(
+                    {
+                        "digest": target_digest,
+                        "at": target_at,
+                        "points": identity_points,
+                        "segments": [
+                            {"first": segment_first, "last": segment_last}
+                            for segment_first, segment_last
+                            in identity_segments
+                        ],
+                    }
+                )
+            # 恒值区域完整覆盖 0..last_now，[first,last] 不超出该范围
+            # （last>last_now 已报 STATE）：每点恰计入 unknown、命中身份
+            # points 或 unmatched（EMPTY 与未查询身份 ACTIVE）之一，故
+            # unknown+matched+unmatched 恒等于 points。
+            results.append(
+                {
+                    "op": "etm",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": unknown > 0,
+                    "items": items,
+                    "summary": {
+                        "points": points_total,
+                        "unknown": unknown,
+                        "matched": matched,
+                        "unmatched": points_total - unknown - matched,
                     },
                 }
             )
