@@ -2563,7 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
-        "eg",
+        "eg", "ee",
         "ru",
         "ua",
         "mu",
@@ -4711,6 +4711,34 @@ def parse_op(raw_op):
         if after > until:
             fail(EXIT_INPUT, "INPUT")
         return ("eg", digest, at, after, until)
+
+    if name == "ee":
+        # 端点切换预约审计序号快照批量查询（只读）：精确键序 op,seqs（键须
+        # 按此序出现，乱序报 INPUT）。seqs 为 1..64 项数组，每项为
+        # 0..10^18 的非 bool 整数且严格递增、不重复。不接受 now：不推进显
+        # 式时钟。字段集合、键序、容器、数量、整数类型、范围或递增关系非
+        # 法统一判 INPUT；任一 seq 大于已分配最大 seq 留执行期判 STATE
+        # （INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "seqs"]:
+            fail(EXIT_INPUT, "INPUT")
+        seqs = raw_op["seqs"]
+        if not isinstance(seqs, list) or not 1 <= len(seqs) <= 64:
+            fail(EXIT_INPUT, "INPUT")
+        previous_seq = -1
+        normalized_seqs = []
+        for seq in seqs:
+            if (
+                not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not 0 <= seq <= 10 ** 18
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            # 严格递增即同时排除重复（相等）与乱序（倒退）。
+            if seq <= previous_seq:
+                fail(EXIT_INPUT, "INPUT")
+            previous_seq = seq
+            normalized_seqs.append(seq)
+        return ("ee", tuple(normalized_seqs))
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -15408,6 +15436,71 @@ def run(raw):
                         "apply": action_counts["APPLY"],
                         "clear": action_counts["CLEAR"],
                     },
+                }
+            )
+
+        elif op[0] == "ee":
+            # 端点切换预约审计序号快照批量查询（只读，不接受 now、不推进时
+            # 钟，不改预约、连接、后端、审计窗口或下一 seq，成功也不写审
+            # 计）：按一批审计序号直接返回各序号处理完成后的预约快照。
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）；任一 seq
+            # 大于 latest 整批报 STATE（形状类 INPUT 已在解析期先行判过）。
+            #
+            # 快照口径：
+            # 1. seq=0 恒为 EMPTY（任何审计事件发生前无预约）；
+            # 2. seq 仍在 64 条保留窗口内（>=最旧保留 seq）——取该事件的
+            #    after：非空为 ACTIVE 并回显 digest、at，为 null 为 EMPTY；
+            # 3. seq 恰为最旧保留 seq 减一——取最旧事件的 before 作为该序
+            #    号处理后的身份：null 为 EMPTY，非空为 ACTIVE；
+            # 4. 其余更早序号（0<seq<最旧 seq-1）前缀已随窗口淘汰、无法
+            #    由边界确定——返回 UNKNOWN 而非失败。
+            # truncated 仅在本次至少一项 UNKNOWN 时为 true。items 与 seqs
+            # 等长且保持输入顺序；窗口事件 seq 连续，物化一次后按
+            # seq-最旧 seq 直接索引，单次时间 O(P+A)、结果额外空间 O(P)
+            # （A≤64）。
+            _, seqs = op
+            latest = ep_audit_seq - 1
+            if seqs[-1] > latest:
+                fail(EXIT_STATE, "STATE")
+            window = list(ep_audit_events)
+            items = []
+            truncated = False
+            for seq in seqs:
+                if seq == 0:
+                    state = "EMPTY"
+                    identity = None
+                elif seq >= window[0][0]:
+                    identity = window[seq - window[0][0]][4]
+                    state = (
+                        "ACTIVE" if identity is not None else "EMPTY"
+                    )
+                elif seq == window[0][0] - 1:
+                    identity = window[0][3]
+                    state = (
+                        "ACTIVE" if identity is not None else "EMPTY"
+                    )
+                else:
+                    state = "UNKNOWN"
+                    identity = None
+                    truncated = True
+                if state == "ACTIVE":
+                    item_digest, item_at = identity
+                else:
+                    item_digest, item_at = None, None
+                items.append(
+                    {
+                        "seq": seq,
+                        "state": state,
+                        "digest": item_digest,
+                        "at": item_at,
+                    }
+                )
+            results.append(
+                {
+                    "op": "ee",
+                    "latest": latest,
+                    "truncated": truncated,
+                    "items": items,
                 }
             )
 

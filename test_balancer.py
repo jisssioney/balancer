@@ -28350,5 +28350,453 @@ class EpSwitchAuditRangeSummaryTest(unittest.TestCase):
         )
 
 
+class EpSwitchAuditSnapshotBatchTest(unittest.TestCase):
+    """ee：端点切换预约审计序号快照批量查询（只读）——按一批审计序号直接
+    返回各序号处理完成后的预约快照：seq=0 恒 EMPTY；窗口内取事件 after；
+    最旧保留 seq-1 取最旧事件 before（null→EMPTY，非空→ACTIVE）；更早
+    序号 UNKNOWN 而非失败；truncated 仅在至少一项 UNKNOWN 时 true。
+    INPUT/STATE 分类与优先级、只读确定性、64 条窗口边界、se/si 与
+    record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def ee(self, seqs):
+        return {"op": "ee", "seqs": list(seqs)}
+
+    def snapshot(self, results):
+        return [r for r in results if r["op"] == "ee"][-1]
+
+    def timeline_ops(self):
+        """同 eg 用例的七事件三身份时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def replace_chain_ops(self, count):
+        """count 条自空建立的 REPLACE 链（首条 SET）：所有事件 after 非
+        null，at=1000+i。"""
+        target = [("a", None, self.EP1)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    # ---- 空历史与输出形状 ----
+
+    def test_empty_history_compact_bytes(self):
+        code, out, err = run_balancer(
+            "run", encode_ops([self.ee([0])])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"ee","latest":0,"truncated":false,'
+            b'"items":[{"seq":0,"state":"EMPTY","digest":null,'
+            b'"at":null}]}],"backends":[]}\n',
+        )
+
+    def test_response_and_item_key_order(self):
+        ops, ids = self.timeline_ops()
+        result = self.snapshot(self.run_ops(ops + [self.ee([0, 7])]))
+        self.assertEqual(
+            list(result), ["op", "latest", "truncated", "items"]
+        )
+        self.assertEqual(result["latest"], 7)
+        self.assertEqual(len(result["items"]), 2)
+        for item in result["items"]:
+            self.assertEqual(
+                list(item), ["seq", "state", "digest", "at"]
+            )
+
+    def test_items_match_input_order_and_length(self):
+        ops, ids = self.timeline_ops()
+        # seqs 须严格递增：以合法顺序验证 items 等长并逐项保持输入顺序。
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 3, 4, 7])]
+        ))
+        self.assertEqual(
+            [item["seq"] for item in result["items"]], [0, 3, 4, 7]
+        )
+
+    # ---- 快照口径 ----
+
+    def test_snapshots_along_timeline(self):
+        ops, ids = self.timeline_ops()
+        d1, a1 = ids["A"]
+        d2, a2 = ids["B"]
+        d3, a3 = ids["C"]
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 1, 2, 3, 4, 5, 6, 7])]
+        ))
+        self.assertFalse(result["truncated"])
+        expected = [
+            (0, "EMPTY", None, None),
+            (1, "ACTIVE", d1, a1),
+            (2, "ACTIVE", d2, a2),
+            (3, "EMPTY", None, None),
+            (4, "ACTIVE", d1, a1),
+            (5, "EMPTY", None, None),
+            (6, "ACTIVE", d3, a3),
+            (7, "EMPTY", None, None),
+        ]
+        self.assertEqual(
+            [(i["seq"], i["state"], i["digest"], i["at"])
+             for i in result["items"]],
+            expected,
+        )
+
+    def test_seq_zero_always_empty(self):
+        ops, ids = self.timeline_ops()
+        result = self.snapshot(self.run_ops(ops + [self.ee([0])]))
+        self.assertEqual(result["items"], [
+            {"seq": 0, "state": "EMPTY", "digest": None, "at": None}
+        ])
+        self.assertEqual(result["latest"], 7)
+
+    def test_latest_snapshot_matches_current_reservation(self):
+        # 当前预约为 ACTIVE：ee[latest] 回显 es 建立的身份。
+        ops, ids = self.timeline_ops()
+        ops = ops[:-1]            # 截至 seq6 SET C，当前预约为 C
+        result = self.snapshot(self.run_ops(ops + [self.ee([6])]))
+        self.assertEqual(result["latest"], 6)
+        self.assertEqual(result["items"][0]["state"], "ACTIVE")
+        self.assertEqual(
+            (result["items"][0]["digest"], result["items"][0]["at"]),
+            ids["C"],
+        )
+        # 时间线末态为空：ee[latest] 为 EMPTY。
+        full_ops, _ = self.timeline_ops()
+        result = self.snapshot(self.run_ops(full_ops + [self.ee([7])]))
+        self.assertEqual(result["items"][0]["state"], "EMPTY")
+
+    def test_window_after_null_gives_empty(self):
+        # 窗口内 CANCEL/APPLY/CLEAR 事件 after=null：快照 EMPTY。
+        ops, ids = self.timeline_ops()
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([3, 5, 7])]
+        ))
+        self.assertEqual(
+            [(i["seq"], i["state"]) for i in result["items"]],
+            [(3, "EMPTY"), (5, "EMPTY"), (7, "EMPTY")],
+        )
+
+    def test_oldest_minus_one_uses_oldest_before(self):
+        # 70 条 REPLACE 链后窗口保留 seq7..70，最旧 seq7 的 before 为
+        # I5（seq6 after）：seq=6 取边界 ACTIVE(I5)，且不截断。
+        ops, identities = self.replace_chain_ops(70)
+        result = self.snapshot(self.run_ops(ops + [self.ee([0, 6, 7])]))
+        d5, at5 = identities[5]
+        d6, at6 = identities[6]
+        self.assertFalse(result["truncated"])
+        self.assertEqual(
+            [(i["seq"], i["state"], i["digest"], i["at"])
+             for i in result["items"]],
+            [(0, "EMPTY", None, None),
+             (6, "ACTIVE", d5, at5),
+             (7, "ACTIVE", d6, at6)],
+        )
+
+    def test_oldest_minus_one_null_before_gives_empty(self):
+        # 构造最旧保留事件为 SET（before=null）：seq1 SET、seq2 CANCEL、
+        # seq3 SET，再 63 次 REPLACE 至 seq66；窗口 seq3..66，seq=2 取
+        # seq3.before=null -> EMPTY，seq=1 已无法确定 -> UNKNOWN。
+        target = [("a", None, self.EP1)]
+        d100 = self.switch_digest(target, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(target, 0, 100, 1),
+            {"op": "eu", "digest": d100, "at": 100, "now": 2},
+            self.es(target, 0, 102, 3),
+        ]
+        for i in range(63):
+            ops.append(self.es(target, 0, 200 + i, 4 + i))
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 1, 2, 3, 66])]
+        ))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(
+            [(i["seq"], i["state"]) for i in result["items"]],
+            [(0, "EMPTY"), (1, "UNKNOWN"), (2, "EMPTY"),
+             (3, "ACTIVE"), (66, "ACTIVE")],
+        )
+
+    def test_evicted_seqs_unknown_and_truncated(self):
+        # 70 条链：seq1..5 早于边界 seq-1=6，UNKNOWN；同批含窗口内项时
+        # truncated 仍仅因 UNKNOWN 置位。
+        ops, identities = self.replace_chain_ops(70)
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([1, 2, 5, 6, 70])]
+        ))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(
+            [(i["seq"], i["state"]) for i in result["items"]],
+            [(1, "UNKNOWN"), (2, "UNKNOWN"), (5, "UNKNOWN"),
+             (6, "ACTIVE"), (70, "ACTIVE")],
+        )
+        for item in result["items"][:3]:
+            self.assertIsNone(item["digest"])
+            self.assertIsNone(item["at"])
+        # 不含任何 UNKNOWN 时 truncated=false，即使历史早已淘汰。
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([6, 70])]
+        ))
+        self.assertFalse(result["truncated"])
+
+    def test_sixty_four_items_supported(self):
+        ops, identities = self.replace_chain_ops(70)
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee(range(0, 64))]
+        ))
+        self.assertEqual(len(result["items"]), 64)
+        self.assertEqual(
+            [i["seq"] for i in result["items"]], list(range(0, 64))
+        )
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["items"][0]["state"], "EMPTY")
+        self.assertTrue(
+            all(i["state"] == "UNKNOWN" for i in result["items"][1:6])
+        )
+        self.assertTrue(
+            all(i["state"] == "ACTIVE" for i in result["items"][6:])
+        )
+
+    # ---- STATE ----
+
+    def test_seq_beyond_latest_is_state(self):
+        ops, ids = self.timeline_ops()           # latest=7
+        self.failure(ops + [self.ee([8])], 4, "STATE")
+        self.failure(ops + [self.ee([0, 7, 8])], 4, "STATE")
+        self.failure(ops + [self.ee([10 ** 18])], 4, "STATE")
+        # 空历史：除 seq=0 外均越界。
+        self.failure([self.ee([1])], 4, "STATE")
+        self.failure([self.ee([0, 1])], 4, "STATE")
+
+    # ---- INPUT ----
+
+    def test_input_validation(self):
+        good = self.ee([0, 1])
+        ops, _ = self.timeline_ops()
+        code, _, err = run_balancer("run", encode_ops(ops + [good]))
+        self.assertEqual((code, err), (0, b""))
+        bad = [
+            # 缺字段 / 多字段 / 乱序。
+            {"op": "ee"},
+            {"op": "ee", "seqs": [0], "now": 1},
+            {"op": "ee", "now": 1, "seqs": [0]},
+            # seqs 容器与数量。
+            {"op": "ee", "seqs": []},
+            {"op": "ee", "seqs": tuple()},
+            {"op": "ee", "seqs": 0},
+            {"op": "ee", "seqs": "0"},
+            {"op": "ee", "seqs": [0] * 65},
+            # 项类型 / bool / float / str。
+            {"op": "ee", "seqs": [True]},
+            {"op": "ee", "seqs": [0, False]},
+            {"op": "ee", "seqs": [1.0]},
+            {"op": "ee", "seqs": ["1"]},
+            {"op": "ee", "seqs": [None]},
+            # 范围。
+            {"op": "ee", "seqs": [-1]},
+            {"op": "ee", "seqs": [10 ** 18 + 1]},
+            # 重复 / 乱序（非严格递增）。
+            {"op": "ee", "seqs": [1, 1]},
+            {"op": "ee", "seqs": [2, 1]},
+            {"op": "ee", "seqs": [0, 0]},
+            {"op": "ee", "seqs": [5, 3, 4]},
+        ]
+        for op in bad:
+            self.failure([op], 2, "INPUT")
+
+    def test_range_boundary_1e18_accepted_as_input(self):
+        # 10^18 自身通过形状校验，仅在执行期判 STATE（latest 远小于它）。
+        ops, _ = self.timeline_ops()
+        self.failure(ops + [self.ee([10 ** 18])], 4, "STATE")
+
+    def test_input_precedes_state(self):
+        ops, _ = self.timeline_ops()
+        # 形状/数量/类型/递增非法，即使含越界 seq 也只报 INPUT。
+        for op in (
+            {"op": "ee"},
+            {"op": "ee", "seqs": [8, 8]},
+            {"op": "ee", "seqs": [8, 7]},
+            {"op": "ee", "seqs": [10 ** 18 + 1]},
+            {"op": "ee", "seqs": [True, 8]},
+        ):
+            self.failure(ops + [op], 2, "INPUT")
+
+    # ---- 只读 / 确定性 / 窗口 / 检查点 ----
+
+    def test_readonly_repeat_and_state_untouched(self):
+        ops, _ = self.timeline_ops()
+        query = self.ee([0, 1, 3, 7])
+        first = self.snapshot(self.run_ops(ops + [query]))
+        pages = [r for r in self.run_ops(ops + [query, query])
+                 if r["op"] == "ee"]
+        self.assertEqual(pages[0], pages[1])
+        self.assertEqual(pages[0], first)
+        # ee 前后 se 摘要逐字节一致：不推进时钟、不改任何运行态
+        # （含 ep_audit 窗口与 next_seq）。
+        results = self.run_ops(
+            self.timeline_ops()[0] + [{"op": "se"}, query, {"op": "se"}]
+        )
+        ses = [r for r in results if r["op"] == "se"]
+        self.assertEqual(ses[0]["digest"], ses[1]["digest"])
+        self.assertEqual(ses[0]["state"], ses[1]["state"])
+        # ee 不占 seq：其后新事件续接 seq8。
+        ops2, _ = self.timeline_ops()
+        ops2 += [
+            query,
+            self.es([("a", None, self.EP1)], 0, 200, 12),
+            {"op": "ek", "after": 0, "limit": 64},
+        ]
+        rows = [r for r in self.run_ops(ops2) if r["op"] == "ek"][-1]
+        self.assertEqual(
+            (rows["events"][-1]["seq"], rows["events"][-1]["action"]),
+            (8, "SET"),
+        )
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        # 同批此前 es 与 ee STATE 失败一并回滚：新进程审计窗口为空。
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.ee([99]),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        # 完整前缀与淘汰窗口两种状态下，se 导出、si 恢复后 ee 逐字节一致。
+        ops, _ = self.timeline_ops()
+        query_full = self.ee([0, 1, 3, 7])
+        results = self.run_ops(ops + [{"op": "se"}, query_full])
+        se = next(r for r in results if r["op"] == "se")
+        before = self.snapshot(results)
+        results = self.run_ops([
+            {"op": "si", "version": se["version"], "digest": se["digest"],
+             "state": se["state"]},
+            query_full,
+        ])
+        self.assertEqual(self.snapshot(results), before)
+
+        ops70, identities = self.replace_chain_ops(70)
+        d69, at69 = identities[69]
+        query_evicted = self.ee([0, 1, 5, 6, 7, 70])
+        results = self.run_ops(ops70 + [{"op": "se"}, query_evicted])
+        se = next(r for r in results if r["op"] == "se")
+        before = self.snapshot(results)
+        results = self.run_ops([
+            {"op": "si", "version": se["version"], "digest": se["digest"],
+             "state": se["state"]},
+            query_evicted,
+        ])
+        after = self.snapshot(results)
+        self.assertEqual(after, before)
+        self.assertTrue(after["truncated"])
+        self.assertEqual(
+            (after["items"][-1]["digest"], after["items"][-1]["at"]),
+            (d69, at69),
+        )
+
+    # ---- record/replay 逐字节 ----
+
+    def test_record_replay_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        ops += [
+            self.ee([0]),
+            self.ee([0, 1, 2, 3, 4, 5, 6, 7]),
+            self.ee([3, 7]),
+        ]
+        raw = encode_ops(ops)
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (0, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+        # 含 UNKNOWN 的淘汰窗口查询同样逐字节复现。
+        ops70, _ = self.replace_chain_ops(70)
+        raw = encode_ops(ops70 + [self.ee([0, 1, 6, 70])])
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (0, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+        # 失败批（STATE）逐字节复现。
+        raw = encode_ops(self.timeline_ops()[0] + [self.ee([8])])
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (4, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

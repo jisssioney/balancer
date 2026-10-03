@@ -367,6 +367,20 @@
 - `truncated` 沿用 `ek` 口径：历史非空且 `after` 小于最旧保留事件 seq 减一时为 true，表示游标之前已有事件被淘汰，否则为 false；`events` 为空不改变该值。
 - 字段集合、键序、UTF-8 编码、摘要格式、整数类型/范围或区间关系非法时返回 INPUT/2，并先于游标状态判断。令 `latest` 为已分配最大 seq（初始 0），`until>latest` 返回 STATE/4。空历史只允许 `until=0`，返回 `state=INACTIVE`、空 events、全零 summary 与 `truncated=false`。失败无 stdout，并回滚同批变化。单次时间与额外空间均为 O(64)，仅使用 Python 标准库；`se`、`si`、`sd`、`sx`、`sm` 及其他操作不变，`run`、`record`、`replay` 保持固定键序 UTF-8 JSON、末尾换行和逐字节一致结果。
 
+## 端点切换预约审计序号快照批量查询：ee
+
+在 `ek`/`el`/`em`/`eg` 的六十四条保留窗口之上，用一批审计序号直接查询各序号处理完成后的预约快照，调用方无需下载事件自行重建历史状态。只读：不接受 `now`，不推进显式时钟，不改变预约、连接、后端、审计窗口或下一 seq，成功查询也不写入审计；相同初态和输入产生逐字节一致的结果。
+
+- `ee`：字段严格按 `op,seqs` 排列（键须按此序出现，乱序报 INPUT）。`seqs` 为 1..64 项的数组，每项为 0..10¹⁸ 的非 bool 整数，且严格递增、不重复。
+- 返回固定键序 `op,latest,truncated,items`：`latest` 为已分配最大审计 seq（初始 0）；`items` 与 `seqs` 等长且保持输入顺序，每项固定键序 `seq,state,digest,at`。
+- `state` 仅为 `EMPTY`、`ACTIVE` 或 `UNKNOWN`：`ACTIVE` 回显该序号处理完成后生效预约的 `digest` 与 `at`（固定键序身份值），`EMPTY` 与 `UNKNOWN` 的 `digest`、`at` 均为 null。
+  - `seq=0` 始终表示任何审计事件发生前的 `EMPTY`；
+  - 仍在六十四条窗口内的序号（不小于最旧保留事件 seq）取该事件的 `after`：为 null 返回 `EMPTY`，否则返回 `ACTIVE`；
+  - 查询最旧保留序号减一时取最旧事件的 `before`：为 null 返回 `EMPTY`，否则返回 `ACTIVE`；
+  - 除 `seq=0` 外，更早且已无法由窗口边界确定的序号返回 `UNKNOWN` 而不是失败。
+- `truncated` 仅在本次至少一项为 `UNKNOWN` 时为 true。查询 `latest` 时的结果与当前预约身份一致；经 `se` 导出、`si` 恢复后，同一查询仍须逐字节一致。
+- 字段集合、键序、容器、数量、整数类型（排除 bool）、范围、递增关系或 UTF-8 编码非法时返回 INPUT/2；任一 seq 大于 `latest` 时整项请求返回 STATE/4，且输入错误优先于状态错误。失败不产生 stdout，并回滚同批此前操作及逻辑时钟。单次时间上界 O(P+A)、结果额外空间 O(P)，其中 P 为查询项数、A 不超过六十四条保留事件；仅使用 Python 标准库，现有端点切换、预约、审计、检查点入口的行为及状态结构不变，`run`、`record`、`replay` 继续使用固定键序紧凑 UTF-8 JSON 与单个末尾换行。
+
 ## 测试
 
     python -m unittest discover
