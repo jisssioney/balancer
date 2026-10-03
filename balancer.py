@@ -2563,7 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
-        "eg", "ee",
+        "eg", "ee", "ef",
         "ru",
         "ua",
         "mu",
@@ -4739,6 +4739,32 @@ def parse_op(raw_op):
             previous_seq = seq
             normalized_seqs.append(seq)
         return ("ee", tuple(normalized_seqs))
+
+    if name == "ef":
+        # 端点切换预约审计状态连续区段查询（只读）：精确键序 op,first,last
+        # （键须按此序出现，乱序报 INPUT）。first、last 为 0..10^18 的非
+        # bool 整数且 first<=last。不接受 now：不推进显式时钟。字段集合、
+        # 键序、UTF-8、整数类型、范围或区间关系非法统一判 INPUT；last 大于
+        # 已分配最大 seq 留执行期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "first", "last"]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ef", first, last)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -15501,6 +15527,136 @@ def run(raw):
                     "latest": latest,
                     "truncated": truncated,
                     "items": items,
+                }
+            )
+
+        elif op[0] == "ef":
+            # 端点切换预约审计状态连续区段查询（只读，不接受 now、不推进时
+            # 钟，不改预约、连接、后端、审计窗口或下一 seq，成功也不写审
+            # 计）：把闭区间 [first,last] 内各审计序号处理后的预约快照压
+            # 缩为按序号升序完整覆盖该区间的连续区段；相邻且状态、身份相
+            # 同的点合并（不同 ACTIVE 身份不合并；同一身份离开后重新进入
+            # 不跨中间 EMPTY 合并）。
+            #
+            # 单点快照口径与 ee 相同：seq=0 恒 EMPTY；窗口内序号（>=最旧
+            # 保留 seq）取该事件 after；最旧保留 seq-1 取最旧事件 before；
+            # 更早且无法由窗口边界确定的序号为 UNKNOWN。
+            #
+            # 保留事件 seq 连续（最旧..latest 无缺口），故区间按序号自小
+            # 到大至多由三类常量段拼成，只遍历 O(A) 条事件（A≤64）并按
+            # 整段并入，不随序号跨度（可达 10^18）分配每点空间：
+            # 1. seq=0 零点（若在区间内）恒 EMPTY；
+            # 2. 0<seq<oldest-1 的前缀已随窗口淘汰、无法由边界确定，整
+            #    段 UNKNOWN；
+            # 3. 边界点 seq=oldest-1（若在区间内）取最旧事件 before；其
+            #    后至 last 逐事件取各自 after——每个事件对应一个常量身份
+            #    点，相邻同（状态,身份）由 add_run 合并。
+            # truncated 仅在区间含 UNKNOWN 点时为 true。latest 为已分配
+            # 最大 seq；last>latest 报 STATE（形状类 INPUT 已在解析期先
+            # 行判过）。空历史只可能查询 [0,0]（latest=0，last>0 已报
+            # STATE），返回单个 EMPTY 区段。
+            _, first, last = op
+            latest = ep_audit_seq - 1
+            if last > latest:
+                fail(EXIT_STATE, "STATE")
+            segments = []
+            counts = {"UNKNOWN": 0, "EMPTY": 0, "ACTIVE": 0}
+
+            def add_run(run_first, run_last, state, identity):
+                """把整段同状态、同身份的闭区间并入区段列表（跨度不分配
+                点空间）：与末区段同状态、同身份（ACTIVE 比
+                (digest,at)，EMPTY/UNKNOWN 身份恒 None）时仅扩展末段
+                last，否则另起区段；点数按长度累计。"""
+                counts[state] += run_last - run_first + 1
+                if (
+                    segments
+                    and segments[-1]["state"] == state
+                    and segments[-1]["_identity"] == identity
+                ):
+                    segments[-1]["last"] = run_last
+                    return
+                if state == "ACTIVE":
+                    seg_digest, seg_at = identity
+                else:
+                    seg_digest = seg_at = None
+                segments.append(
+                    {
+                        "first": run_first,
+                        "last": run_last,
+                        "state": state,
+                        "digest": seg_digest,
+                        "at": seg_at,
+                        "_identity": identity,
+                    }
+                )
+
+            if not ep_audit_events:
+                # 空历史：latest=0，能走到这里必有 first=last=0。
+                add_run(0, 0, "EMPTY", None)
+            else:
+                oldest_seq = ep_audit_events[0][0]
+                boundary = oldest_seq - 1
+                cursor = first
+                # seq=0 恒为 EMPTY：UNKNOWN 前缀不得越过零点。
+                if cursor == 0:
+                    add_run(0, 0, "EMPTY", None)
+                    cursor = 1
+                # 0<seq<oldest-1 的前缀已随窗口淘汰，无法由边界确定。
+                unknown_end = min(last, boundary - 1)
+                if cursor <= unknown_end:
+                    add_run(cursor, unknown_end, "UNKNOWN", None)
+                    cursor = unknown_end + 1
+                # 边界点 seq=oldest-1 取最旧事件 before（oldest=1 时该点
+                # 即 seq0，已按恒 EMPTY 处理并越过）。
+                if cursor == boundary and boundary <= last:
+                    identity = ep_audit_events[0][3]
+                    add_run(
+                        boundary,
+                        boundary,
+                        "ACTIVE" if identity is not None else "EMPTY",
+                        identity,
+                    )
+                    cursor = boundary + 1
+                # 其余点 seq>=oldest 沿事件 after 阶梯逐事件扫描，O(A)。
+                for event in ep_audit_events:
+                    seq = event[0]
+                    if seq < cursor:
+                        continue
+                    if seq > last:
+                        break
+                    identity = event[4]
+                    add_run(
+                        seq,
+                        seq,
+                        "ACTIVE" if identity is not None else "EMPTY",
+                        identity,
+                    )
+            # 去除内部键并按固定键序 first,last,state,digest,at 输出。
+            segment_items = [
+                {
+                    "first": segment["first"],
+                    "last": segment["last"],
+                    "state": segment["state"],
+                    "digest": segment["digest"],
+                    "at": segment["at"],
+                }
+                for segment in segments
+            ]
+            results.append(
+                {
+                    "op": "ef",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": counts["UNKNOWN"] > 0,
+                    "segments": segment_items,
+                    "summary": {
+                        "points": last - first + 1,
+                        "segments": len(segment_items),
+                        "unknown": counts["UNKNOWN"],
+                        "empty": counts["EMPTY"],
+                        "active": counts["ACTIVE"],
+                    },
                 }
             )
 

@@ -28798,5 +28798,580 @@ class EpSwitchAuditSnapshotBatchTest(unittest.TestCase):
         )
 
 
+class EpSwitchAuditStateSegmentsTest(unittest.TestCase):
+    """ef：端点切换预约审计状态连续区段查询（只读）——把闭区间 [first,last]
+    内各审计序号处理后的预约状态压缩为按序号升序完整覆盖的连续区段，相邻
+    且状态、身份相同的点合并。单点口径同 ee（seq0 恒 EMPTY、窗口内取事件
+    after、最旧保留 seq-1 取最旧 before、更早为 UNKNOWN）；不同 ACTIVE
+    身份与同一身份离开后重新进入都不跨中间状态合并。truncated 仅在区间含
+    UNKNOWN 时 true；summary 统计各状态覆盖序号数。INPUT/STATE 分类与优先
+    级、空历史、只读确定性、64 条窗口边界（不随跨度增长）、se/si 与
+    record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def ef(self, first, last):
+        return {"op": "ef", "first": first, "last": last}
+
+    def ee(self, seqs):
+        return {"op": "ee", "seqs": list(seqs)}
+
+    def result(self, results):
+        return [r for r in results if r["op"] == "ef"][-1]
+
+    def expand(self, res):
+        """把 ef 区段展开为逐点 (state,digest,at) 列表。"""
+        points = []
+        for seg in res["segments"]:
+            identity = (
+                (seg["digest"], seg["at"]) if seg["state"] == "ACTIVE"
+                else (None, None)
+            )
+            points.extend(
+                (seg["state"],) + identity
+                for _ in range(seg["last"] - seg["first"] + 1)
+            )
+        return points
+
+    def assert_coverage(self, res, first, last):
+        """区段完整覆盖 [first,last]、首尾相接且相邻区段状态或身份不同。"""
+        segments = res["segments"]
+        self.assertTrue(segments)
+        self.assertEqual(segments[0]["first"], first)
+        self.assertEqual(segments[-1]["last"], last)
+
+        def identity(seg):
+            return (
+                (seg["digest"], seg["at"]) if seg["state"] == "ACTIVE"
+                else None
+            )
+
+        for index, seg in enumerate(segments):
+            self.assertLessEqual(seg["first"], seg["last"])
+            self.assertEqual(
+                list(seg), ["first", "last", "state", "digest", "at"]
+            )
+            if index:
+                prev = segments[index - 1]
+                self.assertEqual(seg["first"], prev["last"] + 1)
+                self.assertFalse(
+                    seg["state"] == prev["state"]
+                    and identity(seg) == identity(prev)
+                )
+
+    def assert_summary(self, res, first, last):
+        summary = res["summary"]
+        self.assertEqual(
+            list(summary),
+            ["points", "segments", "unknown", "empty", "active"],
+        )
+        self.assertEqual(summary["points"], last - first + 1)
+        self.assertEqual(summary["segments"], len(res["segments"]))
+        counts = {"UNKNOWN": 0, "EMPTY": 0, "ACTIVE": 0}
+        for seg in res["segments"]:
+            counts[seg["state"]] += seg["last"] - seg["first"] + 1
+        self.assertEqual(summary["unknown"], counts["UNKNOWN"])
+        self.assertEqual(summary["empty"], counts["EMPTY"])
+        self.assertEqual(summary["active"], counts["ACTIVE"])
+        self.assertEqual(
+            summary["unknown"] + summary["empty"] + summary["active"],
+            summary["points"],
+        )
+        self.assertEqual(res["truncated"], counts["UNKNOWN"] > 0)
+
+    def timeline_ops(self):
+        """同 ee 用例的七事件三身份时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def leave_return_ops(self):
+        """seq1 SET A、seq2 CANCEL、seq3 SET 同一身份 A：同一身份离开后
+        重新进入，中间隔 EMPTY。"""
+        target = [("a", None, self.EP1)]
+        digest = self.switch_digest(target, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(target, 0, 100, 1),
+            {"op": "eu", "digest": digest, "at": 100, "now": 2},
+            self.es(target, 0, 100, 3),
+        ]
+        return ops, (digest, 100)
+
+    def replace_chain_ops(self, count):
+        """count 条自空建立的 REPLACE 链（首条 SET）：after 身份摘要相同、
+        at=1000+i 互不相同。"""
+        target = [("a", None, self.EP1)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    # ---- 空历史与输出形状 ----
+
+    def test_empty_history_compact_bytes(self):
+        code, out, err = run_balancer(
+            "run", encode_ops([self.ef(0, 0)])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"ef","first":0,"last":0,"latest":0,'
+            b'"truncated":false,"segments":[{"first":0,"last":0,'
+            b'"state":"EMPTY","digest":null,"at":null}],"summary":'
+            b'{"points":1,"segments":1,"unknown":0,"empty":1,'
+            b'"active":0}}],"backends":[]}\n',
+        )
+
+    def test_response_key_order(self):
+        ops, _ = self.timeline_ops()
+        res = self.result(self.run_ops(ops + [self.ef(0, 7)]))
+        self.assertEqual(
+            list(res),
+            ["op", "first", "last", "latest", "truncated",
+             "segments", "summary"],
+        )
+        self.assertEqual(res["op"], "ef")
+        self.assertEqual(res["latest"], 7)
+
+    def test_segments_along_timeline(self):
+        ops, ids = self.timeline_ops()
+        d1, a1 = ids["A"]
+        d2, a2 = ids["B"]
+        d3, a3 = ids["C"]
+        res = self.result(self.run_ops(ops + [self.ef(0, 7)]))
+        self.assertFalse(res["truncated"])
+        self.assertEqual(
+            [
+                (s["first"], s["last"], s["state"], s["digest"], s["at"])
+                for s in res["segments"]
+            ],
+            [
+                (0, 0, "EMPTY", None, None),
+                (1, 1, "ACTIVE", d1, a1),
+                (2, 2, "ACTIVE", d2, a2),
+                (3, 3, "EMPTY", None, None),
+                (4, 4, "ACTIVE", d1, a1),
+                (5, 5, "EMPTY", None, None),
+                (6, 6, "ACTIVE", d3, a3),
+                (7, 7, "EMPTY", None, None),
+            ],
+        )
+        self.assert_summary(res, 0, 7)
+        self.assert_coverage(res, 0, 7)
+        self.assertEqual(
+            res["summary"],
+            {"points": 8, "segments": 8, "unknown": 0,
+             "empty": 4, "active": 4},
+        )
+
+    def test_distinct_active_identities_not_merged(self):
+        # seq1=A、seq2=B：摘要相同但 at 不同，身份不同，不得合并。
+        ops, ids = self.timeline_ops()
+        res = self.result(self.run_ops(ops + [self.ef(1, 2)]))
+        self.assertEqual(len(res["segments"]), 2)
+        self.assertEqual(
+            [(s["state"], s["digest"], s["at"]) for s in res["segments"]],
+            [("ACTIVE",) + ids["A"], ("ACTIVE",) + ids["B"]],
+        )
+        self.assert_coverage(res, 1, 2)
+
+    def test_same_identity_reentry_not_merged_across_empty(self):
+        # A -> EMPTY -> A：同一身份离开后重新进入，两个 ACTIVE 区段不得
+        # 跨中间 EMPTY 合并。
+        ops, identity = self.leave_return_ops()
+        res = self.result(self.run_ops(ops + [self.ef(0, 3)]))
+        self.assertEqual(
+            [
+                (s["first"], s["last"], s["state"], s["digest"], s["at"])
+                for s in res["segments"]
+            ],
+            [
+                (0, 0, "EMPTY", None, None),
+                (1, 1, "ACTIVE", identity[0], identity[1]),
+                (2, 2, "EMPTY", None, None),
+                (3, 3, "ACTIVE", identity[0], identity[1]),
+            ],
+        )
+        self.assert_summary(res, 0, 3)
+
+    def test_empty_digest_at_are_null(self):
+        ops, _ = self.timeline_ops()
+        res = self.result(self.run_ops(ops + [self.ef(0, 7)]))
+        for seg in res["segments"]:
+            if seg["state"] != "ACTIVE":
+                self.assertIsNone(seg["digest"])
+                self.assertIsNone(seg["at"])
+
+    def test_subranges_full_coverage(self):
+        ops, _ = self.timeline_ops()
+        for first in range(0, 8):
+            for last in range(first, 8):
+                res = self.result(
+                    self.run_ops(ops + [self.ef(first, last)])
+                )
+                self.assert_coverage(res, first, last)
+                self.assert_summary(res, first, last)
+                self.assertFalse(res["truncated"])
+
+    def test_matches_ee_point_by_point(self):
+        # ef 展开后须与 ee 逐点一致（含身份回显）。
+        ops, _ = self.timeline_ops()
+        first, last = 0, 7
+        results = self.run_ops(
+            ops + [self.ee(range(first, last + 1)), self.ef(first, last)]
+        )
+        ee_items = [r for r in results if r["op"] == "ee"][-1]["items"]
+        ef_points = self.expand(self.result(results))
+        self.assertEqual(
+            ef_points,
+            [(i["state"], i["digest"], i["at"]) for i in ee_items],
+        )
+
+    # ---- 64 条窗口与 UNKNOWN 区段 ----
+
+    def test_evicted_prefix_is_single_unknown_segment(self):
+        ops, identities = self.replace_chain_ops(70)
+        # 窗口保留 seq7..70，边界 seq6，seq1..5 UNKNOWN。
+        res = self.result(self.run_ops(ops + [self.ef(0, 70)]))
+        self.assertTrue(res["truncated"])
+        self.assertEqual(
+            [(s["first"], s["last"], s["state"])
+             for s in res["segments"][:3]],
+            [(0, 0, "EMPTY"), (1, 5, "UNKNOWN"), (6, 6, "ACTIVE")],
+        )
+        # UNKNOWN 五点合并为单个区段。
+        unknown_segments = [s for s in res["segments"]
+                            if s["state"] == "UNKNOWN"]
+        self.assertEqual(len(unknown_segments), 1)
+        self.assertEqual(
+            (unknown_segments[0]["first"], unknown_segments[0]["last"]),
+            (1, 5),
+        )
+        # 边界点 seq6 取最旧事件 before（I5）；seq7 起取 after。
+        d5, at5 = identities[5]
+        d6, at6 = identities[6]
+        self.assertEqual(
+            (res["segments"][2]["digest"], res["segments"][2]["at"]),
+            (d5, at5),
+        )
+        self.assertEqual(
+            (res["segments"][3]["digest"], res["segments"][3]["at"]),
+            (d6, at6),
+        )
+        self.assert_summary(res, 0, 70)
+        self.assert_coverage(res, 0, 70)
+
+    def test_unknown_only_range(self):
+        ops, _ = self.replace_chain_ops(70)
+        res = self.result(self.run_ops(ops + [self.ef(1, 5)]))
+        self.assertTrue(res["truncated"])
+        self.assertEqual(
+            res["segments"],
+            [{"first": 1, "last": 5, "state": "UNKNOWN",
+              "digest": None, "at": None}],
+        )
+        self.assertEqual(
+            res["summary"],
+            {"points": 5, "segments": 1, "unknown": 5,
+             "empty": 0, "active": 0},
+        )
+
+    def test_boundary_null_before_gives_empty_segment(self):
+        # seq1 SET、seq2 CANCEL、seq3 SET，再 63 次 REPLACE 至 seq66；窗口
+        # seq3..66，边界 seq2 取 seq3.before=null -> EMPTY，seq1 UNKNOWN。
+        target = [("a", None, self.EP1)]
+        digest = self.switch_digest(target, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(target, 0, 100, 1),
+            {"op": "eu", "digest": digest, "at": 100, "now": 2},
+            self.es(target, 0, 102, 3),
+        ]
+        for i in range(63):
+            ops.append(self.es(target, 0, 200 + i, 4 + i))
+        res = self.result(self.run_ops(ops + [self.ef(0, 66)]))
+        self.assertTrue(res["truncated"])
+        self.assertEqual(
+            [(s["first"], s["last"], s["state"])
+             for s in res["segments"][:3]],
+            [(0, 0, "EMPTY"), (1, 1, "UNKNOWN"), (2, 2, "EMPTY")],
+        )
+        self.assert_summary(res, 0, 66)
+        # 仅边界点时区间不含 UNKNOWN：truncated=false。
+        only_boundary = self.result(self.run_ops(ops + [self.ef(2, 2)]))
+        self.assertFalse(only_boundary["truncated"])
+        self.assertEqual(
+            only_boundary["segments"],
+            [{"first": 2, "last": 2, "state": "EMPTY",
+              "digest": None, "at": None}],
+        )
+
+    def test_truncated_false_within_reachable_range(self):
+        # 历史虽已淘汰，区间不触碰 UNKNOWN 时 truncated=false。
+        ops, _ = self.replace_chain_ops(70)
+        res = self.result(self.run_ops(ops + [self.ef(6, 70)]))
+        self.assertFalse(res["truncated"])
+        self.assertEqual(res["summary"]["unknown"], 0)
+        self.assert_coverage(res, 6, 70)
+        res = self.result(self.run_ops(ops + [self.ef(0, 0)]))
+        self.assertFalse(res["truncated"])
+
+    def test_large_span_does_not_allocate_per_point(self):
+        # 200 条事件后窗口为 seq137..200，边界 seq136；[0,200] 的 UNKNOWN
+        # 前缀（1..135）合并为单个区段，summary 按跨度计数而非逐点物化。
+        ops, _ = self.replace_chain_ops(200)
+        res = self.result(self.run_ops(ops + [self.ef(0, 200)]))
+        self.assertEqual(res["latest"], 200)
+        unknown = [s for s in res["segments"] if s["state"] == "UNKNOWN"]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual((unknown[0]["first"], unknown[0]["last"]), (1, 135))
+        self.assertEqual(res["summary"]["unknown"], 135)
+        self.assertEqual(res["summary"]["active"], 65)
+        self.assertEqual(res["summary"]["empty"], 1)
+        self.assertEqual(res["summary"]["points"], 201)
+        self.assert_coverage(res, 0, 200)
+
+    def test_window_matches_ee_on_evicted_state(self):
+        ops, _ = self.replace_chain_ops(70)
+        first, last = 0, 63
+        results = self.run_ops(
+            ops + [self.ee(range(first, last + 1)), self.ef(first, last)]
+        )
+        ee_items = [r for r in results if r["op"] == "ee"][-1]["items"]
+        self.assertEqual(
+            self.expand(self.result(results)),
+            [(i["state"], i["digest"], i["at"]) for i in ee_items],
+        )
+
+    # ---- STATE ----
+
+    def test_last_beyond_latest_is_state(self):
+        ops, _ = self.timeline_ops()               # latest=7
+        self.failure(ops + [self.ef(0, 8)], 4, "STATE")
+        self.failure(ops + [self.ef(8, 8)], 4, "STATE")
+        self.failure(ops + [self.ef(7, 8)], 4, "STATE")
+        self.failure(ops + [self.ef(0, 10 ** 18)], 4, "STATE")
+        # 空历史：只允许 [0,0]。
+        self.failure([self.ef(0, 1)], 4, "STATE")
+        self.failure([self.ef(1, 1)], 4, "STATE")
+
+    # ---- INPUT ----
+
+    def test_input_validation(self):
+        good = self.ef(0, 1)
+        ops, _ = self.timeline_ops()
+        code, _, err = run_balancer("run", encode_ops(ops + [good]))
+        self.assertEqual((code, err), (0, b""))
+        bad = [
+            # 缺字段 / 多字段 / 乱序。
+            {"op": "ef"},
+            {"op": "ef", "first": 0},
+            {"op": "ef", "last": 1},
+            {"op": "ef", "first": 0, "last": 1, "now": 1},
+            {"op": "ef", "now": 1, "first": 0, "last": 1},
+            {"op": "ef", "last": 1, "first": 0},
+            {"op": "ef", "first": 0, "now": 1},
+            # 类型 / bool / float / str / None。
+            {"op": "ef", "first": True, "last": 1},
+            {"op": "ef", "first": 0, "last": False},
+            {"op": "ef", "first": 1.0, "last": 1},
+            {"op": "ef", "first": 0, "last": "1"},
+            {"op": "ef", "first": None, "last": 1},
+            {"op": "ef", "first": [0], "last": 1},
+            # 范围。
+            {"op": "ef", "first": -1, "last": 1},
+            {"op": "ef", "first": 0, "last": -1},
+            {"op": "ef", "first": 0, "last": 10 ** 18 + 1},
+            {"op": "ef", "first": 10 ** 18 + 1, "last": 10 ** 18 + 1},
+            # 区间关系。
+            {"op": "ef", "first": 2, "last": 1},
+        ]
+        for op in bad:
+            self.failure([op], 2, "INPUT")
+
+    def test_range_boundary_1e18_accepted_as_input(self):
+        # 10^18 自身通过形状校验，仅在执行期判 STATE。
+        ops, _ = self.timeline_ops()
+        self.failure(
+            ops + [self.ef(0, 10 ** 18)], 4, "STATE"
+        )
+
+    def test_input_precedes_state(self):
+        ops, _ = self.timeline_ops()
+        for op in (
+            {"op": "ef", "first": 0},
+            {"op": "ef", "first": 7, "last": 6},
+            {"op": "ef", "first": True, "last": 99},
+            {"op": "ef", "first": 0, "last": 10 ** 18 + 1},
+            {"op": "ef", "first": 0, "last": 1, "now": 1},
+        ):
+            self.failure(ops + [op], 2, "INPUT")
+
+    # ---- 只读 / 确定性 / 回滚 / 检查点 ----
+
+    def test_readonly_repeat_and_state_untouched(self):
+        ops, _ = self.timeline_ops()
+        query = self.ef(0, 7)
+        first = self.result(self.run_ops(ops + [query]))
+        pages = [r for r in self.run_ops(ops + [query, query])
+                 if r["op"] == "ef"]
+        self.assertEqual(pages[0], pages[1])
+        self.assertEqual(pages[0], first)
+        # ef 前后 se 摘要逐字节一致：不推进时钟、不改任何运行态。
+        results = self.run_ops(
+            self.timeline_ops()[0] + [{"op": "se"}, query, {"op": "se"}]
+        )
+        ses = [r for r in results if r["op"] == "se"]
+        self.assertEqual(ses[0]["digest"], ses[1]["digest"])
+        self.assertEqual(ses[0]["state"], ses[1]["state"])
+        # ef 不占 seq：其后新事件续接 seq8。
+        ops2, _ = self.timeline_ops()
+        ops2 += [
+            query,
+            self.es([("a", None, self.EP1)], 0, 200, 12),
+            {"op": "ek", "after": 0, "limit": 64},
+        ]
+        rows = [r for r in self.run_ops(ops2) if r["op"] == "ek"][-1]
+        self.assertEqual(
+            (rows["events"][-1]["seq"], rows["events"][-1]["action"]),
+            (8, "SET"),
+        )
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.ef(0, 99),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        query = self.ef(0, 7)
+        results = self.run_ops(ops + [{"op": "se"}, query])
+        se = next(r for r in results if r["op"] == "se")
+        before = self.result(results)
+        results = self.run_ops([
+            {"op": "si", "version": se["version"], "digest": se["digest"],
+             "state": se["state"]},
+            query,
+        ])
+        self.assertEqual(self.result(results), before)
+
+        ops70, _ = self.replace_chain_ops(70)
+        query_evicted = self.ef(0, 70)
+        results = self.run_ops(ops70 + [{"op": "se"}, query_evicted])
+        se = next(r for r in results if r["op"] == "se")
+        before = self.result(results)
+        results = self.run_ops([
+            {"op": "si", "version": se["version"], "digest": se["digest"],
+             "state": se["state"]},
+            query_evicted,
+        ])
+        self.assertEqual(self.result(results), before)
+        self.assertTrue(self.result(results)["truncated"])
+
+    # ---- record/replay 逐字节 ----
+
+    def test_record_replay_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        ops += [
+            self.ef(0, 0),
+            self.ef(0, 7),
+            self.ef(3, 7),
+        ]
+        raw = encode_ops(ops)
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (0, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+        # 含 UNKNOWN 的淘汰窗口查询同样逐字节复现。
+        ops70, _ = self.replace_chain_ops(70)
+        raw = encode_ops(ops70 + [self.ef(0, 70)])
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (0, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+        # 失败批（STATE）逐字节复现。
+        raw = encode_ops(self.timeline_ops()[0] + [self.ef(0, 8)])
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (4, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -381,6 +381,21 @@
 - `truncated` 仅在本次至少一项为 `UNKNOWN` 时为 true。查询 `latest` 时的结果与当前预约身份一致；经 `se` 导出、`si` 恢复后，同一查询仍须逐字节一致。
 - 字段集合、键序、容器、数量、整数类型（排除 bool）、范围、递增关系或 UTF-8 编码非法时返回 INPUT/2；任一 seq 大于 `latest` 时整项请求返回 STATE/4，且输入错误优先于状态错误。失败不产生 stdout，并回滚同批此前操作及逻辑时钟。单次时间上界 O(P+A)、结果额外空间 O(P)，其中 P 为查询项数、A 不超过六十四条保留事件；仅使用 Python 标准库，现有端点切换、预约、审计、检查点入口的行为及状态结构不变，`run`、`record`、`replay` 继续使用固定键序紧凑 UTF-8 JSON 与单个末尾换行。
 
+## 端点切换预约审计状态连续区段查询：ef
+
+在 `ek`/`el`/`em`/`eg`/`ee` 的六十四条保留窗口之上，把指定闭区间内各审计序号处理后的预约状态压缩为连续区段，直接回答序号范围内状态连续保持多久。只读：不接受 `now`，不推进显式时钟，不改变预约、连接、后端、审计窗口或下一 seq，成功查询也不写入审计；相同初态和输入产生逐字节一致的结果。
+
+- `ef`：字段严格按 `op,first,last` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 均为 0..10¹⁸ 的非 bool 整数且 `first≤last`，共同给出闭区间 `[first,last]`。
+- 返回固定键序 `op,first,last,latest,truncated,segments,summary`。`latest` 为已分配最大审计 seq（初始 0）；`last>latest` 时返回 STATE/4。
+- `segments` 按序号升序完整覆盖 `[first,last]`（首段 `first` 等于请求 `first`、末段 `last` 等于请求 `last`、相邻区段首尾相接），相邻且状态、身份相同的点合并；每项固定键序 `first,last,state,digest,at`。
+  - `state` 仅为 `EMPTY`、`ACTIVE` 或 `UNKNOWN`；`ACTIVE` 回显预约的六十四位小写 SHA-256 摘要与触发时刻，其他状态的 `digest`、`at` 均为 null。
+  - 单点口径同 `ee`：`seq=0` 恒为 `EMPTY`；保留事件序号取该事件的 `after`；最旧保留序号减一取最旧事件的 `before`；更早且无法从窗口边界确定的序号为 `UNKNOWN`。
+  - 不同 ACTIVE 身份不得合并，同一身份离开后重新进入也不得跨中间状态合并。
+- `truncated` 仅在区间含 UNKNOWN 点时为 true。
+- `summary` 固定键序 `points,segments,unknown,empty,active`：`points=last-first+1`；`segments` 为返回区段数；`unknown`、`empty`、`active` 统计各状态覆盖的序号数（非区段数），三项之和等于 `points`。
+- 字段集合、键序、UTF-8、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2；输入错误优先于状态错误。空历史只允许 `[0,0]`（`latest=0`，`last>0` 已报 STATE/4），返回一个 EMPTY 区段。失败无 stdout，并回滚同批此前变化。
+- 单次时间与结果额外空间均为 O(A)，A 是最多六十四条保留事件，不随序号跨度（可达 10¹⁸）增长；仅使用 Python 标准库。保留 `ek`、`el`、`em`、`eg`、`ee`、`se`、`si` 与其他入口行为，`run`、`record`、`replay` 继续使用固定键序紧凑 UTF-8 JSON、单个末尾换行并保持逐字节一致。
+
 ## 测试
 
     python -m unittest discover
