@@ -2563,7 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
-        "eg", "ee",
+        "eg", "ee", "ef",
         "ru",
         "ua",
         "mu",
@@ -4739,6 +4739,33 @@ def parse_op(raw_op):
             previous_seq = seq
             normalized_seqs.append(seq)
         return ("ee", tuple(normalized_seqs))
+
+    if name == "ef":
+        # 端点切换预约审计序号区间状态区段压缩（只读）：精确键序
+        # op,first,last（键须按此序出现，乱序报 INPUT）。first、last 为
+        # 0..10^18 的非 bool 整数且 first<=last，共同给出闭区间
+        # [first,last]。不接收 now：不推进显式时钟。字段集合、键序、整数
+        # 类型、范围或区间关系非法统一判 INPUT；last 大于已分配最大 seq
+        # 留执行期判 STATE（INPUT 判定先于状态，口径同 ee）。
+        if list(raw_op) != ["op", "first", "last"]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ef", first, last)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -15501,6 +15528,123 @@ def run(raw):
                     "latest": latest,
                     "truncated": truncated,
                     "items": items,
+                }
+            )
+
+        elif op[0] == "ef":
+            # 端点切换预约审计序号区间状态区段压缩（只读，不接受 now、不推
+            # 进时钟，不改预约、连接、后端、审计窗口或下一 seq，成功也不
+            # 写审计）：把闭区间 [first,last] 内各审计序号处理后的预约状态
+            # 压缩为相邻同状态同身份的连续区段。latest 为已分配最大 seq
+            # （ep_audit_seq-1，初始 0）；last>latest 报 STATE（形状类
+            # INPUT 已在解析期先行判过）。空历史 latest=0，故仅 [0,0] 可
+            # 达，返回单个 EMPTY 区段。
+            #
+            # 逐点口径与 ee 完全一致：
+            # 1. seq=0 恒为 EMPTY；
+            # 2. seq 仍在 64 条保留窗口内（>=最旧保留 seq）取该事件 after：
+            #    null 为 EMPTY，非空为 ACTIVE（身份为 digest,at）；
+            # 3. seq 恰为最旧保留 seq 减一取最旧事件 before；
+            # 4. 其余更早序号前缀已淘汰、无法由窗口边界确定——UNKNOWN。
+            # 全部序号空间 0..latest 上只有 O(A) 段恒值区间：点 0、
+            # UNKNOWN 前缀（1..最旧-2）、before 边界点（最旧-1）及每条保
+            # 留事件 after 生效到下一事件前（保留事件 seq 连续）。事件均
+            # 真正改变预约身份，相邻区间身份必不同；交集后仍做一次相邻合
+            # 并以兜底。区间与序号跨度无关：时间 O(A)、结果额外空间 O(A)
+            # （A≤64），不逐点遍历（跨度可达 10^18）。
+            _, first, last = op
+            latest = ep_audit_seq - 1
+            if last > latest:
+                fail(EXIT_STATE, "STATE")
+            regions = [(0, 0, "EMPTY", None)]
+            window = list(ep_audit_events)
+            if window:
+                oldest_seq = window[0][0]
+                if oldest_seq >= 3:
+                    regions.append(
+                        (1, oldest_seq - 2, "UNKNOWN", None)
+                    )
+                if oldest_seq >= 2:
+                    before_identity = window[0][3]
+                    regions.append(
+                        (
+                            oldest_seq - 1,
+                            oldest_seq - 1,
+                            "ACTIVE" if before_identity is not None
+                            else "EMPTY",
+                            before_identity,
+                        )
+                    )
+                for index, event in enumerate(window):
+                    event_seq = event[0]
+                    after_identity = event[4]
+                    region_end = (
+                        window[index + 1][0] - 1
+                        if index + 1 < len(window)
+                        else latest
+                    )
+                    regions.append(
+                        (
+                            event_seq,
+                            region_end,
+                            "ACTIVE" if after_identity is not None
+                            else "EMPTY",
+                            after_identity,
+                        )
+                    )
+            segments = []
+            counts = {"UNKNOWN": 0, "EMPTY": 0, "ACTIVE": 0}
+
+            def append_region(region_first, region_last, state, identity):
+                length = region_last - region_first + 1
+                counts[state] += length
+                if (
+                    segments
+                    and segments[-1]["state"] == state
+                    and segments[-1]["_identity"] == identity
+                ):
+                    segments[-1]["last"] = region_last
+                    return
+                if state == "ACTIVE":
+                    seg_digest, seg_at = identity
+                else:
+                    seg_digest, seg_at = None, None
+                segments.append(
+                    {
+                        "first": region_first,
+                        "last": region_last,
+                        "state": state,
+                        "digest": seg_digest,
+                        "at": seg_at,
+                        "_identity": identity,
+                    }
+                )
+
+            for region_lo, region_hi, state, identity in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first <= overlap_last:
+                    append_region(
+                        overlap_first, overlap_last, state, identity
+                    )
+            for segment in segments:
+                del segment["_identity"]
+            points = last - first + 1
+            results.append(
+                {
+                    "op": "ef",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": counts["UNKNOWN"] > 0,
+                    "segments": segments,
+                    "summary": {
+                        "points": points,
+                        "segments": len(segments),
+                        "unknown": counts["UNKNOWN"],
+                        "empty": counts["EMPTY"],
+                        "active": counts["ACTIVE"],
+                    },
                 }
             )
 
