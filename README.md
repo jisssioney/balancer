@@ -437,6 +437,19 @@
 - `last` 晚于操作开始时的全局逻辑时钟时返回 STATE/4；时钟从未推进时任何请求均属未来。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，并先于状态判断。失败不产生 stdout，并回滚同批变化；成功不推进时钟、不写审计、不改变运行态。空历史但时钟已推进时返回全部 EMPTY、空 identities 和 `truncated=false`。
 - 全部业务时间 0..当前时钟只有 O(A) 个恒值区域（最旧事件 `now` 之前至多一段，其后每个同 `now` 事件组一段、末组延伸至当前时钟），故时间与额外空间均为 O(A)，A 不超过六十四条保留事件，不随区间跨度（可达 10⁹）逐点扫描；仅使用 Python 标准库，`se`、`si` 往返和重复查询须逐字节一致，`run`、`record`、`replay` 继续输出固定键序紧凑 JSON 和单个末尾换行，其他公开入口行为不变。
 
+## 端点切换预约审计业务时间身份占用区段：eti
+
+在 `et`/`etg` 的六十四条保留窗口与逐时刻口径之上新增只读入口，按业务时间闭区间返回单个预约身份（`digest` 与 `at` 共同标识）处于 ACTIVE 的精确占用区段；它只读现有审计事实，不补写淘汰历史，不改变 `et`、`etg`，不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `eti`：输入严格按 `op,digest,at,first,last` 排列（键须按此序出现，乱序报 INPUT）。`digest` 为六十四位小写十六进制 SHA-256；`at`、`first`、`last` 均为 0..10⁹ 的非 bool 整数且 `first≤last`，`first`、`last` 共同给出业务时间闭区间 `[first,last]`。`at` 只参与身份匹配、不推进时钟。
+- 返回固定键序 `op,digest,at,first,last,latest,truncated,segments,summary`；`latest` 为已分配最大审计 seq（初始 0）。
+- `segments` 按时间升序列出目标身份处于 ACTIVE 的最大连续闭区间，项键序 `first,last`，首项不小于 `first`、末项不大于 `last`；相邻的目标 ACTIVE 时刻合并，失效后（EMPTY、UNKNOWN 或其他身份 ACTIVE）再次进入另起一段。
+- 逐时刻结果沿用 `et`：同一 `now` 的事件按 seq 升序整组生效、以末条 `after` 为终态；完整历史首事件前及空历史为 EMPTY；已淘汰且无法判定的前缀为 UNKNOWN；其余时刻取最后一个 `now` 不晚于该时刻的事件。时刻终态身份等于 `(digest,at)` 才计入目标 ACTIVE。
+- `summary` 固定键序 `points,unknown,inactive,active,segments`：`points=last-first+1`；`unknown` 为 UNKNOWN 点数；`active` 为目标身份占用点数；`inactive` 包含 EMPTY 和其他身份的 ACTIVE；恒有 `points=unknown+inactive+active`，UNKNOWN 不计入 inactive；`segments` 为返回段数。
+- `truncated` 仅在 `unknown` 大于零时为 true。合法但从未出现的身份成功返回空 `segments`、`active=0`。
+- `last` 超过查询开始时的全局时钟，或时钟从未推进，返回 STATE/4；字段集合、键序、摘要格式、整数类型、范围或区间关系非法返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批变化。
+- 全部业务时间 0..当前时钟只有 O(A) 个恒值区域（构造同 `et` 区间形态），故时间与额外空间均为 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，保持 `run`、`record`、`replay` 的固定键序紧凑 UTF-8 JSON、单末尾换行及 `et`、`etg` 和其他公开行为不变。
+
 ## 测试
 
     python -m unittest discover
