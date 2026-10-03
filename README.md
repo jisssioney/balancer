@@ -108,7 +108,7 @@
 
 在现有 JSON 操作流中新增 `se`、`si`，使一次调用导出的状态能在另一条全新调用中恢复并继续处理公开操作；不依赖文件、网络或进程时间。对任意合法后续操作序列，直接继续与“导出后在空实例恢复再继续”所得退出码、stdout、stderr 逐字节一致。
 
-- `se` 只接受 `op` 一个键，不推进显式时钟、不修改状态；返回固定键序 `op,version,digest,state`。`version` 初始为 1（非 bool 整数）；`state` 为规范化 JSON 对象，逐层键序固定，有业务顺序的集合（后端加入序、连接建连序、等待队列 FIFO、提交/审计 rev 序、告警转换事件窗序、分钟窗时序）保持原序，其余集合（粘性键、桶/配额与池级告警标识、老化服务类等）沿用 UTF-8 字节排序（复合键 scope 先按 B/C/S）。`state` 包含全部影响后续公开行为的状态：逻辑时钟、纯登记配置与待生效计划（vnodes、sticky/idle/lifetime、scheduler、overload、backpressure、queue 策略、aging、faults、quotas、capacities）、后端顺序及健康/权重预热/熔断/排空/不可用起点/登记端点、令牌桶（含当前令牌与补充时刻）、固定窗口配额（window、used）、活动连接与建连时端点快照、粘性映射、等待队列、限流配额与各类分钟历史、故障计划/统计/恢复基线、请求与采样指标及 mo 增量游标缓存、全部告警状态机（fe/ea/pa/xa/na/le/ua/wa）及其转换历史、配置提交历史与 next_rev、审计事件与段级差异、配置预约、全池端点切换预约。
+- `se` 只接受 `op` 一个键，不推进显式时钟、不修改状态；返回固定键序 `op,version,digest,state`。`version` 初始为 1（非 bool 整数）；`state` 为规范化 JSON 对象，逐层键序固定，有业务顺序的集合（后端加入序、连接建连序、等待队列 FIFO、提交/审计 rev 序、告警转换事件窗序、分钟窗时序）保持原序，其余集合（粘性键、桶/配额与池级告警标识、老化服务类等）沿用 UTF-8 字节排序（复合键 scope 先按 B/C/S）。`state` 包含全部影响后续公开行为的状态：逻辑时钟、纯登记配置与待生效计划（vnodes、sticky/idle/lifetime、scheduler、overload、backpressure、queue 策略、aging、faults、quotas、capacities）、后端顺序及健康/权重预热/熔断/排空/不可用起点/登记端点、令牌桶（含当前令牌与补充时刻）、固定窗口配额（window、used）、活动连接与建连时端点快照、粘性映射、等待队列、限流配额与各类分钟历史、故障计划/统计/恢复基线、请求与采样指标及 mo 增量游标缓存、全部告警状态机（fe/ea/pa/xa/na/le/ua/wa）及其转换历史、配置提交历史与 next_rev、审计事件与段级差异、配置预约、全池端点切换预约及其生命周期审计窗口与下一 seq。
 - `digest` 为对紧凑 UTF-8 编码的 `{"version":1,"state":...}`（`ensure_ascii=False`、分隔符 `,:`、无末尾换行）计算的小写 SHA-256 十六进制；相同状态逐字节导出相同结果。
 - `si` 接受两种严格键序形式（键须按各自次序出现）：四键 `op,version,digest,state` 为无条件原子替换；五键 `op,base,version,digest,state` 为带基线摘要的乐观并发形式，调用方把 `sd` 返回的 `before` 或此前 `se` 返回的 `digest` 作为替换前提，避免预览后运行态已变化时覆盖新状态。两形式 `version` 仅收 1（非 bool 整数）；五键的 `base` 与两形式的 `digest` 均为小写 64 位十六进制 SHA-256；`state` 含义、检查点版本与 8MiB 限制沿用四键形式。
 - 五键形式先按现有规则校验键序、字段类型、UTF-8、版本、候选编码大小、候选摘要与状态语义（错误优先级同四键），再按 `se` 的规范化规则取得执行到该操作时的当前状态及摘要。若当前摘要等于候选 `digest`，视为成功的幂等重报——即使 `base` 已不等于当前摘要也不再次替换；否则只有 `base` 等于当前摘要时才原子导入，`base` 不匹配报 STATE/4。成功后原子替换当前状态，返回固定键序 `op,digest,ok`（`ok=true`，`digest` 为候选摘要）；连续重报（含 `base` 已过期的幂等重报）逐字节返回同一结果。
@@ -313,6 +313,17 @@
 - 全部项目可执行时返回 `APPLIED`：先按预约顺序切换需要变化的端点，再按全局建连顺序关闭列出的连接并删除预约。排空 D 状态后端若因此失去最后连接，沿用 `ei`/`ej` 的现有规则转为 X，`end` 取 `now`，`forced` 维持原值不变；不消费队列、令牌或配额，也不重新调度。
 - 结果固定键序为 `op,now,status,digest,at,items,affected,closed`。`EMPTY` 的 `digest` 与 `at` 为 null，`items` 为空数组且计数为零；其他状态回显预约身份（digest、at），`affected` 为各项 `cids` 总数，只有 `APPLIED` 的 `closed` 等于 `affected`，其余状态 `closed` 为 0。
 - 字段集合、键序、类型、范围、UTF-8 编码或时钟倒退报 INPUT/2；失败无 stdout 并回滚整批变化和时钟。`ed` 没有 BACKEND/STATE 错误路径：未到期、后端已删除与前提冲突都是成功结果的 `status`。`se` 与 `si` 继续保存预约（`ep_switch` 段），现有端点预约入口行为不变；`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节确定性。单次时间与结果额外空间均为 O(N+C)（N 为预约项数、C 为活动连接数），不新增持久状态，仅使用 Python 标准库。
+
+## 端点切换预约生命周期审计：ek
+
+在既有端点切换预约的建立、替换、取消、预演与到期执行之上，按稳定游标记录真正改变预约状态的操作；预约消失后可凭审计追查原因。审计使用独立且不复用的 seq（与配置审计 rev 无关），自 1 递增，事件按 seq 升序仅保留最近 64 条，超额淘汰最旧项。
+
+- 仅在预约状态真正改变时原子记录一条事件，动作固定为五种：`es` 从空状态建立记 `SET`；`es` 以不同身份（摘要或触发时刻不同）覆盖既有预约记 `REPLACE`；`eo` 首次替换（旧身份匹配、新身份不同）记 `REPLACE`；`eu` 身份匹配的成功取消记 `CANCEL`；`ei` 成功应用记 `APPLY`；`ed` 仅在结果为 `APPLIED` 时记 `APPLY`；成功的 `ci`、`cb`、`cu`、`ca` 清除现存端点预约记 `CLEAR`（无预约可清则不记）。
+- 不产生事件的情形：`es`/`eo` 相同身份的幂等重报（不重写预约）、`eu` 无预约的空取消（`cancelled=false`）、`ed` 的 `EMPTY`/`WAITING`/`MISSING`/`CONFLICT` 结果、所有失败操作（不分配 seq、不追加），以及全部只读操作（`en`、`ev`、`ew`、`ek` 等）。事件与预约变更原子提交：原操作失败不留记录，整批失败同时回滚时钟、预约、端点/连接与审计序号。
+- `ek`：输入严格按键序 `op,after,limit` 排列（键须按此序出现）。`after` 为 0..10^18、`limit` 为 1..64 的非 bool 整数；只读，不推进显式时钟、不改变窗口。字段集合、键序、类型或范围非法报 INPUT/2。
+- 令最新已分配 seq 为 `next-1`（初始 0）；`after` 大于它时报 STATE/4。历史非空且 `after` 早于最旧保留事件 seq 减一时，游标之前已有事件被淘汰：自最旧事件读取并置 `truncated=true`；否则 `truncated=false`，只取 seq 大于 `after` 的事件。事件按 seq 升序、至多 `limit` 项。`next` 取末项 seq，无结果时等于请求 `after`；`more` 表示该页之后仍有可读事件。空历史配 `after=0` 返回空数组、`next=0`、`truncated=false`、`more=false`。
+- 返回固定键序 `op,after,next,truncated,more,events`；每项固定键序 `seq,now,action,before,after`。`now` 取造成该次变更的显式时钟；`action` ∈ SET/REPLACE/CANCEL/APPLY/CLEAR；`before` 与 `after` 均为 null 或固定键序 `digest,at` 的预约身份（SET 的 before 为 null；CANCEL/APPLY/CLEAR 的 after 为 null）。
+- `se` 完整保存审计窗口及下一 seq（state 顶层段 `ep_audit`，键序 `next,events`）；`si` 恢复后继续分配与查询的结果与直接继续逐字节一致，恢复时校验 seq 连续递增、动作与前后身份相符、相邻事件首尾相链、末事件与当前预约一致，矛盾计数或非法状态组合报 STATE/4；`sd`、`sx`、`sm` 按既有检查点规则观察该段差异。写入为 O(1)，`ek` 时间与结果空间 O(limit)（窗口恒 ≤64），总空间 O(64)，仅用 Python 标准库；`run`、`record`、`replay` 继续保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，全部既有入口的结果、异常类型和退出码不变。
 
 ## 测试
 
