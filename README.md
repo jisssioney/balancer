@@ -395,18 +395,22 @@
 - 字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2；`last>latest` 返回 STATE/4，且输入错误优先于状态错误。失败无 stdout，并回滚同批此前变化；重复查询逐字节一致。经 `se` 导出、`si` 恢复后同一查询仍须逐字节一致。
 - 全部序号空间 0..latest 只有 O(A) 段恒值区间（点 0、淘汰前缀、最旧事件 before 边界点及每条保留事件 after 的生效区间），故单次时间与结果额外空间均为 O(A)，A 是最多六十四条保留事件，不随序号跨度（可达 10¹⁸）增长；仅用 Python 标准库；`run`、`record`、`replay` 继续使用固定键序紧凑 UTF-8 JSON、单个末尾换行并保持逐字节一致，`ek`、`el`、`em`、`eg`、`ee`、`se`、`si` 与其他入口行为不变。
 
-## 端点切换预约审计业务时间快照批量查询：et
+## 端点切换预约审计业务时间快照查询：et
 
-在 `ee`/`ef` 的六十四条保留窗口之上，用一批显式业务时间直接查询各时刻处理完成后的预约快照，调用方无需先把时间换算成审计 seq。只读：不接受 `now`，不推进显式时钟，不产生审计事件，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+在 `ee`/`ef` 的六十四条保留窗口之上，用显式业务时间直接查询各时刻处理完成后的预约快照，调用方无需先把时间换算成审计 seq。支持两种严格形态：离散批量 `op,times` 与连续闭区间 `op,first,last`。只读：不接受 `now`，不推进显式时钟，不产生审计事件，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
 
-- `et`：字段严格按 `op,times` 排列（键须按此序出现，乱序报 INPUT）。`times` 为 1..64 项的数组，每项为 0..10⁹ 的非 bool 整数，且严格递增、不重复。
-- 返回固定键序 `op,latest,truncated,items`：`latest` 为已分配最大审计 seq（初始 0）；`items` 与 `times` 等长且保持输入顺序，每项固定键序 `time,seq,state,digest,at`。
-- `state` 仅为 `EMPTY`、`ACTIVE`、`UNKNOWN`：`ACTIVE` 回显预约的六十四位小写摘要与触发时刻，另两态的 `digest`、`at` 为 null。
-  - 每项的 `time` 表示按 seq 升序处理完全部 `event.now<=time` 的事件后的状态；同一 `now` 的事件整组处理，终态以该组最大 seq 事件的 `after` 为准，`seq` 回显最后应用的事件序号；
-  - 完整历史在首条事件之前为 `EMPTY` 且 `seq=0`；空历史的合法查询也均如此；
-  - 若窗口已淘汰前缀，`time` 早于最旧保留事件的 `now` 时返回 `UNKNOWN` 且 `seq=null`；否则以最旧事件的 `before` 为起点，应用 `now` 不晚于 `time` 的保留事件；`time` 等于最旧 `now` 时处理该时刻全部保留事件。
-- `truncated` 仅在本次至少一项为 `UNKNOWN` 时为 true。任一 `time` 晚于操作开始时的全局逻辑时钟时整项请求返回 STATE/4（时钟从未推进时任何 `time` 均属未来）；经 `se` 导出、`si` 恢复后，同一查询仍须逐字节一致。
-- 字段集合、键序、UTF-8 编码、容器、数量、整数类型（排除 bool）、范围或递增关系非法时返回 INPUT/2，且输入错误优先于状态错误。失败不产生 stdout，并回滚同批此前变化；成功查询不得改变任何运行态。单次时间上界 O(P+A)、结果额外空间 O(P)，其中 P 为查询项数（≤64）、A 不超过六十四条保留事件；仅使用 Python 标准库，现有 `ek`、`el`、`em`、`eg`、`ee`、`ef`、端点切换、检查点入口行为及状态结构不变，`run`、`record`、`replay` 继续使用固定键序紧凑 UTF-8 JSON 与单个末尾换行。
+- `et`（离散形态）：字段严格按 `op,times` 排列（键须按此序出现，乱序报 INPUT）。`times` 为 1..64 项的数组，每项为 0..10⁹ 的非 bool 整数，且严格递增、不重复。
+  - 返回固定键序 `op,latest,truncated,items`：`latest` 为已分配最大审计 seq（初始 0）；`items` 与 `times` 等长且保持输入顺序，每项固定键序 `time,seq,state,digest,at`。
+- `et`（区间形态）：字段严格按 `op,first,last` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 为 0..10⁹ 的非 bool 整数且 `first≤last`，共同给出业务时间闭区间 `[first,last]`，区间包含两端。
+  - 返回固定键序 `op,first,last,latest,truncated,segments,summary`；`latest` 为已分配最大审计 seq（初始 0）。
+  - `segments` 按业务时间升序完整覆盖 `[first,last]`（首项 `first`、末项 `last`、相邻首尾相接），仅合并相邻时刻中 `seq`、`state`、`digest`、`at` 全部相同者为最大连续区段；每项固定键序 `first,last,seq,state,digest,at`。
+  - `summary` 固定键序 `points,segments,unknown,empty,active`：`points=last-first+1`；`segments` 为返回区段数；`unknown`、`empty`、`active` 统计三态各自覆盖的时刻数（段长之和），满足 `points=unknown+empty+active`。
+- 两形态的逐时刻口径完全一致，`state` 仅为 `EMPTY`、`ACTIVE`、`UNKNOWN`：`ACTIVE` 回显预约的六十四位小写摘要与触发时刻，另两态的 `digest`、`at` 为 null。
+  - 每个时刻表示按 seq 升序处理完全部 `event.now<=该时刻` 的事件后的状态；同一 `now` 的事件整组处理，终态以该组最大 seq 事件的 `after` 为准，`seq` 回显最后应用的事件序号；
+  - 完整历史在首条事件之前为 `EMPTY` 且 `seq=0`；空历史且时钟已推进时，区间形态返回覆盖 `[first,last]` 的单个 `EMPTY` 区段；
+  - 若窗口已淘汰前缀，该时刻早于最旧保留事件的 `now` 时为 `UNKNOWN` 且 `seq`、`digest`、`at` 均为 null；否则以最旧事件的 `before` 为起点，应用 `now` 不晚于该时刻的保留事件；时刻等于最旧 `now` 时处理该时刻全部保留事件。区间形态下淘汰前缀压缩为单个 `UNKNOWN` 区段。
+- `truncated` 仅在本次结果含至少一个 `UNKNOWN` 时刻时为 true。任一查询时刻（离散形态为最大 `time`、区间形态为 `last`）晚于操作开始时的全局逻辑时钟时整项请求返回 STATE/4（时钟从未推进时任何区间均属未来）；经 `se` 导出、`si` 恢复后，同一查询仍须逐字节一致。
+- 字段集合、键序、UTF-8 编码、容器、数量、整数类型（排除 bool）、范围、递增或区间关系非法时返回 INPUT/2，且输入错误优先于状态错误。失败不产生 stdout，并回滚同批此前变化；成功查询不得改变任何运行态。离散形态单次时间上界 O(P+A)、结果额外空间 O(P)（P≤64）；区间形态全部业务时间 0..当前时钟只有 O(A) 个恒值区域（最旧事件 `now` 之前至多一段，其后每个同 `now` 事件组一段、末组延伸至当前时钟），故单次时间与结果额外空间均为 O(A)，不随区间跨度（可达 10⁹）逐点扫描，其中 A 不超过六十四条保留事件；仅使用 Python 标准库，现有 `ek`、`el`、`em`、`eg`、`ee`、`ef`、端点切换、检查点入口行为及状态结构不变，`run`、`record`、`replay` 继续使用固定键序紧凑 UTF-8 JSON 与单个末尾换行。
 
 ## 测试
 

@@ -4768,32 +4768,54 @@ def parse_op(raw_op):
         return ("ef", first, last)
 
     if name == "et":
-        # 端点切换预约审计业务时间快照批量查询（只读）：精确键序 op,times
-        # （键须按此序出现，乱序报 INPUT）。times 为 1..64 项数组，每项为
-        # 0..10^9 的非 bool 整数且严格递增、不重复。不接受 now：不推进显
-        # 式时钟。字段集合、键序、UTF-8 编码、容器、数量、整数类型（排除
-        # bool）、范围或递增关系非法统一判 INPUT；任一 time 晚于操作开始
-        # 时的全局逻辑时钟留执行期判 STATE（INPUT 判定先于状态）。
-        if list(raw_op) != ["op", "times"]:
-            fail(EXIT_INPUT, "INPUT")
-        times = raw_op["times"]
-        if not isinstance(times, list) or not 1 <= len(times) <= 64:
-            fail(EXIT_INPUT, "INPUT")
-        previous_time = -1
-        normalized_times = []
-        for tm in times:
+        # 端点切换预约审计业务时间快照查询（只读）：支持两种严格形态。
+        # 离散形态键序 op,times：times 为 1..64 项数组，每项为 0..10^9 的
+        # 非 bool 整数且严格递增、不重复。
+        # 连续闭区间形态键序 op,first,last（键须按此序出现，乱序报
+        # INPUT）：first、last 为 0..10^9 的非 bool 整数且 first<=last，共
+        # 同给出业务时间闭区间 [first,last]。
+        # 两形态均不接受 now、不推进显式时钟。字段集合、键序、UTF-8 编
+        # 码、容器、数量、整数类型（排除 bool）、范围或递增/区间关系非法
+        # 统一判 INPUT；任一查询时刻晚于操作开始时的全局逻辑时钟留执行期
+        # 判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) == ["op", "times"]:
+            times = raw_op["times"]
+            if not isinstance(times, list) or not 1 <= len(times) <= 64:
+                fail(EXIT_INPUT, "INPUT")
+            previous_time = -1
+            normalized_times = []
+            for tm in times:
+                if (
+                    not isinstance(tm, int)
+                    or isinstance(tm, bool)
+                    or not 0 <= tm <= 10 ** 9
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                # 严格递增即同时排除重复（相等）与乱序（倒退）。
+                if tm <= previous_time:
+                    fail(EXIT_INPUT, "INPUT")
+                previous_time = tm
+                normalized_times.append(tm)
+            return ("et", "points", tuple(normalized_times))
+        if list(raw_op) == ["op", "first", "last"]:
+            first = raw_op["first"]
             if (
-                not isinstance(tm, int)
-                or isinstance(tm, bool)
-                or not 0 <= tm <= 10 ** 9
+                not isinstance(first, int)
+                or isinstance(first, bool)
+                or not 0 <= first <= 10 ** 9
             ):
                 fail(EXIT_INPUT, "INPUT")
-            # 严格递增即同时排除重复（相等）与乱序（倒退）。
-            if tm <= previous_time:
+            last = raw_op["last"]
+            if (
+                not isinstance(last, int)
+                or isinstance(last, bool)
+                or not 0 <= last <= 10 ** 9
+            ):
                 fail(EXIT_INPUT, "INPUT")
-            previous_time = tm
-            normalized_times.append(tm)
-        return ("et", tuple(normalized_times))
+            if first > last:
+                fail(EXIT_INPUT, "INPUT")
+            return ("et", "range", first, last)
+        fail(EXIT_INPUT, "INPUT")
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -15677,120 +15699,251 @@ def run(raw):
             )
 
         elif op[0] == "et":
-            # 端点切换预约审计业务时间快照批量查询（只读，不接受 now、不推
-            # 进时钟、不产生审计事件，不改预约、连接、后端、审计窗口或下一
-            # seq）：以显式业务时间批量查询按 seq 升序处理完全部
-            # event.now<=time 的保留事件后的预约快照，调用方无需自行把时间
-            # 换算成 seq。同一 now 的事件整组处理，终态取该组最大 seq 事件
-            # 的 after，seq 回显最后应用的事件序号。
+            # 端点切换预约审计业务时间快照查询（只读，不接受 now、不推进
+            # 时钟、不产生审计事件，不改预约、连接、后端、审计窗口或下一
+            # seq），支持两种形态：
+            # - points：op,times，按一批离散业务时间返回逐项快照；
+            # - range：op,first,last，把闭区间 [first,last] 内各业务时刻
+            #   的快照压缩为相邻同 seq/状态/身份的连续区段。
             #
-            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。任一 time
-            # 晚于操作开始时的全局逻辑时钟整项报 STATE（形状类 INPUT 已在
-            # 解析期先行判过；INPUT 先于状态）。时钟从未推进（last_now 为
-            # None）时任何 time 都晚于时钟，一律 STATE。
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。任一查询
+            # 时刻晚于操作开始时的全局逻辑时钟整项报 STATE（形状类 INPUT
+            # 已在解析期先行判过；INPUT 先于状态）。时钟从未推进
+            # （last_now 为 None）时任何时刻都晚于时钟，一律 STATE。
             #
-            # 逐项口径：
-            # 1. time 早于最旧保留事件的 now 且前缀已随窗口淘汰（最旧保留
+            # 逐时刻口径（两形态完全一致）：
+            # 1. 时刻早于最旧保留事件的 now 且前缀已随窗口淘汰（最旧保留
             #    seq>1）——判定所需历史缺失：UNKNOWN、seq/digest/at 均为
             #    null；
             # 2. 完整历史（最旧保留事件即 seq1）在首条事件之前恒为
             #    EMPTY、seq=0；空历史的合法查询也均如此；
-            # 3. 否则以最旧保留事件的 before 为起点，应用所有 now<=time 的
-            #    保留事件（time 等于最旧 now 时该刻整组全部处理）：终态身
-            #    份取最后应用事件的 after（time 不早于最旧 now，至少应用最
-            #    旧事件一条），seq 回显最后应用事件序号；身份为 null 是
-            #    EMPTY，非空为 ACTIVE 并回显 digest、at。
-            # truncated 仅在至少一项 UNKNOWN 时为 true。
-            #
-            # times 严格递增，事件按 seq（即追加序）升序且事件 now 非递减
-            # （共用非递减时钟，si 同样校验），故单趟双指针即可：每项至多
-            # 把游标推过所有 now<=time 的事件，时间 O(P+A)、结果额外空间
-            # O(P)（P≤64、A≤64）。
-            _, times = op
-            if last_now is None or times[-1] > last_now:
-                fail(EXIT_STATE, "STATE")
-            latest = ep_audit_seq - 1
-            window = list(ep_audit_events)
-            items = []
-            truncated = False
-            if not window:
-                # 空历史：任何合法 time（不晚于当前时钟）都落在首条事件之
-                # 前，状态恒为 EMPTY、seq=0。
-                for tm in times:
-                    items.append(
-                        {
-                            "time": tm,
-                            "seq": 0,
-                            "state": "EMPTY",
-                            "digest": None,
-                            "at": None,
-                        }
-                    )
-            else:
-                oldest_event = window[0]
-                oldest_seq = oldest_event[0]
-                oldest_now = oldest_event[1]
-                # 最旧保留事件即 seq1 时前缀从未缺失：更早时刻（首条事件
-                # 之前）一律 EMPTY、seq=0；否则最旧事件之前的历史已淘汰，
-                # 早于最旧 now 的查询无法判定。
-                prefix_evicted = oldest_seq > 1
-                # cursor 为首个未应用事件下标；last_seq 为最后应用事件 seq；
-                # identity 为应用后终态身份。
-                cursor = 0
-                last_seq = None
-                identity = None
-                for tm in times:
-                    if tm < oldest_now and prefix_evicted:
-                        # time 早于最旧保留事件 now 且前缀已随窗口淘汰。
-                        state = "UNKNOWN"
-                        item_seq = None
-                        item_digest = None
-                        item_at = None
-                        truncated = True
-                    elif tm < oldest_now:
-                        # 完整历史（最旧保留即 seq1）首条事件之前：从未有
-                        # 预约，EMPTY、seq=0。
-                        state = "EMPTY"
-                        item_seq = 0
-                        item_digest = None
-                        item_at = None
-                    else:
-                        # 以最旧事件 before 为起点应用 now<=time 的保留事
-                        # 件；tm>=最旧 now 时 while 至少应用最旧事件，同
-                        # now 整组处理完才停。更大的 time 复用 cursor 续
-                        # 扫，整窗事件只过一遍。
-                        while (
-                            cursor < len(window)
-                            and window[cursor][1] <= tm
-                        ):
-                            last_seq = window[cursor][0]
-                            identity = window[cursor][4]
-                            cursor += 1
-                        item_seq = last_seq
-                        if identity is None:
+            # 3. 否则以最旧保留事件的 before 为起点，应用所有 now<=该时刻
+            #    的保留事件（时刻等于最旧 now 时该刻整组全部处理）：同一
+            #    now 的事件整组处理，终态身份取组内最大 seq 事件的 after，
+            #    seq 回显最后应用事件序号；身份为 null 是 EMPTY，非空为
+            #    ACTIVE 并回显 digest、at。
+            et_mode = op[1]
+            if et_mode == "points":
+                _, _, times = op
+                if last_now is None or times[-1] > last_now:
+                    fail(EXIT_STATE, "STATE")
+                latest = ep_audit_seq - 1
+                window = list(ep_audit_events)
+                items = []
+                truncated = False
+                if not window:
+                    # 空历史：任何合法 time（不晚于当前时钟）都落在首条
+                    # 事件之前，状态恒为 EMPTY、seq=0。
+                    for tm in times:
+                        items.append(
+                            {
+                                "time": tm,
+                                "seq": 0,
+                                "state": "EMPTY",
+                                "digest": None,
+                                "at": None,
+                            }
+                        )
+                else:
+                    oldest_event = window[0]
+                    oldest_seq = oldest_event[0]
+                    oldest_now = oldest_event[1]
+                    # 最旧保留事件即 seq1 时前缀从未缺失：更早时刻（首条
+                    # 事件之前）一律 EMPTY、seq=0；否则最旧事件之前的历
+                    # 史已淘汰，早于最旧 now 的查询无法判定。
+                    prefix_evicted = oldest_seq > 1
+                    # cursor 为首个未应用事件下标；last_seq 为最后应用事
+                    # 件 seq；identity 为应用后终态身份。
+                    cursor = 0
+                    last_seq = None
+                    identity = None
+                    for tm in times:
+                        if tm < oldest_now and prefix_evicted:
+                            # time 早于最旧保留事件 now 且前缀已随窗口淘
+                            # 汰。
+                            state = "UNKNOWN"
+                            item_seq = None
+                            item_digest = None
+                            item_at = None
+                            truncated = True
+                        elif tm < oldest_now:
+                            # 完整历史（最旧保留即 seq1）首条事件之前：从
+                            # 未有预约，EMPTY、seq=0。
                             state = "EMPTY"
+                            item_seq = 0
                             item_digest = None
                             item_at = None
                         else:
-                            state = "ACTIVE"
-                            item_digest, item_at = identity
-                    items.append(
+                            # 以最旧事件 before 为起点应用 now<=time 的保
+                            # 留事件；tm>=最旧 now 时 while 至少应用最旧
+                            # 事件，同 now 整组处理完才停。更大的 time 复
+                            # 用 cursor 续扫，整窗事件只过一遍。
+                            while (
+                                cursor < len(window)
+                                and window[cursor][1] <= tm
+                            ):
+                                last_seq = window[cursor][0]
+                                identity = window[cursor][4]
+                                cursor += 1
+                            item_seq = last_seq
+                            if identity is None:
+                                state = "EMPTY"
+                                item_digest = None
+                                item_at = None
+                            else:
+                                state = "ACTIVE"
+                                item_digest, item_at = identity
+                        items.append(
+                            {
+                                "time": tm,
+                                "seq": item_seq,
+                                "state": state,
+                                "digest": item_digest,
+                                "at": item_at,
+                            }
+                        )
+                results.append(
+                    {
+                        "op": "et",
+                        "latest": latest,
+                        "truncated": truncated,
+                        "items": items,
+                    }
+                )
+            else:
+                # 连续闭区间形态：全部业务时间 0..last_now 上只有 O(A) 个
+                # 恒值区域——最旧事件 now 之前至多一个区域（完整历史为
+                # EMPTY/seq0，前缀淘汰为 UNKNOWN/null），其后每个同 now 事
+                # 件组一个区域（组内整组生效、终态取组内最大 seq 的
+                # after），末组延伸至当前时钟。区域数 ≤ A+1（A≤64），不
+                # 随区间跨度（可达 10^9）逐点扫描；裁剪到 [first,last]
+                # 后仅合并 seq、state、digest、at 全部相同的相邻区域。
+                _, _, first, last = op
+                if last_now is None or last > last_now:
+                    fail(EXIT_STATE, "STATE")
+                latest = ep_audit_seq - 1
+                window = list(ep_audit_events)
+                regions = []
+                if not window:
+                    # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY/seq0，
+                    # 裁剪后即单个 EMPTY 区段。
+                    regions.append((0, last_now, 0, "EMPTY", None))
+                else:
+                    oldest_seq = window[0][0]
+                    oldest_now = window[0][1]
+                    prefix_evicted = oldest_seq > 1
+                    # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，
+                    # 不入列）：完整历史 EMPTY/seq0；前缀已淘汰则
+                    # UNKNOWN，seq 与身份均为 null。
+                    if oldest_now >= 1:
+                        if prefix_evicted:
+                            regions.append(
+                                (0, oldest_now - 1, None, "UNKNOWN", None)
+                            )
+                        else:
+                            regions.append(
+                                (0, oldest_now - 1, 0, "EMPTY", None)
+                            )
+                    # 同 now 事件整组为一个恒值区域：终态取组内最大 seq
+                    # 事件的 after（事件按 seq 升序，即组末事件）。
+                    index = 0
+                    event_count = len(window)
+                    while index < event_count:
+                        group_now = window[index][1]
+                        group_seq = window[index][0]
+                        group_identity = window[index][4]
+                        index += 1
+                        while (
+                            index < event_count
+                            and window[index][1] == group_now
+                        ):
+                            group_seq = window[index][0]
+                            group_identity = window[index][4]
+                            index += 1
+                        group_end = (
+                            window[index][1] - 1
+                            if index < event_count
+                            else last_now
+                        )
+                        group_state = (
+                            "ACTIVE" if group_identity is not None
+                            else "EMPTY"
+                        )
+                        regions.append(
+                            (
+                                group_now,
+                                group_end,
+                                group_seq,
+                                group_state,
+                                group_identity,
+                            )
+                        )
+                segments = []
+                counts = {"UNKNOWN": 0, "EMPTY": 0, "ACTIVE": 0}
+
+                def append_time_region(
+                    region_first, region_last, region_seq, state, identity
+                ):
+                    length = region_last - region_first + 1
+                    counts[state] += length
+                    merge_key = (region_seq, state, identity)
+                    # 仅合并 seq、state、digest、at 全部相同的相邻区域；
+                    # 构造上相邻区域必不同，此处兜底裁剪边界。
+                    if (
+                        segments
+                        and segments[-1]["_key"] == merge_key
+                    ):
+                        segments[-1]["last"] = region_last
+                        return
+                    if state == "ACTIVE":
+                        seg_digest, seg_at = identity
+                    else:
+                        seg_digest, seg_at = None, None
+                    segments.append(
                         {
-                            "time": tm,
-                            "seq": item_seq,
+                            "first": region_first,
+                            "last": region_last,
+                            "seq": region_seq,
                             "state": state,
-                            "digest": item_digest,
-                            "at": item_at,
+                            "digest": seg_digest,
+                            "at": seg_at,
+                            "_key": merge_key,
                         }
                     )
-            results.append(
-                {
-                    "op": "et",
-                    "latest": latest,
-                    "truncated": truncated,
-                    "items": items,
-                }
-            )
+
+                for region_lo, region_hi, region_seq, state, identity in (
+                    regions
+                ):
+                    overlap_first = max(first, region_lo)
+                    overlap_last = min(last, region_hi)
+                    if overlap_first <= overlap_last:
+                        append_time_region(
+                            overlap_first,
+                            overlap_last,
+                            region_seq,
+                            state,
+                            identity,
+                        )
+                for segment in segments:
+                    del segment["_key"]
+                points = last - first + 1
+                results.append(
+                    {
+                        "op": "et",
+                        "first": first,
+                        "last": last,
+                        "latest": latest,
+                        "truncated": counts["UNKNOWN"] > 0,
+                        "segments": segments,
+                        "summary": {
+                            "points": points,
+                            "segments": len(segments),
+                            "unknown": counts["UNKNOWN"],
+                            "empty": counts["EMPTY"],
+                            "active": counts["ACTIVE"],
+                        },
+                    }
+                )
 
         elif op[0] == "se":
             # 运行态检查点导出：不推进时钟、不改状态。state 为规范化 JSON

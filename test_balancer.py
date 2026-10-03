@@ -29840,5 +29840,527 @@ class EpSwitchAuditTimeSnapshotBatchTest(unittest.TestCase):
         )
 
 
+class EpSwitchAuditTimeRangeFoldTest(unittest.TestCase):
+    """et 连续闭区间形态 op,first,last（只读）——把业务时间闭区间
+    [first,last] 内各时刻的预约快照压缩为相邻同 seq/状态/身份的连续区
+    段，逐时刻口径与离散 op,times 形态完全一致：同一 now 事件整组生效、
+    终态取组内最大 seq 的 after；完整历史首事件前与空历史为
+    EMPTY/seq=0；窗口淘汰前缀时早于最旧保留事件 now 的时刻为
+    UNKNOWN/seq/digest/at=null，其余从最旧事件 before 起重建。
+    segments 升序完整覆盖；summary 键序 points,segments,unknown,empty,
+    active 且 points=last-first+1=三态之和；truncated 仅含 UNKNOWN 时为
+    true；last 晚于操作开始时钟报 STATE/4，时钟从未推进任何区间均属未
+    来；INPUT 优先。不逐点扫描、不推进时钟、不写审计；se/si 与
+    record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def etr(self, first, last):
+        return {"op": "et", "first": first, "last": last}
+
+    def fold(self, results):
+        return [r for r in results if r["op"] == "et"][-1]
+
+    def seg_tuples(self, result):
+        return [
+            (s["first"], s["last"], s["seq"], s["state"],
+             s["digest"], s["at"])
+            for s in result["segments"]
+        ]
+
+    def timeline_ops(self):
+        """同 et 离散用例的七事件三身份时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def replace_chain_ops(self, count):
+        """count 条交替身份的 SET/REPLACE 链：now=10+i、at=1000+i，所有
+        事件 after 非空、身份两两不同。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            target = items1 if i % 2 == 0 else items2
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    def assert_coverage(self, result, first, last):
+        segments = result["segments"]
+        self.assertEqual(segments[0]["first"], first)
+        self.assertEqual(segments[-1]["last"], last)
+        for earlier, later in zip(segments, segments[1:]):
+            self.assertEqual(later["first"], earlier["last"] + 1)
+            # 只合并 seq、state、digest、at 全部相同的相邻时刻。
+            self.assertNotEqual(
+                (earlier["seq"], earlier["state"],
+                 earlier["digest"], earlier["at"]),
+                (later["seq"], later["state"], later["digest"], later["at"]),
+            )
+        summary = result["summary"]
+        self.assertEqual(
+            summary["points"],
+            sum(s["last"] - s["first"] + 1 for s in segments),
+        )
+        self.assertEqual(summary["segments"], len(segments))
+        self.assertEqual(summary["points"], last - first + 1)
+        self.assertEqual(
+            summary["points"],
+            summary["unknown"] + summary["empty"] + summary["active"],
+        )
+
+    # ---- 空历史与紧凑字节 ----
+
+    def test_empty_history_compact_bytes(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etr(0, 5),
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"add","ok":true},{"op":"et",'
+            b'"first":0,"last":5,"latest":0,"truncated":false,'
+            b'"segments":[{"first":0,"last":5,"seq":0,'
+            b'"state":"EMPTY","digest":null,"at":null}],"summary":'
+            b'{"points":6,"segments":1,"unknown":0,"empty":6,'
+            b'"active":0}}],"backends":[{"id":"a","weight":100}]}\n',
+        )
+
+    def test_empty_history_subrange_single_empty_segment(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etr(2, 4),
+        ]
+        result = self.fold(self.run_ops(ops))
+        self.assertEqual(
+            self.seg_tuples(result),
+            [(2, 4, 0, "EMPTY", None, None)],
+        )
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["summary"], {
+            "points": 3, "segments": 1, "unknown": 0,
+            "empty": 3, "active": 0,
+        })
+
+    def test_empty_history_clock_never_advanced_is_state(self):
+        self.failure([self.etr(0, 0)], 4, "STATE")
+        self.failure([self.etr(0, 10 ** 9)], 4, "STATE")
+
+    # ---- 键序与逐时刻口径 ----
+
+    def test_key_orders(self):
+        ops, _ = self.timeline_ops()
+        result = self.fold(self.run_ops(ops + [self.etr(0, 11)]))
+        self.assertEqual(
+            list(result),
+            ["op", "first", "last", "latest", "truncated",
+             "segments", "summary"],
+        )
+        self.assertEqual(result["latest"], 7)
+        self.assertEqual(
+            list(result["summary"]),
+            ["points", "segments", "unknown", "empty", "active"],
+        )
+        for segment in result["segments"]:
+            self.assertEqual(
+                list(segment),
+                ["first", "last", "seq", "state", "digest", "at"],
+            )
+
+    def test_full_timeline_segments(self):
+        ops, ids = self.timeline_ops()
+        d1, at1 = ids["A"]
+        d2, at2 = ids["B"]
+        dc, atc = ids["C"]
+        result = self.fold(self.run_ops(ops + [self.etr(0, 11)]))
+        self.assertFalse(result["truncated"])
+        self.assertEqual(self.seg_tuples(result), [
+            (0, 4, 0, "EMPTY", None, None),
+            (5, 5, 1, "ACTIVE", d1, at1),
+            (6, 6, 2, "ACTIVE", d2, at2),
+            (7, 7, 3, "EMPTY", None, None),
+            (8, 8, 4, "ACTIVE", d1, at1),
+            (9, 9, 5, "EMPTY", None, None),
+            (10, 10, 6, "ACTIVE", dc, atc),
+            (11, 11, 7, "EMPTY", None, None),
+        ])
+        self.assertEqual(result["summary"], {
+            "points": 12, "segments": 8, "unknown": 0,
+            "empty": 8, "active": 4,
+        })
+        self.assert_coverage(result, 0, 11)
+
+    def test_region_extends_to_clock_without_new_events(self):
+        # SET@10 后仅以 add b@20 推进时钟（不写端点审计）：ACTIVE/seq1 区
+        # 段须延伸至当前时钟 20，而不是止于事件 now。
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 10),
+            {"op": "add", "id": "b", "weight": 100, "d": 0, "now": 20},
+        ]
+        result = self.fold(self.run_ops(ops + [self.etr(0, 20)]))
+        self.assertEqual(self.seg_tuples(result), [
+            (0, 9, 0, "EMPTY", None, None),
+            (10, 20, 1, "ACTIVE", d1, 100),
+        ])
+        # 完全落在延伸尾部的子区间为单段。
+        tail = self.fold(self.run_ops(ops + [self.etr(15, 20)]))
+        self.assertEqual(self.seg_tuples(tail), [
+            (15, 20, 1, "ACTIVE", d1, 100),
+        ])
+        self.assertEqual(tail["summary"], {
+            "points": 6, "segments": 1, "unknown": 0,
+            "empty": 0, "active": 6,
+        })
+
+    def test_same_now_events_form_single_region(self):
+        # seq1 SET@10 A、seq2 REPLACE@10 B、seq3 CANCEL@13：时刻 10..12
+        # 整组生效为 B/seq2 一段，不得在组内拆出 seq1。
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 10),
+            self.es(items2, 0, 101, 10),
+            {"op": "eu", "digest": d2, "at": 101, "now": 13},
+        ]
+        result = self.fold(self.run_ops(ops + [self.etr(9, 13)]))
+        self.assertEqual(self.seg_tuples(result), [
+            (9, 9, 0, "EMPTY", None, None),
+            (10, 12, 2, "ACTIVE", d2, 101),
+            (13, 13, 3, "EMPTY", None, None),
+        ])
+        self.assert_coverage(result, 9, 13)
+
+    def test_subranges_clip_to_maximal_regions(self):
+        ops, ids = self.timeline_ops()
+        d2, at2 = ids["B"]
+        d1, at1 = ids["A"]
+        # 完全落在单一恒值区域 [6,6]。
+        result = self.fold(self.run_ops(ops + [self.etr(6, 6)]))
+        self.assertEqual(self.seg_tuples(result), [
+            (6, 6, 2, "ACTIVE", d2, at2),
+        ])
+        # 跨区域裁剪：[4,8] 边界随裁剪改写、逐时刻口径不变。
+        result = self.fold(self.run_ops(ops + [self.etr(4, 8)]))
+        self.assertEqual(self.seg_tuples(result), [
+            (4, 4, 0, "EMPTY", None, None),
+            (5, 5, 1, "ACTIVE", d1, at1),
+            (6, 6, 2, "ACTIVE", d2, at2),
+            (7, 7, 3, "EMPTY", None, None),
+            (8, 8, 4, "ACTIVE", d1, at1),
+        ])
+        self.assert_coverage(result, 4, 8)
+        # 首事件前的子区间保持 EMPTY/seq0。
+        pre = self.fold(self.run_ops(ops + [self.etr(1, 4)]))
+        self.assertEqual(self.seg_tuples(pre), [
+            (1, 4, 0, "EMPTY", None, None),
+        ])
+
+    def test_range_matches_discrete_points_every_time(self):
+        # 展开区间段后逐时刻与离散 op,times 结果一致（含淘汰窗口）。
+        for base, hi in (
+            (self.timeline_ops()[0], 11),
+            (self.replace_chain_ops(70)[0], 79),
+        ):
+            expected = {}
+            for offset in range(0, hi + 1, 64):
+                chunk = list(range(offset, min(offset + 64, hi + 1)))
+                results = self.run_ops(
+                    base + [{"op": "et", "times": chunk}]
+                )
+                point_result = [
+                    r for r in results if r["op"] == "et"
+                ][-1]
+                for item in point_result["items"]:
+                    expected[item["time"]] = (
+                        item["seq"], item["state"],
+                        item["digest"], item["at"],
+                    )
+            result = self.fold(self.run_ops(base + [self.etr(0, hi)]))
+            expanded = {}
+            for segment in result["segments"]:
+                for tm in range(segment["first"], segment["last"] + 1):
+                    expanded[tm] = (
+                        segment["seq"], segment["state"],
+                        segment["digest"], segment["at"],
+                    )
+            self.assertEqual(expanded, expected)
+
+    # ---- 淘汰窗口与 UNKNOWN ----
+
+    def test_evicted_window_unknown_prefix(self):
+        ops70, identities = self.replace_chain_ops(70)
+        # 保留 seq7..70，最旧保留事件 now=16；时刻 0..15 前缀已淘汰。
+        result = self.fold(self.run_ops(ops70 + [self.etr(0, 79)]))
+        segments = result["segments"]
+        self.assertEqual(segments[0], {
+            "first": 0, "last": 15, "seq": None,
+            "state": "UNKNOWN", "digest": None, "at": None,
+        })
+        self.assertEqual(segments[1]["first"], 16)
+        self.assertEqual(segments[1]["seq"], 7)
+        self.assertEqual(
+            (segments[1]["digest"], segments[1]["at"]), identities[6]
+        )
+        self.assertEqual(segments[-1]["last"], 79)
+        self.assertEqual(segments[-1]["seq"], 70)
+        self.assertTrue(result["truncated"])
+        summary = result["summary"]
+        self.assertEqual(summary["points"], 80)
+        self.assertEqual(summary["unknown"], 16)
+        self.assertEqual(summary["empty"], 0)
+        self.assertEqual(summary["active"], 64)
+        self.assert_coverage(result, 0, 79)
+
+    def test_evicted_clip_inside_known_not_truncated(self):
+        ops70, identities = self.replace_chain_ops(70)
+        result = self.fold(self.run_ops(ops70 + [self.etr(16, 79)]))
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["summary"]["unknown"], 0)
+        self.assertEqual(result["segments"][0]["first"], 16)
+        self.assertEqual(result["segments"][0]["seq"], 7)
+        self.assertEqual(result["segments"][-1]["last"], 79)
+
+    def test_evicted_partial_unknown_clip(self):
+        ops70, _ = self.replace_chain_ops(70)
+        result = self.fold(self.run_ops(ops70 + [self.etr(10, 20)]))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(self.seg_tuples(result)[0], (
+            10, 15, None, "UNKNOWN", None, None,
+        ))
+        self.assertEqual(result["segments"][-1]["last"], 20)
+        self.assertEqual(
+            result["summary"]["unknown"], 6
+        )
+        self.assertEqual(
+            result["summary"]["points"],
+            result["summary"]["unknown"]
+            + result["summary"]["empty"]
+            + result["summary"]["active"],
+        )
+
+    def test_full_64_window_prehistory_is_empty(self):
+        ops64, _ = self.replace_chain_ops(64)
+        result = self.fold(self.run_ops(ops64 + [self.etr(0, 10)]))
+        self.assertFalse(result["truncated"])
+        self.assertEqual(self.seg_tuples(result)[:1], [
+            (0, 9, 0, "EMPTY", None, None),
+        ])
+        self.assertEqual(
+            (result["segments"][1]["first"], result["segments"][1]["seq"]),
+            (10, 1),
+        )
+
+    # ---- INPUT 校验与优先级 ----
+
+    def test_input_validation(self):
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        bad = [
+            {"op": "et"},
+            {"op": "et", "first": 0},
+            {"op": "et", "last": 1},
+            {"op": "et", "first": 0, "last": 1, "now": 1},
+            {"op": "et", "last": 1, "first": 0},
+            {"op": "et", "times": [0], "first": 0},
+            {"op": "et", "first": 0, "last": 1, "times": [0]},
+            {"op": "et", "first": True, "last": 1},
+            {"op": "et", "first": 0, "last": False},
+            {"op": "et", "first": 1.0, "last": 1},
+            {"op": "et", "first": "1", "last": 1},
+            {"op": "et", "first": None, "last": 1},
+            {"op": "et", "first": [0], "last": 1},
+            {"op": "et", "first": 0, "last": {"x": 1}},
+            {"op": "et", "first": -1, "last": 0},
+            {"op": "et", "first": 0, "last": 10 ** 9 + 1},
+            {"op": "et", "first": 5, "last": 4},
+        ]
+        for request in bad:
+            self.failure(clock + [request], 2, "INPUT")
+
+    def test_input_precedence_over_state(self):
+        # 同时具备形状错误与未来区间：INPUT 优先。
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        self.failure(
+            clock + [{"op": "et", "first": True, "last": 999}], 2, "INPUT"
+        )
+        self.failure(
+            clock + [{"op": "et", "first": 5, "last": 4}], 2, "INPUT"
+        )
+        self.failure(
+            clock + [{"op": "et", "first": 0, "last": 10 ** 9 + 1}],
+            2, "INPUT",
+        )
+
+    # ---- STATE 失败与回滚 ----
+
+    def test_future_range_state_no_stdout(self):
+        ops, _ = self.timeline_ops()
+        self.failure(ops + [self.etr(0, 12)], 4, "STATE")
+        self.failure(ops + [self.etr(12, 12)], 4, "STATE")
+        self.failure(ops + [self.etr(0, 10 ** 9)], 4, "STATE")
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.etr(0, 6),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    # ---- 只读、se/si 与 record/replay ----
+
+    def test_does_not_advance_clock_or_write_audit(self):
+        ops, _ = self.timeline_ops()
+        without = self.run_ops(ops + [{"op": "se"}])
+        with_query = self.run_ops(
+            ops + [self.etr(0, 11), {"op": "se"}]
+        )
+        se_without = [r for r in without if r["op"] == "se"][-1]
+        se_with = [r for r in with_query if r["op"] == "se"][-1]
+        self.assertEqual(se_with, se_without)
+        results = self.run_ops(
+            ops + [self.etr(0, 11), {"op": "ek", "after": 0, "limit": 64}]
+        )
+        ek = [r for r in results if r["op"] == "ek"][-1]
+        self.assertEqual([e["seq"] for e in ek["events"]], list(range(1, 8)))
+
+    def test_repeated_query_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        results = self.run_ops(
+            ops + [self.etr(0, 11), self.etr(3, 9)]
+        )
+        ets = [r for r in results if r["op"] == "et"]
+        self.run_ops(ops + [self.etr(0, 11), self.etr(0, 11)])
+        repeated = self.run_ops(ops + [self.etr(3, 9), self.etr(3, 9)])
+        repeated_ets = [r for r in repeated if r["op"] == "et"]
+        self.assertEqual(repeated_ets[0], repeated_ets[1])
+        self.assertEqual(ets[1], repeated_ets[0])
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        for base, query in (
+            (self.timeline_ops()[0], self.etr(0, 11)),
+            (self.replace_chain_ops(70)[0], self.etr(0, 79)),
+        ):
+            results = self.run_ops(base + [{"op": "se"}, query])
+            se = next(r for r in results if r["op"] == "se")
+            before = self.fold(results)
+            results = self.run_ops([
+                {"op": "si", "version": se["version"], "digest": se["digest"],
+                 "state": se["state"]},
+                query,
+            ])
+            after = self.fold(results)
+            self.assertEqual(after, before)
+
+    def test_record_replay_byte_identical(self):
+        cases = [
+            self.timeline_ops()[0] + [self.etr(0, 11)],
+            self.replace_chain_ops(70)[0] + [self.etr(0, 79)],
+            # 失败批（STATE：未来区间）。
+            self.timeline_ops()[0] + [self.etr(0, 12)],
+        ]
+        for ops in cases:
+            raw = encode_ops(ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual(rec_err, b"")
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual(
+                (rep_code, rep_out, rep_err),
+                (run_code, run_out, run_err),
+            )
+
+    def test_span_up_to_1e9_without_point_scan(self):
+        # 区间跨度可达 10^9：仅 O(A) 段，不得逐点扫描。首事件 now=0，
+        # 故整段 [0,10^9] 只有 ACTIVE/seq1 一段，points=10^9+1。
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 0),
+            {"op": "add", "id": "b", "weight": 100, "d": 0,
+             "now": 10 ** 9},
+            self.etr(0, 10 ** 9),
+        ]
+        result = self.fold(self.run_ops(ops))
+        self.assertEqual(self.seg_tuples(result), [
+            (0, 10 ** 9, 1, "ACTIVE", d1, 100),
+        ])
+        self.assertEqual(result["summary"], {
+            "points": 10 ** 9 + 1, "segments": 1, "unknown": 0,
+            "empty": 0, "active": 10 ** 9 + 1,
+        })
+
+
 if __name__ == "__main__":
     unittest.main()
