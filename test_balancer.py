@@ -30362,5 +30362,552 @@ class EpSwitchAuditTimeRangeFoldTest(unittest.TestCase):
         })
 
 
+class EpSwitchAuditTimeRangeAggregateTest(unittest.TestCase):
+    """etg op,first,last（只读）——业务时间闭区间三态与预约身份占用汇总。
+    逐时刻口径与 et 区间形态完全一致；states 固定键序
+    unknown,empty,active 按覆盖点数计数且总和 last-first+1；identities
+    只汇总 ACTIVE，按身份在区间内首次生效时刻升序，每项固定键序
+    digest,at,points,segments,first,last，points 之和等于 states.active，
+    segments 为 et 口径互不相邻最大区段数。truncated 仅含 UNKNOWN 时为
+    true；空历史时钟已推进全 EMPTY、空 identities；last 晚于操作开始时
+    钟报 STATE/4，时钟从未推进任何请求均属未来；INPUT 优先。不逐点扫
+    描、不推进时钟、不写审计；se/si 与 record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def etg(self, first, last):
+        return {"op": "etg", "first": first, "last": last}
+
+    def etr(self, first, last):
+        return {"op": "et", "first": first, "last": last}
+
+    def fold(self, results):
+        return [r for r in results if r["op"] == "etg"][-1]
+
+    def timeline_ops(self):
+        """同 et 用例的七事件三身份时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。
+        B 与 C 摘要相同、at 不同，是两个身份；A 在 5、8 两次进入。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def replace_chain_ops(self, count):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            target = items1 if i % 2 == 0 else items2
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    def assert_invariants(self, result, first, last):
+        self.assertEqual(
+            list(result),
+            ["op", "first", "last", "latest", "truncated",
+             "states", "identities"],
+        )
+        self.assertEqual(list(result["states"]),
+                         ["unknown", "empty", "active"])
+        states = result["states"]
+        self.assertEqual(
+            states["unknown"] + states["empty"] + states["active"],
+            last - first + 1,
+        )
+        for identity in result["identities"]:
+            self.assertEqual(
+                list(identity),
+                ["digest", "at", "points", "segments",
+                 "first", "last"],
+            )
+            self.assertGreaterEqual(identity["first"], first)
+            self.assertLessEqual(identity["last"], last)
+            self.assertLessEqual(identity["first"], identity["last"])
+            self.assertGreaterEqual(identity["points"], 1)
+            self.assertGreaterEqual(identity["segments"], 1)
+            self.assertLessEqual(
+                identity["segments"], identity["points"]
+            )
+        self.assertEqual(
+            sum(identity["points"]
+                for identity in result["identities"]),
+            states["active"],
+        )
+        # identities 按身份在区间内首次生效时刻升序。
+        firsts = [identity["first"] for identity in result["identities"]]
+        self.assertEqual(firsts, sorted(firsts))
+        self.assertEqual(
+            len({(identity["digest"], identity["at"])
+                 for identity in result["identities"]}),
+            len(result["identities"]),
+        )
+
+    def expected_from_et(self, base_ops, first, last):
+        """以 et 区间形态结果为基准，独立展开逐时刻计算 etg 汇总。"""
+        results = self.run_ops(base_ops + [self.etr(first, last)])
+        et_result = [r for r in results if r["op"] == "et"][-1]
+        counts = {"UNKNOWN": 0, "EMPTY": 0, "ACTIVE": 0}
+        per_identity = {}
+        order = []
+        previous_key = None
+        for segment in et_result["segments"]:
+            length = segment["last"] - segment["first"] + 1
+            counts[segment["state"]] += length
+            if segment["state"] == "ACTIVE":
+                key = (segment["digest"], segment["at"])
+                stats = per_identity.get(key)
+                if stats is None:
+                    per_identity[key] = {
+                        "points": length,
+                        "segments": 1,
+                        "first": segment["first"],
+                        "last": segment["last"],
+                    }
+                    order.append(key)
+                else:
+                    stats["points"] += length
+                    stats["last"] = segment["last"]
+                    if key != previous_key:
+                        stats["segments"] += 1
+                previous_key = key
+            else:
+                previous_key = None
+        identities = []
+        for key in order:
+            digest_value, at_value = key
+            stats = per_identity[key]
+            identities.append({
+                "digest": digest_value,
+                "at": at_value,
+                "points": stats["points"],
+                "segments": stats["segments"],
+                "first": stats["first"],
+                "last": stats["last"],
+            })
+        return {
+            "latest": et_result["latest"],
+            "truncated": et_result["truncated"],
+            "states": {
+                "unknown": counts["UNKNOWN"],
+                "empty": counts["EMPTY"],
+                "active": counts["ACTIVE"],
+            },
+            "identities": identities,
+        }
+
+    # ---- 空历史与紧凑字节 ----
+
+    def test_empty_history_compact_bytes(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etg(0, 5),
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"add","ok":true},{"op":"etg",'
+            b'"first":0,"last":5,"latest":0,"truncated":false,'
+            b'"states":{"unknown":0,"empty":6,"active":0},'
+            b'"identities":[]}],"backends":[{"id":"a","weight":100}]}\n',
+        )
+
+    def test_empty_history_subrange(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etg(2, 4),
+        ]
+        result = self.fold(self.run_ops(ops))
+        self.assertEqual(result["latest"], 0)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["states"],
+                         {"unknown": 0, "empty": 3, "active": 0})
+        self.assertEqual(result["identities"], [])
+        self.assert_invariants(result, 2, 4)
+
+    def test_clock_never_advanced_is_state(self):
+        self.failure([self.etg(0, 0)], 4, "STATE")
+        self.failure([self.etg(0, 10 ** 9)], 4, "STATE")
+
+    # ---- 时间线聚合 ----
+
+    def test_full_timeline_aggregation(self):
+        ops, ids = self.timeline_ops()
+        result = self.fold(self.run_ops(ops + [self.etg(0, 11)]))
+        self.assertEqual(result["latest"], 7)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["states"],
+                         {"unknown": 0, "empty": 8, "active": 4})
+        d1, at1 = ids["A"]
+        d2, at2 = ids["B"]
+        dc, atc = ids["C"]
+        # 同摘要不同 at 是两个身份；A 在 5 与 8 两段。
+        self.assertEqual(result["identities"], [
+            {"digest": d1, "at": at1, "points": 2, "segments": 2,
+             "first": 5, "last": 8},
+            {"digest": d2, "at": at2, "points": 1, "segments": 1,
+             "first": 6, "last": 6},
+            {"digest": dc, "at": atc, "points": 1, "segments": 1,
+             "first": 10, "last": 10},
+        ])
+        self.assert_invariants(result, 0, 11)
+
+    def test_identity_order_is_first_effective_time(self):
+        ops, ids = self.timeline_ops()
+        # 裁剪掉时刻 5、6：区间内首生效顺序变为 A@8 后 C@10。
+        result = self.fold(self.run_ops(ops + [self.etg(7, 11)]))
+        d1, at1 = ids["A"]
+        dc, atc = ids["C"]
+        self.assertEqual(
+            [(i["digest"], i["at"]) for i in result["identities"]],
+            [(d1, at1), (dc, atc)],
+        )
+        identity_a = result["identities"][0]
+        self.assertEqual(
+            (identity_a["first"], identity_a["last"],
+             identity_a["points"], identity_a["segments"]),
+            (8, 8, 1, 1),
+        )
+        self.assertEqual(result["states"],
+                         {"unknown": 0, "empty": 3, "active": 2})
+
+    def test_region_extends_to_clock_without_new_events(self):
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 10),
+            {"op": "add", "id": "b", "weight": 100, "d": 0, "now": 20},
+        ]
+        result = self.fold(self.run_ops(ops + [self.etg(0, 20)]))
+        self.assertEqual(result["states"],
+                         {"unknown": 0, "empty": 10, "active": 11})
+        self.assertEqual(result["identities"], [
+            {"digest": d1, "at": 100, "points": 11, "segments": 1,
+             "first": 10, "last": 20},
+        ])
+        tail = self.fold(self.run_ops(ops + [self.etg(15, 20)]))
+        self.assertEqual(tail["states"],
+                         {"unknown": 0, "empty": 0, "active": 6})
+        self.assertEqual(tail["identities"][0]["first"], 15)
+
+    def test_same_now_group_is_one_continuous_coverage(self):
+        # SET A@10、REPLACE B@10 同刻整组生效为 B：10..12 只算 B 一段，
+        # A 在区间内从未生效，不得出现在 identities。
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 10),
+            self.es(items2, 0, 101, 10),
+            {"op": "eu", "digest": d2, "at": 101, "now": 13},
+        ]
+        result = self.fold(self.run_ops(ops + [self.etg(9, 13)]))
+        self.assertEqual(result["states"],
+                         {"unknown": 0, "empty": 2, "active": 3})
+        self.assertEqual(result["identities"], [
+            {"digest": d2, "at": 101, "points": 3, "segments": 1,
+             "first": 10, "last": 12},
+        ])
+
+    def test_reentry_counts_disjoint_segments(self):
+        # A@2 生效、A@4 取消、A@6 再建立：A 覆盖 2、3、6 三点两段。
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 2),
+            {"op": "eu", "digest": d1, "at": 100, "now": 4},
+            self.es(items1, 0, 100, 6),
+        ]
+        result = self.fold(self.run_ops(ops + [self.etg(0, 6)]))
+        self.assertEqual(result["identities"], [
+            {"digest": d1, "at": 100, "points": 3, "segments": 2,
+             "first": 2, "last": 6},
+        ])
+        self.assertEqual(result["states"],
+                         {"unknown": 0, "empty": 4, "active": 3})
+        # 只裁第一段：一段、两点。
+        first_only = self.fold(self.run_ops(ops + [self.etg(2, 3)]))
+        self.assertEqual(
+            (first_only["identities"][0]["points"],
+             first_only["identities"][0]["segments"],
+             first_only["identities"][0]["first"],
+             first_only["identities"][0]["last"]),
+            (2, 1, 2, 3),
+        )
+
+    def test_matches_et_range_every_range(self):
+        # 多种区间（含淘汰窗口）下 etg 与由 et 区段独立展开的汇总一致。
+        for base, hi in (
+            (self.timeline_ops()[0], 11),
+            (self.replace_chain_ops(70)[0], 79),
+        ):
+            for first, last in (
+                (0, hi), (0, 0), (hi, hi), (3, 9),
+                (0, hi // 2), (hi // 2, hi), (1, 1),
+            ):
+                if first > last:
+                    continue
+                expected = self.expected_from_et(base, first, last)
+                result = self.fold(
+                    self.run_ops(base + [self.etg(first, last)])
+                )
+                self.assertEqual(
+                    {
+                        "latest": result["latest"],
+                        "truncated": result["truncated"],
+                        "states": result["states"],
+                        "identities": result["identities"],
+                    },
+                    expected,
+                )
+                self.assert_invariants(result, first, last)
+
+    # ---- 淘汰窗口与 UNKNOWN ----
+
+    def test_evicted_window_unknown_prefix(self):
+        ops70, identities = self.replace_chain_ops(70)
+        result = self.fold(self.run_ops(ops70 + [self.etg(0, 79)]))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["latest"], 70)
+        self.assertEqual(result["states"],
+                         {"unknown": 16, "empty": 0, "active": 64})
+        self.assertEqual(len(result["identities"]), 64)
+        self.assertEqual(result["identities"][0]["first"], 16)
+        self.assertEqual(
+            (result["identities"][0]["digest"],
+             result["identities"][0]["at"]),
+            identities[6],
+        )
+        self.assert_invariants(result, 0, 79)
+
+    def test_evicted_clip_inside_known_not_truncated(self):
+        ops70, _ = self.replace_chain_ops(70)
+        result = self.fold(self.run_ops(ops70 + [self.etg(16, 79)]))
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["states"]["unknown"], 0)
+        self.assertEqual(result["identities"][0]["first"], 16)
+        self.assertEqual(result["identities"][-1]["last"], 79)
+
+    def test_evicted_partial_unknown_clip(self):
+        ops70, _ = self.replace_chain_ops(70)
+        result = self.fold(self.run_ops(ops70 + [self.etg(10, 20)]))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["states"]["unknown"], 6)
+        self.assertEqual(result["states"]["active"], 5)
+        self.assert_invariants(result, 10, 20)
+
+    def test_full_64_window_prehistory_is_empty(self):
+        ops64, _ = self.replace_chain_ops(64)
+        result = self.fold(self.run_ops(ops64 + [self.etg(0, 10)]))
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["states"],
+                         {"unknown": 0, "empty": 10, "active": 1})
+        self.assertEqual(result["identities"][0]["first"], 10)
+
+    # ---- INPUT 校验与优先级 ----
+
+    def test_input_validation(self):
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        bad = [
+            {"op": "etg"},
+            {"op": "etg", "first": 0},
+            {"op": "etg", "last": 1},
+            {"op": "etg", "first": 0, "last": 1, "now": 1},
+            {"op": "etg", "last": 1, "first": 0},
+            {"op": "etg", "times": [0]},
+            {"op": "etg", "first": 0, "last": 1, "times": [0]},
+            {"op": "etg", "first": True, "last": 1},
+            {"op": "etg", "first": 0, "last": False},
+            {"op": "etg", "first": 1.0, "last": 1},
+            {"op": "etg", "first": "1", "last": 1},
+            {"op": "etg", "first": None, "last": 1},
+            {"op": "etg", "first": [0], "last": 1},
+            {"op": "etg", "first": 0, "last": {"x": 1}},
+            {"op": "etg", "first": -1, "last": 0},
+            {"op": "etg", "first": 0, "last": 10 ** 9 + 1},
+            {"op": "etg", "first": 5, "last": 4},
+        ]
+        for request in bad:
+            self.failure(clock + [request], 2, "INPUT")
+
+    def test_input_precedence_over_state(self):
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        self.failure(
+            clock + [{"op": "etg", "first": True, "last": 999}], 2, "INPUT"
+        )
+        self.failure(
+            clock + [{"op": "etg", "first": 5, "last": 4}], 2, "INPUT"
+        )
+        self.failure(
+            clock + [{"op": "etg", "first": 0, "last": 10 ** 9 + 1}],
+            2, "INPUT",
+        )
+
+    # ---- STATE 失败与回滚 ----
+
+    def test_future_range_state_no_stdout(self):
+        ops, _ = self.timeline_ops()
+        self.failure(ops + [self.etg(0, 12)], 4, "STATE")
+        self.failure(ops + [self.etg(12, 12)], 4, "STATE")
+        self.failure(ops + [self.etg(0, 10 ** 9)], 4, "STATE")
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.etg(0, 6),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    # ---- 只读、se/si 与 record/replay ----
+
+    def test_does_not_advance_clock_or_write_audit(self):
+        ops, _ = self.timeline_ops()
+        without = self.run_ops(ops + [{"op": "se"}])
+        with_query = self.run_ops(
+            ops + [self.etg(0, 11), {"op": "se"}]
+        )
+        se_without = [r for r in without if r["op"] == "se"][-1]
+        se_with = [r for r in with_query if r["op"] == "se"][-1]
+        self.assertEqual(se_with, se_without)
+        results = self.run_ops(
+            ops + [self.etg(0, 11), {"op": "ek", "after": 0, "limit": 64}]
+        )
+        ek = [r for r in results if r["op"] == "ek"][-1]
+        self.assertEqual([e["seq"] for e in ek["events"]], list(range(1, 8)))
+
+    def test_repeated_query_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        results = self.run_ops(
+            ops + [self.etg(0, 11), self.etg(3, 9)]
+        )
+        etgs = [r for r in results if r["op"] == "etg"]
+        repeated = self.run_ops(
+            ops + [self.etg(3, 9), self.etg(3, 9)]
+        )
+        repeated_etgs = [r for r in repeated if r["op"] == "etg"]
+        self.assertEqual(repeated_etgs[0], repeated_etgs[1])
+        self.assertEqual(etgs[1], repeated_etgs[0])
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        for base, query in (
+            (self.timeline_ops()[0], self.etg(0, 11)),
+            (self.replace_chain_ops(70)[0], self.etg(0, 79)),
+        ):
+            results = self.run_ops(base + [{"op": "se"}, query])
+            se = next(r for r in results if r["op"] == "se")
+            before = self.fold(results)
+            results = self.run_ops([
+                {"op": "si", "version": se["version"], "digest": se["digest"],
+                 "state": se["state"]},
+                query,
+            ])
+            after = self.fold(results)
+            self.assertEqual(after, before)
+
+    def test_record_replay_byte_identical(self):
+        cases = [
+            self.timeline_ops()[0] + [self.etg(0, 11)],
+            self.replace_chain_ops(70)[0] + [self.etg(0, 79)],
+            # 失败批（STATE：未来区间）。
+            self.timeline_ops()[0] + [self.etg(0, 12)],
+        ]
+        for ops in cases:
+            raw = encode_ops(ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual(rec_err, b"")
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual(
+                (rep_code, rep_out, rep_err),
+                (run_code, run_out, run_err),
+            )
+
+    def test_span_up_to_1e9_without_point_scan(self):
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 0),
+            {"op": "add", "id": "b", "weight": 100, "d": 0,
+             "now": 10 ** 9},
+            self.etg(0, 10 ** 9),
+        ]
+        result = self.fold(self.run_ops(ops))
+        self.assertEqual(result["states"],
+                         {"unknown": 0, "empty": 0,
+                          "active": 10 ** 9 + 1})
+        self.assertEqual(result["identities"], [
+            {"digest": d1, "at": 100, "points": 10 ** 9 + 1,
+             "segments": 1, "first": 0, "last": 10 ** 9},
+        ])
+
+
 if __name__ == "__main__":
     unittest.main()

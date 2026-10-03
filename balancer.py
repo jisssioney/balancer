@@ -2563,7 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
-        "eg", "ee", "ef", "et",
+        "eg", "ee", "ef", "et", "etg",
         "ru",
         "ua",
         "mu",
@@ -4837,6 +4837,34 @@ def parse_op(raw_op):
                 fail(EXIT_INPUT, "INPUT")
             return ("et", "range", first, last)
         fail(EXIT_INPUT, "INPUT")
+
+    if name == "etg":
+        # 端点切换预约审计业务时间区间三态与预约身份占用汇总（只读）：精确
+        # 键序 op,first,last（键须按此序出现，乱序报 INPUT）。first、last
+        # 为 0..10^9 的非 bool 整数且 first<=last，共同给出业务时间闭区
+        # 间 [first,last]。不接受 now、不推进显式时钟。字段集合、键序、
+        # UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法统一判
+        # INPUT；last 晚于操作开始时的全局逻辑时钟留执行期判 STATE
+        # （INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "first", "last"]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        return ("etg", first, last)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -16011,6 +16039,162 @@ def run(raw):
                         },
                     }
                 )
+
+        elif op[0] == "etg":
+            # 端点切换预约审计业务时间区间三态与预约身份占用汇总（只读，
+            # 不接受 now、不推进时钟、不产生审计事件，不改预约、连接、后
+            # 端、审计窗口或下一 seq）：汇总业务时间闭区间 [first,last]
+            # 内三态（UNKNOWN/EMPTY/ACTIVE）覆盖点数，并仅对 ACTIVE 按身
+            # 份汇总覆盖点数、按 et 口径划分的互不相邻最大区段数及最早/
+            # 最晚覆盖时刻。只汇总现有审计事实：不补写淘汰历史，也不改
+            # et 的两种形态。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟整项报 STATE；时钟从未推进
+            # （last_now 为 None）时任何请求均属未来，一律 STATE（形状类
+            # INPUT 已在解析期先行判过；INPUT 先于状态）。
+            #
+            # 逐时刻口径与 et 区间形态完全一致：
+            # 1. 时刻早于最旧保留事件的 now 且前缀已随窗口淘汰（最旧保留
+            #    seq>1）为 UNKNOWN，seq 与身份均为 null；
+            # 2. 完整历史（最旧保留即 seq1）首条事件之前恒为 EMPTY；空
+            #    历史且时钟已推进的合法查询全部 EMPTY、identities 为空、
+            #    truncated=false；
+            # 3. 否则以最旧保留事件的 before 为起点应用 now 不晚于该时刻
+            #    的保留事件；同一 now 的事件按 seq 升序整组生效，终态身
+            #    份取组内最大 seq 事件的 after：null 为 EMPTY，非空为
+            #    ACTIVE 并回显 digest、at。
+            #
+            # 全部业务时间 0..last_now 只有 O(A) 个恒值区域（区域构造同
+            # et 区间形态），故三态点数与各身份的点数/区段/首尾时刻均在
+            # O(A) 时间与额外空间内完成，不随区间跨度（可达 10^9）逐点
+            # 扫描，其中 A 不超过六十四条保留事件。
+            _, first, last = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            regions = []
+            if not window:
+                # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY。
+                regions.append((0, last_now, "EMPTY", None))
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                prefix_evicted = oldest_seq > 1
+                # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，不入
+                # 列）：完整历史 EMPTY；前缀已淘汰则 UNKNOWN。
+                if oldest_now >= 1:
+                    if prefix_evicted:
+                        regions.append(
+                            (0, oldest_now - 1, "UNKNOWN", None)
+                        )
+                    else:
+                        regions.append(
+                            (0, oldest_now - 1, "EMPTY", None)
+                        )
+                # 同 now 事件整组为一个恒值区域：终态取组内最大 seq 事
+                # 件的 after（事件按 seq 升序，即组末事件）。
+                index = 0
+                event_count = len(window)
+                while index < event_count:
+                    group_now = window[index][1]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_identity = window[index][4]
+                        index += 1
+                    group_end = (
+                        window[index][1] - 1
+                        if index < event_count
+                        else last_now
+                    )
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    regions.append(
+                        (group_now, group_end, group_state, group_identity)
+                    )
+            counts = {"UNKNOWN": 0, "EMPTY": 0, "ACTIVE": 0}
+            # 各身份以 [points, segments, first, last] 聚合（区段在裁剪后
+            # 逐区域判定，相邻同身份才合并）；dict 保持身份在区间内首次
+            # 生效时刻的插入次序。身份至多 A 个。
+            identity_stats = {}
+            identity_order = []
+            previous_active_identity = None
+            for region_lo, region_hi, state, identity in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first > overlap_last:
+                    # 恒值区域按时间升序；与区间不相交的区域不延续相邻
+                    # 身份关系（实际仅区间左侧区域可能整体早于 first）。
+                    if region_hi < first:
+                        previous_active_identity = (
+                            identity if state == "ACTIVE" else None
+                        )
+                    continue
+                length = overlap_last - overlap_first + 1
+                counts[state] += length
+                if state == "ACTIVE":
+                    stats = identity_stats.get(identity)
+                    if stats is None:
+                        # 首次在区间内生效：一点、一个区段，首尾同点。
+                        identity_stats[identity] = [
+                            length, 1, overlap_first, overlap_last
+                        ]
+                        identity_order.append(identity)
+                    else:
+                        stats[0] += length
+                        stats[3] = overlap_last
+                        # 仅当与上一落入区间的区域身份相同（时间相邻、中
+                        # 间无其他状态；同 now 整组前后身份相同也属连续
+                        # 覆盖）时合并为同一最大区段，否则新增一个互不相邻
+                        # 区段。身份按值比较：同一身份两次预约是不同元组
+                        # 对象，其间必为其他状态，区段不得合并。
+                        if (
+                            previous_active_identity is None
+                            or previous_active_identity != identity
+                        ):
+                            stats[1] += 1
+                    previous_active_identity = identity
+                else:
+                    previous_active_identity = None
+            identities = []
+            for identity in identity_order:
+                points_count, segment_count, id_first, id_last = (
+                    identity_stats[identity]
+                )
+                identities.append(
+                    {
+                        "digest": identity[0],
+                        "at": identity[1],
+                        "points": points_count,
+                        "segments": segment_count,
+                        "first": id_first,
+                        "last": id_last,
+                    }
+                )
+            # 构造上每个 ACTIVE 恒值区域同时计入 states.active 与唯一身份
+            # 的 points，故各身份 points 之和恒等于 states.active。
+            results.append(
+                {
+                    "op": "etg",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": counts["UNKNOWN"] > 0,
+                    "states": {
+                        "unknown": counts["UNKNOWN"],
+                        "empty": counts["EMPTY"],
+                        "active": counts["ACTIVE"],
+                    },
+                    "identities": identities,
+                }
+            )
 
         elif op[0] == "se":
             # 运行态检查点导出：不推进时钟、不改状态。state 为规范化 JSON
