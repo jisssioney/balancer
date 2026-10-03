@@ -460,6 +460,20 @@
 - `last` 超过查询开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、容器数量、重复身份、UTF-8 编码、摘要格式、整数类型（排除 bool）、范围或区间关系非法返回 INPUT/2，输入错误先于状态判断。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计、不改变运行态。
 - 全部业务时间 0..当前时钟只有 O(A) 个恒值区域，区域只过一遍，故时间与额外空间均为 O(A+P+S)（P≤64 为查询身份数、S 为返回区段总数），不按时间跨度（可达 10⁹）逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及现有 `et`、`etg`、`eti` 与其他公开行为不变。
 
+## 端点切换预约审计业务时间区间净变化切换：ett
+
+在 `et` 的六十四条保留窗口与逐时刻口径之上新增只读入口，按业务时间闭区间只报告各同 `now` 事件组处理后的净变化切换，调用方无需自行比较相邻区段。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `ett`：字段严格按 `op,first,last` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 均为 0..10⁹ 的非 bool 整数且 `first≤last`，共同给出业务时间闭区间 `[first,last]`，区间包含两端。
+- 返回固定键序 `op,first,last,latest,truncated,initial,transitions,summary`；`latest` 为已分配最大审计 seq（初始 0）。
+  - `initial` 固定键序 `seq,state,digest,at`，与 `et` 在 `first` 时刻的快照逐值一致：同一 `now` 事件按 seq 升序整组生效、以组末事件 `after` 为终态；完整历史首事件前及空历史为 EMPTY、seq=0；淘汰前缀无法判定时为 UNKNOWN 且 seq、digest、at 均为 null。`first` 时刻的状态只由 `initial` 表达，不产生切换。
+  - `transitions` 按 `time` 升序，只列 `now` 位于 `(first,last]` 的事件组净变化；每项固定键序 `time,seq,kind,before,after`。`seq` 取整组最后应用（组内最大）审计序号；`before`/`after` 固定键序 `state,digest,at`，非 ACTIVE 时 digest 与 at 为 null。组前后状态及身份相同（含组内先变后变回、seq 不同）时不产生切换。
+  - `kind` 仅为 `ENTER`、`LEAVE`、`REPLACE`、`RECOVER`：`ENTER` 为 EMPTY 进入 ACTIVE；`LEAVE` 为 ACTIVE 进入 EMPTY；`REPLACE` 为两个不同 ACTIVE 身份互换；`RECOVER` 为 UNKNOWN 前缀结束后进入可判定状态（终态为 ACTIVE 或 EMPTY）。四类穷尽全部净变化；组前后相同（EMPTY→EMPTY 或同身份 ACTIVE→ACTIVE）不产生切换。
+  - `summary` 固定键序 `total,enter,leave,replace,recover`，五类之和等于 `total`（也等于 transitions 项数）。
+- `truncated` 仅在区间含至少一个 UNKNOWN 时刻时为 true。空历史且时钟已推进时返回 EMPTY 初态、空 transitions 和全零汇总。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法返回 INPUT/2，输入错误优先于状态错误。失败不产生 stdout 并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
+- 全部业务时间 0..当前时钟只有 O(A) 个同 `now` 事件组与一个至多一段的淘汰前缀，故单次时间与空间均为 O(A)，A 至多六十四条保留事件，不按时间跨度（可达 10⁹）逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及 `et`、`etg`、`eti`、`etm` 和其他公开行为不变。
+
 ## 测试
 
     python -m unittest discover

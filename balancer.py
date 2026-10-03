@@ -2563,7 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
-        "eg", "ee", "ef", "et", "etg", "eti", "etm",
+        "eg", "ee", "ef", "et", "etg", "eti", "etm", "ett",
         "ru",
         "ua",
         "mu",
@@ -4956,6 +4956,34 @@ def parse_op(raw_op):
         if first > last:
             fail(EXIT_INPUT, "INPUT")
         return ("etm", tuple(normalized_items), first, last)
+
+    if name == "ett":
+        # 端点切换预约审计业务时间区间净变化切换查询（只读）：精确键序
+        # op,first,last（键须按此序出现，乱序报 INPUT）。first、last 为
+        # 0..10^9 的非 bool 整数且 first<=last，共同给出业务时间闭区间
+        # [first,last]。不接受 now、不推进显式时钟。字段集合、键序、
+        # UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法统一判
+        # INPUT；last 晚于操作开始时的全局逻辑时钟或时钟从未推进留执行
+        # 期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "first", "last"]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ett", first, last)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -16569,11 +16597,210 @@ def run(raw):
                 }
             )
 
+        elif op[0] == "ett":
+            # 端点切换预约审计业务时间区间净变化切换查询（只读，不接受
+            # now、不推进时钟、不产生审计事件，不改预约、连接、后端、审计
+            # 窗口或下一 seq）：在 et 的六十四条保留窗口与逐时刻口径之
+            # 上，按业务时间闭区间 [first,last] 只报告各组处理后的净变
+            # 化。同一 now 的事件按 seq 升序整组生效，终态身份取组内最
+            # 大 seq 事件的 after；组前后状态与身份相同（含组内先变后
+            # 变回、seq 不同）时不产生切换，first 状态仅由 initial 表
+            # 达，不作为切换。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟整项报 STATE；时钟从未推进
+            # （last_now 为 None）时任何请求均属未来，一律 STATE（形状类
+            # INPUT 已在解析期先行判过；INPUT 先于状态）。
+            #
+            # 初态与 et 区间形态在 first 时刻的快照逐值一致：时刻早于最
+            # 旧保留事件 now 且前缀已随窗口淘汰（最旧保留 seq>1）为
+            # UNKNOWN、seq/digest/at 均为 null；完整历史（最旧保留即
+            # seq1）首条事件之前及空历史（时钟已推进）恒为 EMPTY、
+            # seq=0；否则以最旧保留事件 before 为起点应用 now 不晚于
+            # first 的保留事件（时刻等于某组 now 时整组处理）。
+            #
+            # 切换只在 now 位于 (first,last] 的事件组上判定：
+            # - ENTER：EMPTY 进入 ACTIVE；
+            # - LEAVE：ACTIVE 进入 EMPTY；
+            # - REPLACE：两个不同 ACTIVE 身份互换；
+            # - RECOVER：UNKNOWN 前缀结束后进入可判定状态（et 三态中
+            #   EMPTY 与 ACTIVE 同为可判定状态，故 UNKNOWN->EMPTY 与
+            #   UNKNOWN->ACTIVE 都计 RECOVER；UNKNOWN 只可能是首个落入
+            #   区间事件组之前的状态）。
+            # 组前后状态与身份相同（EMPTY->EMPTY 或同身份
+            # ACTIVE->ACTIVE）不产生切换。四类穷尽所有净变化。
+            #
+            # truncated 仅在区间含至少一个 UNKNOWN 时刻（前缀淘汰区域
+            # [0,oldest_now-1] 与 [first,last] 相交）时为 true。事件自
+            # cursor 起顺序只过一遍，总时间与空间均为 O(A)（A≤64），不
+            # 随区间跨度（可达 10^9）逐点扫描。
+            _, first, last = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+
+            def state_view(state, identity):
+                # before/after 固定键序 state,digest,at；非 ACTIVE 时
+                # digest 与 at 为 null。
+                if state == "ACTIVE":
+                    return {
+                        "state": "ACTIVE",
+                        "digest": identity[0],
+                        "at": identity[1],
+                    }
+                return {"state": state, "digest": None, "at": None}
+
+            transitions = []
+            counts = {
+                "ENTER": 0, "LEAVE": 0,
+                "REPLACE": 0, "RECOVER": 0,
+            }
+            if not window:
+                # 空历史且时钟已推进：EMPTY 初态、空 transitions、全零
+                # 汇总，区间不含 UNKNOWN。
+                initial = {
+                    "seq": 0,
+                    "state": "EMPTY",
+                    "digest": None,
+                    "at": None,
+                }
+                truncated = False
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                event_count = len(window)
+                prefix_evicted = oldest_seq > 1
+                # UNKNOWN 前缀区域为 [0,oldest_now-1]（oldest_now=0 时为
+                # 空）：与 [first,last] 相交当且仅当 first<oldest_now。
+                truncated = prefix_evicted and first < oldest_now
+                # —— first 时刻快照（同 et 逐时刻口径）——
+                # cursor 为应用到 first 后已消费的事件数；同 now 事件连
+                # 续出现且整组消费，cursor 恰指向首个 now>first 的事件。
+                if first < oldest_now:
+                    cursor = 0
+                    if prefix_evicted:
+                        initial_state = "UNKNOWN"
+                        initial_identity = None
+                    else:
+                        initial_state = "EMPTY"
+                        initial_identity = None
+                    initial_seq = None if prefix_evicted else 0
+                else:
+                    # first>=oldest_now：应用全部 now<=first 的保留事
+                    # 件，同 now 整组处理完才停；终态身份与 seq 取最后
+                    # 应用（即组内最大 seq）事件。
+                    cursor = 0
+                    initial_seq = None
+                    initial_identity = None
+                    while (
+                        cursor < event_count
+                        and window[cursor][1] <= first
+                    ):
+                        initial_seq = window[cursor][0]
+                        initial_identity = window[cursor][4]
+                        cursor += 1
+                    initial_state = (
+                        "ACTIVE" if initial_identity is not None
+                        else "EMPTY"
+                    )
+                initial = {
+                    "seq": initial_seq,
+                    "state": initial_state,
+                    "digest": (
+                        initial_identity[0]
+                        if initial_state == "ACTIVE"
+                        else None
+                    ),
+                    "at": (
+                        initial_identity[1]
+                        if initial_state == "ACTIVE"
+                        else None
+                    ),
+                }
+                # —— (first,last] 内各同 now 事件组的净变化 ——
+                # 事件按 seq 升序、now 非递减，故相等 now 连续成组；
+                # cursor 之后首组即首个 now>first 的组。
+                index = cursor
+                prev_state = initial_state
+                prev_identity = initial_identity
+                while index < event_count:
+                    group_now = window[index][1]
+                    if group_now > last:
+                        break
+                    group_seq = window[index][0]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_seq = window[index][0]
+                        group_identity = window[index][4]
+                        index += 1
+                    # 组的终态：组末事件 after 为 null 是 EMPTY，非空为
+                    # ACTIVE；seq 取整组最后应用的审计序号。
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    kind = None
+                    if prev_state == "UNKNOWN":
+                        # UNKNOWN 前缀结束后进入可判定状态（ACTIVE 或
+                        # EMPTY）；UNKNOWN 只可能是首个落入区间事件组之
+                        # 前的状态。
+                        kind = "RECOVER"
+                    elif group_state == "ACTIVE":
+                        if prev_state == "ACTIVE":
+                            if prev_identity != group_identity:
+                                kind = "REPLACE"
+                        else:
+                            kind = "ENTER"
+                    elif prev_state == "ACTIVE":
+                        kind = "LEAVE"
+                    # 组前后状态与身份相同（EMPTY->EMPTY 或同身份
+                    # ACTIVE->ACTIVE）不产生切换。
+                    if kind is not None:
+                        transitions.append(
+                            {
+                                "time": group_now,
+                                "seq": group_seq,
+                                "kind": kind,
+                                "before": state_view(
+                                    prev_state, prev_identity
+                                ),
+                                "after": state_view(
+                                    group_state, group_identity
+                                ),
+                            }
+                        )
+                        counts[kind] += 1
+                    prev_state = group_state
+                    prev_identity = group_identity
+            total = (
+                counts["ENTER"] + counts["LEAVE"]
+                + counts["REPLACE"] + counts["RECOVER"]
+            )
+            results.append(
+                {
+                    "op": "ett",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": truncated,
+                    "initial": initial,
+                    "transitions": transitions,
+                    "summary": {
+                        "total": total,
+                        "enter": counts["ENTER"],
+                        "leave": counts["LEAVE"],
+                        "replace": counts["REPLACE"],
+                        "recover": counts["RECOVER"],
+                    },
+                }
+            )
+
         elif op[0] == "se":
-            # 运行态检查点导出：不推进时钟、不改状态。state 为规范化 JSON
-            # 对象；紧凑 UTF-8 编码超 8MiB 报 OVERLOAD/7（无 stdout、整批
-            # 回滚——se 本不改状态，故仅不产出结果）。digest 为紧凑编码
-            # {"version":1,"state":...} 的小写 SHA-256。
             state = export_bundle(current_bundle())
             envelope = {"version": CHECKPOINT_VERSION, "state": state}
             try:
