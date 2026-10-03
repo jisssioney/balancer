@@ -2563,7 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
-        "eg",
+        "eg", "ee",
         "ru",
         "ua",
         "mu",
@@ -4711,6 +4711,32 @@ def parse_op(raw_op):
         if after > until:
             fail(EXIT_INPUT, "INPUT")
         return ("eg", digest, at, after, until)
+
+    if name == "ee":
+        # 端点切换预约审计序号快照批量查询（只读）：精确键序 op,seqs（键须
+        # 按此序出现，乱序报 INPUT）；不接受 now，不推进显式时钟。seqs 为
+        # 1..64 项严格递增且不重复的非 bool 整数，每项范围 0..10^18；故仅
+        # 判断容器、项数、布尔混入、范围与相邻项严格递增（同秩重复与次序
+        # 倒退一并拒绝）。字段集合、键序、容器、数量、整数类型、范围、递
+        # 增关系或 UTF-8 编码非法统一判 INPUT；任一 seq 大于已分配最大 seq
+        # 留执行期判 STATE（INPUT 判定先于状态错误）。
+        if list(raw_op) != ["op", "seqs"]:
+            fail(EXIT_INPUT, "INPUT")
+        seqs = raw_op["seqs"]
+        if not isinstance(seqs, list) or not 1 <= len(seqs) <= 64:
+            fail(EXIT_INPUT, "INPUT")
+        previous = -1
+        for value in seqs:
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not 0 <= value <= 10 ** 18
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            if value <= previous:
+                fail(EXIT_INPUT, "INPUT")
+            previous = value
+        return ("ee", tuple(seqs))
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -15408,6 +15434,94 @@ def run(raw):
                         "apply": action_counts["APPLY"],
                         "clear": action_counts["CLEAR"],
                     },
+                }
+            )
+
+        elif op[0] == "ee":
+            # 端点切换预约审计序号快照批量查询（只读，不推进显式时钟，不改
+            # 预约、连接、后端、审计窗口或下一 seq）：按一批审计序号直接返
+            # 回各序号处理完成后的预约快照，items 与 seqs 等长且保持输入次
+            # 序。latest 为已分配最大 seq（ep_audit_seq-1，初始 0），任一
+            # seq 大于 latest 整项请求判 STATE（INPUT 已在 parse_op 先判）。
+            #
+            # 快照口径：
+            # - seq=0 恒为任何审计事件发生前的 EMPTY；
+            # - seq 仍在六十四条保留窗口内（不小于最旧保留事件 seq）时取
+            #   该事件 after：null 为 EMPTY，否则 ACTIVE 并回显 digest/at；
+            # - seq 恰为最旧保留 seq 减一时，取最旧事件的 before 作为该序
+            #   号处理后的状态：null 为 EMPTY，否则 ACTIVE；
+            # - 更早且已无法由窗口边界确定的序号返回 UNKNOWN 而非失败，且
+            #   仅当本次至少一项为 UNKNOWN 时 truncated=true。
+            # EMPTY/UNKNOWN 的 digest、at 均为 null。响应固定键序
+            # op,latest,truncated,items，项固定键序 seq,state,digest,at。
+            # 单次时间 O(P+A)、结果额外空间 O(P)（P 为查询项数、A≤64）；
+            # 失败批次回滚且无 stdout，成功也不写审计。
+            _, seq_values = op
+            latest = ep_audit_seq - 1
+            for value in seq_values:
+                if value > latest:
+                    fail(EXIT_STATE, "STATE")
+            # list(deque) 单遍复制保留事件，O(A)，随后按下标 O(1) 取事件。
+            window = list(ep_audit_events)
+            items = []
+            truncated = False
+            if window:
+                oldest = window[0][0]
+                for value in seq_values:
+                    if value == 0:
+                        state = "EMPTY"
+                        snapshot = None
+                    elif value >= oldest:
+                        after_identity = window[value - oldest][4]
+                        if after_identity is None:
+                            state = "EMPTY"
+                            snapshot = None
+                        else:
+                            state = "ACTIVE"
+                            snapshot = after_identity
+                    elif value == oldest - 1:
+                        before_identity = window[0][3]
+                        if before_identity is None:
+                            state = "EMPTY"
+                            snapshot = None
+                        else:
+                            state = "ACTIVE"
+                            snapshot = before_identity
+                    else:
+                        state = "UNKNOWN"
+                        snapshot = None
+                        truncated = True
+                    if snapshot is None:
+                        item_digest = None
+                        item_at = None
+                    else:
+                        item_digest, item_at = snapshot
+                    items.append(
+                        {
+                            "seq": value,
+                            "state": state,
+                            "digest": item_digest,
+                            "at": item_at,
+                        }
+                    )
+            else:
+                # 空历史：latest=0，能走到这里的 seq 只能为 0（更大值已在
+                # 上方判 STATE），seq=0 恒为事件发生前的 EMPTY。
+                for value in seq_values:
+                    items.append(
+                        {
+                            "seq": value,
+                            "state": "EMPTY",
+                            "digest": None,
+                            "at": None,
+                        }
+                    )
+            results.append(
+                {
+                    "op": "ee",
+                    "latest": latest,
+                    "truncated": truncated,
+                    "items": items,
                 }
             )
 

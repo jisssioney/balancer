@@ -28350,5 +28350,406 @@ class EpSwitchAuditRangeSummaryTest(unittest.TestCase):
         )
 
 
+class EpSwitchAuditSnapshotBatchTest(unittest.TestCase):
+    """ee：端点切换预约审计序号快照批量查询（只读）。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def ee(self, seqs):
+        return {"op": "ee", "seqs": list(seqs)}
+
+    def snapshot(self, results):
+        return [r for r in results if r["op"] == "ee"][-1]
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def timeline_ops(self):
+        """四事件（同 eg 风格）：
+        seq1 SET@5     null -> A=(d1,100)
+        seq2 SET@6     A    -> B=(d2,101)（不同身份覆盖=REPLACE）
+        seq3 CANCEL@7  B    -> null
+        seq4 SET@8     null -> A。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101)}
+        return ops, identities
+
+    # ---- 空历史与输出形状 ----
+
+    def test_empty_history_seq_zero(self):
+        results = self.run_ops([self.ee([0])])
+        result = self.snapshot(results)
+        self.assertEqual(
+            list(result), ["op", "latest", "truncated", "items"]
+        )
+        self.assertEqual(result["latest"], 0)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(
+            result["items"],
+            [{"seq": 0, "state": "EMPTY",
+              "digest": None, "at": None}],
+        )
+
+    def test_items_key_order_and_input_order(self):
+        ops, ids = self.timeline_ops()
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 2, 4])]
+        ))
+        self.assertEqual(
+            list(result), ["op", "latest", "truncated", "items"]
+        )
+        seqs = [item["seq"] for item in result["items"]]
+        self.assertEqual(seqs, [0, 2, 4])
+        for item in result["items"]:
+            self.assertEqual(list(item), ["seq", "state", "digest", "at"])
+        # seq2 后生效的是身份 B；seq4 后是 A。
+        self.assertEqual(result["items"][1]["state"], "ACTIVE")
+        self.assertEqual(result["items"][1]["digest"], ids["B"][0])
+        self.assertEqual(result["items"][1]["at"], 101)
+        self.assertEqual(result["items"][2]["digest"], ids["A"][0])
+        self.assertEqual(result["items"][2]["at"], 100)
+
+    def test_compact_bytes(self):
+        code, out, err = run_balancer(
+            "run", encode_ops([self.ee([0])])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"ee","latest":0,"truncated":false,'
+            b'"items":[{"seq":0,"state":"EMPTY","digest":null,'
+            b'"at":null}]}],"backends":[]}\n',
+        )
+
+    # ---- 快照三态 ----
+
+    def test_states_track_event_after(self):
+        ops, ids = self.timeline_ops()
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 1, 2, 3, 4])]
+        ))
+        self.assertEqual(result["latest"], 4)
+        self.assertFalse(result["truncated"])
+        states = [(item["seq"], item["state"]) for item in result["items"]]
+        self.assertEqual(
+            states,
+            [(0, "EMPTY"), (1, "ACTIVE"), (2, "ACTIVE"),
+             (3, "EMPTY"), (4, "ACTIVE")],
+        )
+        self.assertIsNone(result["items"][0]["digest"])
+        self.assertIsNone(result["items"][0]["at"])
+        self.assertEqual(result["items"][1]["digest"], ids["A"][0])
+        self.assertEqual(result["items"][1]["at"], ids["A"][1])
+        self.assertEqual(result["items"][3]["digest"], None)
+        self.assertEqual(result["items"][3]["at"], None)
+        self.assertEqual(result["items"][4]["digest"], ids["A"][0])
+
+    def test_latest_matches_current_reservation(self):
+        ops, ids = self.timeline_ops()
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([4])]
+        ))
+        item = result["items"][0]
+        self.assertEqual(item["state"], "ACTIVE")
+        self.assertEqual((item["digest"], item["at"]), ids["A"])
+        # en 看到的当前预约身份与 latest 快照逐值一致。
+        en = [r for r in self.run_ops(ops + [{"op": "en"}])
+              if r["op"] == "en"][0]
+        self.assertTrue(en["pending"])
+        self.assertEqual(en["digest"], item["digest"])
+        self.assertEqual(en["at"], item["at"])
+
+    def test_empty_and_active_share_null_fields(self):
+        ops, ids = self.timeline_ops()
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 3])]
+        ))
+        for item in result["items"]:
+            if item["state"] in ("EMPTY", "UNKNOWN"):
+                self.assertIsNone(item["digest"])
+                self.assertIsNone(item["at"])
+        self.assertEqual(result["items"][0]["state"], "EMPTY")
+        self.assertEqual(result["items"][1]["state"], "EMPTY")
+        self.assertIsNone(result["items"][0]["digest"])
+        self.assertIsNone(result["items"][1]["digest"])
+
+    # ---- 六十四条窗口边界 ----
+
+    def build_evicted_ops(self, total, current_at=None):
+        """构造 total 个事件的历史：es(SET，after 非 null、before=null)
+        与 eu(CANCEL，after=null、before 非 null) 交替，奇数 seq 为 SET、
+        偶数 seq 为 CANCEL；可选末尾追加一个固定 at 的 es 使当前预约确
+        定。摘要只由 items/before 决定，与 at 无关，故所有 eu 共用同一
+        digest。"""
+        target = [("a", None, self.EP1)]
+        digest = self.switch_digest(target, 0)
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        for i in range(1, total // 2 + 1):
+            at = 1000 + i
+            ops.append(self.es(target, 0, at, 2 * i - 1))
+            if 2 * i <= total:
+                ops.append(
+                    {"op": "eu", "digest": digest, "at": at, "now": 2 * i}
+                )
+        if current_at is not None:
+            ops.append(self.es(target, 0, current_at, total + 1))
+        return ops
+
+    def test_within_window_uses_after(self):
+        # 70 事件 -> 保留 seq7..70；seq7 为 SET（after 非 null => ACTIVE，
+        # at=1004），seq70 为 CANCEL（after=null => EMPTY）。
+        ops = self.build_evicted_ops(70)
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 7, 70])]
+        ))
+        self.assertEqual(result["latest"], 70)
+        by_seq = {item["seq"]: item for item in result["items"]}
+        self.assertEqual(by_seq[0]["state"], "EMPTY")
+        self.assertEqual(by_seq[7]["state"], "ACTIVE")
+        self.assertEqual(by_seq[7]["at"], 1004)
+        self.assertEqual(by_seq[70]["state"], "EMPTY")
+        self.assertIsNone(by_seq[70]["digest"])
+        self.assertFalse(result["truncated"])
+
+    def test_oldest_minus_one_null_before_is_empty(self):
+        # 全部 SET/REPLACE：最旧事件 before=null，oldest-1=6 取 before =>
+        # EMPTY；不置 truncated。
+        ops = self.build_evicted_ops(70)
+        result = self.snapshot(self.run_ops(ops + [self.ee([6])]))
+        self.assertEqual(result["latest"], 70)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["items"][0]["state"], "EMPTY")
+        self.assertIsNone(result["items"][0]["digest"])
+
+    def test_oldest_minus_one_nonnull_before_is_active(self):
+        # 事件交替 es(SET/REPLACE，after 非 null)/eu(CANCEL，after=null)：
+        # seq1=es，i=2..65 各一对 es/eu => seq2..129，再补 es=seq130。
+        # 窗口 seq67..130；seq67 是 eu（before 非 null），故 seq66 取最旧
+        # 事件 before => ACTIVE。
+        target = [("a", None, self.EP1)]
+        digest = self.switch_digest(target, 0)
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0},
+               self.es(target, 0, 101, 1)]
+        for i in range(2, 66):
+            at = 200 + i
+            ops.append(self.es(target, 0, at, i))
+            ops.append({"op": "eu", "digest": digest, "at": at, "now": i})
+        ops.append(self.es(target, 0, 999, 66))
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([65, 66, 67, 130])]
+        ))
+        self.assertEqual(result["latest"], 130)
+        by_seq = {item["seq"]: item for item in result["items"]}
+        self.assertTrue(result["truncated"])
+        self.assertEqual(by_seq[65]["state"], "UNKNOWN")
+        self.assertEqual(by_seq[66]["state"], "ACTIVE")
+        self.assertEqual(by_seq[66]["at"], 234)
+        self.assertEqual(by_seq[67]["state"], "EMPTY")
+        self.assertEqual(by_seq[130]["state"], "ACTIVE")
+        self.assertEqual(by_seq[130]["at"], 999)
+
+    def test_earlier_than_boundary_is_unknown_and_truncated(self):
+        ops = self.build_evicted_ops(70)
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 1, 5, 6, 7])]
+        ))
+        by_seq = {item["seq"]: item for item in result["items"]}
+        self.assertTrue(result["truncated"])
+        self.assertEqual(by_seq[0]["state"], "EMPTY")
+        self.assertEqual(by_seq[1]["state"], "UNKNOWN")
+        self.assertEqual(by_seq[5]["state"], "UNKNOWN")
+        self.assertEqual(by_seq[6]["state"], "EMPTY")
+        self.assertEqual(by_seq[7]["state"], "ACTIVE")
+        for seq in (1, 5):
+            self.assertIsNone(by_seq[seq]["digest"])
+            self.assertIsNone(by_seq[seq]["at"])
+
+    def test_truncated_false_without_unknown_even_after_eviction(self):
+        ops = self.build_evicted_ops(70)
+        result = self.snapshot(self.run_ops(
+            ops + [self.ee([0, 6, 7, 70])]
+        ))
+        self.assertFalse(result["truncated"])
+
+    def test_truncated_per_request(self):
+        ops = self.build_evicted_ops(70)
+        without = self.snapshot(self.run_ops(ops + [self.ee([70])]))
+        self.assertFalse(without["truncated"])
+        with_unknown = self.snapshot(self.run_ops(
+            ops + [self.ee([1, 70])]
+        ))
+        self.assertTrue(with_unknown)
+
+    # ---- 错误分类与优先级 ----
+
+    def test_seq_beyond_latest_is_state(self):
+        ops, _ = self.timeline_ops()
+        self.failure(ops + [self.ee([5])], 4, "STATE")
+        self.failure([self.ee([1])], 4, "STATE")
+
+    def test_input_validation(self):
+        bad = [
+            {"op": "ee"},
+            {"op": "ee", "seqs": []},
+            {"op": "ee", "seqs": [0] * 65},
+            {"op": "ee", "seqs": [-1]},
+            {"op": "ee", "seqs": [10 ** 18 + 1]},
+            {"op": "ee", "seqs": [True]},
+            {"op": "ee", "seqs": [False]},
+            {"op": "ee", "seqs": [0.0]},
+            {"op": "ee", "seqs": ["0"]},
+            {"op": "ee", "seqs": None},
+            {"op": "ee", "seqs": [[]]},
+            {"op": "ee", "seqs": [{}]},
+            {"op": "ee", "seqs": [1, 1]},
+            {"op": "ee", "seqs": [2, 1]},
+            {"op": "ee", "seqs": [0, 3, 3]},
+            {"op": "ee", "seqs": [0, 1, 0]},
+            {"op": "ee", "seqs": [0], "now": 0},
+            {"seqs": [0]},
+            {"op": "ee", "seqs": [0], "x": 1},
+            {"op": "ee", "at": 0},
+        ]
+        for op in bad:
+            self.failure([op], 2, "INPUT")
+
+    def test_boundary_counts_and_range_accepted(self):
+        # 64 项、范围端点 0 与 10^18：空历史仅允许 0，故先制造一个
+        # latest>=10^18 不可行；范围 10^18 在无事件时会 STATE，因此这里只
+        # 验证 64 项 0..63 中 0 合法而其余超界（STATE 而非 INPUT）——改为
+        # 有事件后测 64 项容量本身不被 INPUT 拒绝。
+        ops = self.build_evicted_ops(70)
+        seqs = list(range(7, 71))
+        self.assertEqual(len(seqs), 64)
+        results = self.run_ops(ops + [self.ee(seqs)])
+        result = self.snapshot(results)
+        self.assertEqual(len(result["items"]), 64)
+        # 10^18 作为元素类型/范围合法但超 latest：STATE（非 INPUT）。
+        self.failure(ops + [self.ee([0, 10 ** 18])], 4, "STATE")
+
+    def test_input_priority_over_state(self):
+        # 同时含超 latest 与非法形态时判 INPUT。
+        ops, _ = self.timeline_ops()
+        self.failure(ops + [{"op": "ee", "seqs": [5, True]}], 2, "INPUT")
+        self.failure(ops + [{"op": "ee", "seqs": [5, 5]}], 2, "INPUT")
+        self.failure(ops + [{"op": "ee", "seqs": []}], 2, "INPUT")
+
+    # ---- 只读保证与检查点 ----
+
+    def test_does_not_advance_clock_or_write_audit(self):
+        ops, _ = self.timeline_ops()          # 时钟已到 8
+        # ee 不推进时钟：随后 now=8 的 dq 合法（同刻），now=7 倒退报 INPUT。
+        self.run_ops(ops + [self.ee([0, 4]), {"op": "dq", "now": 8}])
+        self.failure(
+            ops + [self.ee([0, 4]), {"op": "dq", "now": 7}],
+            2, "INPUT",
+        )
+        # 不写审计：连续 ee 之间 latest 不变。
+        first = self.snapshot(self.run_ops(ops + [self.ee([4])]))
+        second = self.snapshot(self.run_ops(
+            ops + [self.ee([4]), self.ee([0, 4])]
+        ))
+        self.assertEqual(first["latest"], second["latest"])
+
+    def test_failed_batch_rolls_back_prior_op(self):
+        # 同批先成功 es（会分配 seq5、推进时钟），再以超界 ee 失败：整批
+        # 无 stdout。
+        ops, _ = self.timeline_ops()
+        ops.append(self.es([("a", None, self.EP1)], 0, 500, 9))
+        ops.append(self.ee([99]))
+        self.failure(ops, 4, "STATE")
+        # 回滚后另一全新批次仍只见 seq1..4。
+        result = self.snapshot(self.run_ops(
+            self.timeline_ops()[0] + [self.ee([4])]
+        ))
+        self.assertEqual(result["latest"], 4)
+
+    def test_checkpoint_export_import_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        query = self.ee([0, 1, 2, 3, 4])
+        code, direct_out, err = run_balancer(
+            "run", encode_ops(ops + [query])
+        )
+        self.assertEqual((code, err), (0, b""))
+        code, se_out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "se"}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        se = json.loads(se_out.decode())["results"][-1]
+        si = {"op": "si", "version": 1, "digest": se["digest"],
+              "state": se["state"]}
+        code, restored_out, err = run_balancer(
+            "run", encode_ops(ops + [{"op": "se"}, si, query])
+        )
+        self.assertEqual((code, err), (0, b""))
+        direct = [r for r in json.loads(direct_out)["results"]
+                  if r["op"] == "ee"][0]
+        restored = [r for r in json.loads(restored_out)["results"]
+                    if r["op"] == "ee"][0]
+        self.assertEqual(restored, direct)
+        self.assertEqual(ids["A"][0], direct["items"][4]["digest"])
+
+    def test_record_replay_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        raw = encode_ops(ops + [self.ee([0, 1, 2, 3, 4])])
+        run_code, run_out, run_err = run_balancer("run", raw)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((run_code, rec_code, rec_err), (0, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+        # 失败批同样逐字节复现。
+        raw_fail = encode_ops(ops + [self.ee([99])])
+        run_code, run_out, run_err = run_balancer("run", raw_fail)
+        rec_code, rec_out, rec_err = run_balancer("record", raw_fail)
+        self.assertEqual((run_code, rec_code, rec_err), (4, 0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
