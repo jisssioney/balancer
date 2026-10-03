@@ -2562,7 +2562,7 @@ def parse_op(raw_op):
         "ey", "eb",
         "ez",
         "ej",
-        "es", "en", "eu", "ei", "ed", "eo", "ev", "ew",
+        "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek",
         "ru",
         "ua",
         "mu",
@@ -4519,6 +4519,30 @@ def parse_op(raw_op):
             fail(EXIT_INPUT, "INPUT")
         return ("ew", base, base_at, items, before, at, now)
 
+    if name == "ek":
+        # 端点切换预约生命周期审计游标查询：精确键序 op,after,limit（键须按
+        # 此序出现，乱序报 INPUT），只读、不推进时钟、不改预约与审计窗口。
+        # after 为 0..10^18、limit 为 1..64 的非 bool 整数；键序、类型、
+        # 布尔混入或范围非法报 INPUT，after 大于已分配最大 seq 留执行期判
+        # STATE（同 ai 口径）。
+        if list(raw_op) != ["op", "after", "limit"]:
+            fail(EXIT_INPUT, "INPUT")
+        after = raw_op["after"]
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or not 0 <= after <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        limit = raw_op["limit"]
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 64
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("ek", after, limit)
+
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
         # 规范化全部状态并按 O(N) 计算摘要，state 紧凑编码超 8MiB 报
@@ -4975,6 +4999,19 @@ def run(raw):
     # 同一事务内与事件一起固化，失败不追加。额外空间 O(64S)，S 为规范化
     # 顶层段数。
     audit_sections = deque(maxlen=64)
+    # 端点切换预约生命周期审计（ek）：独立、不复用的 seq 自 1 递增（ep_audit
+    # seq 为下一个待分配 seq），事件按 seq 升序以 deque(maxlen=64) 仅保留最
+    # 近 64 条，超额淘汰最旧项；ci/cb/cu/ca 清除预约不清空审计窗口。每事件
+    # 为 (seq, now, action, before, after)：now 为造成变更的显式时钟，
+    # action ∈ SET/REPLACE/CANCEL/APPLY/CLEAR，before/after 为 None 或
+    # (digest, at) 预约身份。仅真正改变预约状态的成功操作追加：es 从空建立
+    # 记 SET、以不同身份覆盖记 REPLACE（同身份重报不记）；eo 旧身份匹配的
+    # 首次替换记 REPLACE（已等于新身份的幂等重报不记）；eu 成功取消记
+    # CANCEL（无预约空取消不记）；ei 成功生效与 ed APPLIED 记 APPLY（ed 的
+    # EMPTY/WAITING/MISSING/CONFLICT 不记）；ci/cb/cu/ca 成功清除现存预约记
+    # CLEAR（本无预约不记）。追加 O(1)，额外空间 O(64)。
+    ep_audit_events = deque(maxlen=64)
+    ep_audit_seq = 1
     results = []
 
     def backend_routable(record, drain_strict=False):
@@ -6786,6 +6823,25 @@ def run(raw):
                 ],
             }
 
+        # 端点切换预约生命周期审计：顶层段 ep_audit 固定键序
+        # next_seq,events；事件按 seq 升序仅保留最近 64 条，逐项固定键序
+        # seq,now,action,before,after，before/after 为 null 或固定键序
+        # digest,at 的预约身份。
+        ep_audit_state = {
+            "next_seq": b["ep_audit_seq"],
+            "events": [
+                {
+                    "seq": seq,
+                    "now": event_now,
+                    "action": action,
+                    "before": ep_identity_json(before),
+                    "after": ep_identity_json(after_identity),
+                }
+                for seq, event_now, action, before, after_identity
+                in b["ep_audit_events"]
+            ],
+        }
+
         return {
             "now": last_now,
             "vnodes": ring_vnodes,
@@ -6838,6 +6894,7 @@ def run(raw):
             "audit": audit_states,
             "reservation": reservation_state,
             "ep_switch": ep_switch_state,
+            "ep_audit": ep_audit_state,
             "mo": {
                 "seq": mo_seq,
                 "cache": (
@@ -6861,7 +6918,8 @@ def run(raw):
         "retry_alerts", "retry_events", "conc_alerts", "limit_alerts",
         "unavail_alerts",
         "commit_history", "next_rev", "audit_events", "audit_sections",
-        "reservation", "ep_switch", "mo_seq", "mo_cache",
+        "reservation", "ep_switch", "ep_audit_events", "ep_audit_seq",
+        "mo_seq", "mo_cache",
     )
 
     def current_bundle():
@@ -6912,6 +6970,8 @@ def run(raw):
             "audit_sections": audit_sections,
             "reservation": reservation,
             "ep_switch": ep_switch,
+            "ep_audit_events": ep_audit_events,
+            "ep_audit_seq": ep_audit_seq,
             "mo_seq": mo_seq,
             "mo_cache": mo_cache,
         }
@@ -6930,7 +6990,8 @@ def run(raw):
         nonlocal retry_alerts, retry_events, conc_alerts, limit_alerts
         nonlocal unavail_alerts
         nonlocal commit_history, next_rev, audit_events, audit_sections
-        nonlocal reservation, ep_switch, mo_seq, mo_cache
+        nonlocal reservation, ep_switch, ep_audit_events, ep_audit_seq
+        nonlocal mo_seq, mo_cache
         last_now = b["last_now"]
         ring_vnodes = b["ring_vnodes"]
         sticky_ttl = b["sticky_ttl"]
@@ -6976,6 +7037,8 @@ def run(raw):
         audit_sections = b["audit_sections"]
         reservation = b["reservation"]
         ep_switch = b["ep_switch"]
+        ep_audit_events = b["ep_audit_events"]
+        ep_audit_seq = b["ep_audit_seq"]
         mo_seq = b["mo_seq"]
         mo_cache = b["mo_cache"]
 
@@ -7097,7 +7160,7 @@ def run(raw):
             "backends", "connections", "sticky", "buckets", "quotas",
             "wait_queue", "capacities", "overload_hist", "wait_hist",
             "limit_hist", "alerts", "commits", "next_rev", "audit",
-            "reservation", "ep_switch", "mo",
+            "reservation", "ep_switch", "ep_audit", "mo",
         ))
 
         last_now = root["now"]
@@ -8306,6 +8369,85 @@ def run(raw):
                 cp_state_int()
             ep_switch = (es_items, es_before, es_at, es_digest)
 
+        # 端点切换预约生命周期审计：顶层段 ep_audit 固定键序
+        # next_seq,events。seq 独立自 1 递增、不复用；事件按 seq 升序仅
+        # 保留最近 64 条，故恢复后窗口须与 next_seq 严格一致（连续、末项
+        # 为 next_seq-1、长度为 min(64, next_seq-1)），矛盾计数或缺口为
+        # 非法状态组合（STATE）。
+        ep_audit_raw = o(root["ep_audit"], ("next_seq", "events"))
+        ep_audit_seq = si2(ep_audit_raw["next_seq"], 1, 10 ** 18)
+        ep_audit_events = deque(maxlen=64)
+        ep_event_list = cp_list(ep_audit_raw["events"])
+        if len(ep_event_list) > 64:
+            cp_state_int()
+        expected_len = min(64, ep_audit_seq - 1)
+        if len(ep_event_list) != expected_len:
+            cp_state_int()
+        def ep_audit_identity(value):
+            if value is None:
+                return None
+            iv = o(value, ("digest", "at"))
+            return (cp_hex_digest(iv["digest"]), ti(iv["at"]))
+
+        previous_seq = None
+        previous_after = None
+        previous_now = None
+        for eentry in ep_event_list:
+            ekobj = o(eentry, ("seq", "now", "action", "before", "after"))
+            ese_seq = si2(ekobj["seq"], 1, 10 ** 18)
+            if previous_seq is not None and ese_seq != previous_seq + 1:
+                cp_state_int()
+            previous_seq = ese_seq
+            ese_now = ti(ekobj["now"])
+            # 事件 now 取自共用非递减显式时钟，故事件间不得递减（允许同
+            # 刻多个变更）。
+            if previous_now is not None and ese_now < previous_now:
+                cp_state_int()
+            previous_now = ese_now
+            ese_action = enum(
+                ekobj["action"],
+                ("SET", "REPLACE", "CANCEL", "APPLY", "CLEAR"),
+            )
+            ese_before = ep_audit_identity(ekobj["before"])
+            ese_after = ep_audit_identity(ekobj["after"])
+            # 窗口内相邻事件身份须首尾相接（上一条 after 即下一条
+            # before）；最旧保留项之前可能已有事件随窗口淘汰，不校验其
+            # before。
+            if previous_after is not None and ese_before != previous_after:
+                cp_state_int()
+            previous_after = ese_after
+            # 动作与前后身份组合须与写入路径一致：SET 从空建立（before 为
+            # null、after 非空）；REPLACE 以不同身份覆盖（两侧均非空）；
+            # CANCEL/APPLY/CLEAR 清除现存预约（before 非空、after 为
+            # null）。矛盾组合为非法状态。
+            if ese_action == "SET":
+                if ese_before is not None or ese_after is None:
+                    cp_state_int()
+            elif ese_action == "REPLACE":
+                # 写入路径仅在身份确实不同时记 REPLACE（同身份为幂等重
+                # 报、不记事件）。
+                if ese_before is None or ese_after is None \
+                        or ese_before == ese_after:
+                    cp_state_int()
+            else:
+                if ese_before is None or ese_after is not None:
+                    cp_state_int()
+            ep_audit_events.append(
+                (ese_seq, ese_now, ese_action, ese_before, ese_after)
+            )
+        if ep_audit_events and ep_audit_events[-1][0] != ep_audit_seq - 1:
+            cp_state_int()
+        # 末条事件的 after 必须等于当前预约身份：最近一次真正改变预约的
+        # 操作决定现状。窗口为空时（从未分配 seq）不得存在预约。
+        if ep_audit_events:
+            if ep_audit_events[-1][4] != ep_identity(ep_switch):
+                cp_state_int()
+            # 最后事件时钟不得晚于当前逻辑时钟。
+            if last_now is not None and ep_audit_events[-1][1] > last_now:
+                cp_state_int()
+        elif ep_switch is not None:
+            cp_state_int()
+
         mo_raw = o(root["mo"], ("seq", "cache"))
         mo_seq = si2(mo_raw["seq"], 1, 10 ** 18)
         mo_cache = None
@@ -8374,6 +8516,8 @@ def run(raw):
             "audit_sections": audit_sections,
             "reservation": reservation,
             "ep_switch": ep_switch,
+            "ep_audit_events": ep_audit_events,
+            "ep_audit_seq": ep_audit_seq,
             "mo_seq": mo_seq,
             "mo_cache": mo_cache,
         }
@@ -8424,6 +8568,27 @@ def run(raw):
         if norm_bytes != state_bytes:
             fail(EXIT_STATE, "STATE")
         return cp_digest, norm_state, norm_bytes, bundle
+
+    def ep_identity(switch):
+        """预约身份 (digest, at)；无预约为 None。"""
+        if switch is None:
+            return None
+        return (switch[3], switch[2])
+
+    def ep_identity_json(identity):
+        """把 (digest, at) 身份输出为固定键序 digest,at 的对象；None 为
+        null。"""
+        if identity is None:
+            return None
+        identity_digest, identity_at = identity
+        return {"digest": identity_digest, "at": identity_at}
+
+    def ep_audit_append(action, now, before, after):
+        """分配下一个永不复用的 seq 并追加一条端点预约生命周期事件；deque
+        按 64 条窗口自动淘汰最旧项，seq 游标不随淘汰回退或复用。O(1)。"""
+        nonlocal ep_audit_seq
+        ep_audit_events.append((ep_audit_seq, now, action, before, after))
+        ep_audit_seq += 1
 
     for raw_op in ops:
         op = parse_op(raw_op)
@@ -10891,7 +11056,12 @@ def run(raw):
                 commit_history.pop(0)
             # ci 成功清除既有配置预约。
             reservation = None
-            # ci 成功同时清除全池端点切换预约。
+            # ci 成功同时清除全池端点切换预约；生命周期审计：清除现存预约
+            # 记 CLEAR（before 为被清除预约身份），本无预约不记。
+            if ep_switch is not None:
+                ep_audit_append(
+                    "CLEAR", now, (ep_switch[3], ep_switch[2]), None,
+                )
             ep_switch = None
             # 审计：成功并分配新 rev 时按 rev 升序追加（仅留最近 64 条），
             # section 恒 null；before 为操作前指纹，after 为新提交指纹。
@@ -11403,7 +11573,12 @@ def run(raw):
                 commit_history.pop(0)
             # cb 成功清除既有配置预约。
             reservation = None
-            # cb 成功同时清除全池端点切换预约。
+            # cb 成功同时清除全池端点切换预约；生命周期审计：清除现存预约
+            # 记 CLEAR，本无预约不记。
+            if ep_switch is not None:
+                ep_audit_append(
+                    "CLEAR", now, (ep_switch[3], ep_switch[2]), None,
+                )
             ep_switch = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
             # null；before 为回滚前指纹，after 为目标快照指纹。同一事件内
@@ -11479,7 +11654,12 @@ def run(raw):
                 commit_history.pop(0)
             # cu 成功清除既有配置预约。
             reservation = None
-            # cu 成功同时清除全池端点切换预约。
+            # cu 成功同时清除全池端点切换预约；生命周期审计：清除现存预约
+            # 记 CLEAR，本无预约不记。
+            if ep_switch is not None:
+                ep_audit_append(
+                    "CLEAR", now, (ep_switch[3], ep_switch[2]), None,
+                )
             ep_switch = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 取被
             # 替换顶层字段；before/after 即响应中的 base/target 摘要（值未变
@@ -11600,7 +11780,13 @@ def run(raw):
             if len(commit_history) > 16:
                 commit_history.pop(0)
             reservation = None
-            # ca 成功同时清除全池端点切换预约。
+            # ca 成功同时清除全池端点切换预约；生命周期审计：清除现存预约
+            # 记 CLEAR，本无预约不记（能走到此处 reservation 非空，但
+            # ep_switch 可能本就为 None）。
+            if ep_switch is not None:
+                ep_audit_append(
+                    "CLEAR", now, (ep_switch[3], ep_switch[2]), None,
+                )
             ep_switch = None
             # 审计：成功并分配新 rev 时追加（仅留最近 64 条），section 恒
             # null；before 为生效前指纹，after 为预约快照指纹（同响应 digest）。
@@ -14081,10 +14267,17 @@ def run(raw):
                 if backends.get(backend_id) is None:
                     fail(EXIT_BACKEND, "BACKEND")
             digest = endpoint_switch_digest(switch_items, before)
+            old_identity = ep_identity(ep_switch)
             if ep_switch is None or (ep_switch[3], ep_switch[2]) != (
                 digest, at
             ):
                 ep_switch = (switch_items, before, at, digest)
+                # 生命周期审计：仅真正改变预约身份时追加——从空建立记
+                # SET，以不同身份覆盖记 REPLACE；同身份幂等重报不记。
+                ep_audit_append(
+                    "SET" if old_identity is None else "REPLACE",
+                    now, old_identity, (digest, at),
+                )
             results.append(
                 {"op": "es", "digest": digest, "at": at, "ok": True}
             )
@@ -14142,6 +14335,11 @@ def run(raw):
                 _, _, reserved_at, reserved_digest = ep_switch
                 if reserved_digest != digest or reserved_at != at:
                     fail(EXIT_STATE, "STATE")
+                # 生命周期审计：成功取消现存预约记 CANCEL；无预约的幂等空
+                # 取消已在上方分支返回、不产生事件。
+                ep_audit_append(
+                    "CANCEL", now, (reserved_digest, reserved_at), None,
+                )
                 ep_switch = None
                 results.append(
                     {"op": "eu", "digest": digest, "at": at,
@@ -14229,7 +14427,9 @@ def run(raw):
                     }
                 )
                 closed_total += len(cids)
-            # 成功后删除预约；失败路径均在任何写入之前 fail，预约保留。
+            # 生命周期审计：成功生效记 APPLY（失败路径均在任何写入之前
+            # fail，不产生事件）；随后删除预约。
+            ep_audit_append("APPLY", now, (digest, at), None)
             ep_switch = None
             results.append(
                 {
@@ -14369,6 +14569,12 @@ def run(raw):
                                 drain["state"] = "X"
                                 drain["end"] = now
                     closed_total = affected_total
+                    # 生命周期审计：仅 APPLIED 记 APPLY；EMPTY/WAITING/
+                    # MISSING/CONFLICT 不改变预约，均不产生事件。
+                    ep_audit_append(
+                        "APPLY", now,
+                        (reserved_digest, reserved_at), None,
+                    )
                     # 成功后删除预约。
                     ep_switch = None
                 results.append(
@@ -14413,6 +14619,12 @@ def run(raw):
             if matches_old and not matches_new:
                 # 原子替换为候选快照；幂等重报（matches_new）不重写状态。
                 ep_switch = (switch_items, before, at, digest)
+                # 生命周期审计：仅旧身份匹配的首次替换记 REPLACE；已等于
+                # 新身份的幂等重报（含新旧身份相同）不重写、不记事件。
+                ep_audit_append(
+                    "REPLACE", now,
+                    (reserved_digest, reserved_at), (digest, at),
+                )
             # 首次替换与同一请求重报逐字节同输出：base 回显请求值，digest
             # 为候选摘要，at 回显新时刻，ok 恒 true。
             results.append(
@@ -14604,6 +14816,63 @@ def run(raw):
                     "status": status,
                     "items": result_items,
                     "closed": closed_total,
+                }
+            )
+
+        elif op[0] == "ek":
+            # 端点切换预约生命周期审计游标查询（只读，不推进时钟、不改预约
+            # 与审计窗口及下一 seq）：事件按 seq 升序、至多 limit 项。
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0），after>
+            # latest（游标越过最新事件、指向尚未分配 seq）报 STATE。历史
+            # 非空且 after 小于最旧保留事件 seq 减 1 时，after 与最旧事件
+            # 之间必有已按 64 条窗口淘汰的事件，置 truncated=true 并自最旧
+            # 事件读取；after 等于最旧 seq 减 1（缺口恰为淘汰区、不漏可读
+            # 事件）或更大时不截断，仅取 seq>after 的事件。至多取 limit
+            # 条；next 为末条 seq、无条目等于 after；more 表示该页之后是
+            # 否仍有窗口内可读事件。响应固定键序
+            # op,after,next,truncated,more,events；事件项固定键序
+            # seq,now,action,before,after，before/after 为 null 或固定键序
+            # digest,at 的预约身份。空历史 after=0 返回空数组、next=0、
+            # truncated=false、more=false。ek 时间 O(A)（A≤64，常数）、结
+            # 果空间 O(limit)；失败批次回滚且无 stdout。
+            _, after, limit = op
+            latest = ep_audit_seq - 1
+            if after > latest:
+                fail(EXIT_STATE, "STATE")
+            truncated = False
+            if ep_audit_events and after < ep_audit_events[0][0] - 1:
+                truncated = True
+                candidates = ep_audit_events
+            else:
+                candidates = (
+                    event for event in ep_audit_events if event[0] > after
+                )
+            picked = []
+            more = False
+            for event in candidates:
+                if len(picked) < limit:
+                    picked.append(event)
+                else:
+                    more = True
+                    break
+            results.append(
+                {
+                    "op": "ek",
+                    "after": after,
+                    "next": picked[-1][0] if picked else after,
+                    "truncated": truncated,
+                    "more": more,
+                    "events": [
+                        {
+                            "seq": seq,
+                            "now": event_now,
+                            "action": action,
+                            "before": ep_identity_json(before),
+                            "after": ep_identity_json(after_identity),
+                        }
+                        for seq, event_now, action, before, after_identity
+                        in picked
+                    ],
                 }
             )
 

@@ -314,6 +314,17 @@
 - 结果固定键序为 `op,now,status,digest,at,items,affected,closed`。`EMPTY` 的 `digest` 与 `at` 为 null，`items` 为空数组且计数为零；其他状态回显预约身份（digest、at），`affected` 为各项 `cids` 总数，只有 `APPLIED` 的 `closed` 等于 `affected`，其余状态 `closed` 为 0。
 - 字段集合、键序、类型、范围、UTF-8 编码或时钟倒退报 INPUT/2；失败无 stdout 并回滚整批变化和时钟。`ed` 没有 BACKEND/STATE 错误路径：未到期、后端已删除与前提冲突都是成功结果的 `status`。`se` 与 `si` 继续保存预约（`ep_switch` 段），现有端点预约入口行为不变；`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节确定性。单次时间与结果额外空间均为 O(N+C)（N 为预约项数、C 为活动连接数），不新增持久状态，仅使用 Python 标准库。
 
+## 端点切换预约生命周期审计：ek
+
+按稳定游标追查端点切换预约消失与变化的原因：仅记录真正改变预约状态的成功操作，使用独立且不复用的 `seq`（自 1 递增，与配置审计 rev、mo seq 无关），事件按 seq 升序只保留最近 64 条，超额淘汰最旧项；`ci`/`cb`/`cu`/`ca` 清除预约不清空该审计窗口。事件与预约变更在同一事务内追加，原操作失败不留任何记录。
+
+- 动作集合：`es` 从空状态建立记 `SET`，以不同身份覆盖现存预约记 `REPLACE`（同身份幂等重报不记）；`eo` 旧身份匹配的首次替换记 `REPLACE`（已等于新身份的幂等重报不记）；`eu` 成功取消现存预约记 `CANCEL`（无预约的空取消不记）；`ei` 成功生效与 `ed` 返回 `APPLIED` 记 `APPLY`；`ci`、`cb`、`cu`、`ca` 成功清除现存端点预约记 `CLEAR`（本无预约不记）。幂等重报、空取消、`ed` 的 `EMPTY`/`WAITING`/`MISSING`/`CONFLICT` 结果和 `en`/`ev`/`ew`/`ek` 等所有只读操作均不产生事件。
+- `ek`：输入严格按 `op,after,limit` 排列（键须按此序出现）；`after` 为 0..10¹⁸、`limit` 为 1..64 的非 bool 整数。只读，不推进显式时钟、不改变预约与审计窗口及下一 seq。
+- 返回固定键序 `op,after,next,truncated,more,events`；事件按 seq 升序、至多 `limit` 项，每项固定键序 `seq,now,action,before,after`：`now` 为造成该变更的显式时钟，`action` 为上述五种值之一，`before`/`after` 均为 null 或固定键序 `digest,at` 的预约身份。
+- 令 `latest` 为已分配最大 seq（初始 0）：`after>latest` 报 STATE/4。历史非空且 `after` 早于最旧保留事件 seq 减一时，游标之前已有事件被淘汰：自最旧事件读取并置 `truncated=true`；`after` 等于最旧 seq 减一或更大时 `truncated=false`，只取 seq 大于 `after` 的事件。`next` 取末项 seq，无结果时等于请求 `after`；`more` 表示该页之后窗口内仍有后续事件。空历史配 `after=0` 返回空数组、`next=0`、`truncated=false`、`more=false`。
+- 字段集合、键序、编码、类型或范围非法返回 INPUT/2，失败无 stdout，并回滚同批的变化、时钟、预约和审计序号（seq 只在成功提交时分配）。
+- `se`/`si` 完整保存审计窗口及下一 seq（顶层段 `ep_audit`，固定键序 `next_seq,events`；事件项固定键序 `seq,now,action,before,after`，恢复时校验 seq 连续、窗口计数、动作与身份组合及与当前预约的一致性，矛盾状态报 STATE/4）；`sd`、`sx`、`sm` 按既有检查点规则观察该段差异。事件写入为 O(1)，`ek` 时间与结果空间 O(limit)，总空间 O(64)，仅用 Python 标准库；`run`、`record`、`replay` 继续保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，全部既有入口的结果、异常类型和退出码不变。
+
 ## 测试
 
     python -m unittest discover

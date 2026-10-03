@@ -26130,5 +26130,606 @@ class EpSwitchDuePollTest(unittest.TestCase):
                              (run_code, run_out, run_err))
 
 
+class EpSwitchLifecycleAuditTest(unittest.TestCase):
+    """ek：端点切换预约生命周期审计——独立 seq 自 1 递增、仅留最近 64 条；
+    SET/REPLACE/CANCEL/APPLY/CLEAR 五种动作的产生与不产生口径、游标分页/
+    truncated/more/next、INPUT/STATE 分类、与预约变更同事务原子提交、
+    se/si/sd/sx/sm 对 ep_audit 段的保存观察、record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+    EP3 = {"host": "10.0.0.3", "port": 82}
+    EPX = {"host": "10.9.9.9", "port": 88}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def ek(self, after, limit):
+        return {"op": "ek", "after": after, "limit": limit}
+
+    def setup_reservation(self, items=(("a", None, EP1),), before=0,
+                          at=10, now=5):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(list(items), before, at, now),
+        ]
+        results = self.run_ops(ops)
+        digest = self.switch_digest(list(items), before)
+        self.assertEqual(results[-1]["digest"], digest)
+        return ops, digest
+
+    def audit(self, results):
+        rows = [r for r in results if r["op"] == "ek"]
+        return rows[-1]
+
+    # ---- 空历史与输出形状 ----
+
+    def test_empty_history_compact_bytes(self):
+        code, out, err = run_balancer(
+            "run", encode_ops([self.ek(0, 64)])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"ek","after":0,"next":0,'
+            b'"truncated":false,"more":false,"events":[]}],'
+            b'"backends":[]}\n',
+        )
+
+    def test_response_and_event_key_order(self):
+        ops, _ = self.setup_reservation()
+        result = self.audit(self.run_ops(ops + [self.ek(0, 64)]))
+        self.assertEqual(
+            list(result),
+            ["op", "after", "next", "truncated", "more", "events"],
+        )
+        event = result["events"][0]
+        self.assertEqual(
+            list(event), ["seq", "now", "action", "before", "after"]
+        )
+        self.assertEqual(list(event["after"]), ["digest", "at"])
+
+    # ---- SET / REPLACE（es）----
+
+    def test_es_empty_is_set_override_is_replace_replay_silent(self):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops, d1 = self.setup_reservation(items1, 0, 10, 5)
+        ops.append(self.es(items1, 0, 10, 6))          # 同身份幂等
+        ops.append(self.es(items2, 0, 12, 7))          # 不同身份覆盖
+        ops.append(self.ek(0, 64))
+        events = self.audit(self.run_ops(ops))["events"]
+        self.assertEqual([e["action"] for e in events],
+                         ["SET", "REPLACE"])
+        self.assertEqual([e["now"] for e in events], [5, 7])
+        self.assertEqual(events[0]["before"], None)
+        self.assertEqual(events[0]["after"], {"digest": d1, "at": 10})
+        self.assertEqual(events[1]["before"], {"digest": d1, "at": 10})
+        self.assertEqual(
+            events[1]["after"],
+            {"digest": self.switch_digest(items2, 0), "at": 12},
+        )
+
+    # ---- eo 首次替换 / 幂等 ----
+
+    def test_eo_replace_once_replay_silent(self):
+        items2 = [("a", None, self.EP2)]
+        ops, d1 = self.setup_reservation()
+        d2 = self.switch_digest(items2, 0)
+        ops += [
+            {"op": "eo", "base": d1, "base_at": 10, "items": [
+                {"id": i, "base": b, "target": t} for i, b, t in items2],
+             "before": 0, "at": 12, "now": 6},
+            {"op": "eo", "base": d1, "base_at": 10, "items": [
+                {"id": i, "base": b, "target": t} for i, b, t in items2],
+             "before": 0, "at": 12, "now": 7},
+            self.ek(0, 64),
+        ]
+        events = self.audit(self.run_ops(ops))["events"]
+        self.assertEqual([e["action"] for e in events],
+                         ["SET", "REPLACE"])
+        self.assertEqual(events[1]["now"], 6)
+        self.assertEqual(events[1]["after"], {"digest": d2, "at": 12})
+
+    # ---- CANCEL ----
+
+    def test_eu_cancel_recorded_empty_cancel_silent(self):
+        ops, d1 = self.setup_reservation()
+        ops += [
+            {"op": "eu", "digest": d1, "at": 10, "now": 6},
+            {"op": "eu", "digest": d1, "at": 10, "now": 7},
+            self.ek(0, 64),
+        ]
+        events = self.audit(self.run_ops(ops))["events"]
+        self.assertEqual([e["action"] for e in events],
+                         ["SET", "CANCEL"])
+        cancel = events[1]
+        self.assertEqual(cancel["before"], {"digest": d1, "at": 10})
+        self.assertIsNone(cancel["after"])
+
+    def test_eu_mismatch_rolls_back_clock_reservation_and_seq(self):
+        ops, d1 = self.setup_reservation()
+        # 身份不符：STATE 且整批无 stdout。
+        self.failure(
+            ops + [{"op": "eu", "digest": "0" * 64, "at": 99, "now": 6}],
+            4, "STATE",
+        )
+        # 新批次中预约仍在、只有 SET；用同 now=6 取消成功（失败批未推进
+        # 时钟，5→6 合法）。
+        results = self.run_ops(ops + [
+            {"op": "eu", "digest": d1, "at": 10, "now": 6},
+            self.ek(0, 64),
+        ])
+        events = self.audit(results)["events"]
+        self.assertEqual([e["action"] for e in events],
+                         ["SET", "CANCEL"])
+
+    # ---- APPLY（ei / ed）----
+
+    def test_ei_apply_recorded(self):
+        ops, d1 = self.setup_reservation()
+        ops += [
+            {"op": "ei", "digest": d1, "at": 10, "now": 10},
+            self.ek(0, 64),
+        ]
+        events = self.audit(self.run_ops(ops))["events"]
+        self.assertEqual([(e["action"], e["now"]) for e in events],
+                         [("SET", 5), ("APPLY", 10)])
+        self.assertEqual(events[1]["before"], {"digest": d1, "at": 10})
+        self.assertIsNone(events[1]["after"])
+
+    def test_ed_non_applied_statuses_silent_applied_recorded(self):
+        # WAITING 与 APPLIED 同批：WAITING 不记事件。
+        ops, d1 = self.setup_reservation()
+        ops += [
+            {"op": "ed", "now": 9},
+            {"op": "ed", "now": 10},
+            {"op": "ed", "now": 11},     # EMPTY
+            self.ek(0, 64),
+        ]
+        results = self.run_ops(ops)
+        statuses = [r["status"] for r in results if r["op"] == "ed"]
+        self.assertEqual(statuses, ["WAITING", "APPLIED", "EMPTY"])
+        events = self.audit(results)["events"]
+        self.assertEqual([e["action"] for e in events],
+                         ["SET", "APPLY"])
+        self.assertEqual(events[1]["now"], 10)
+
+    def test_ed_missing_and_conflict_silent_and_keep_reservation(self):
+        # MISSING：预约引用的 b2 被删除。
+        ops = [
+            {"op": "add", "id": "b1", "weight": 1},
+            {"op": "add", "id": "b2", "weight": 1},
+            self.es([("b2", None, self.EP2)], 0, 10, 5),
+            {"op": "remove", "id": "b2"},
+            {"op": "ed", "now": 10},
+            {"op": "en"},
+            self.ek(0, 64),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            [r for r in results if r["op"] == "ed"][0]["status"], "MISSING"
+        )
+        # 只有建立时的 SET，MISSING 未追加事件。
+        self.assertEqual(
+            [e["action"] for e in self.audit(results)["events"]], ["SET"]
+        )
+        self.assertTrue([r for r in results if r["op"] == "en"][0]["pending"])
+        # CONFLICT：当前端点既非 base 也非 target。
+        ops = [
+            {"op": "add", "id": "a", "weight": 1},
+            {"op": "ep", "id": "a", **self.EPX},
+            self.es([("a", self.EP1, self.EP2)], 0, 10, 5),
+            {"op": "ed", "now": 10},
+            self.ek(0, 64),
+        ]
+        results = self.run_ops(ops)
+        self.assertEqual(
+            [r for r in results if r["op"] == "ed"][0]["status"], "CONFLICT"
+        )
+        self.assertEqual(
+            [e["action"] for e in self.audit(results)["events"]], ["SET"]
+        )
+
+    def test_ei_failure_records_nothing(self):
+        # now<at 过早：STATE，预约保留、无 APPLY 事件。
+        ops, d1 = self.setup_reservation()
+        self.failure(
+            ops + [{"op": "ei", "digest": d1, "at": 10, "now": 9}],
+            4, "STATE",
+        )
+        results = self.run_ops(ops + [self.ek(0, 64)])
+        self.assertEqual(
+            [e["action"] for e in self.audit(results)["events"]], ["SET"]
+        )
+
+    # ---- CLEAR（ci/cb/cu/ca）----
+
+    def test_config_changes_clear_recorded_only_when_present(self):
+        config = config_v11(1)
+        items = [("a", None, self.EP1)]
+        # ci 清除现存预约。
+        ops = [
+            {"op": "ci", "config": config, "now": 1},
+            self.es(items, 0, 10, 5),
+            {"op": "ci", "config": config, "now": 8},
+            self.ek(0, 64),
+        ]
+        events = self.audit(self.run_ops(ops))["events"]
+        self.assertEqual([e["action"] for e in events],
+                         ["SET", "CLEAR"])
+        self.assertEqual(events[1]["now"], 8)
+        self.assertIsNone(events[1]["after"])
+        # 无预约时 ci 不记 CLEAR。
+        results = self.run_ops([
+            {"op": "ci", "config": config, "now": 1},
+            {"op": "ci", "config": config, "now": 2},
+            self.ek(0, 64),
+        ])
+        self.assertEqual(self.audit(results)["events"], [])
+
+    def test_cb_cu_ca_clear_recorded(self):
+        config = config_v11(1)
+        items = [("a", None, self.EP1)]
+        # cb。
+        ops = [
+            {"op": "ci", "config": config, "now": 1},
+            self.es(items, 0, 10, 5),
+            {"op": "cb", "rev": 1, "now": 9},
+            self.ek(0, 64),
+        ]
+        self.assertEqual(
+            [e["action"] for e in self.audit(self.run_ops(ops))["events"]],
+            ["SET", "CLEAR"],
+        )
+        # cu（base 取同批 ct 摘要）。
+        ops = [
+            {"op": "ci", "config": config, "now": 1},
+            self.es(items, 0, 10, 5),
+            {"op": "ct"},
+        ]
+        results = self.run_ops(ops)
+        base = results[-1]["digest"]
+        ops += [
+            {"op": "cu", "base": base, "section": "sticky",
+             "value": None, "now": 8},
+            self.ek(0, 64),
+        ]
+        self.assertEqual(
+            [e["action"] for e in self.audit(self.run_ops(ops))["events"]],
+            ["SET", "CLEAR"],
+        )
+        # ca（配置预约生效同时清除端点预约）。
+        ops = [
+            {"op": "ci", "config": config, "now": 1},
+            self.es(items, 0, 10, 5),
+            {"op": "cp", "config": config, "at": 20, "now": 6},
+            {"op": "ca", "now": 20},
+            self.ek(0, 64),
+        ]
+        events = self.audit(self.run_ops(ops))["events"]
+        self.assertEqual([e["action"] for e in events],
+                         ["SET", "CLEAR"])
+        self.assertEqual(events[1]["now"], 20)
+
+    # ---- 只读操作不产生事件、不推进时钟 ----
+
+    def test_readonly_ops_silent_and_ek_keeps_clock(self):
+        ops, d1 = self.setup_reservation()
+        # 先记录建立后的基线事件。
+        before_page = self.audit(self.run_ops(ops + [self.ek(0, 64)]))
+        ops += [
+            {"op": "en"},
+            {"op": "ev", "digest": d1, "at": 10, "now": 9},
+            {"op": "ew", "base": d1, "base_at": 10,
+             "items": [{"id": "a", "base": None, "target": self.EP2}],
+             "before": 0, "at": 12, "now": 9},
+            self.ek(0, 64),
+        ]
+        # 只读操作不新增事件：事件集与建立后完全一致。
+        self.assertEqual(
+            self.audit(self.run_ops(ops))["events"], before_page["events"]
+        )
+        # ek 不推进时钟：ek 后以同刻 now=5 提交身份不符的 eu 须报 STATE
+        # （而非时钟倒退 INPUT）。
+        ops2, _ = self.setup_reservation()
+        ops2 += [
+            self.ek(0, 64),
+            {"op": "eu", "digest": "0" * 64, "at": 10, "now": 5},
+        ]
+        self.failure(ops2, 4, "STATE")
+
+    # ---- 分页 / truncated / more / next ----
+
+    def test_pagination_limit_more_next(self):
+        items = [("a", None, self.EP1)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        for i in range(3):
+            ops.append(self.es(items, 0, 100 + i, 10 + i))
+        ops.append(self.ek(0, 2))
+        page = self.audit(self.run_ops(ops))
+        self.assertEqual([e["seq"] for e in page["events"]], [1, 2])
+        self.assertEqual(page["next"], 2)
+        self.assertTrue(page["more"])
+        self.assertFalse(page["truncated"])
+        ops.append(self.ek(2, 2))
+        page = self.audit(self.run_ops(ops))
+        self.assertEqual([e["seq"] for e in page["events"]], [3])
+        self.assertEqual(page["next"], 3)
+        self.assertFalse(page["more"])
+        # 无条目：next 等于 after。
+        ops.append(self.ek(3, 2))
+        page = self.audit(self.run_ops(ops))
+        self.assertEqual(page["events"], [])
+        self.assertEqual(page["next"], 3)
+        self.assertFalse(page["more"])
+        self.assertFalse(page["truncated"])
+
+    def test_window_keeps_last_64_and_truncation(self):
+        target = [("a", None, self.EP1)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        for i in range(70):
+            # 同 target、不同 at => 身份各异，逐次 REPLACE。
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+        ops.append(self.ek(0, 64))
+        page = self.audit(self.run_ops(ops))
+        self.assertTrue(page["truncated"])
+        self.assertEqual([e["seq"] for e in page["events"]],
+                         list(range(7, 71)))
+        self.assertEqual(page["next"], 70)
+        self.assertFalse(page["more"])
+        # after 早于最旧 seq-1（=6）：截断读取。
+        ops.append(self.ek(4, 3))
+        page = self.audit(self.run_ops(ops))
+        self.assertTrue(page["truncated"])
+        self.assertEqual([e["seq"] for e in page["events"]], [7, 8, 9])
+        self.assertEqual(page["next"], 9)
+        self.assertTrue(page["more"])
+        # after==最旧 seq-1：不截断。
+        ops.append(self.ek(6, 3))
+        page = self.audit(self.run_ops(ops))
+        self.assertFalse(page["truncated"])
+        self.assertEqual([e["seq"] for e in page["events"]], [7, 8, 9])
+
+    def test_after_beyond_latest_is_state(self):
+        ops, _ = self.setup_reservation()       # 已分配 seq 1
+        self.failure(ops + [self.ek(2, 64)], 4, "STATE")
+        # 空历史 after>0 同样 STATE。
+        self.failure([self.ek(1, 64)], 4, "STATE")
+
+    # ---- INPUT 分类 ----
+
+    def test_input_validation(self):
+        bad = [
+            {"op": "ek", "limit": 10},
+            {"op": "ek", "after": 0},
+            {"op": "ek", "after": 0, "limit": 0},
+            {"op": "ek", "after": 0, "limit": 65},
+            {"op": "ek", "after": -1, "limit": 10},
+            {"op": "ek", "after": 10 ** 18 + 1, "limit": 10},
+            {"op": "ek", "after": True, "limit": 10},
+            {"op": "ek", "after": 0, "limit": False},
+            {"op": "ek", "after": 0.0, "limit": 10},
+            {"op": "ek", "after": "0", "limit": 10},
+            {"op": "ek", "after": 0, "limit": 10, "x": 1},
+            {"op": "ek", "limit": 10, "after": 0},
+        ]
+        for op in bad:
+            self.failure([op], 2, "INPUT")
+
+    # ---- 检查点 ----
+
+    def test_checkpoint_saves_and_restores_audit_window(self):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops, d1 = self.setup_reservation()
+        ops += [
+            {"op": "eu", "digest": d1, "at": 10, "now": 6},
+            self.es(items2, 0, 20, 7),
+            {"op": "se"},
+        ]
+        results = self.run_ops(ops)
+        se = results[-1]
+        state = se["state"]
+        self.assertIn("ep_audit", state)
+        self.assertEqual(list(state).index("ep_audit"),
+                         list(state).index("ep_switch") + 1)
+        audit_state = state["ep_audit"]
+        self.assertEqual(list(audit_state), ["next_seq", "events"])
+        self.assertEqual(audit_state["next_seq"], 4)
+        self.assertEqual(
+            [e["action"] for e in audit_state["events"]],
+            ["SET", "CANCEL", "SET"],
+        )
+        # si 恢复后 ek 逐值一致，新事件继续 seq=4。
+        results = self.run_ops(ops + [
+            {"op": "si", "version": se["version"], "digest": se["digest"],
+             "state": state},
+            self.ek(0, 64),
+            {"op": "eu", "digest": audit_state["events"][-1]["after"]
+             ["digest"], "at": 20, "now": 8},
+            self.ek(0, 64),
+        ])
+        pages = [r for r in results if r["op"] == "ek"]
+        self.assertEqual(
+            [e["action"] for e in pages[0]["events"]],
+            ["SET", "CANCEL", "SET"],
+        )
+        self.assertEqual(
+            [(e["seq"], e["action"]) for e in pages[1]["events"]][-1],
+            (4, "CANCEL"),
+        )
+        # 恢复后立即再 se：摘要与 state 逐字节一致。
+        results = self.run_ops(ops + [
+            {"op": "si", "version": se["version"], "digest": se["digest"],
+             "state": state},
+            {"op": "se"},
+        ])
+        self.assertEqual(results[-1]["digest"], se["digest"])
+        self.assertEqual(results[-1]["state"], se["state"])
+
+    def test_sd_observes_ep_audit_section(self):
+        items = [("a", None, self.EP1)]
+        # 当前无事件、候选含一个 SET：sd 报告 ep_audit 段差异。
+        base_ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            {"op": "se"},
+        ]
+        base = self.run_ops(base_ops)[-1]
+        target_ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items, 0, 10, 5),
+            {"op": "se"},
+        ]
+        target = self.run_ops(target_ops)[-1]
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            {"op": "sd", "version": target["version"],
+             "digest": target["digest"], "state": target["state"]},
+        ])
+        sd = results[-1]
+        sections = [c["section"] for c in sd["changes"]]
+        self.assertIn("ep_audit", sections)
+        # 自身差异为空。
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            {"op": "sd", "version": base["version"],
+             "digest": base["digest"], "state": base["state"]},
+        ])
+        self.assertTrue(results[-1]["equal"])
+        self.assertEqual(results[-1]["changes"], [])
+
+    def test_sx_sm_observe_and_merge_ep_audit(self):
+        items = [("a", None, self.EP1)]
+        base = self.run_ops([
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            {"op": "se"},
+        ])[-1]
+        target = self.run_ops([
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items, 0, 10, 5),
+            {"op": "se"},
+        ])[-1]
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            {"op": "sx", "base": {
+                "version": base["version"], "digest": base["digest"],
+                "state": base["state"]},
+             "target": {
+                "version": target["version"], "digest": target["digest"],
+                "state": target["state"]}},
+        ])
+        sx = results[-1]
+        self.assertEqual(sx["status"], "CLEAN")
+        kinds = {c["section"]: c["kind"] for c in sx["changes"]}
+        self.assertEqual(kinds.get("ep_audit"), "TARGET")
+        # sm 合入后 ek 可见合并来的事件。
+        results = self.run_ops([
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            {"op": "sm", "base": {
+                "version": base["version"], "digest": base["digest"],
+                "state": base["state"]},
+             "target": {
+                "version": target["version"], "digest": target["digest"],
+                "state": target["state"]}},
+            self.ek(0, 64),
+        ])
+        sm = [r for r in results if r["op"] == "sm"][0]
+        self.assertIn("ep_audit", sm["sections"])
+        events = self.audit(results)["events"]
+        self.assertEqual([(e["seq"], e["action"]) for e in events],
+                         [(1, "SET")])
+
+    def test_si_rejects_inconsistent_audit_state(self):
+        target = self.run_ops([
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            {"op": "se"},
+        ])[-1]
+
+        def import_state(state, expected_code, label):
+            envelope = json.dumps(
+                {"version": 1, "state": state},
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8")
+            digest = hashlib.sha256(envelope).hexdigest()
+            self.failure(
+                [{"op": "si", "version": 1, "digest": digest,
+                  "state": state}],
+                expected_code, label,
+            )
+
+        state = json.loads(json.dumps(target["state"]))
+        # seq 缺口（窗口长度与 next_seq 矛盾）。
+        state["ep_audit"]["events"][0]["seq"] = 2
+        state["ep_audit"]["next_seq"] = 3
+        import_state(state, 4, "STATE")
+        # 非法动作枚举：INPUT。
+        state = json.loads(json.dumps(target["state"]))
+        state["ep_audit"]["events"][0]["action"] = "WAT"
+        import_state(state, 2, "INPUT")
+        # 事件项键序错误：INPUT。
+        state = json.loads(json.dumps(target["state"]))
+        ev = state["ep_audit"]["events"][0]
+        state["ep_audit"]["events"][0] = {
+            "now": ev["now"], "seq": ev["seq"], "action": ev["action"],
+            "before": ev["before"], "after": ev["after"],
+        }
+        import_state(state, 2, "INPUT")
+        # 末事件 after 与现存预约不一致：STATE。
+        state = json.loads(json.dumps(target["state"]))
+        state["ep_audit"]["events"][0]["after"]["at"] = 11
+        import_state(state, 4, "STATE")
+
+    # ---- record/replay 逐字节 ----
+
+    def test_record_replay_byte_identical(self):
+        ops, d1 = self.setup_reservation()
+        ops += [
+            {"op": "eu", "digest": d1, "at": 10, "now": 6},
+            self.ek(0, 64),
+            self.ek(0, 1),
+            self.ek(99, 64),                            # STATE 失败
+        ]
+        raw = encode_ops(ops)
+        run_code, run_out, run_err = run_balancer("run", raw)
+        self.assertEqual(run_code, 4)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_err), (0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
