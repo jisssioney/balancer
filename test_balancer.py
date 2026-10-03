@@ -18838,6 +18838,341 @@ class AuditDiffTest(unittest.TestCase):
         self.assertEqual(rep_code, 4)
 
 
+class AuditRangeSummaryTest(unittest.TestCase):
+    """审计修订区间汇总 ag：左开右闭区间、段差异透传、汇总、淘汰口径、
+    INPUT/STATE 优先级、只读与 record/replay 契约。"""
+
+    def ag(self, after, until):
+        return {"op": "ag", "after": after, "until": until}
+
+    def ci(self, weight, now, **ov):
+        return {"op": "ci", "config": config_v11(weight, **ov), "now": now}
+
+    def run_ops(self, ops):
+        return run_balancer("run", encode_ops(ops))
+
+    def result(self, ops):
+        code, stdout, stderr = self.run_ops(ops)
+        self.assertEqual((code, stderr), (0, b""))
+        return json.loads(stdout.decode("utf-8"))["results"][-1]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = self.run_ops(ops)
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def timeline_ops(self):
+        """五种修订：
+        rev1 ci@0   改 backends,vnodes
+        rev2 cu@1   vnodes 同值重报，changes 空
+        rev3 cb@2   回到 rev1（内容相同），changes 空
+        rev4 cu@3   改 lifetime
+        rev5 ca@5   cp 配置生效，改 backends,lifetime。"""
+        base_config = config_v11(1, vnodes=8)
+        base_digest = digest_of(base_config)
+        return [
+            self.ci(1, 0, vnodes=8),
+            {"op": "cu", "base": base_digest, "section": "vnodes",
+             "value": 8, "now": 1},
+            {"op": "cb", "rev": 1, "now": 2},
+            {"op": "cu", "base": base_digest, "section": "lifetime",
+             "value": {"ttl": 42}, "now": 3},
+            {"op": "cp", "config": config_v11(5, lifetime=3),
+             "at": 5, "now": 4},
+            {"op": "ca", "now": 5},
+        ]
+
+    # ---- 空历史与输出形状 ----
+
+    def test_empty_history_compact_bytes(self):
+        code, out, err = run_balancer(
+            "run", encode_ops([self.ag(0, 0)])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"ag","after":0,"until":0,'
+            b'"truncated":false,"events":[],"summary":{'
+            b'"total":0,"ci":0,"cb":0,"cu":0,"ca":0,'
+            b'"changed":0,"sections":[]}}],"backends":[]}\n',
+        )
+
+    def test_response_key_order_and_shape(self):
+        r = self.result(self.timeline_ops() + [self.ag(0, 5)])
+        self.assertEqual(
+            list(r),
+            ["op", "after", "until", "truncated", "events", "summary"],
+        )
+        self.assertEqual(
+            list(r["summary"]),
+            ["total", "ci", "cb", "cu", "ca", "changed", "sections"],
+        )
+        for event in r["events"]:
+            self.assertEqual(
+                list(event),
+                ["rev", "now", "kind", "section", "before", "after",
+                 "changes"],
+            )
+            for change in event["changes"]:
+                self.assertEqual(list(change), ["section", "before", "after"])
+        for section_row in r["summary"]["sections"]:
+            self.assertEqual(list(section_row), ["section", "events"])
+
+    # ---- 区间选择 ----
+
+    def test_events_follow_left_open_right_closed_range(self):
+        ops = self.timeline_ops()
+        r = self.result(ops + [self.ag(0, 5)])
+        self.assertEqual([e["rev"] for e in r["events"]], [1, 2, 3, 4, 5])
+        # 左开：after 指向的 rev 不含；右闭：until 指向的 rev 含。
+        r = self.result(ops + [self.ag(1, 4)])
+        self.assertEqual([e["rev"] for e in r["events"]], [2, 3, 4])
+        r = self.result(ops + [self.ag(1, 1)])
+        self.assertEqual(r["events"], [])
+        self.assertFalse(r["truncated"])
+        self.assertEqual(r["summary"]["total"], 0)
+
+    def test_event_headers_match_al_ai_and_changes_match_ad(self):
+        ops_check = self.timeline_ops()
+        code, out, err = self.run_ops(
+            ops_check + [self.ag(0, 5), {"op": "al"},
+                         {"op": "ai", "after": 0, "limit": 64}]
+            + [{"op": "ad", "rev": rev} for rev in range(1, 6)]
+        )
+        self.assertEqual((code, err), (0, b""))
+        results = json.loads(out.decode())["results"]
+        ag_events = results[len(ops_check)]["events"]
+        al_events = results[len(ops_check) + 1]["events"]
+        ai_events = results[len(ops_check) + 2]["events"]
+        ads = {r["rev"]: r for r in results[len(ops_check) + 3:]}
+        for event, al_event, ai_event in zip(ag_events, al_events, ai_events):
+            for field in ("rev", "now", "kind", "section", "before", "after"):
+                self.assertEqual(event[field], al_event[field])
+                self.assertEqual(event[field], ai_event[field])
+            self.assertEqual(
+                event["changes"], ads[event["rev"]]["changes"]
+            )
+
+    # ---- summary ----
+
+    def test_summary_kind_and_changed_counts(self):
+        r = self.result(self.timeline_ops() + [self.ag(0, 5)])
+        self.assertEqual(
+            {k: r["summary"][k]
+             for k in ("total", "ci", "cb", "cu", "ca", "changed")},
+            {"total": 5, "ci": 1, "cb": 1, "cu": 2, "ca": 1,
+             "changed": 3},
+        )
+        # 仅实际有非空 changes 的事件计入 changed。
+        empty_changes = [
+            e["rev"] for e in r["events"] if not e["changes"]
+        ]
+        self.assertEqual(empty_changes, [2, 3])
+        # 子区间 (1,4]：rev2/3/4，仅 rev4 changed。
+        r = self.result(self.timeline_ops() + [self.ag(1, 4)])
+        self.assertEqual(
+            {k: r["summary"][k]
+             for k in ("total", "ci", "cb", "cu", "ca", "changed")},
+            {"total": 3, "ci": 0, "cb": 1, "cu": 2, "ca": 0,
+             "changed": 1},
+        )
+
+    def test_summary_sections_follow_canonical_order_and_counts(self):
+        full = config_v11(
+            1, vnodes=8, lifetime=9,
+            quotas=[{"scope": "C", "id": "c", "limit": 5, "span": 60}],
+        )
+        # 单事件改 backends,vnodes,quotas,lifetime 四段。
+        r = self.result([self.ci(1, 0, vnodes=8, lifetime=9,
+                                 quotas=[{"scope": "C", "id": "c",
+                                          "limit": 5, "span": 60}]),
+                         self.ag(0, 1)])
+        self.assertEqual(
+            [row["section"] for row in r["summary"]["sections"]],
+            ["backends", "vnodes", "quotas", "lifetime"],
+        )
+        self.assertTrue(
+            all(row["events"] == 1 for row in r["summary"]["sections"])
+        )
+        # 时间线：backends 出现在 rev1/rev5，vnodes 在 rev1（默认 null→8）
+        # 与 rev5（8→ca 配置的 null），lifetime 在 rev4/rev5；按顶层段序
+        # 只列出现过的段，同事件同段只计一次。
+        r = self.result(self.timeline_ops() + [self.ag(0, 5)])
+        self.assertEqual(
+            r["summary"]["sections"],
+            [
+                {"section": "backends", "events": 2},
+                {"section": "vnodes", "events": 2},
+                {"section": "lifetime", "events": 2},
+            ],
+        )
+
+    # ---- truncated / 淘汰 ----
+
+    def test_truncated_follows_ai_eviction_rule(self):
+        ops = [self.ci(i + 1, i + 1) for i in range(70)]
+        r = self.result(ops + [self.ag(0, 70)])
+        self.assertTrue(r["truncated"])
+        # 淘汰事件不进入 events 或汇总：窗口仅 rev 7..70。
+        self.assertEqual(
+            [e["rev"] for e in r["events"]], list(range(7, 71))
+        )
+        self.assertEqual(r["summary"]["total"], 64)
+        self.assertEqual(r["summary"]["ci"], 64)
+        self.assertEqual(
+            r["summary"]["sections"],
+            [{"section": "backends", "events": 64}],
+        )
+        # 区间无事件时 truncated 仍为 true。
+        r = self.result(ops + [self.ag(0, 0)])
+        self.assertTrue(r["truncated"])
+        self.assertEqual(r["events"], [])
+        self.assertEqual(r["summary"]["total"], 0)
+        # after 等于最旧 rev 减一（6）：缺口恰为淘汰区，不截断。
+        r = self.result(ops + [self.ag(6, 70)])
+        self.assertFalse(r["truncated"])
+        self.assertEqual(r["events"][0]["rev"], 7)
+        r = self.result(ops + [self.ag(5, 70)])
+        self.assertTrue(r["truncated"])
+        # 窗口内子区间不截断。
+        r = self.result(ops + [self.ag(30, 40)])
+        self.assertFalse(r["truncated"])
+        self.assertEqual(
+            [e["rev"] for e in r["events"]], list(range(31, 41))
+        )
+
+    def test_truncated_matches_ai_on_same_window(self):
+        ops = [self.ci(i + 1, i + 1) for i in range(70)]
+        for after in (0, 5, 6, 7, 30):
+            code, out, err = self.run_ops(
+                ops + [{"op": "ai", "after": after, "limit": 64},
+                       self.ag(after, 70)]
+            )
+            self.assertEqual((code, err), (0, b""))
+            results = json.loads(out.decode())["results"]
+            self.assertEqual(
+                results[-2]["truncated"], results[-1]["truncated"], after
+            )
+
+    # ---- 错误 ----
+
+    def test_until_beyond_latest_is_state(self):
+        self.failure([self.ag(0, 1)], 4, "STATE")
+        # 空历史仅允许 until=0：ag(5,5) 同样越界。
+        self.failure([self.ag(5, 5)], 4, "STATE")
+        ops = [self.ci(1, 1)]
+        self.failure(ops + [self.ag(0, 2)], 4, "STATE")
+
+    def test_input_precedes_state_judgement(self):
+        bad_raw = [
+            b'{"ops":[{"op":"ag"}]}',
+            b'{"ops":[{"op":"ag","after":0}]}',
+            b'{"ops":[{"op":"ag","until":1}]}',
+            b'{"ops":[{"op":"ag","after":0,"until":1,"x":1}]}',
+            b'{"ops":[{"op":"ag","until":1,"after":0}]}',
+            b'{"ops":[{"op":"ag","after":-1,"until":1}]}',
+            b'{"ops":[{"op":"ag","after":0,"until":-1}]}',
+            b'{"ops":[{"op":"ag","after":1000000000000000001,"until":1}]}',
+            b'{"ops":[{"op":"ag","after":0,"until":1000000000000000001}]}',
+            b'{"ops":[{"op":"ag","after":true,"until":1}]}',
+            b'{"ops":[{"op":"ag","after":0,"until":false}]}',
+            b'{"ops":[{"op":"ag","after":0.0,"until":1}]}',
+            b'{"ops":[{"op":"ag","after":"0","until":1}]}',
+            b'{"ops":[{"op":"ag","after":0,"until":null}]}',
+            b'{"ops":[{"op":"ag","after":2,"until":1}]}',
+            b'{"ops":[{"op":"ag","after":0,"after":0,"until":1}]}',
+        ]
+        for raw in bad_raw:
+            code, stdout, stderr = run_balancer("run", raw)
+            self.assertEqual(
+                (code, stdout, stderr),
+                (2, b"", b'{"error":"INPUT"}\n'),
+                raw,
+            )
+        # 范围非法先于 STATE：空历史上 until 越界但类型/范围本身非法。
+        code, stdout, stderr = self.run_ops(
+            [self.ag(True, 10 ** 18 + 1)]
+        )
+        self.assertEqual((code, stdout, stderr),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_boundary_values(self):
+        # 空历史仅 until=0 成功。
+        self.assertEqual(
+            self.result([self.ag(0, 0)])["summary"]["total"], 0
+        )
+        ops = [self.ci(1, 1)]
+        # 10^18 通过范围校验但超过最新 rev：STATE（而非 INPUT）。
+        self.failure(ops + [self.ag(0, 10 ** 18)], 4, "STATE")
+        self.failure([self.ag(10 ** 18, 10 ** 18)], 4, "STATE")
+        # after==until 合法：空区间。
+        r = self.result(ops + [self.ag(1, 1)])
+        self.assertEqual((r["events"], r["summary"]["total"]), ([], 0))
+
+    # ---- 只读 / 回滚 / 逐字节 ----
+
+    def test_read_only_does_not_move_clock_or_change_window(self):
+        ops = [self.ci(1, 5)]
+        code, stdout, stderr = self.run_ops(
+            ops + [self.ag(0, 1), self.ag(0, 1), {"op": "al"}, {"op": "ct"}]
+        )
+        self.assertEqual((code, stderr), (0, b""))
+        results = json.loads(stdout.decode())["results"]
+        self.assertEqual(results[1], results[2])
+        # ag 不推进时钟：其后 now=5 的 ci 仍合法（非倒退）。
+        code, _, stderr = self.run_ops(
+            ops + [self.ag(0, 1), self.ci(2, 5)]
+        )
+        self.assertEqual((code, stderr), (0, b""))
+        # ag 不改审计窗口：ag 之后 al 事件与之前一致。
+        _, before_out, _ = self.run_ops(ops + [{"op": "al"}])
+        _, after_out, _ = self.run_ops(
+            ops + [self.ag(0, 1), {"op": "al"}]
+        )
+        before_al = json.loads(before_out.decode())["results"][-1]
+        after_al = json.loads(after_out.decode())["results"][-1]
+        self.assertEqual(before_al, after_al)
+
+    def test_failure_rolls_back_whole_batch(self):
+        code, stdout, stderr = self.run_ops(
+            [self.ci(1, 1), self.ag(0, 9)]
+        )
+        self.assertEqual((code, stdout, stderr),
+                         (4, b"", b'{"error":"STATE"}\n'))
+        code, stdout, stderr = self.run_ops(
+            [self.ci(1, 1), {"op": "ag", "after": 0, "until": -1}]
+        )
+        self.assertEqual((code, stdout, stderr),
+                         (2, b"", b'{"error":"INPUT"}\n'))
+
+    def test_repeat_queries_byte_identical(self):
+        raw = encode_ops(self.timeline_ops() + [self.ag(0, 5)])
+        _, out1, _ = run_balancer("run", raw)
+        _, out1_again, _ = run_balancer("run", raw)
+        self.assertEqual(out1, out1_again)
+
+    def test_record_replay_byte_identical(self):
+        raw = encode_ops(
+            [self.ci(i + 1, i + 1) for i in range(70)] + [self.ag(0, 70)]
+        )
+        run_code, run_stdout, _ = run_balancer("run", raw)
+        _, rec_stdout, rec_stderr = run_balancer("record", raw)
+        rep_code, rep_stdout, rep_stderr = run_balancer("replay", rec_stdout)
+        self.assertEqual((run_code, rec_stderr, rep_stderr), (0, b"", b""))
+        self.assertEqual((rep_code, rep_stdout), (run_code, run_stdout))
+        # 失败结果（STATE）同样可 record/replay。
+        raw_fail = encode_ops([self.ci(1, 1), self.ag(0, 5)])
+        fail_code, fail_out, fail_err = run_balancer("run", raw_fail)
+        _, rec_fail, _ = run_balancer("record", raw_fail)
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_fail)
+        self.assertEqual((rep_code, rep_out, rep_err),
+                         (fail_code, fail_out, fail_err))
+        self.assertEqual(rep_code, 4)
+
+
 class CheckpointTest(unittest.TestCase):
     """运行态检查点 se/si：导出、恢复、摘要、规范化键序、错误优先级与
     record/replay 逐字节契约。"""

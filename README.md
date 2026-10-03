@@ -62,6 +62,16 @@
 - `changes` 按 ce 规范化 version=11 配置的顶层键序排列但排除 `version`（backends,vnodes,limits,overload,sticky,idle,backpressure,scheduler,faults,quotas,queue,capacities,lifetime），只列前后值不同的段；每项固定键序 `section,before,after`，两指纹都是对该段规范化 JSON 值按现有紧凑 UTF-8 与固定键序编码后取得的 64 位小写 SHA-256。即使成功操作生成相同的整配置指纹，事件仍保留且 `changes` 为空数组；cu 的 `section` 继续表示请求替换的段，不据此伪造实际差异。
 - 重复查询逐字节一致；record 和 replay 继续覆盖成功与失败结果。段级记录保留空间上界 O(64S)，`ad` 时间与额外空间 O(S)，成功配置变更新增的指纹计算 O(C)，其中 S 为规范化顶层段数、C 为配置编码长度，仅用标准库。
 
+## 审计修订区间汇总：ag
+
+在 `al`/`ai`/`ad` 的六十四条保留窗口之上，按左开右闭的修订区间汇总保留事件。只读：不推进显式时钟，不改变审计窗口、修订号、配置与运行态；相同初态和输入产生逐字节一致的结果。
+
+- `ag`：仅接受按 `op,after,until` 排列的三个字段（键须按此序出现）；`after`、`until` 均为 0..10¹⁸ 的非 bool 整数，共同给出区间 `(after,until]`，`after>until` 报 INPUT/2。字段集合、键序、编码、整数类型、范围或区间关系非法均返回 INPUT/2，并先于修订状态判断。
+- 令 `latest` 为已分配最大 rev（初始 0）：`until>latest` 返回 STATE/4；空历史仅允许 `until=0`。
+- 返回固定键序 `op,after,until,truncated,events,summary`。`events` 按 rev 升序列出 `after<rev<=until` 的保留事件，每项固定键序 `rev,now,kind,section,before,after,changes`：前六项与同 rev 的 `al`/`ai` 事件逐值一致，`changes` 直接采用 `ad` 固化的段级差异（按规范化配置顶层段顺序排列，差异项固定键序 `section,before,after`）。
+- `summary` 固定键序 `total,ci,cb,cu,ca,changed,sections`：`total` 为返回事件数；`ci`/`cb`/`cu`/`ca` 按事件 `kind` 计数；`changed` 为 `changes` 非空的事件数；`sections` 只列出现过的配置段并按规范化顶层段顺序排列，每项固定键序 `section,events`，`events` 统计 `changes` 包含该段的事件数（同一事件同一段只计一次）。区间无保留事件时 `events` 与 `sections` 为空、各计数为零。
+- `truncated` 沿用 `ai` 的淘汰口径：历史非空且 `after` 小于最旧保留 rev 减一时为 true，即使区间无事件；被淘汰事件不得进入 `events` 或 `summary`。失败不产生 stdout，并回滚同批先前变化。单次时间与结果额外空间均为 O(64S)，S 为规范化顶层段数；仅使用 Python 标准库；紧凑 UTF-8 固定键序 JSON、单个末尾换行及 run、record、replay 逐字节契约不变，`se`、`si` 与其他公开操作不变。
+
 ## 后端并发告警：na
 
 每后端独立的并发滞回告警，窗值取该后端 `w` 窗 `mx` 口径的 `samples`/`peak`（空窗均为 0）。
