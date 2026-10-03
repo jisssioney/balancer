@@ -460,6 +460,22 @@
 - `last` 超过查询开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、容器数量、重复身份、UTF-8 编码、摘要格式、整数类型（排除 bool）、范围或区间关系非法返回 INPUT/2，输入错误先于状态判断。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计、不改变运行态。
 - 全部业务时间 0..当前时钟只有 O(A) 个恒值区域，区域只过一遍，故时间与额外空间均为 O(A+P+S)（P≤64 为查询身份数、S 为返回区段总数），不按时间跨度（可达 10⁹）逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及现有 `et`、`etg`、`eti` 与其他公开行为不变。
 
+## 端点切换预约审计业务时间区间净切换查询：ett
+
+在 `et`/`etg`/`eti`/`etm` 的六十四条保留窗口与逐时刻口径之上新增只读入口，按业务时间闭区间直接报告各同 `now` 事件整组处理后的净切换，调用方无需比较相邻区段自行识别。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `ett`：字段严格按 `op,first,last` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 均为 0..10⁹ 的非 bool 整数且 `first≤last`，共同给出业务时间闭区间 `[first,last]`，区间包含两端。
+- 返回固定键序 `op,first,last,latest,truncated,initial,transitions,summary`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`。`initial` 固定键序 `seq,state,digest,at`，与 `et` 在 `first` 时刻的快照逐值一致。
+- `transitions` 按 `time` 升序，每项固定键序 `time,seq,kind,before,after`：`before`、`after` 均按 `state,digest,at` 排列，非 `ACTIVE` 时 `digest` 与 `at` 为 null，`seq` 为整组最后应用的审计序号（即该时刻组内最大 seq）。`kind` 仅为：
+  - `ENTER`：`EMPTY` 进入 `ACTIVE`；
+  - `LEAVE`：`ACTIVE` 进入 `EMPTY`；
+  - `REPLACE`：不同 `ACTIVE` 身份互换；
+  - `RECOVER`：`UNKNOWN` 前缀结束后进入可判定状态。
+- 逐时刻口径沿用 `et`：同一 `now` 的事件按 seq 升序整组生效，以末条 `after` 为终态；只报告各组处理后的净变化，整组前后状态及身份相同（含 `EMPTY→EMPTY` 与同身份 `ACTIVE→ACTIVE`）时不产生切换。`first` 时刻的状态仅由 `initial` 表达，即使该时刻恰有事件组生效也不另造切换；区间只覆盖到组时刻之后时，组的净变化发生在区间之前、不报告。
+- `summary` 固定键序 `total,enter,leave,replace,recover`，五类之和等于 `total`。`truncated` 仅在区间含 `UNKNOWN` 时刻时为 true；`UNKNOWN` 只可能位于最旧保留事件之前的淘汰前缀，故 `after` 恒为可判定状态。空历史且时钟已推进时返回 `EMPTY` 初态（`seq=0`）、空 `transitions` 与全零汇总。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败不产生 stdout，并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
+- 全部业务时间 0..当前时钟只有 O(A) 个恒值区域，切换仅可能发生在事件组边界，故单次时间与空间均为 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描，仅使用 Python 标准库；重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及 `et`、`etg`、`eti`、`etm`、检查点与其他公开入口行为不变。
+
 ## 测试
 
     python -m unittest discover
