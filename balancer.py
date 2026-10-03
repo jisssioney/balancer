@@ -4768,32 +4768,53 @@ def parse_op(raw_op):
         return ("ef", first, last)
 
     if name == "et":
-        # 端点切换预约审计业务时间快照批量查询（只读）：精确键序 op,times
-        # （键须按此序出现，乱序报 INPUT）。times 为 1..64 项数组，每项为
-        # 0..10^9 的非 bool 整数且严格递增、不重复。不接受 now：不推进显
-        # 式时钟。字段集合、键序、UTF-8 编码、容器、数量、整数类型（排除
-        # bool）、范围或递增关系非法统一判 INPUT；任一 time 晚于操作开始
-        # 时的全局逻辑时钟留执行期判 STATE（INPUT 判定先于状态）。
-        if list(raw_op) != ["op", "times"]:
-            fail(EXIT_INPUT, "INPUT")
-        times = raw_op["times"]
-        if not isinstance(times, list) or not 1 <= len(times) <= 64:
-            fail(EXIT_INPUT, "INPUT")
-        previous_time = -1
-        normalized_times = []
-        for tm in times:
+        # 端点切换预约审计业务时间快照查询（只读）：两种精确键序形态。
+        # 离散形态 op,times：times 为 1..64 项数组，每项为 0..10^9 的非
+        # bool 整数且严格递增、不重复。
+        # 连续区间形态 op,first,last：first、last 为 0..10^9 的非 bool 整
+        # 数且 first<=last，共同给出闭区间 [first,last]。
+        # 两形态均不接受 now、不推进显式时钟。字段集合、键序、UTF-8 编
+        # 码、容器、数量、整数类型（排除 bool）、范围、递增或区间关系非
+        # 法统一判 INPUT；任一查询时间晚于操作开始时的全局逻辑时钟留执
+        # 行期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) == ["op", "times"]:
+            times = raw_op["times"]
+            if not isinstance(times, list) or not 1 <= len(times) <= 64:
+                fail(EXIT_INPUT, "INPUT")
+            previous_time = -1
+            normalized_times = []
+            for tm in times:
+                if (
+                    not isinstance(tm, int)
+                    or isinstance(tm, bool)
+                    or not 0 <= tm <= 10 ** 9
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                # 严格递增即同时排除重复（相等）与乱序（倒退）。
+                if tm <= previous_time:
+                    fail(EXIT_INPUT, "INPUT")
+                previous_time = tm
+                normalized_times.append(tm)
+            return ("et", tuple(normalized_times))
+        if list(raw_op) == ["op", "first", "last"]:
+            first = raw_op["first"]
             if (
-                not isinstance(tm, int)
-                or isinstance(tm, bool)
-                or not 0 <= tm <= 10 ** 9
+                not isinstance(first, int)
+                or isinstance(first, bool)
+                or not 0 <= first <= 10 ** 9
             ):
                 fail(EXIT_INPUT, "INPUT")
-            # 严格递增即同时排除重复（相等）与乱序（倒退）。
-            if tm <= previous_time:
+            last = raw_op["last"]
+            if (
+                not isinstance(last, int)
+                or isinstance(last, bool)
+                or not 0 <= last <= 10 ** 9
+            ):
                 fail(EXIT_INPUT, "INPUT")
-            previous_time = tm
-            normalized_times.append(tm)
-        return ("et", tuple(normalized_times))
+            if first > last:
+                fail(EXIT_INPUT, "INPUT")
+            return ("eti", first, last)
+        fail(EXIT_INPUT, "INPUT")
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -15789,6 +15810,148 @@ def run(raw):
                     "latest": latest,
                     "truncated": truncated,
                     "items": items,
+                }
+            )
+
+        elif op[0] == "eti":
+            # 端点切换预约审计业务时间闭区间状态压缩（只读，不接受 now、
+            # 不推进时钟、不产生审计事件，不改预约、连接、后端、审计窗口
+            # 或下一 seq）：把闭区间 [first,last] 内各业务时刻的预约快照
+            # 压缩为相邻 seq、state、digest、at 全同的最大连续区段，逐点
+            # 口径与离散形态 et 完全一致。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟整项报 STATE（形状类 INPUT 已在解
+            # 析期先行判过；INPUT 先于状态）。时钟从未推进（last_now 为
+            # None）时任何区间都属未来，一律 STATE。
+            #
+            # 逐时刻口径（同 et）：完整历史在首条事件前为 EMPTY、seq=0；
+            # 窗口淘汰前缀后，早于最旧保留事件 now 的时刻为 UNKNOWN，
+            # seq/digest/at 均为 null；其余时刻以最旧事件 before 为起点，
+            # 应用 now 不晚于该时刻的保留事件（同一 now 的事件按 seq 整组
+            # 生效，终态取组内最大 seq 的 after），EMPTY 的 seq 为最后应
+            # 用序号、ACTIVE 另回显摘要与触发时刻。
+            #
+            # 全部 0..last_now 时间轴上只有 O(A) 段恒值区间：UNKNOWN 前
+            # 缀（淘汰窗口且前缀缺失时 [0,oldest_now-1]）、完整历史首事
+            # 件前的 EMPTY 前缀 [0,oldest_now-1]，以及按事件 now 分组的
+            # 逐组生效区间 [g_now, 下一组 now-1]（末组延伸至 last_now）。
+            # 事件 now 非递减，单趟分组即可，与区间跨度（可达 10^9）无
+            # 关：时间 O(A)、结果额外空间 O(A)（A≤64），绝不按跨度逐点
+            # 扫描。交集只裁剪首段（first 落在其中）与末段（last 落在其
+            # 中），中段整段保留，段数不增；相邻段四元组 (seq,state,
+            # digest,at) 必不同，仍做一次相邻合并兜底。
+            _, first, last = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            # 先按事件 now 非递减整组：同一 now 的事件整组生效，组终态
+            # 取组内最大 seq（窗内该组最后一条）的 after。
+            groups = []
+            for event in window:
+                event_now = event[1]
+                if groups and groups[-1][0] == event_now:
+                    groups[-1] = (event_now, event[0], event[4])
+                else:
+                    groups.append((event_now, event[0], event[4]))
+            regions = []
+            if not groups:
+                # 空历史且时钟已推进：区间内全部时刻都在首条事件之前，
+                # 单个 EMPTY 区段（seq=0）覆盖整条时间轴。
+                regions.append((0, last_now, 0, "EMPTY", None))
+            else:
+                oldest_now = groups[0][0]
+                if window[0][0] > 1:
+                    # 前缀已随窗口淘汰：早于最旧保留事件 now 的时刻无法
+                    # 判定，UNKNOWN 且 seq/digest/at 均为 null。oldest_now
+                    # 为 0 时该前缀为空区间，交集阶段自然跳过。
+                    regions.append((0, oldest_now - 1, None,
+                                    "UNKNOWN", None))
+                else:
+                    # 完整历史（最旧保留即 seq1）：首条事件之前恒为
+                    # EMPTY、seq=0。
+                    regions.append((0, oldest_now - 1, 0,
+                                    "EMPTY", None))
+                # 每组生效到下一组起点之前，末组延伸至当前时钟。
+                for group_index, (group_now, group_seq,
+                                  identity) in enumerate(groups):
+                    group_hi = (
+                        groups[group_index + 1][0] - 1
+                        if group_index + 1 < len(groups)
+                        else last_now
+                    )
+                    if identity is None:
+                        regions.append(
+                            (group_now, group_hi, group_seq,
+                             "EMPTY", None)
+                        )
+                    else:
+                        regions.append(
+                            (group_now, group_hi, group_seq,
+                             "ACTIVE", identity)
+                        )
+            segments = []
+            counts = {"UNKNOWN": 0, "EMPTY": 0, "ACTIVE": 0}
+
+            def append_time_region(region_lo, region_hi, region_seq,
+                                   state, identity):
+                length = region_hi - region_lo + 1
+                counts[state] += length
+                # 仅合并 seq、state、digest、at 全同的相邻时刻；相邻恒
+                # 值区间的四元组必不同（每组至少推进一个 seq），此处合
+                # 并仅作交集裁剪后的兜底。
+                if (
+                    segments
+                    and segments[-1]["_key"] == (
+                        region_seq, state, identity
+                    )
+                ):
+                    segments[-1]["last"] = region_hi
+                    return
+                if state == "ACTIVE":
+                    seg_digest, seg_at = identity
+                else:
+                    seg_digest, seg_at = None, None
+                segments.append(
+                    {
+                        "first": region_lo,
+                        "last": region_hi,
+                        "seq": region_seq,
+                        "state": state,
+                        "digest": seg_digest,
+                        "at": seg_at,
+                        "_key": (region_seq, state, identity),
+                    }
+                )
+
+            for region_lo, region_hi, region_seq, state, identity \
+                    in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first <= overlap_last:
+                    append_time_region(
+                        overlap_first, overlap_last, region_seq,
+                        state, identity
+                    )
+            for segment in segments:
+                del segment["_key"]
+            points = last - first + 1
+            results.append(
+                {
+                    "op": "et",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": counts["UNKNOWN"] > 0,
+                    "segments": segments,
+                    "summary": {
+                        "points": points,
+                        "segments": len(segments),
+                        "unknown": counts["UNKNOWN"],
+                        "empty": counts["EMPTY"],
+                        "active": counts["ACTIVE"],
+                    },
                 }
             )
 
