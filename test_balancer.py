@@ -26731,5 +26731,400 @@ class EpSwitchLifecycleAuditTest(unittest.TestCase):
         )
 
 
+class EpSwitchLifecycleAuditFilterTest(unittest.TestCase):
+    """el：ek 的动作/时段只读筛选变体——固定键序输入输出、闭区间时段与
+    动作子集筛选、本页 summary、分页 more/next/truncated、INPUT/STATE
+    分类与优先级、只读不改时钟/seq/窗口、record/replay 逐字节一致。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    ALL_ACTIONS = ["SET", "REPLACE", "CANCEL", "APPLY", "CLEAR"]
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def el(self, after, limit, actions, since=0, until=10 ** 9):
+        return {"op": "el", "after": after, "limit": limit,
+                "actions": actions, "since": since, "until": until}
+
+    def ek(self, after, limit):
+        return {"op": "ek", "after": after, "limit": limit}
+
+    def filtered(self, results):
+        rows = [r for r in results if r["op"] == "el"]
+        return rows[-1]
+
+    def mixed_timeline(self):
+        # SET(5) REPLACE(7) CANCEL(9) SET(11) APPLY(20)，seq 1..5。
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self._digest(items1, 0)
+        d2 = self._digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 10, 5),
+            self.es(items2, 0, 12, 7),
+            {"op": "eu", "digest": d2, "at": 12, "now": 9},
+            self.es(items1, 0, 20, 11),
+            {"op": "ei", "digest": d1, "at": 20, "now": 20},
+        ]
+        return ops
+
+    @staticmethod
+    def _digest(items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    # ---- 输出形状 ----
+
+    def test_empty_history_compact_bytes(self):
+        code, out, err = run_balancer(
+            "run",
+            encode_ops([self.el(0, 64, ["SET"])]),
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"el","after":0,"next":0,'
+            b'"truncated":false,"more":false,"events":[],'
+            b'"summary":{"total":0,"set":0,"replace":0,"cancel":0,'
+            b'"apply":0,"clear":0}}],"backends":[]}\n',
+        )
+
+    def test_response_event_summary_key_order(self):
+        result = self.filtered(self.run_ops(
+            self.mixed_timeline() + [self.el(0, 64, self.ALL_ACTIONS)]
+        ))
+        self.assertEqual(
+            list(result),
+            ["op", "after", "next", "truncated", "more", "events",
+             "summary"],
+        )
+        self.assertEqual(
+            list(result["summary"]),
+            ["total", "set", "replace", "cancel", "apply", "clear"],
+        )
+        event = result["events"][0]
+        self.assertEqual(
+            list(event), ["seq", "now", "action", "before", "after"]
+        )
+        self.assertEqual(list(event["after"]), ["digest", "at"])
+
+    # ---- 动作与时段筛选 ----
+
+    def test_action_filter(self):
+        result = self.filtered(self.run_ops(
+            self.mixed_timeline()
+            + [self.el(0, 64, ["SET", "CANCEL"])]
+        ))
+        self.assertEqual(
+            [(e["seq"], e["action"]) for e in result["events"]],
+            [(1, "SET"), (3, "CANCEL"), (4, "SET")],
+        )
+        self.assertEqual(result["summary"], {
+            "total": 3, "set": 2, "replace": 0, "cancel": 1,
+            "apply": 0, "clear": 0,
+        })
+
+    def test_time_window_is_closed_interval(self):
+        ops = self.mixed_timeline()
+        result = self.filtered(self.run_ops(
+            ops + [self.el(0, 64, self.ALL_ACTIONS, 7, 11)]
+        ))
+        self.assertEqual(
+            [(e["seq"], e["action"]) for e in result["events"]],
+            [(2, "REPLACE"), (3, "CANCEL"), (4, "SET")],
+        )
+        # since==until：只留该刻事件。
+        result = self.filtered(self.run_ops(
+            ops + [self.el(0, 64, self.ALL_ACTIONS, 9, 9)]
+        ))
+        self.assertEqual(
+            [(e["seq"], e["action"]) for e in result["events"]],
+            [(3, "CANCEL")],
+        )
+
+    def test_no_match_is_empty_with_zero_summary(self):
+        result = self.filtered(self.run_ops(
+            self.mixed_timeline()
+            + [self.el(0, 64, ["SET"], 100, 200)]
+        ))
+        self.assertEqual(result["events"], [])
+        self.assertEqual(result["next"], 0)
+        self.assertFalse(result["more"])
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["summary"], {
+            "total": 0, "set": 0, "replace": 0, "cancel": 0,
+            "apply": 0, "clear": 0,
+        })
+
+    # ---- 分页 / summary 仅本页 / more 按筛选口径 ----
+
+    def test_pagination_summary_counts_page_only(self):
+        ops = self.mixed_timeline()
+        page1 = self.filtered(self.run_ops(
+            ops + [self.el(0, 2, ["SET", "REPLACE", "CANCEL", "APPLY"])]
+        ))
+        self.assertEqual([e["seq"] for e in page1["events"]], [1, 2])
+        self.assertEqual(page1["next"], 2)
+        self.assertTrue(page1["more"])
+        self.assertEqual(page1["summary"], {
+            "total": 2, "set": 1, "replace": 1, "cancel": 0,
+            "apply": 0, "clear": 0,
+        })
+        page2 = self.filtered(self.run_ops(
+            ops + [
+                self.el(0, 2, ["SET", "REPLACE", "CANCEL", "APPLY"]),
+                self.el(2, 2, ["SET", "REPLACE", "CANCEL", "APPLY"]),
+            ]
+        ))
+        self.assertEqual([e["seq"] for e in page2["events"]], [3, 4])
+        self.assertEqual(page2["next"], 4)
+        self.assertTrue(page2["more"])
+        self.assertEqual(page2["summary"], {
+            "total": 2, "set": 1, "replace": 0, "cancel": 1,
+            "apply": 0, "clear": 0,
+        })
+        page3 = self.filtered(self.run_ops(
+            ops + [self.el(4, 2, ["SET", "REPLACE", "CANCEL", "APPLY"])]
+        ))
+        self.assertEqual([e["seq"] for e in page3["events"]], [5])
+        self.assertEqual(page3["next"], 5)
+        self.assertFalse(page3["more"])
+        self.assertEqual(page3["summary"]["total"], 1)
+        self.assertEqual(page3["summary"]["apply"], 1)
+        # 游标越过末项后无条目，next 保持 after。
+        empty = self.filtered(self.run_ops(
+            ops + [self.el(5, 2, ["SET", "REPLACE", "CANCEL", "APPLY"])]
+        ))
+        self.assertEqual(empty["events"], [])
+        self.assertEqual(empty["next"], 5)
+        self.assertFalse(empty["more"])
+
+    def test_more_ignores_nonmatching_tail(self):
+        ops = self.mixed_timeline()
+        # limit=1 且只选 SET：seq1 之后还有 seq4 SET，more=true。
+        first = self.filtered(self.run_ops(
+            ops + [self.el(0, 1, ["SET"])]
+        ))
+        self.assertEqual([e["seq"] for e in first["events"]], [1])
+        self.assertTrue(first["more"])
+        second = self.filtered(self.run_ops(
+            ops + [self.el(1, 1, ["SET"])]
+        ))
+        self.assertEqual([e["seq"] for e in second["events"]], [4])
+        self.assertFalse(second["more"])
+        # 只选 APPLY：满页前即最后一条，后续无匹配，more=false。
+        only_apply = self.filtered(self.run_ops(
+            ops + [self.el(0, 64, ["APPLY"])]
+        ))
+        self.assertEqual([e["seq"] for e in only_apply["events"]], [5])
+        self.assertFalse(only_apply["more"])
+
+    # ---- 淘汰窗口 / truncated ----
+
+    def test_truncation_and_evicted_excluded_from_summary(self):
+        target = [("a", None, self.EP1)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        for i in range(70):
+            # seq1 为 SET，seq2..70 均为 REPLACE；now=10..79。
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+        # 保留窗口为 seq7..70，全是 REPLACE；被淘汰的 seq2..6 五条
+        # REPLACE 不计入 summary，total=64 而非 69。
+        page = self.filtered(self.run_ops(
+            ops + [self.el(0, 64, ["REPLACE"])]
+        ))
+        self.assertTrue(page["truncated"])
+        self.assertEqual([e["seq"] for e in page["events"]],
+                         list(range(7, 71)))
+        self.assertFalse(page["more"])
+        self.assertEqual(page["summary"]["total"], 64)
+        self.assertEqual(page["summary"]["replace"], 64)
+        # 小页：截断仍自最旧保留事件筛选，more 按同条件后续计。
+        page = self.filtered(self.run_ops(
+            ops + [self.el(4, 3, ["REPLACE"])]
+        ))
+        self.assertTrue(page["truncated"])
+        self.assertEqual([e["seq"] for e in page["events"]], [7, 8, 9])
+        self.assertEqual(page["next"], 9)
+        self.assertTrue(page["more"])
+        # after==最旧 seq-1（=6）：不截断。
+        page = self.filtered(self.run_ops(
+            ops + [self.el(6, 3, ["REPLACE"])]
+        ))
+        self.assertFalse(page["truncated"])
+        self.assertEqual([e["seq"] for e in page["events"]], [7, 8, 9])
+
+    # ---- STATE ----
+
+    def test_after_beyond_latest_is_state(self):
+        ops = self.mixed_timeline()              # 已分配 seq 1..5
+        self.failure(ops + [self.el(6, 64, ["SET"])], 4, "STATE")
+        self.failure([self.el(1, 64, ["SET"])], 4, "STATE")
+
+    # ---- INPUT 分类与优先级 ----
+
+    def test_input_validation(self):
+        base = {"after": 0, "limit": 10,
+                "actions": ["SET"], "since": 0, "until": 10}
+
+        def mutate(**changes):
+            value = dict(base)
+            value.update(changes)
+            value["op"] = "el"
+            return value
+
+        bad = [
+            {"op": "el", "after": 0, "limit": 10,
+             "since": 0, "until": 10},                    # 缺 actions
+            {"op": "el", "after": 0, "limit": 10,
+             "actions": ["SET"], "since": 0,
+             "until": 10, "x": 1},                        # 多余键
+            mutate(after=-1),
+            mutate(after=10 ** 18 + 1),
+            mutate(after=True),
+            mutate(after=0.0),
+            mutate(after="0"),
+            mutate(limit=0),
+            mutate(limit=65),
+            mutate(limit=False),
+            mutate(limit=1.0),
+            mutate(actions=[]),
+            mutate(actions=["SET", "REPLACE", "CANCEL",
+                            "APPLY", "CLEAR", "SET"]),    # 六项
+            mutate(actions=["SET", "SET"]),               # 重复
+            mutate(actions=["REPLACE", "SET"]),           # 乱序
+            mutate(actions=["APPLY", "CLEAR", "CANCEL"]), # 乱序
+            mutate(actions=["set"]),                      # 非法枚举
+            mutate(actions=[0]),                          # 非字符串
+            mutate(actions="SET"),                        # 非数组
+            mutate(since=-1),
+            mutate(until=10 ** 9 + 1),
+            mutate(since=True),
+            mutate(until=False),
+            mutate(since=1.0),
+            mutate(since="0"),
+            mutate(since=11, until=10),                   # since>until
+        ]
+        for op in bad:
+            self.failure([op], 2, "INPUT")
+
+    def test_wrong_key_order_is_input(self):
+        # 顶层乱序。
+        self.failure([{
+            "op": "el", "limit": 10, "after": 0,
+            "actions": ["SET"], "since": 0, "until": 10,
+        }], 2, "INPUT")
+        self.failure([{
+            "op": "el", "after": 0, "limit": 10,
+            "actions": ["SET"], "until": 10, "since": 0,
+        }], 2, "INPUT")
+
+    def test_input_precedes_cursor_state(self):
+        # after 越过 latest 本应 STATE，但形状非法优先 INPUT。
+        self.failure([{
+            "op": "el", "after": 99, "limit": 64,
+            "actions": ["SET", "SET"], "since": 0, "until": 0,
+        }], 2, "INPUT")
+        self.failure([{
+            "op": "el", "after": 99, "limit": 64,
+            "actions": ["SET"], "since": 5, "until": 4,
+        }], 2, "INPUT")
+
+    # ---- 只读语义 / 确定性 ----
+
+    def test_readonly_keeps_clock_seq_window_and_byte_deterministic(self):
+        ops = self.mixed_timeline()
+        # el 不推进时钟：预约尚存时（截到 APPLY 前，时钟停在 11），以同
+        # 刻 now=11 提交身份不符 eu 须报 STATE（若时钟被改动则归类不同）。
+        live_ops = ops[:-1]
+        self.failure(
+            live_ops + [
+                self.el(0, 64, self.ALL_ACTIONS),
+                {"op": "eu", "digest": "0" * 64, "at": 20, "now": 11},
+            ],
+            4, "STATE",
+        )
+        # el 不改审计窗口与 seq：紧接 ek 与未插入 el 的基线逐值一致。
+        with_el = self.run_ops(
+            ops + [self.el(0, 64, self.ALL_ACTIONS), self.ek(0, 64)]
+        )
+        without_el = self.run_ops(ops + [self.ek(0, 64)])
+        self.assertEqual(
+            [r for r in with_el if r["op"] == "ek"],
+            [r for r in without_el if r["op"] == "ek"],
+        )
+        # 同批重复查询逐值一致，独立进程重复提交逐字节一致。
+        raw = encode_ops(ops + [
+            self.el(0, 2, ["SET", "REPLACE"], 6, 12),
+            self.el(0, 2, ["SET", "REPLACE"], 6, 12),
+        ])
+        code, out1, err = run_balancer("run", raw)
+        self.assertEqual((code, err), (0, b""))
+        pages1 = [r for r in json.loads(out1.decode())["results"]
+                  if r["op"] == "el"]
+        self.assertEqual(pages1[0], pages1[1])
+        _, out2, _ = run_balancer("run", raw)
+        self.assertEqual(out1, out2)
+
+    def test_checkpoint_state_unaffected_by_el(self):
+        ops = self.mixed_timeline()
+        base = self.run_ops(ops + [{"op": "se"}])[-1]
+        with_el = self.run_ops(
+            ops + [
+                self.el(0, 64, self.ALL_ACTIONS, 3, 11),
+                self.el(2, 1, ["CANCEL"]),
+                {"op": "se"},
+            ]
+        )[-1]
+        self.assertEqual(with_el["digest"], base["digest"])
+        self.assertEqual(with_el["state"], base["state"])
+
+    # ---- record/replay 逐字节 ----
+
+    def test_record_replay_byte_identical(self):
+        ops = self.mixed_timeline()
+        ops += [
+            self.el(0, 2, ["SET", "REPLACE", "CANCEL", "APPLY"]),
+            self.el(2, 2, ["SET", "REPLACE", "CANCEL", "APPLY"]),
+            self.el(99, 64, ["SET"]),                    # STATE 失败
+        ]
+        raw = encode_ops(ops)
+        run_code, run_out, run_err = run_balancer("run", raw)
+        self.assertEqual(run_code, 4)
+        rec_code, rec_out, rec_err = run_balancer("record", raw)
+        self.assertEqual((rec_code, rec_err), (0, b""))
+        rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+        self.assertEqual(
+            (rep_code, rep_out, rep_err),
+            (run_code, run_out, run_err),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

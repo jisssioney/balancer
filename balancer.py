@@ -2562,7 +2562,7 @@ def parse_op(raw_op):
         "ey", "eb",
         "ez",
         "ej",
-        "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek",
+        "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el",
         "ru",
         "ua",
         "mu",
@@ -4542,6 +4542,60 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("ek", after, limit)
+
+    if name == "el":
+        # 端点切换预约生命周期审计动作/时段筛选游标查询（ek 的只读筛选
+        # 变体，不新增事件、不改淘汰窗口与 seq 分配）：精确键序
+        # op,after,limit,actions,since,until（键须按此序出现，乱序报
+        # INPUT）。after 为 0..10^18、limit 为 1..64 的非 bool 整数；
+        # actions 为 1..5 项数组，元素取自 SET、REPLACE、CANCEL、
+        # APPLY、CLEAR，不重复且严格按此次序的子序列排列；since、
+        # until 为 0..10^9 非 bool 整数且 since<=until。after 大于已
+        # 分配最大 seq 留执行期判 STATE（INPUT 判定先于游标状态）。
+        if list(raw_op) != [
+            "op", "after", "limit", "actions", "since", "until",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        after = raw_op["after"]
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or not 0 <= after <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        limit = raw_op["limit"]
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 64
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        raw_actions = raw_op["actions"]
+        if not isinstance(raw_actions, list) or not 1 <= len(raw_actions) <= 5:
+            fail(EXIT_INPUT, "INPUT")
+        action_order = {
+            "SET": 0,
+            "REPLACE": 1,
+            "CANCEL": 2,
+            "APPLY": 3,
+            "CLEAR": 4,
+        }
+        actions = []
+        last_index = -1
+        for raw_action in raw_actions:
+            if not isinstance(raw_action, str) or raw_action not in action_order:
+                fail(EXIT_INPUT, "INPUT")
+            index = action_order[raw_action]
+            # 严格递增即同时拒绝重复与乱序（空数组已由长度下界拒绝）。
+            if index <= last_index:
+                fail(EXIT_INPUT, "INPUT")
+            last_index = index
+            actions.append(raw_action)
+        since = parse_metric_num(raw_op["since"])
+        until = parse_metric_num(raw_op["until"])
+        if since > until:
+            fail(EXIT_INPUT, "INPUT")
+        return ("el", after, limit, frozenset(actions), since, until)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -14873,6 +14927,85 @@ def run(raw):
                         for seq, event_now, action, before, after_identity
                         in picked
                     ],
+                }
+            )
+
+        elif op[0] == "el":
+            # 端点切换预约生命周期审计动作/时段筛选查询（ek 的只读筛选
+            # 变体）：游标、截断、next/more 口径与 ek 完全一致，仅在候选
+            # 事件上额外要求 action 属于请求 actions 且事件 now 落在闭区
+            # 间 [since,until]；不推进时钟、不改预约、审计窗口、下一 seq
+            # 或任何运行态。after>latest 报 STATE（INPUT 已在解析期先
+            # 判）。截断时自最旧保留事件扫描，但被淘汰事件不参与本页与
+            # 汇总。more 表示末项之后仍有同时满足 seq、动作与时段条件的
+            # 保留事件；至多扫描 64 条保留事件，时间 O(64)、结果额外空
+            # 间 O(limit)。响应固定键序
+            # op,after,next,truncated,more,events,summary；事件项沿用
+            # ek；summary 固定键序 total,set,replace,cancel,apply,
+            # clear，仅统计本页事件。空历史或窗口内无匹配时 events 为
+            # 空、summary 全零、next=after、more=false。
+            _, after, limit, action_filter, since, until = op
+            latest = ep_audit_seq - 1
+            if after > latest:
+                fail(EXIT_STATE, "STATE")
+            truncated = False
+            if ep_audit_events and after < ep_audit_events[0][0] - 1:
+                truncated = True
+                source = ep_audit_events
+            else:
+                source = (
+                    event for event in ep_audit_events if event[0] > after
+                )
+            picked = []
+            more = False
+            for event in source:
+                _, event_now, action, _, _ = event
+                if action not in action_filter:
+                    continue
+                if event_now < since or event_now > until:
+                    continue
+                if len(picked) < limit:
+                    picked.append(event)
+                else:
+                    # 满页后再遇一条同条件事件即有下一页，即刻停止。
+                    more = True
+                    break
+            summary = {
+                "total": len(picked),
+                "set": 0,
+                "replace": 0,
+                "cancel": 0,
+                "apply": 0,
+                "clear": 0,
+            }
+            summary_key = {
+                "SET": "set",
+                "REPLACE": "replace",
+                "CANCEL": "cancel",
+                "APPLY": "apply",
+                "CLEAR": "clear",
+            }
+            for _, _, action, _, _ in picked:
+                summary[summary_key[action]] += 1
+            results.append(
+                {
+                    "op": "el",
+                    "after": after,
+                    "next": picked[-1][0] if picked else after,
+                    "truncated": truncated,
+                    "more": more,
+                    "events": [
+                        {
+                            "seq": seq,
+                            "now": event_now,
+                            "action": action,
+                            "before": ep_identity_json(before),
+                            "after": ep_identity_json(after_identity),
+                        }
+                        for seq, event_now, action, before, after_identity
+                        in picked
+                    ],
+                    "summary": summary,
                 }
             )
 
