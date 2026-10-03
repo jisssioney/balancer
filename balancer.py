@@ -2547,7 +2547,7 @@ def parse_op(raw_op):
         "oq",
         "mr", "mg", "mh", "ms", "mx", "rh", "rt", "rr", "ra", "ma", "mo", "lp", "pa", "ph", "xa", "xh", "xg", "xp",
         "na",
-        "ce", "ci", "cl", "al", "ai", "ad", "cb", "cu", "cv", "ct", "cd", "pd", "hd", "hb",
+        "ce", "ci", "cl", "al", "ai", "ad", "ag", "cb", "cu", "cv", "ct", "cd", "pd", "hd", "hb",
         "cp", "cq", "ca", "cx", "cy",
         "fs", "fx", "fr", "fi", "ft", "oi", "od",
         "fb", "fp", "fq", "fd", "fc",
@@ -4129,6 +4129,32 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("ad", rev)
+
+    if name == "ag":
+        # 审计区间汇总查询：精确键序 op,after,until（键须按此序出现），
+        # 只读、不推进时钟。after/until 均为 0..10^18 的非 bool 整数且
+        # after<=until（左开右闭区间）；键序、字段集合、整数类型、范围或
+        # 区间关系非法报 INPUT，先于修订状态判断。until 超过最新修订留执
+        # 行期判 STATE。
+        if list(raw_op) != ["op", "after", "until"]:
+            fail(EXIT_INPUT, "INPUT")
+        after = raw_op["after"]
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or not 0 <= after <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        until = raw_op["until"]
+        if (
+            not isinstance(until, int)
+            or isinstance(until, bool)
+            or not 0 <= until <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if after > until:
+            fail(EXIT_INPUT, "INPUT")
+        return ("ag", after, until)
 
     if name == "cb":
         # 配置回滚：两种形式。原三键 op,rev,now 仅按键集识别（键序不限，
@@ -11661,6 +11687,89 @@ def run(raw):
                         for section, before_digest, after_digest
                         in target_changes
                     ],
+                }
+            )
+
+        elif op[0] == "ag":
+            # 审计区间汇总（只读，不推进时钟、不改审计窗口、修订号、配置与
+            # 运行态）：以左开右闭区间 (after,until] 汇总与 al/ai/ad 同窗口
+            # （最近 64 条）保留的配置变更事件。until 超过已分配最大 rev
+            # （next_rev-1，初始 0）报 STATE；空历史仅允许 until=0。淘汰口
+            # 径沿用 ai：历史非空且 after 小于最旧保留 rev 减一时
+            # truncated=true，即使区间内无事件；已淘汰事件不进入 events 与
+            # 汇总。events 按 rev 升序（deque 本即此序），项键序
+            # rev,now,kind,section,before,after,changes，前六项同 al/ai，
+            # changes 直接采用 ad 固化的段级差异（按 AD_SECTIONS 序，项键
+            # 序 section,before,after）并逐项全新复制。summary 键序
+            # total,ci,cb,cu,ca,changed,sections：total 为返回事件数，四个
+            # 同名字段按 kind 计数，changed 为 changes 非空的事件数；
+            # sections 只列出现过的配置段并按 AD_SECTIONS 顶层段序排列，
+            # events 为包含该段的事件数（同一事件同段只计一次）。区间无事
+            # 件时 events 与 sections 为空数组、各计数为 0。O(64S) 时间与
+            # 额外空间，S 为规范化顶层段数；失败批次回滚且无 stdout。
+            _, after, until = op
+            latest = next_rev - 1
+            if until > latest:
+                fail(EXIT_STATE, "STATE")
+            truncated = bool(
+                audit_events and after < audit_events[0]["rev"] - 1
+            )
+            kind_counts = {"ci": 0, "cb": 0, "cu": 0, "ca": 0}
+            changed_count = 0
+            section_counts = {section: 0 for section in AD_SECTIONS}
+            out_events = []
+            for index, event in enumerate(audit_events):
+                if not (after < event["rev"] <= until):
+                    continue
+                kind_counts[event["kind"]] += 1
+                event_changes = audit_sections[index]
+                if event_changes:
+                    changed_count += 1
+                counted_sections = set()
+                out_changes = []
+                for section, before_digest, after_digest in event_changes:
+                    out_changes.append(
+                        {
+                            "section": section,
+                            "before": before_digest,
+                            "after": after_digest,
+                        }
+                    )
+                    if section not in counted_sections:
+                        counted_sections.add(section)
+                        section_counts[section] += 1
+                out_events.append(
+                    {
+                        "rev": event["rev"],
+                        "now": event["now"],
+                        "kind": event["kind"],
+                        "section": event["section"],
+                        "before": event["before"],
+                        "after": event["after"],
+                        "changes": out_changes,
+                    }
+                )
+            out_sections = [
+                {"section": section, "events": section_counts[section]}
+                for section in AD_SECTIONS
+                if section_counts[section]
+            ]
+            results.append(
+                {
+                    "op": "ag",
+                    "after": after,
+                    "until": until,
+                    "truncated": truncated,
+                    "events": out_events,
+                    "summary": {
+                        "total": len(out_events),
+                        "ci": kind_counts["ci"],
+                        "cb": kind_counts["cb"],
+                        "cu": kind_counts["cu"],
+                        "ca": kind_counts["ca"],
+                        "changed": changed_count,
+                        "sections": out_sections,
+                    },
                 }
             )
 
