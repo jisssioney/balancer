@@ -2562,7 +2562,7 @@ def parse_op(raw_op):
         "ey", "eb",
         "ez",
         "ej",
-        "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek",
+        "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el",
         "ru",
         "ua",
         "mu",
@@ -4542,6 +4542,69 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("ek", after, limit)
+
+    if name == "el":
+        # 端点切换预约生命周期审计的只读筛选查询：精确键序
+        # op,after,limit,actions,since,until（键须按此序出现，乱序报
+        # INPUT），只读、不推进时钟、不改事件生成/淘汰窗口/下一 seq。
+        # after 为 0..10^18、limit 为 1..64 的非 bool 整数（同 ek）；
+        # actions 为 1..5 项数组，元素限 SET/REPLACE/CANCEL/APPLY/CLEAR，
+        # 不重复且须按该固定枚举次序排列（故仅判断相邻项严格递增即可同时
+        # 拒绝重复与乱序）；since/until 为 0..10^9 的非 bool 整数且
+        # since<=until。字段集合、键序、编码、类型、范围、枚举、重复、次
+        # 序、空数组或时间关系非法统一判 INPUT；after 大于已分配最大 seq
+        # 留执行期判 STATE（INPUT 判定先于游标状态，同 ek/ai 口径）。
+        if list(raw_op) != [
+            "op", "after", "limit", "actions", "since", "until",
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        after = raw_op["after"]
+        if (
+            not isinstance(after, int)
+            or isinstance(after, bool)
+            or not 0 <= after <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        limit = raw_op["limit"]
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 64
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        actions = raw_op["actions"]
+        if not isinstance(actions, list) or not 1 <= len(actions) <= 5:
+            fail(EXIT_INPUT, "INPUT")
+        action_order = {
+            "SET": 0, "REPLACE": 1, "CANCEL": 2, "APPLY": 3, "CLEAR": 4,
+        }
+        previous_rank = -1
+        for action in actions:
+            if not isinstance(action, str) or action not in action_order:
+                fail(EXIT_INPUT, "INPUT")
+            rank = action_order[action]
+            # 元素须严格按 SET、REPLACE、CANCEL、APPLY、CLEAR 次序排列；
+            # 重复（同秩）与乱序（秩倒退）一并拒绝。
+            if rank <= previous_rank:
+                fail(EXIT_INPUT, "INPUT")
+            previous_rank = rank
+        since = raw_op["since"]
+        if (
+            not isinstance(since, int)
+            or isinstance(since, bool)
+            or not 0 <= since <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        until = raw_op["until"]
+        if (
+            not isinstance(until, int)
+            or isinstance(until, bool)
+            or not 0 <= until <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if since > until:
+            fail(EXIT_INPUT, "INPUT")
+        return ("el", after, limit, tuple(actions), since, until)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -14873,6 +14936,83 @@ def run(raw):
                         for seq, event_now, action, before, after_identity
                         in picked
                     ],
+                }
+            )
+
+        elif op[0] == "el":
+            # 端点切换预约生命周期审计只读筛选查询：在 ek 同口径的游标与
+            # 64 条保留窗口之上，按动作集合 actions 与事件显式时钟闭区间
+            # [since,until] 确定性筛选。不推进显式时钟、不改预约、审计窗
+            # 口、事件生成/淘汰或下一 seq；重复查询逐字节一致。游标与截
+            # 断规则同 ek：latest 为已分配最大 seq（初始 0），after>latest
+            # 报 STATE；历史非空且 after 小于最旧保留事件 seq 减一时截断
+            # 为 true 并自最旧事件读取，否则只取 seq>after。候选再要求
+            # action 入选且 now∈[since,until]（端点闭区间），按 seq 升序
+            # 至多取 limit 项；more 表示末项之后仍有符合相同条件的保留事
+            # 件。next 取末项 seq、无结果等于 after。summary 仅统计本页
+            # （被淘汰事件不参与）：total 为本页条数，余五项按动作计数。
+            # 响应固定键序 op,after,next,truncated,more,events,summary；
+            # 事件项与 ek 逐值同构；summary 固定键序
+            # total,set,replace,cancel,apply,clear。单次时间 O(64)、结果
+            # 额外空间 O(limit)；失败批次回滚且无 stdout。
+            _, after, limit, actions, since, until = op
+            latest = ep_audit_seq - 1
+            if after > latest:
+                fail(EXIT_STATE, "STATE")
+            selected_actions = frozenset(actions)
+            truncated = False
+            if ep_audit_events and after < ep_audit_events[0][0] - 1:
+                truncated = True
+                candidates = ep_audit_events
+            else:
+                candidates = (
+                    event for event in ep_audit_events if event[0] > after
+                )
+            picked = []
+            more = False
+            for event in candidates:
+                _, event_now, action, _, _ = event
+                if (
+                    action in selected_actions
+                    and since <= event_now <= until
+                ):
+                    if len(picked) < limit:
+                        picked.append(event)
+                    else:
+                        more = True
+                        break
+            summary_counts = {
+                "SET": 0, "REPLACE": 0, "CANCEL": 0, "APPLY": 0,
+                "CLEAR": 0,
+            }
+            for event in picked:
+                summary_counts[event[2]] += 1
+            results.append(
+                {
+                    "op": "el",
+                    "after": after,
+                    "next": picked[-1][0] if picked else after,
+                    "truncated": truncated,
+                    "more": more,
+                    "events": [
+                        {
+                            "seq": seq,
+                            "now": event_now,
+                            "action": action,
+                            "before": ep_identity_json(before),
+                            "after": ep_identity_json(after_identity),
+                        }
+                        for seq, event_now, action, before, after_identity
+                        in picked
+                    ],
+                    "summary": {
+                        "total": len(picked),
+                        "set": summary_counts["SET"],
+                        "replace": summary_counts["REPLACE"],
+                        "cancel": summary_counts["CANCEL"],
+                        "apply": summary_counts["APPLY"],
+                        "clear": summary_counts["CLEAR"],
+                    },
                 }
             )
 

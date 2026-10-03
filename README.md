@@ -325,6 +325,17 @@
 - 字段集合、键序、编码、类型或范围非法返回 INPUT/2，失败无 stdout，并回滚同批的变化、时钟、预约和审计序号（seq 只在成功提交时分配）。
 - `se`/`si` 完整保存审计窗口及下一 seq（顶层段 `ep_audit`，固定键序 `next_seq,events`；事件项固定键序 `seq,now,action,before,after`，恢复时校验 seq 连续、窗口计数、动作与身份组合及与当前预约的一致性，矛盾状态报 STATE/4）；`sd`、`sx`、`sm` 按既有检查点规则观察该段差异。事件写入为 O(1)，`ek` 时间与结果空间 O(limit)，总空间 O(64)，仅用 Python 标准库；`run`、`record`、`replay` 继续保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，全部既有入口的结果、异常类型和退出码不变。
 
+## 端点切换预约审计动作时段筛选：el
+
+在 `ek` 的六十四条保留窗口与游标之上提供只读筛选：按动作集合与事件显式时钟闭区间确定性过滤，不改变事件生成、淘汰或 seq 分配。
+
+- `el`：字段严格按 `op,after,limit,actions,since,until` 排列（键须按此序出现，乱序报 INPUT）。`after` 为 0..10¹⁸、`limit` 为 1..64 的非 bool 整数（口径同 `ek`）；`actions` 为一至五个不重复动作的数组，元素限 `SET`、`REPLACE`、`CANCEL`、`APPLY`、`CLEAR` 且按该次序排列；`since`、`until` 为 0..10⁹ 的非 bool 整数且 `since≤until`。
+- 匹配条件为 `seq>after`、`action` 入选 `actions` 且事件 `now` 位于闭区间 `[since,until]`（端点相等计入）。只读，不推进显式时钟，不改变预约、审计窗口、下一 seq 或其他运行态，重复查询逐字节一致。
+- 返回固定键序 `op,after,next,truncated,more,events,summary`：`events` 按 seq 升序至多 `limit` 项，条目与 `ek` 逐值同构（固定键序 `seq,now,action,before,after`，身份为 null 或 `digest,at`）；`summary` 固定键序 `total,set,replace,cancel,apply,clear`，仅统计本页返回条目（被淘汰事件不参与汇总）。
+- 游标与截断沿用 `ek`：令 `latest` 为已分配最大 seq（初始 0），`after>latest` 报 STATE/4；历史非空且 `after` 小于最旧保留事件 seq 减一时，从最旧事件筛选并返回 `truncated=true`，否则为 `false`。`next` 有结果时取末项 seq，无结果时保持 `after`；`more` 表示末项之后仍有符合相同动作与时段条件的保留事件。
+- 空历史且 `after=0`，或窗口内无任何匹配时，`events` 为空、`summary` 全零、`next=after`、`more=false`（截断情形下 `truncated` 仍可能为 true）。
+- 字段集合、键序、编码、类型、范围、actions 枚举、重复、次序、空数组或时间关系非法时只返回 INPUT/2，且 INPUT 判定先于游标状态；失败无 stdout，并回滚同批先前变化。单次时间上界 O(64)，结果额外空间 O(limit)，仅使用 Python 标准库；现有 `ek`、端点预约入口以及 `se`、`si`、`sd`、`sx`、`sm` 的结果和检查点结构不变，`run`、`record`、`replay` 继续输出固定键序紧凑 UTF-8 JSON 和单个末尾换行。
+
 ## 测试
 
     python -m unittest discover
