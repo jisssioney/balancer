@@ -476,6 +476,19 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败不产生 stdout，并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
 - 全部业务时间 0..当前时钟只有 O(A) 个恒值区域，切换仅可能发生在事件组边界，故单次时间与空间均为 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描，仅使用 Python 标准库；重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及 `et`、`etg`、`eti`、`etm`、检查点与其他公开入口行为不变。
 
+## 端点切换预约审计业务时间区间净切换突发查询：etu
+
+在 `ett` 的六十四条保留窗口、同 `now` 事件整组与区间首时刻口径之上新增只读入口，把业务时间闭区间内可判定的净切换按相邻时间差聚合为切换突发（burst），调用方直接得到密集切换的分组而无需自行比较各条切换。它不补写淘汰历史，不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `etu`：字段严格按 `op,first,last,gap` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last`、`gap` 均为 0..10⁹ 的非 bool 整数且 `first≤last`，`[first,last]` 为包含两端的业务时间闭区间；`gap` 为相邻真实切换并入同一突发允许的最大时间差。
+- 返回固定键序 `op,first,last,gap,latest,truncated,initial,bursts,summary`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`；`initial` 固定键序 `seq,state,digest,at`，与相同区间 `ett` 的 `initial` 逐值一致（也与 `et` 在 `first` 时刻的快照一致）。
+- 初态与后续净变化完全按 `ett` 取得：同一 `now` 的事件按 seq 升序整组生效，以末条 `after` 为终态；`first` 时刻的状态仅由 `initial` 表达，即使该时刻恰有事件组生效也不另造切换；整组前后状态及身份相同不产生变化。仅保留 `ENTER`、`LEAVE`、`REPLACE` 三类真实切换，`RECOVER`（`UNKNOWN` 淘汰前缀结束后进入可判定状态）不算真实切换：不进入任何突发、不计入汇总，但不影响其后各组的状态衔接与分类；`transitions` 各项保持 `ett` 的 `time,seq,kind,before,after` 结构（`before`、`after` 固定键序 `state,digest,at`，非 `ACTIVE` 时 `digest`、`at` 为 null）。
+- `bursts` 按时间升序；第一条真实切换建立突发，其后每条与前一条真实切换的 `time` 差不大于 `gap` 时并入当前突发，否则另起突发，单条切换也自成一组。每项固定键序 `first,last,changes,enter,leave,replace,transitions`：`first`、`last` 为组内首条与末条切换的 `time`；`changes` 为组内切换数，`enter`、`leave`、`replace` 为对应分类计数（三者之和等于 `changes`）；`transitions` 按 `time` 升序列出该组切换，结构同 `ett`。
+- `summary` 固定键序 `total,bursts,enter,leave,replace,max_changes`：`total` 为真实切换总数（等于各突发 `changes` 之和，也等于同区间 `ett` 的 `total-recover`）；`bursts` 为突发数；`enter`、`leave`、`replace` 为全区间真实切换分类计数；`max_changes` 为单个突发的最大 `changes`，无真实切换时为 0。无真实切换时 `bursts` 为空数组，`summary` 六项全为 0。
+- `truncated` 仅在区间含至少一个 `UNKNOWN` 时刻时为 true（`UNKNOWN` 只可能位于最旧保留事件之前的淘汰前缀）；空历史且时钟已推进时返回 `EMPTY` 初态（`seq=0`）、空 `bursts` 与全零汇总。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批此前变化；成功不推进时钟、不写审计，也不改变预约或审计窗口。
+- 全部业务时间 0..当前时钟只有 O(A) 个恒值区域，真实切换仅可能发生在事件组边界，区域只过一遍，故单次时间与额外空间均为 O(A)，A 至多为六十四条保留事件，不按时间跨度（可达 10⁹）逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出后经 `si` 恢复的查询逐字节一致，`run`、`record`、`replay` 继续输出固定键序紧凑 UTF-8 JSON、单末尾换行，现有 `et`、`etg`、`eti`、`etm`、`ett` 与其他公开入口行为不变。
+
 ## 测试
 
     python -m unittest discover

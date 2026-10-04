@@ -32771,5 +32771,789 @@ class EpSwitchAuditTimeTransitionsTest(unittest.TestCase):
         )
 
 
+class EpSwitchAuditTimeBurstsTest(unittest.TestCase):
+    """etu op,first,last,gap（只读）——业务时间闭区间净切换突发查询。返回
+    固定键序 op,first,last,gap,latest,truncated,initial,bursts,summary；
+    initial 与同区间 ett 一致；只保留 ENTER/LEAVE/REPLACE 真实切换，
+    RECOVER 不计入。第一条真实切换建立突发，其后每条与前一条 time 差不
+    大于 gap 并入当前突发，否则另起突发，单条也自成一组。burst 项键序
+    first,last,changes,enter,leave,replace,transitions，transitions 结构
+    同 ett（time,seq,kind,before,after）；summary 键序
+    total,bursts,enter,leave,replace,max_changes，无真实切换时全零。
+    last 晚于操作开始时钟或时钟从未推进报 STATE/4，形状类错误 INPUT/2
+    且优先。不逐点扫描、不推进时钟、不写审计；se/si 与 record/replay
+    逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def eu(self, identity, now):
+        digest, at = identity
+        return {"op": "eu", "digest": digest, "at": at, "now": now}
+
+    def etu(self, first, last, gap):
+        return {"op": "etu", "first": first, "last": last, "gap": gap}
+
+    def ett(self, first, last):
+        return {"op": "ett", "first": first, "last": last}
+
+    def fold(self, results):
+        return [r for r in results if r["op"] == "etu"][-1]
+
+    def timeline_ops(self):
+        """同 ett 用例的七事件三身份时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。真实切换时刻 5..11 逐刻相邻。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def sparse_ops(self):
+        """间隔为 3 的 ENTER/LEAVE 时间线：t5 ENTER、t8 LEAVE、t11
+        ENTER、t14 LEAVE。"""
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        identity = (d1, 100)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.eu(identity, 8),
+            self.es(items1, 0, 100, 11),
+            self.eu(identity, 14),
+        ]
+        return ops
+
+    def replace_chain_ops(self, count):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            target = items1 if i % 2 == 0 else items2
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    def assert_key_order_and_burst_consistency(self, result, first, last):
+        self.assertEqual(
+            list(result),
+            ["op", "first", "last", "gap", "latest", "truncated",
+             "initial", "bursts", "summary"],
+        )
+        self.assertEqual(
+            list(result["initial"]), ["seq", "state", "digest", "at"]
+        )
+        self.assertEqual(
+            list(result["summary"]),
+            ["total", "bursts", "enter", "leave", "replace",
+             "max_changes"],
+        )
+        summary = result["summary"]
+        kind_totals = {"ENTER": 0, "LEAVE": 0, "REPLACE": 0}
+        total_changes = 0
+        max_changes = 0
+        previous_burst_last = None
+        gap = result["gap"]
+        all_times = []
+        for burst in result["bursts"]:
+            self.assertEqual(
+                list(burst),
+                ["first", "last", "changes", "enter", "leave",
+                 "replace", "transitions"],
+            )
+            transitions = burst["transitions"]
+            self.assertGreaterEqual(burst["changes"], 1)
+            self.assertEqual(burst["changes"], len(transitions))
+            self.assertEqual(
+                burst["changes"],
+                burst["enter"] + burst["leave"] + burst["replace"],
+            )
+            times = [transition["time"] for transition in transitions]
+            self.assertEqual(times, sorted(times))
+            self.assertEqual(burst["first"], times[0])
+            self.assertEqual(burst["last"], times[-1])
+            self.assertGreater(burst["first"], first)
+            self.assertLessEqual(burst["last"], last)
+            for earlier, later in zip(times, times[1:]):
+                self.assertLessEqual(later - earlier, gap)
+            for transition in transitions:
+                self.assertEqual(
+                    list(transition),
+                    ["time", "seq", "kind", "before", "after"],
+                )
+                self.assertIn(
+                    transition["kind"], ("ENTER", "LEAVE", "REPLACE")
+                )
+                kind_totals[transition["kind"]] += 1
+                for side in ("before", "after"):
+                    self.assertEqual(
+                        list(transition[side]),
+                        ["state", "digest", "at"],
+                    )
+                self.assertNotEqual(
+                    transition["after"]["state"], "UNKNOWN"
+                )
+            kind_counts = {
+                "ENTER": burst["enter"],
+                "LEAVE": burst["leave"],
+                "REPLACE": burst["replace"],
+            }
+            burst_kind_totals = {
+                kind: sum(
+                    1 for transition in transitions
+                    if transition["kind"] == kind
+                )
+                for kind in ("ENTER", "LEAVE", "REPLACE")
+            }
+            self.assertEqual(kind_counts, burst_kind_totals)
+            if previous_burst_last is not None:
+                # 跨突发相邻真实切换的 time 差必大于 gap。
+                self.assertGreater(
+                    burst["first"] - previous_burst_last, gap
+                )
+            previous_burst_last = burst["last"]
+            total_changes += burst["changes"]
+            max_changes = max(max_changes, burst["changes"])
+            all_times.extend(times)
+        self.assertEqual(all_times, sorted(all_times))
+        self.assertEqual(summary["total"], total_changes)
+        self.assertEqual(summary["bursts"], len(result["bursts"]))
+        self.assertEqual(
+            (summary["enter"], summary["leave"], summary["replace"]),
+            (kind_totals["ENTER"], kind_totals["LEAVE"],
+             kind_totals["REPLACE"]),
+        )
+        self.assertEqual(
+            summary["total"],
+            summary["enter"] + summary["leave"] + summary["replace"],
+        )
+        self.assertEqual(summary["max_changes"], max_changes)
+
+    # ---- 空历史与紧凑字节 ----
+
+    def test_empty_history_compact_bytes(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etu(0, 5, 0),
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"add","ok":true},{"op":"etu",'
+            b'"first":0,"last":5,"gap":0,"latest":0,"truncated":false,'
+            b'"initial":{"seq":0,"state":"EMPTY","digest":null,'
+            b'"at":null},"bursts":[],'
+            b'"summary":{"total":0,"bursts":0,"enter":0,"leave":0,'
+            b'"replace":0,"max_changes":0}}],'
+            b'"backends":[{"id":"a","weight":100}]}\n',
+        )
+        self.assertEqual(out.count(b"\n"), 1)
+
+    def test_empty_history_subrange_any_gap(self):
+        for gap in (0, 1, 10 ** 9):
+            result = self.fold(self.run_ops([
+                {"op": "add", "id": "a", "weight": 100, "d": 0,
+                 "now": 5},
+                self.etu(2, 4, gap),
+            ]))
+            self.assertEqual(result["latest"], 0)
+            self.assertFalse(result["truncated"])
+            self.assertEqual(
+                result["initial"],
+                {"seq": 0, "state": "EMPTY", "digest": None, "at": None},
+            )
+            self.assertEqual(result["bursts"], [])
+            self.assertEqual(
+                result["summary"],
+                {"total": 0, "bursts": 0, "enter": 0, "leave": 0,
+                 "replace": 0, "max_changes": 0},
+            )
+
+    def test_clock_never_advanced_is_state(self):
+        self.failure([self.etu(0, 0, 0)], 4, "STATE")
+        self.failure([self.etu(0, 10 ** 9, 0)], 4, "STATE")
+        self.failure([self.etu(0, 10 ** 9, 10 ** 9)], 4, "STATE")
+
+    # ---- 突发聚合 ----
+
+    def test_full_timeline_gap_zero_all_singletons(self):
+        ops, ids = self.timeline_ops()
+        result = self.fold(self.run_ops(ops + [self.etu(0, 11, 0)]))
+        self.assertEqual(result["latest"], 7)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(
+            result["initial"],
+            {"seq": 0, "state": "EMPTY", "digest": None, "at": None},
+        )
+        self.assertEqual(len(result["bursts"]), 7)
+        for time_value, burst in zip(
+            range(5, 12), result["bursts"]
+        ):
+            self.assertEqual(burst["first"], time_value)
+            self.assertEqual(burst["last"], time_value)
+            self.assertEqual(burst["changes"], 1)
+            self.assertEqual(len(burst["transitions"]), 1)
+        kinds = [
+            burst["transitions"][0]["kind"]
+            for burst in result["bursts"]
+        ]
+        self.assertEqual(
+            kinds,
+            ["ENTER", "REPLACE", "LEAVE", "ENTER", "LEAVE",
+             "ENTER", "LEAVE"],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"total": 7, "bursts": 7, "enter": 3, "leave": 3,
+             "replace": 1, "max_changes": 1},
+        )
+        self.assert_key_order_and_burst_consistency(result, 0, 11)
+
+    def test_consecutive_transitions_merge_when_gap_positive(self):
+        ops, _ = self.timeline_ops()
+        # t5..t11 逐刻相邻：gap=1 即全部并入同一突发。
+        result = self.fold(self.run_ops(ops + [self.etu(0, 11, 1)]))
+        self.assertEqual(len(result["bursts"]), 1)
+        burst = result["bursts"][0]
+        self.assertEqual((burst["first"], burst["last"]), (5, 11))
+        self.assertEqual(burst["changes"], 7)
+        self.assertEqual(
+            (burst["enter"], burst["leave"], burst["replace"]),
+            (3, 3, 1),
+        )
+        self.assertEqual(result["summary"]["max_changes"], 7)
+        self.assert_key_order_and_burst_consistency(result, 0, 11)
+
+    def test_gap_boundary_uses_inclusive_difference(self):
+        # 间隔为 3 的切换序列 t5,t8,t11,t14：差恰好等于 gap 时并入。
+        ops = self.sparse_ops()
+        result = self.fold(self.run_ops(ops + [self.etu(0, 14, 2)]))
+        self.assertEqual(
+            [(b["first"], b["last"]) for b in result["bursts"]],
+            [(5, 5), (8, 8), (11, 11), (14, 14)],
+        )
+        self.assertEqual(result["summary"]["max_changes"], 1)
+        result = self.fold(self.run_ops(ops + [self.etu(0, 14, 3)]))
+        self.assertEqual(len(result["bursts"]), 1)
+        burst = result["bursts"][0]
+        self.assertEqual((burst["first"], burst["last"]), (5, 14))
+        self.assertEqual(burst["changes"], 4)
+        self.assertEqual(
+            (burst["enter"], burst["leave"], burst["replace"]),
+            (2, 2, 0),
+        )
+        self.assertEqual(
+            result["summary"],
+            {"total": 4, "bursts": 1, "enter": 2, "leave": 2,
+             "replace": 0, "max_changes": 4},
+        )
+
+    def test_multiple_bursts_with_split_in_middle(self):
+        # 差为 2 的序列 t5,t7,t9：gap=1 全拆，gap=2 全并。
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        identity = (d1, 100)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.eu(identity, 7),
+            self.es(items1, 0, 100, 9),
+            {"op": "add", "id": "z", "weight": 1, "d": 0, "now": 9},
+        ]
+        result = self.fold(self.run_ops(ops + [self.etu(4, 9, 1)]))
+        self.assertEqual(
+            [(b["first"], b["last"], b["changes"])
+             for b in result["bursts"]],
+            [(5, 5, 1), (7, 7, 1), (9, 9, 1)],
+        )
+        result = self.fold(self.run_ops(ops + [self.etu(4, 9, 2)]))
+        self.assertEqual(len(result["bursts"]), 1)
+        self.assertEqual(
+            (result["bursts"][0]["first"],
+             result["bursts"][0]["last"],
+             result["bursts"][0]["changes"]),
+            (5, 9, 3),
+        )
+
+    def test_first_boundary_group_expressed_only_by_initial(self):
+        ops, ids = self.timeline_ops()
+        # 区间自 t5 起：t5 的 ENTER 不另造切换，initial 直接是 A/seq1；
+        # 首个突发自 t6 起。
+        result = self.fold(self.run_ops(ops + [self.etu(5, 11, 0)]))
+        self.assertEqual(result["initial"]["seq"], 1)
+        self.assertEqual(result["initial"]["state"], "ACTIVE")
+        self.assertEqual(
+            (result["initial"]["digest"], result["initial"]["at"]),
+            ids["A"],
+        )
+        self.assertEqual(
+            [b["transitions"][0]["time"] for b in result["bursts"]],
+            [6, 7, 8, 9, 10, 11],
+        )
+        # 区间整体晚于首个组：该组净变化在区间之前，不报告。
+        result = self.fold(self.run_ops(ops + [self.etu(6, 9, 0)]))
+        self.assertEqual(result["initial"]["seq"], 2)
+        self.assertEqual(
+            [b["transitions"][0]["time"] for b in result["bursts"]],
+            [7, 8, 9],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"total": 3, "bursts": 3, "enter": 1, "leave": 2,
+             "replace": 0, "max_changes": 1},
+        )
+
+    def test_single_point_has_no_transition(self):
+        ops, _ = self.timeline_ops()
+        for tm, state, seq in (
+            (5, "ACTIVE", 1), (7, "EMPTY", 3), (11, "EMPTY", 7),
+            (4, "EMPTY", 0),
+        ):
+            result = self.fold(
+                self.run_ops(ops + [self.etu(tm, tm, 0)])
+            )
+            self.assertEqual(result["initial"]["state"], state)
+            self.assertEqual(result["initial"]["seq"], seq)
+            self.assertEqual(result["bursts"], [])
+            self.assertEqual(result["summary"]["total"], 0)
+            self.assertEqual(result["summary"]["max_changes"], 0)
+
+    def test_same_now_group_net_no_change_emits_nothing(self):
+        items1 = [("a", None, self.EP1)]
+        d1 = self.switch_digest(items1, 0)
+        # t20：SET A 后 CANCEL A，净 null->null 不产生切换；t21 ENTER
+        # 自成唯一突发。
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 20),
+            self.eu((d1, 100), 20),
+            self.es(items1, 0, 100, 21),
+        ]
+        result = self.fold(self.run_ops(ops + [self.etu(19, 21, 0)]))
+        self.assertEqual(result["initial"]["state"], "EMPTY")
+        self.assertEqual(len(result["bursts"]), 1)
+        transition = result["bursts"][0]["transitions"][0]
+        self.assertEqual(
+            (transition["time"], transition["seq"],
+             transition["kind"]),
+            (21, 3, "ENTER"),
+        )
+
+    # ---- 淘汰前缀：RECOVER 不算真实切换 ----
+
+    def test_evicted_prefix_recover_excluded_gap_zero(self):
+        ops, identities = self.replace_chain_ops(70)
+        ops.append(
+            {"op": "add", "id": "z", "weight": 1, "d": 0, "now": 79}
+        )
+        result = self.fold(self.run_ops(ops + [self.etu(0, 79, 0)]))
+        # 最旧保留为 seq7@now16：initial 为 UNKNOWN；t16 的 RECOVER 不
+        # 进入突发，真实切换自 t17 起共 63 条 REPLACE。
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["latest"], 70)
+        self.assertEqual(
+            result["initial"],
+            {"seq": None, "state": "UNKNOWN",
+             "digest": None, "at": None},
+        )
+        self.assertEqual(len(result["bursts"]), 63)
+        self.assertEqual(
+            [b["first"] for b in result["bursts"]],
+            list(range(17, 80)),
+        )
+        for burst in result["bursts"]:
+            self.assertEqual(burst["changes"], 1)
+            self.assertEqual(burst["replace"], 1)
+            self.assertEqual(
+                burst["transitions"][0]["kind"], "REPLACE"
+            )
+        self.assertEqual(
+            result["summary"],
+            {"total": 63, "bursts": 63, "enter": 0, "leave": 0,
+             "replace": 63, "max_changes": 1},
+        )
+        # 首个 REPLACE 的 before 为 t16 组后身份（identities[6]），
+        # RECOVER 的状态衔接不受其被排除的影响。
+        first_transition = result["bursts"][0]["transitions"][0]
+        self.assertEqual(
+            (first_transition["before"]["digest"],
+             first_transition["before"]["at"]),
+            identities[6],
+        )
+        self.assert_key_order_and_burst_consistency(result, 0, 79)
+
+    def test_evicted_prefix_recover_excluded_merged(self):
+        ops, _ = self.replace_chain_ops(70)
+        ops.append(
+            {"op": "add", "id": "z", "weight": 1, "d": 0, "now": 79}
+        )
+        result = self.fold(self.run_ops(ops + [self.etu(0, 79, 1)]))
+        # t17..t79 逐刻相邻：全部并入一个突发，t16 的 RECOVER 不占位。
+        self.assertEqual(len(result["bursts"]), 1)
+        burst = result["bursts"][0]
+        self.assertEqual((burst["first"], burst["last"]), (17, 79))
+        self.assertEqual(burst["changes"], 63)
+        self.assertEqual(burst["replace"], 63)
+        self.assertEqual(result["summary"]["max_changes"], 63)
+
+    def test_evicted_prefix_only_range_is_empty(self):
+        ops, _ = self.replace_chain_ops(70)
+        ops.append(
+            {"op": "add", "id": "z", "weight": 1, "d": 0, "now": 79}
+        )
+        for gap in (0, 10 ** 9):
+            result = self.fold(
+                self.run_ops(ops + [self.etu(0, 15, gap)])
+            )
+            self.assertTrue(result["truncated"])
+            self.assertEqual(result["initial"]["state"], "UNKNOWN")
+            self.assertEqual(result["bursts"], [])
+            self.assertEqual(
+                result["summary"],
+                {"total": 0, "bursts": 0, "enter": 0, "leave": 0,
+                 "replace": 0, "max_changes": 0},
+            )
+
+    def test_range_starting_inside_window_is_not_truncated(self):
+        ops, _ = self.replace_chain_ops(70)
+        ops.append(
+            {"op": "add", "id": "z", "weight": 1, "d": 0, "now": 79}
+        )
+        result = self.fold(self.run_ops(ops + [self.etu(16, 79, 0)]))
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["initial"]["state"], "ACTIVE")
+        self.assertEqual(result["initial"]["seq"], 7)
+        self.assertEqual(result["summary"]["total"], 63)
+
+    # ---- 与 ett 交叉验证 ----
+
+    def test_matches_ett_initial_and_real_transitions(self):
+        timeline, _ = self.timeline_ops()
+        chain, _ = self.replace_chain_ops(70)
+        chain.append(
+            {"op": "add", "id": "z", "weight": 1, "d": 0, "now": 79}
+        )
+        for base, last_clock, gap in (
+            (timeline, 11, 0),
+            (timeline, 11, 1),
+            (chain, 79, 0),
+            (chain, 79, 1),
+        ):
+            for first, last in (
+                (0, last_clock), (0, 0), (0, 5), (5, 9),
+                (6, last_clock), (last_clock, last_clock),
+                (last_clock // 2, last_clock // 2 + 3),
+            ):
+                if first > last:
+                    continue
+                outcomes = self.run_ops(
+                    base
+                    + [self.etu(first, last, gap),
+                       self.ett(first, last)]
+                )
+                etu_result = [
+                    r for r in outcomes if r["op"] == "etu"
+                ][-1]
+                ett_result = [
+                    r for r in outcomes if r["op"] == "ett"
+                ][-1]
+                self.assertEqual(
+                    etu_result["initial"], ett_result["initial"]
+                )
+                self.assertEqual(
+                    etu_result["truncated"],
+                    ett_result["truncated"],
+                )
+                self.assertEqual(
+                    etu_result["latest"], ett_result["latest"]
+                )
+                flattened = [
+                    transition
+                    for burst in etu_result["bursts"]
+                    for transition in burst["transitions"]
+                ]
+                real_transitions = [
+                    transition
+                    for transition in ett_result["transitions"]
+                    if transition["kind"] != "RECOVER"
+                ]
+                self.assertEqual(flattened, real_transitions)
+                summary = etu_result["summary"]
+                self.assertEqual(
+                    summary["total"],
+                    ett_result["summary"]["total"]
+                    - ett_result["summary"]["recover"],
+                )
+                self.assertEqual(
+                    (summary["enter"], summary["leave"],
+                     summary["replace"]),
+                    (ett_result["summary"]["enter"],
+                     ett_result["summary"]["leave"],
+                     ett_result["summary"]["replace"]),
+                )
+                self.assert_key_order_and_burst_consistency(
+                    etu_result, first, last
+                )
+
+    # ---- INPUT 校验 ----
+
+    def test_input_validation(self):
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+
+        def raw(**overrides):
+            value = {"op": "etu", "first": 0, "last": 5, "gap": 0}
+            value.update(overrides)
+            return value
+
+        bad = [
+            {},
+            {"op": "etu"},
+            {"op": "etu", "first": 0, "last": 5},
+            {"op": "etu", "first": 0, "gap": 0},
+            {"op": "etu", "last": 5, "gap": 0},
+            raw(now=5),
+            # 乱序一律 INPUT（含 gap 位置错误）。
+            {"op": "etu", "last": 5, "first": 0, "gap": 0},
+            {"op": "etu", "first": 0, "last": 5, "gap": 0,
+             "extra": 1},
+            {"op": "etu", "gap": 0, "first": 0, "last": 5},
+            {"op": "etu", "first": 0, "gap": 0, "last": 5},
+            raw(first=True),
+            raw(first=False),
+            raw(last=True),
+            raw(gap=True),
+            raw(gap=False),
+            raw(first=-1),
+            raw(gap=-1),
+            raw(first=10 ** 9 + 1),
+            raw(last=10 ** 9 + 1),
+            raw(gap=10 ** 9 + 1),
+            raw(first="0"),
+            raw(gap="0"),
+            raw(last=5.0),
+            raw(gap=5.0),
+            raw(first=None),
+            raw(gap=None),
+            raw(gap=[]),
+            raw(first=5, last=4),
+        ]
+        for request in bad:
+            self.failure(clock + [request], 2, "INPUT")
+
+    def test_input_precedence_over_state(self):
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        # 形状类非法先于 last 越界的 STATE 判定。
+        self.failure(
+            clock + [{"op": "etu", "first": True, "last": 10 ** 9,
+                      "gap": 0}],
+            2, "INPUT",
+        )
+        self.failure(
+            clock + [{"op": "etu", "first": 0, "last": 10 ** 9,
+                      "gap": -1}],
+            2, "INPUT",
+        )
+        self.failure(
+            clock + [{"op": "etu", "first": 6, "last": 5, "gap": 0}],
+            2, "INPUT",
+        )
+        # 形状合法、last 越过当前时钟才是 STATE。
+        self.failure(clock + [self.etu(0, 6, 0)], 4, "STATE")
+        self.failure(clock + [self.etu(0, 6, 10 ** 9)], 4, "STATE")
+
+    # ---- STATE 失败与回滚 ----
+
+    def test_future_range_state_no_stdout(self):
+        ops, _ = self.timeline_ops()
+        self.failure(ops + [self.etu(0, 12, 0)], 4, "STATE")
+        self.failure(ops + [self.etu(12, 12, 0)], 4, "STATE")
+        self.failure(
+            ops + [self.etu(0, 10 ** 9, 10 ** 9)], 4, "STATE"
+        )
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.etu(0, 6, 0),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    # ---- 只读、se/si 与 record/replay ----
+
+    def test_does_not_advance_clock_or_write_audit(self):
+        ops, _ = self.timeline_ops()
+        query = self.etu(0, 11, 1)
+        without = self.run_ops(ops + [{"op": "se"}])
+        with_query = self.run_ops(ops + [query, {"op": "se"}])
+        se_without = [r for r in without if r["op"] == "se"][-1]
+        se_with = [r for r in with_query if r["op"] == "se"][-1]
+        self.assertEqual(se_with, se_without)
+        results = self.run_ops(
+            ops + [query, {"op": "ek", "after": 0, "limit": 64}]
+        )
+        ek = [r for r in results if r["op"] == "ek"][-1]
+        self.assertEqual(
+            [e["seq"] for e in ek["events"]], list(range(1, 8))
+        )
+
+    def test_repeated_query_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        query = self.etu(3, 9, 1)
+        first = self.run_ops(ops + [query, query])
+        first_results = [r for r in first if r["op"] == "etu"]
+        self.assertEqual(first_results[0], first_results[1])
+        second = self.fold(self.run_ops(ops + [query]))
+        self.assertEqual(first_results[0], second)
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        for base, last_clock in (
+            (self.timeline_ops()[0], 11),
+            (self.replace_chain_ops(70)[0]
+             + [{"op": "add", "id": "z", "weight": 1, "d": 0,
+                 "now": 79}], 79),
+            (self.replace_chain_ops(70)[0], 79),
+        ):
+            for gap in (0, 1):
+                query = self.etu(0, last_clock, gap)
+                results = self.run_ops(base + [{"op": "se"}, query])
+                se = next(r for r in results if r["op"] == "se")
+                before = self.fold(results)
+                results = self.run_ops([
+                    {"op": "si", "version": se["version"],
+                     "digest": se["digest"], "state": se["state"]},
+                    query,
+                ])
+                after = self.fold(results)
+                self.assertEqual(after, before)
+
+    def test_record_replay_byte_identical(self):
+        ops, _ = self.timeline_ops()
+        chain_ops = self.replace_chain_ops(70)[0] + [
+            {"op": "add", "id": "z", "weight": 1, "d": 0, "now": 79}
+        ]
+        cases = [
+            ops + [self.etu(0, 11, 0)],
+            ops + [self.etu(0, 11, 1)],
+            ops + [self.etu(5, 9, 2)],
+            chain_ops + [self.etu(0, 79, 0)],
+            chain_ops + [self.etu(0, 79, 1)],
+            chain_ops + [self.etu(17, 79, 3)],
+            # 失败批（STATE：未来区间）。
+            ops + [self.etu(0, 12, 0)],
+            # 失败批（INPUT：gap 为 bool）。
+            ops + [{"op": "etu", "first": 0, "last": 11,
+                    "gap": True}],
+            # 失败批（INPUT：first>last）。
+            ops + [self.etu(11, 0, 0)],
+        ]
+        for case_ops in cases:
+            raw = encode_ops(case_ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual(rec_err, b"")
+            rep_code, rep_out, rep_err = run_balancer(
+                "replay", rec_out
+            )
+            self.assertEqual(
+                (rep_code, rep_out, rep_err),
+                (run_code, run_out, run_err),
+            )
+
+    def test_span_up_to_1e9_without_point_scan(self):
+        items1 = [("a", None, self.EP1)]
+        identity = (self.switch_digest(items1, 0), 100)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 0),
+            self.eu(identity, 1),
+            {"op": "add", "id": "b", "weight": 100, "d": 0,
+             "now": 10 ** 9},
+            self.etu(0, 10 ** 9, 10 ** 9),
+        ]
+        result = self.fold(self.run_ops(ops))
+        # t0 的 SET 即 first 状态（ACTIVE，仅由 initial 表达）；t1 一条
+        # LEAVE，自成唯一突发；区间其余近 10^9 点恒 EMPTY，不得逐点
+        # 扫描。
+        self.assertEqual(result["initial"]["state"], "ACTIVE")
+        self.assertEqual(result["initial"]["seq"], 1)
+        self.assertEqual(len(result["bursts"]), 1)
+        burst = result["bursts"][0]
+        self.assertEqual((burst["first"], burst["last"]), (1, 1))
+        self.assertEqual(burst["changes"], 1)
+        transition = burst["transitions"][0]
+        self.assertEqual(
+            (transition["time"], transition["seq"],
+             transition["kind"]),
+            (1, 2, "LEAVE"),
+        )
+        self.assertFalse(result["truncated"])
+        self.assertEqual(
+            result["summary"],
+            {"total": 1, "bursts": 1, "enter": 0, "leave": 1,
+             "replace": 0, "max_changes": 1},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

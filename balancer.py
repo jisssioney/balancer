@@ -2563,7 +2563,7 @@ def parse_op(raw_op):
         "ez",
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
-        "eg", "ee", "ef", "et", "etg", "eti", "etm", "ett",
+        "eg", "ee", "ef", "et", "etg", "eti", "etm", "ett", "etu",
         "ru",
         "ua",
         "mu",
@@ -4984,6 +4984,41 @@ def parse_op(raw_op):
         if first > last:
             fail(EXIT_INPUT, "INPUT")
         return ("ett", first, last)
+
+    if name == "etu":
+        # 端点切换预约审计业务时间区间净切换突发查询（只读）：精确键序
+        # op,first,last,gap（键须按此序出现，乱序报 INPUT）。first、last、
+        # gap 均为 0..10^9 的非 bool 整数且 first<=last；gap 为相邻真实
+        # 切换并入同一突发的最大时间差。不接受 now、不推进显式时钟。字
+        # 段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间
+        # 关系非法统一判 INPUT；last 晚于操作开始时的全局逻辑时钟，或时
+        # 钟从未推进，留执行期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "first", "last", "gap"]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        gap = raw_op["gap"]
+        if (
+            not isinstance(gap, int)
+            or isinstance(gap, bool)
+            or not 0 <= gap <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        return ("etu", first, last, gap)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -16795,6 +16830,231 @@ def run(raw):
                         "leave": counts["LEAVE"],
                         "replace": counts["REPLACE"],
                         "recover": counts["RECOVER"],
+                    },
+                }
+            )
+
+        elif op[0] == "etu":
+            # 端点切换预约审计业务时间区间净切换突发查询（只读，不接受 now、
+            # 不推进时钟、不产生审计事件，不改预约、连接、后端、审计窗口或
+            # 下一 seq）：沿 ett 的同 now 事件组区域与区间口径取得初态及
+            # 各事件组边界的净变化，但只把 ENTER/LEAVE/REPLACE 视为真实切
+            # 换——UNKNOWN 前缀结束产生的 RECOVER 不是真实切换，既不进入
+            # transitions 也不参与突发。真实切换按 time 升序逐条入列：第
+            # 一条建立突发；其后每条与前一条真实切换的 time 差不大于 gap
+            # 时并入当前突发，否则另起突发；单条切换也自成一组。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟，或时钟从未推进（last_now 为
+            # None），整项报 STATE（形状类 INPUT 已在解析期先行判过；
+            # INPUT 先于状态）。
+            #
+            # initial 与同区间 ett 的 initial 逐值一致；恒值区域、净变化
+            # 分类与 first 边界口径（first 时刻状态仅由 initial 表达，不另
+            # 造切换）全部沿用 ett。切换仅可能发生在事件组边界，全部业务
+            # 时间 0..last_now 只有 O(A) 个恒值区域，故时间与额外空间均
+            # 为 O(A)（A≤64），不随区间跨度（可达 10^9）逐点扫描。
+            _, first, last, gap = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            # 区域元组 (lo, hi, seq, state, identity, is_group)：前缀区域
+            # is_group=False；每个同 now 事件组区域 is_group=True 且 seq
+            # 为组内最大事件序号。
+            regions = []
+            if not window:
+                # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY/seq0。
+                regions.append(
+                    (0, last_now, 0, "EMPTY", None, False)
+                )
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                prefix_evicted = oldest_seq > 1
+                # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，不入
+                # 列）：完整历史 EMPTY/seq0；前缀已淘汰则 UNKNOWN、seq
+                # 与身份均为 null。
+                if oldest_now >= 1:
+                    if prefix_evicted:
+                        regions.append(
+                            (0, oldest_now - 1, None, "UNKNOWN", None,
+                             False)
+                        )
+                    else:
+                        regions.append(
+                            (0, oldest_now - 1, 0, "EMPTY", None, False)
+                        )
+                # 同 now 事件整组为一个恒值区域：终态取组内最大 seq 事
+                # 件的 after（事件按 seq 升序，即组末事件）。
+                index = 0
+                event_count = len(window)
+                while index < event_count:
+                    group_now = window[index][1]
+                    group_seq = window[index][0]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_seq = window[index][0]
+                        group_identity = window[index][4]
+                        index += 1
+                    group_end = (
+                        window[index][1] - 1
+                        if index < event_count
+                        else last_now
+                    )
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    regions.append(
+                        (
+                            group_now,
+                            group_end,
+                            group_seq,
+                            group_state,
+                            group_identity,
+                            True,
+                        )
+                    )
+
+            def state_json(state, identity):
+                """state,digest,at 固定键序快照；非 ACTIVE 时 digest、at
+                为 null。"""
+                if state == "ACTIVE":
+                    return {
+                        "state": "ACTIVE",
+                        "digest": identity[0],
+                        "at": identity[1],
+                    }
+                return {"state": state, "digest": None, "at": None}
+
+            initial = None
+            transitions = []
+            truncated = False
+            counts = {
+                "ENTER": 0, "LEAVE": 0, "REPLACE": 0,
+            }
+            # 前一恒值区域（完整时间轴上）的状态与身份：即下一事件组时
+            # 刻前一时刻的状态。首组 now=0 时前一时刻不存在，按 et 的首
+            # 事件前口径视为 EMPTY（seq 不出现在 before/after 中）。
+            prev_state = "EMPTY"
+            prev_identity = None
+            for (
+                region_lo, region_hi, region_seq, state, identity, is_group
+            ) in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first <= overlap_last:
+                    if state == "UNKNOWN":
+                        truncated = True
+                    # initial 取首个与区间相交区域在 first 时刻的快照：
+                    # 区域按时间升序且完整覆盖 0..last_now，故首相交区域
+                    # 必包含 first；与同区间 ett 的 initial 逐值一致。
+                    if initial is None:
+                        initial = {
+                            "seq": region_seq,
+                            "state": state,
+                            "digest": (
+                                identity[0] if state == "ACTIVE" else None
+                            ),
+                            "at": (
+                                identity[1] if state == "ACTIVE" else None
+                            ),
+                        }
+                    # 切换只可能发生在事件组边界，且要求边界为区间内部
+                    # 边界：组时刻落在 (first,last] 内（组区域左缘本身落
+                    # 入区间）。组时刻等于 first 时其 after 即 first 状
+                    # 态——"first 状态仅由初态表达"，不另造切换；组区域
+                    # 因裁剪只保留边界之后部分（overlap_first>region_lo）
+                    # 时净变化发生在区间之前，同样不报告。
+                    if (
+                        is_group
+                        and overlap_first == region_lo
+                        and region_lo > first
+                    ):
+                        kind = None
+                        if prev_state == "EMPTY" and state == "ACTIVE":
+                            kind = "ENTER"
+                        elif prev_state == "ACTIVE" and state == "EMPTY":
+                            kind = "LEAVE"
+                        elif (
+                            prev_state == "ACTIVE"
+                            and state == "ACTIVE"
+                            and prev_identity != identity
+                        ):
+                            kind = "REPLACE"
+                        # UNKNOWN->ACTIVE/EMPTY 的 RECOVER 不是真实切
+                        # 换：不计入 transitions、不参与突发（区域状态仍
+                        # 照常前移，后续组的分类不受影响）。
+                        if kind is not None:
+                            counts[kind] += 1
+                            transitions.append(
+                                {
+                                    "time": region_lo,
+                                    "seq": region_seq,
+                                    "kind": kind,
+                                    "before": state_json(
+                                        prev_state, prev_identity
+                                    ),
+                                    "after": state_json(state, identity),
+                                }
+                            )
+                prev_state = state
+                prev_identity = identity
+
+            # 真实切换已按 time 升序入列。第一条建立突发；其后每条与突发
+            # 末条（即前一条真实切换）的 time 差不大于 gap 时并入，否则
+            # 另起突发。突发内 transitions 保持升序追加，故其末条 time
+            # 即该突发最新时刻，无需额外私有字段。
+            bursts = []
+            max_changes = 0
+            for transition in transitions:
+                transition_time = transition["time"]
+                if (
+                    bursts
+                    and transition_time
+                    - bursts[-1]["transitions"][-1]["time"] <= gap
+                ):
+                    burst = bursts[-1]
+                else:
+                    burst = {
+                        "first": transition_time,
+                        "last": transition_time,
+                        "changes": 0,
+                        "enter": 0,
+                        "leave": 0,
+                        "replace": 0,
+                        "transitions": [],
+                    }
+                    bursts.append(burst)
+                burst["last"] = transition_time
+                burst["changes"] += 1
+                burst[transition["kind"].lower()] += 1
+                burst["transitions"].append(transition)
+                if burst["changes"] > max_changes:
+                    max_changes = burst["changes"]
+            total = len(transitions)
+            results.append(
+                {
+                    "op": "etu",
+                    "first": first,
+                    "last": last,
+                    "gap": gap,
+                    "latest": latest,
+                    "truncated": truncated,
+                    "initial": initial,
+                    "bursts": bursts,
+                    "summary": {
+                        "total": total,
+                        "bursts": len(bursts),
+                        "enter": counts["ENTER"],
+                        "leave": counts["LEAVE"],
+                        "replace": counts["REPLACE"],
+                        "max_changes": max_changes,
                     },
                 }
             )
