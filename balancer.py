@@ -2564,7 +2564,7 @@ def parse_op(raw_op):
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
         "eg", "ee", "ef", "et", "etg", "eti", "etm", "ett", "etu",
-        "etx",
+        "etx", "etr",
         "ru",
         "ua",
         "mu",
@@ -5057,6 +5057,36 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("etx", first, last, gap)
+
+    if name == "etr":
+        # 端点切换预约审计业务时间净切换关系汇总（只读）：精确键序
+        # op,first,last（键须按此序出现，乱序报 INPUT）。first、last 为
+        # 0..10^9 的非 bool 整数且 first<=last，共同给出业务时间闭区间
+        # [first,last]。不接受 now、不推进显式时钟。在保留窗口内按业务
+        # 时间闭区间聚合净切换的有向关系，覆盖 EMPTY 进出与身份间的替
+        # 换；UNKNOWN 前缀结束产生的 RECOVER 不计入关系。字段集合、键
+        # 序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法统一
+        # 判 INPUT；last 晚于操作开始时的全局逻辑时钟，或时钟从未推进，
+        # 留执行期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "first", "last"]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        return ("etr", first, last)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -17395,6 +17425,216 @@ def run(raw):
                         "replace": counts["REPLACE"],
                         "identities": len(identities),
                         "max_changes": overall_max_changes,
+                    },
+                }
+            )
+
+        elif op[0] == "etr":
+            # 端点切换预约审计业务时间净切换关系汇总（只读，不接受 now、
+            # 不推进时钟、不产生审计事件，不改预约、连接、后端、审计窗口
+            # 或下一 seq）：沿用 ett 的同 now 事件整组生效、淘汰前缀与区
+            # 间首时刻口径识别区间 (first,last] 内的净切换，first 时刻仅
+            # 作初态；UNKNOWN 前缀结束产生的 RECOVER 不计入关系，淘汰前
+            # 缀本身不产生关系。只保留 ENTER/LEAVE/REPLACE 三类真实切
+            # 换，并把相同 kind、before、after 的有向关系合并：count 为
+            # 发生次数，first、last 为首末发生时刻；edges 按关系首次发生
+            # 时刻升序。
+            #
+            # summary.total=enter+leave+replace 为真实切换总数；edges 为
+            # 合并后的关系数；identities 为所有 ACTIVE 端点（各关系
+            # before/after 中的 ACTIVE 身份）去重身份数。无真实切换时空
+            # edges 与全零汇总；空历史且时钟已推进时返回确定的空结果。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟，或时钟从未推进（last_now 为
+            # None），整项报 STATE（形状类 INPUT 已在解析期先行判过；
+            # INPUT 先于状态）。truncated 仅在区间含保留窗口无法判定的
+            # UNKNOWN 时刻时为 true。
+            #
+            # 区域构造与切换识别同 ett/etu/etx，全程只过一遍 O(A) 个区
+            # 域与 O(A) 条真实切换；edges 按首次发生时刻排序为
+            # O(A log A)。时间与额外空间均为 O(A log A)（A≤64），不随区
+            # 间跨度（可达 10^9）逐点扫描。
+            _, first, last = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            # 区域元组 (lo, hi, seq, state, identity, is_group)：前缀区域
+            # is_group=False；每个同 now 事件组区域 is_group=True 且 seq
+            # 为组内最大事件序号。构造同 ett。
+            regions = []
+            if not window:
+                # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY/seq0。
+                regions.append(
+                    (0, last_now, 0, "EMPTY", None, False)
+                )
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                prefix_evicted = oldest_seq > 1
+                # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，不入
+                # 列）：完整历史 EMPTY/seq0；前缀已淘汰则 UNKNOWN、seq
+                # 与身份均为 null。
+                if oldest_now >= 1:
+                    if prefix_evicted:
+                        regions.append(
+                            (0, oldest_now - 1, None, "UNKNOWN", None,
+                             False)
+                        )
+                    else:
+                        regions.append(
+                            (0, oldest_now - 1, 0, "EMPTY", None, False)
+                        )
+                # 同 now 事件整组为一个恒值区域：终态取组内最大 seq 事
+                # 件的 after（事件按 seq 升序，即组末事件）。
+                index = 0
+                event_count = len(window)
+                while index < event_count:
+                    group_now = window[index][1]
+                    group_seq = window[index][0]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_seq = window[index][0]
+                        group_identity = window[index][4]
+                        index += 1
+                    group_end = (
+                        window[index][1] - 1
+                        if index < event_count
+                        else last_now
+                    )
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    regions.append(
+                        (
+                            group_now,
+                            group_end,
+                            group_seq,
+                            group_state,
+                            group_identity,
+                            True,
+                        )
+                    )
+
+            truncated = False
+            counts = {"ENTER": 0, "LEAVE": 0, "REPLACE": 0}
+            # 关系键 (kind, before_key, after_key) -> 可变聚合行
+            # [count, first, last]；端点键 EMPTY 为 ("EMPTY",)，ACTIVE
+            # 为 ("ACTIVE", digest, at)，全部可哈希且与身份等值。
+            edge_rows = {}
+            # 所有关系中 ACTIVE 端点身份 (digest,at) 的去重集合。
+            active_identities = set()
+            # 前一恒值区域（完整时间轴上）的状态与身份：口径同 ett，
+            # RECOVER 只用于前后状态比较，不产生任何关系。
+            prev_state = "EMPTY"
+            prev_identity = None
+            for (
+                region_lo, region_hi, region_seq, state, identity, is_group
+            ) in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first <= overlap_last:
+                    if state == "UNKNOWN":
+                        truncated = True
+                    # 切换边界判定同 ett：组时刻落入 (first,last] 且区域
+                    # 自左缘完整相交。first 时刻的组后状态即初态，不另造
+                    # 切换；UNKNOWN 前缀结束的 RECOVER 不计入关系。
+                    if (
+                        is_group
+                        and overlap_first == region_lo
+                        and region_lo > first
+                    ):
+                        kind = None
+                        if prev_state == "EMPTY" and state == "ACTIVE":
+                            kind = "ENTER"
+                        elif prev_state == "ACTIVE" and state == "EMPTY":
+                            kind = "LEAVE"
+                        elif (
+                            prev_state == "ACTIVE"
+                            and state == "ACTIVE"
+                            and prev_identity != identity
+                        ):
+                            kind = "REPLACE"
+                        if kind is not None:
+                            counts[kind] += 1
+                            if prev_state == "ACTIVE":
+                                before_key = (
+                                    "ACTIVE", prev_identity[0],
+                                    prev_identity[1],
+                                )
+                                active_identities.add(prev_identity)
+                            else:
+                                before_key = ("EMPTY",)
+                            if state == "ACTIVE":
+                                after_key = (
+                                    "ACTIVE", identity[0], identity[1],
+                                )
+                                active_identities.add(identity)
+                            else:
+                                after_key = ("EMPTY",)
+                            edge_key = (kind, before_key, after_key)
+                            row = edge_rows.get(edge_key)
+                            if row is None:
+                                edge_rows[edge_key] = [
+                                    1, region_lo, region_lo
+                                ]
+                            else:
+                                row[0] += 1
+                                row[2] = region_lo
+                prev_state = state
+                prev_identity = identity
+            # edges 按关系首次发生时刻升序；first 同为组时刻而组时刻严格
+            # 递增，同刻只可能产生一条净切换，故同 first 的并列不会出
+            # 现，次序完全确定。
+            ordered_keys = sorted(
+                edge_rows, key=lambda edge_key: edge_rows[edge_key][1]
+            )
+
+            def edge_side_json(side_key):
+                if side_key[0] == "ACTIVE":
+                    return {
+                        "state": "ACTIVE",
+                        "digest": side_key[1],
+                        "at": side_key[2],
+                    }
+                return {"state": "EMPTY", "digest": None, "at": None}
+
+            edges = []
+            for edge_key in ordered_keys:
+                edge_kind, before_key, after_key = edge_key
+                edge_count, edge_first, edge_last = edge_rows[edge_key]
+                edges.append(
+                    {
+                        "kind": edge_kind,
+                        "before": edge_side_json(before_key),
+                        "after": edge_side_json(after_key),
+                        "count": edge_count,
+                        "first": edge_first,
+                        "last": edge_last,
+                    }
+                )
+            total = counts["ENTER"] + counts["LEAVE"] + counts["REPLACE"]
+            results.append(
+                {
+                    "op": "etr",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": truncated,
+                    "edges": edges,
+                    "summary": {
+                        "total": total,
+                        "enter": counts["ENTER"],
+                        "leave": counts["LEAVE"],
+                        "replace": counts["REPLACE"],
+                        "edges": len(edges),
+                        "identities": len(active_identities),
                     },
                 }
             )
