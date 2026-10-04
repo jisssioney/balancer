@@ -488,6 +488,18 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败不产生 stdout，并回滚同批此前变化；成功不推进时钟、不写审计或改变预约与审计窗口。
 - 时间与额外空间均为 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描，仅使用 Python 标准库；重复查询、`se` 导出后经 `si` 恢复的查询及 `run`、`record`、`replay` 均须保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，现有 `et`、`etg`、`eti`、`etm`、`ett` 与其他公开行为不变。
 
+## 端点切换预约审计业务时间身份抖动归因查询：etx
+
+在 `et`/`ett`/`etu` 的六十四条保留窗口与逐时刻口径之上新增只读入口，按业务时间闭区间把 ENTER、LEAVE、REPLACE 三类真实切换归入参与切换的预约身份，并按各身份自己的参与序列以 `gap` 聚合切换突发，直接给出区间内发生身份抖动的身份及其抖动次数。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `etx`：字段严格按 `op,first,last,gap` 排列（键须按此序出现，乱序报 INPUT）。字段类型、范围与区间关系口径同 `etu`：`first`、`last`、`gap` 均为 0..10⁹ 的非 bool 整数且 `first≤last`，`first`、`last` 共同给出业务时间闭区间 `[first,last]`，`gap` 为同一身份相邻两次参与切换并入同一突发的最大时间差。
+- 真实切换的识别与 `ett`/`etu` 完全一致：同一 `now` 的事件按 seq 升序整组生效，以末条 `after` 为终态；`first` 时刻仅作初态，即使该时刻恰有事件组生效也不归因；`UNKNOWN` 前缀结束进入可判定状态的 RECOVER 不参与归因，淘汰前缀不得产生任何身份或切换。
+- 归因口径：ENTER 归入 after 身份（计 `enter`），LEAVE 归入 before 身份（计 `leave`），REPLACE 同时归入 before 身份的 `replace_out` 与 after 身份的 `replace_in`。只列参与切换的身份；身份按首次参与时刻、digest 的 UTF-8 字节序、`at` 升序排列。
+- 返回固定键序 `op,first,last,gap,latest,truncated,identities,summary`；`latest` 为已分配最大审计 seq（初始 0）。每个身份项固定键序 `digest,at,first,last,transitions,enter,leave,replace_in,replace_out,bursts,max_changes`：`first`、`last` 为该身份首次、末次参与切换的时刻；`transitions` 为 `enter,leave,replace_in,replace_out` 四类之和；`bursts` 与 `max_changes` 只按该身份自己的参与时刻序列（严格升序）以 `gap` 聚合——首条参与建组，之后与前一条参与的时间差不大于 `gap` 时并入当前组，否则另起一组；`bursts` 为组数、`max_changes` 为最大组大小。
+- `summary` 固定键序 `total,bursts,enter,leave,replace,identities,max_changes`：前五项与同参数 `etu` 逐值一致（`total` 为真实切换总数、`bursts` 为全部真实切换时间轴上的全局突发组数、`enter`/`leave`/`replace` 为全局分类计数）；`identities` 为参与身份数；`max_changes` 为各身份最大组大小的最大值。区间无切换时 `identities` 为空数组、汇总全部为 0。`truncated` 沿用 `etu`，仅在区间含 `UNKNOWN` 时刻时为 true。空历史且时钟已推进时返回空身份与全零汇总。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段、键序、编码、整数类型（排除 bool）、范围或区间关系非法返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批变化；成功不改变运行态。
+- 参与序列总长度为 O(A)，身份排序 O(A log A)，故时间与额外空间均为 O(A log A)，A 至多六十四条保留事件，不按时间跨度（可达 10⁹）逐点扫描，仅使用 Python 标准库；重复查询、`se` 与 `si` 往返及 `run`、`record`、`replay` 保持固定键序紧凑 JSON、单末尾换行和逐字节一致，现有 `et`、`etg`、`eti`、`etm`、`ett`、`etu` 与其他公开入口行为不变。
+
 ## 测试
 
     python -m unittest discover

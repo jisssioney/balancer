@@ -2564,6 +2564,7 @@ def parse_op(raw_op):
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
         "eg", "ee", "ef", "et", "etg", "eti", "etm", "ett", "etu",
+        "etx",
         "ru",
         "ua",
         "mu",
@@ -5020,6 +5021,41 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("etu", first, last, gap)
+
+    if name == "etx":
+        # 端点切换预约审计业务时间身份抖动归因查询（只读）：精确键序
+        # op,first,last,gap（键须按此序出现，乱序报 INPUT）。字段类型、
+        # 范围与区间关系口径同 etu：first、last、gap 均为 0..10^9 的非
+        # bool 整数且 first<=last。不接受 now、不推进显式时钟。字段集
+        # 合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系
+        # 非法统一判 INPUT；last 晚于操作开始时的全局逻辑时钟，或时钟
+        # 从未推进，留执行期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "first", "last", "gap"]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        gap = raw_op["gap"]
+        if (
+            not isinstance(gap, int)
+            or isinstance(gap, bool)
+            or not 0 <= gap <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("etx", first, last, gap)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -17073,6 +17109,253 @@ def run(raw):
                         "leave": counts["LEAVE"],
                         "replace": counts["REPLACE"],
                         "max_changes": max_changes,
+                    },
+                }
+            )
+
+        elif op[0] == "etx":
+            # 端点切换预约审计业务时间身份抖动归因查询（只读，不接受 now、
+            # 不推进时钟、不产生审计事件，不改预约、连接、后端、审计窗口或
+            # 下一 seq）：沿用 ett/etu 的同 now 事件整组生效、淘汰前缀与
+            # 区间首时刻口径，只保留 ENTER/LEAVE/REPLACE 三类真实切换
+            # （RECOVER 不参与归因），再把每条切换归入相关身份，并按各身
+            # 份自己的参与时刻序列以 gap 聚合切换突发。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟，或时钟从未推进（last_now 为
+            # None），整项报 STATE（形状类 INPUT 已在解析期先行判过；
+            # INPUT 先于状态）。
+            #
+            # 归因：ENTER 归入 after 身份（enter），LEAVE 归入 before 身
+            # 份（leave），REPLACE 同时归入 before 身份 replace_out 与
+            # after 身份 replace_in；transitions 为四类计数之和。first、
+            # last 为该身份首次、末次参与切换的时刻。
+            #
+            # 突发：各身份只按自己的参与时刻序列（严格升序）扫描，首条
+            # 参与建组，之后与前一条参与的时间差不大于 gap 时并入当前
+            # 组，否则另起一组；bursts 为组数、max_changes 为最大组大小。
+            # 身份按（首次参与时刻、digest 的 UTF-8 字节序、at）升序输出。
+            #
+            # 淘汰前缀不产生任何身份或切换；truncated 沿用 etu，仅在区间
+            # 含 UNKNOWN 时刻时为 true。区域与切换识别同 ett/etu，参与序
+            # 列总长度为 O(A)，身份排序 O(A log A)，故时间与额外空间均
+            # 为 O(A log A)（A≤64），不随区间跨度（可达 10^9）逐点扫描。
+            _, first, last, gap = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            # 区域元组 (lo, hi, seq, state, identity, is_group)：前缀区域
+            # is_group=False；每个同 now 事件组区域 is_group=True。构造
+            # 同 ett/etu。
+            regions = []
+            if not window:
+                # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY/seq0。
+                regions.append(
+                    (0, last_now, 0, "EMPTY", None, False)
+                )
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                prefix_evicted = oldest_seq > 1
+                # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，不入
+                # 列）：完整历史 EMPTY/seq0；前缀已淘汰则 UNKNOWN、seq
+                # 与身份均为 null。
+                if oldest_now >= 1:
+                    if prefix_evicted:
+                        regions.append(
+                            (0, oldest_now - 1, None, "UNKNOWN", None,
+                             False)
+                        )
+                    else:
+                        regions.append(
+                            (0, oldest_now - 1, 0, "EMPTY", None, False)
+                        )
+                # 同 now 事件整组为一个恒值区域：终态取组内最大 seq 事
+                # 件的 after（事件按 seq 升序，即组末事件）。
+                index = 0
+                event_count = len(window)
+                while index < event_count:
+                    group_now = window[index][1]
+                    group_seq = window[index][0]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_seq = window[index][0]
+                        group_identity = window[index][4]
+                        index += 1
+                    group_end = (
+                        window[index][1] - 1
+                        if index < event_count
+                        else last_now
+                    )
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    regions.append(
+                        (
+                            group_now,
+                            group_end,
+                            group_seq,
+                            group_state,
+                            group_identity,
+                            True,
+                        )
+                    )
+
+            truncated = False
+            # 参与序列：identity=(digest,at) -> 严格升序的参与时刻列表。
+            # 计数表槽位固定为 [enter, leave, replace_in, replace_out]。
+            participation = {}
+            counters = {}
+            # 全部真实切换时刻（严格升序）：供 summary.bursts 按 etu 同式
+            # 的全局突发口径计数（前五项与同参数 etu 一致）。
+            real_times = []
+            totals = {"ENTER": 0, "LEAVE": 0, "REPLACE": 0}
+
+            def attribute(identity, slot, at_time):
+                times = participation.get(identity)
+                if times is None:
+                    times = []
+                    participation[identity] = times
+                    counters[identity] = [0, 0, 0, 0]
+                times.append(at_time)
+                counters[identity][slot] += 1
+
+            # 前一恒值区域（完整时间轴上）的状态与身份：口径同 ett/etu。
+            prev_state = "EMPTY"
+            prev_identity = None
+            for (
+                region_lo, region_hi, region_seq, state, identity, is_group
+            ) in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first <= overlap_last:
+                    if state == "UNKNOWN":
+                        truncated = True
+                    # 切换边界判定同 ett/etu：组时刻落入 (first,last] 且
+                    # 区域自左缘完整相交。first 时刻的组后状态即初态，不
+                    # 产生归因；裁剪后的区域其净变化发生在区间之前。
+                    if (
+                        is_group
+                        and overlap_first == region_lo
+                        and region_lo > first
+                    ):
+                        if prev_state == "EMPTY" and state == "ACTIVE":
+                            totals["ENTER"] += 1
+                            real_times.append(region_lo)
+                            attribute(identity, 0, region_lo)
+                        elif prev_state == "ACTIVE" and state == "EMPTY":
+                            totals["LEAVE"] += 1
+                            real_times.append(region_lo)
+                            attribute(prev_identity, 1, region_lo)
+                        elif (
+                            prev_state == "ACTIVE"
+                            and state == "ACTIVE"
+                            and prev_identity != identity
+                        ):
+                            totals["REPLACE"] += 1
+                            real_times.append(region_lo)
+                            # REPLACE 同时归入 before 的 replace_out（槽
+                            # 位 3）与 after 的 replace_in（槽位 2）。
+                            attribute(prev_identity, 3, region_lo)
+                            attribute(identity, 2, region_lo)
+                        # UNKNOWN 前缀结束的 RECOVER 不归因任何身份。
+                prev_state = state
+                prev_identity = identity
+
+            # 逐身份按自己的参与序列做 gap 突发聚合，再按首次参与时刻、
+            # digest 的 UTF-8 字节序、at 升序排列。
+            records = []
+            identity_burst_total = 0
+            global_max_changes = 0
+            for participant, times in participation.items():
+                digest, participant_at = participant
+                enter_c, leave_c, replace_in_c, replace_out_c = (
+                    counters[participant]
+                )
+                burst_count = 0
+                max_changes = 0
+                group_size = 0
+                previous_time = None
+                for at_time in times:
+                    if (
+                        previous_time is None
+                        or at_time - previous_time > gap
+                    ):
+                        burst_count += 1
+                        group_size = 1
+                    else:
+                        group_size += 1
+                    if group_size > max_changes:
+                        max_changes = group_size
+                    previous_time = at_time
+                identity_burst_total += burst_count
+                if max_changes > global_max_changes:
+                    global_max_changes = max_changes
+                records.append(
+                    {
+                        "digest": digest,
+                        "at": participant_at,
+                        "first": times[0],
+                        "last": times[-1],
+                        "transitions": (
+                            enter_c + leave_c
+                            + replace_in_c + replace_out_c
+                        ),
+                        "enter": enter_c,
+                        "leave": leave_c,
+                        "replace_in": replace_in_c,
+                        "replace_out": replace_out_c,
+                        "bursts": burst_count,
+                        "max_changes": max_changes,
+                        "_sort": (
+                            times[0],
+                            digest.encode("utf-8"),
+                            participant_at,
+                        ),
+                    }
+                )
+            records.sort(key=lambda record: record["_sort"])
+            for record in records:
+                del record["_sort"]
+            # summary.bursts 沿用 etu 的全局突发口径：在全部真实切换时间
+            # 轴上相邻差不大于 gap 并入同一组（REPLACE 只占一个时刻），
+            # 与同参数 etu 的 summary.bursts 逐值一致；它不是各身份 bursts
+            # 之和（REPLACE 同时被两身份参与）。
+            global_bursts = 0
+            previous_real_time = None
+            for at_time in real_times:
+                if (
+                    previous_real_time is None
+                    or at_time - previous_real_time > gap
+                ):
+                    global_bursts += 1
+                previous_real_time = at_time
+            total_transitions = (
+                totals["ENTER"] + totals["LEAVE"] + totals["REPLACE"]
+            )
+            results.append(
+                {
+                    "op": "etx",
+                    "first": first,
+                    "last": last,
+                    "gap": gap,
+                    "latest": latest,
+                    "truncated": truncated,
+                    "identities": records,
+                    "summary": {
+                        "total": total_transitions,
+                        "bursts": global_bursts,
+                        "enter": totals["ENTER"],
+                        "leave": totals["LEAVE"],
+                        "replace": totals["REPLACE"],
+                        "identities": len(records),
+                        "max_changes": global_max_changes,
                     },
                 }
             )
