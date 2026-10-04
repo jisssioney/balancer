@@ -476,6 +476,18 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败不产生 stdout，并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
 - 全部业务时间 0..当前时钟只有 O(A) 个恒值区域，切换仅可能发生在事件组边界，故单次时间与空间均为 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描，仅使用 Python 标准库；重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及 `et`、`etg`、`eti`、`etm`、检查点与其他公开入口行为不变。
 
+## 端点切换预约审计业务时间净切换突发查询：etu
+
+在 `et`/`etg`/`eti`/`etm`/`ett` 的六十四条保留窗口与逐时刻口径之上新增只读入口，把业务时间闭区间内可判定的净切换按相邻时间间隔聚合为切换突发：沿用 `ett` 取得初态及同 `now` 事件整组处理后的净变化，`UNKNOWN` 前缀结束产生的 RECOVER 不算真实切换，只保留 ENTER、LEAVE、REPLACE。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `etu`：字段严格按 `op,first,last,gap` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last`、`gap` 均为 0..10⁹ 的非 bool 整数，且 `first≤last`，`first`、`last` 共同给出业务时间闭区间 `[first,last]`，`gap` 为相邻两条真实切换并入同一突发的最大时间差。
+- 返回固定键序 `op,first,last,gap,latest,truncated,initial,bursts,summary`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`；`initial` 固定键序 `seq,state,digest,at`，与相同区间 `ett`（及 `et` 在 `first` 时刻快照）逐值一致。
+- 真实切换的识别与 `ett` 完全一致：同一 `now` 的事件按 seq 升序整组生效，以末条 `after` 为终态；`EMPTY→ACTIVE` 为 ENTER、`ACTIVE→EMPTY` 为 LEAVE、不同 `ACTIVE` 身份互换为 REPLACE；整组前后状态及身份相同不产生切换；`first` 时刻的状态仅由 `initial` 表达；`UNKNOWN` 前缀结束进入可判定状态的 RECOVER 既不计入 `bursts`，也不参与相邻间隔计算与汇总。`truncated` 仅在区间含 `UNKNOWN` 时刻时为 true。
+- `bursts` 按时间升序：第一条真实切换建立突发；之后每条与前一条真实切换的 `time` 差不大于 `gap` 时并入当前突发，否则另起突发；单条切换也成一组。每项固定键序 `first,last,changes,enter,leave,replace,transitions`：`first`、`last` 为首尾切换时刻，`changes` 为组内真实切换数，`enter`/`leave`/`replace` 为组内各类计数；`transitions` 保留同区间 `ett` 的 `time,seq,kind,before,after` 结构（`before`/`after` 键序 `state,digest,at`，非 ACTIVE 时 digest、at 为 null），但只含 ENTER/LEAVE/REPLACE。
+- `summary` 固定键序 `total,bursts,enter,leave,replace,max_changes`：`total` 为真实切换总数（即各组 `changes` 之和）；`bursts` 为突发组数；`enter`/`leave`/`replace` 为全局分类计数；`max_changes` 为空时为 0，否则为单组最大 `changes`。无真实切换时 `bursts` 为空数组且汇总全部为 0。空历史且时钟已推进时返回 EMPTY 初态（`seq=0`）、空 `bursts` 与全零汇总。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败不产生 stdout，并回滚同批此前变化；成功不推进时钟、不写审计或改变预约与审计窗口。
+- 时间与额外空间均为 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描，仅使用 Python 标准库；重复查询、`se` 导出后经 `si` 恢复的查询及 `run`、`record`、`replay` 均须保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，现有 `et`、`etg`、`eti`、`etm`、`ett` 与其他公开行为不变。
+
 ## 测试
 
     python -m unittest discover
