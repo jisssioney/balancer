@@ -503,6 +503,22 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
 - 恒值区域与真实切换各只过一遍，身份排序为主要超线性代价，单次时间与额外空间均为 O(A log A)，A 至多六十四条保留事件（REPLACE 每条至多产生两条身份参与记录，参与记录总数 O(A)），不按时间跨度逐点扫描；仅使用 Python 标准库，重复查询、`se` 与 `si` 往返及 `run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，其他公开行为不变。
 
+## 端点切换预约审计业务时间净切换关系聚合查询：etr
+
+在 `et`/`ett`/`etu`/`etx` 的六十四条保留窗口与逐时刻口径之上新增只读入口，在保留窗口内按业务时间闭区间把净切换聚合成身份之间（及 EMPTY 进出）的有向关系，直接回答“谁替换了谁、各发生多少次”。它只汇总现有审计事实：不补写淘汰历史，不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `etr`：字段严格按 `op,first,last` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 均为 0..10⁹ 的非 bool 整数且 `first≤last`，共同给出业务时间闭区间 `[first,last]`，区间包含两端。
+- 返回固定键序 `op,first,last,latest,truncated,edges,summary`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`。
+- 切换口径沿用 `ett`：同一 `now` 的事件按 seq 升序整组生效，只比较组前一时刻与整组后净状态；`first` 时刻仅作初态，即使该时刻恰有事件组生效也不另造关系；`UNKNOWN` 前缀结束进入可判定状态产生的 RECOVER 不计入关系，淘汰前缀本身不产生任何关系。
+- `edges` 按关系首次发生时刻升序排列（切换时刻严格递增，首现时刻互不相同）。每项固定键序 `kind,before,after,count,first,last`：
+  - `kind` 仅为 `ENTER`（`EMPTY→ACTIVE`）、`LEAVE`（`ACTIVE→EMPTY`）、`REPLACE`（不同 `ACTIVE` 身份互换）；
+  - `before`、`after` 均固定含 `state,digest,at`，`state` 仅为 `EMPTY` 或 `ACTIVE`；`EMPTY` 的 `digest`、`at` 为 null，`ACTIVE` 回显身份（六十四位小写摘要与触发时刻）；
+  - 相同 `kind`、`before`、`after` 的切换合并为一条关系，`count` 为发生次数，`first`、`last` 为该关系首末切换时刻（方向不同的替换不合并）。
+- `summary` 固定键序 `total,enter,leave,replace,edges,identities`：`enter`/`leave`/`replace` 为三类真实切换次数，三者之和等于 `total`；`edges` 为去重后关系数；`identities` 为所有 edge 端点中 `ACTIVE` 身份（`(digest,at)`）的去重数——区间内始终 ACTIVE 但从未参与切换的身份不计。无真实切换时 `edges` 为空数组且汇总全零。
+- `truncated` 仅在区间含保留窗口无法判定的 UNKNOWN 时刻时为 true；空历史但时钟已推进时返回确定的空结果（`latest=0`、空 `edges`、全零汇总、`truncated=false`）。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
+- 恒值区域与真实切换各只过一遍，关系用字典聚合，时间与额外空间上界为 O(A log A)、实际 O(A)，A 至多六十四条保留事件，不按时间跨度（可达 10⁹）逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出、`si` 恢复后的结果逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，现有 `et`、`ett`、`etu`、`etx` 与其他公开入口行为不变。
+
 ## 测试
 
     python -m unittest discover
