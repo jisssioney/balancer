@@ -488,6 +488,21 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败不产生 stdout，并回滚同批此前变化；成功不推进时钟、不写审计或改变预约与审计窗口。
 - 时间与额外空间均为 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描，仅使用 Python 标准库；重复查询、`se` 导出后经 `si` 恢复的查询及 `run`、`record`、`replay` 均须保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，现有 `et`、`etg`、`eti`、`etm`、`ett` 与其他公开行为不变。
 
+## 端点切换预约审计业务时间身份抖动归因查询：etx
+
+在 `et`/`ett`/`etu` 的六十四条保留窗口与逐时刻口径之上新增只读入口，给出业务时间闭区间内参与切换的预约身份及各身份按自身参与序列聚合的切换突发：沿用 `ett` 的同 `now` 事件整组生效规则取得净变化，`first` 时刻仅作初态，`RECOVER` 不参与归因，只统计 ENTER、LEAVE、REPLACE，并按身份把每次切换归入参与方。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `etx`：字段严格按 `op,first,last,gap` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last`、`gap` 均为 0..10⁹ 的非 bool 整数且 `first≤last`；`first`、`last` 共同给出业务时间闭区间 `[first,last]`，`gap` 为同一身份相邻两次参与切换并入同一突发的最大时间差。
+- 返回固定键序 `op,first,last,gap,latest,truncated,identities,summary`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`。真实切换的识别与 `ett`/`etu` 完全一致：同一 `now` 的事件按 seq 升序整组生效，以末条 `after` 为终态；`EMPTY→ACTIVE` 为 ENTER、`ACTIVE→EMPTY` 为 LEAVE、不同 `ACTIVE` 身份互换为 REPLACE；整组前后状态及身份相同不产生切换；组时刻等于 `first` 时其 after 即初态、不另造切换；`UNKNOWN` 前缀结束进入可判定状态的 RECOVER 不产生身份、不计入任何计数与突发。
+- 切换归入参与身份：ENTER 归入 after 身份，LEAVE 归入 before 身份，REPLACE 同时归入 before 身份的 `replace_out` 与 after 身份的 `replace_in`（两身份不同）。`identities` 只列参与切换的身份，按首次参与时刻升序、再按 `digest` 的 UTF-8 字节序、再按 `at` 升序排列；无参与身份时为空数组。每项固定键序 `digest,at,first,last,transitions,enter,leave,replace_in,replace_out,bursts,max_changes`：
+  - `first`、`last` 为该身份在区间内首次与末次参与切换的时刻（不是预约触发时刻 `at`）；
+  - `enter`/`leave`/`replace_in`/`replace_out` 为四类归因计数，`transitions` 为四类之和；
+  - 各身份按自己的参与序列（参与时刻严格递增，REPLACE 的双方在同一时刻各计一次）用 `gap` 聚合：第一条参与建立突发，之后与上一条参与时刻差不大于 `gap` 时并入当前突发，否则另起突发，单条参与也成一组；`bursts` 为组数，`max_changes` 为最大组大小。
+- `summary` 固定键序 `total,bursts,enter,leave,replace,identities,max_changes`：前五项与同参数 `etu` 逐值一致——`total` 为真实切换总数（REPLACE 计一次，不等于各行 `transitions` 之和）、`bursts` 为全局切换序列按相邻时间差划分的突发数、`enter`/`leave`/`replace` 为全局分类计数；`identities` 为列出的身份数；`max_changes` 为各身份自身最大突发组大小的最大值，无切换时为 0。无切换时 `identities` 为空数组且汇总全部为 0。
+- `truncated` 沿用 `etu`，仅表示区间含至少一个 `UNKNOWN` 时刻；淘汰前缀不得产生身份或切换。空历史且时钟已推进时返回空 `identities`、全零汇总与 `truncated=false`。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
+- 恒值区域与真实切换各只过一遍，身份排序为主要超线性代价，单次时间与额外空间均为 O(A log A)，A 至多六十四条保留事件（REPLACE 每条至多产生两条身份参与记录，参与记录总数 O(A)），不按时间跨度逐点扫描；仅使用 Python 标准库，重复查询、`se` 与 `si` 往返及 `run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行和逐字节一致，其他公开行为不变。
+
 ## 测试
 
     python -m unittest discover

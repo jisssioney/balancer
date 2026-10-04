@@ -2564,6 +2564,7 @@ def parse_op(raw_op):
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
         "eg", "ee", "ef", "et", "etg", "eti", "etm", "ett", "etu",
+        "etx",
         "ru",
         "ua",
         "mu",
@@ -5020,6 +5021,42 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("etu", first, last, gap)
+
+    if name == "etx":
+        # 端点切换预约审计业务时间身份抖动归因查询（只读）：精确键序
+        # op,first,last,gap（键须按此序出现，乱序报 INPUT）。first、last、
+        # gap 均为 0..10^9 的非 bool 整数且 first<=last，共同给出业务时间
+        # 闭区间 [first,last] 与身份相邻两次参与切换的时间差并入同一突发
+        # 的最大间隔。不接受 now、不推进显式时钟。字段集合、键序、UTF-8
+        # 编码、整数类型（排除 bool）、范围或区间关系非法统一判 INPUT；
+        # last 晚于操作开始时的全局逻辑时钟，或时钟从未推进，留执行期判
+        # STATE（INPUT 判定先于状态）。
+        if list(raw_op) != ["op", "first", "last", "gap"]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+        gap = raw_op["gap"]
+        if (
+            not isinstance(gap, int)
+            or isinstance(gap, bool)
+            or not 0 <= gap <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("etx", first, last, gap)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -17073,6 +17110,291 @@ def run(raw):
                         "leave": counts["LEAVE"],
                         "replace": counts["REPLACE"],
                         "max_changes": max_changes,
+                    },
+                }
+            )
+
+        elif op[0] == "etx":
+            # 端点切换预约审计业务时间身份抖动归因查询（只读，不接受 now、
+            # 不推进时钟、不产生审计事件，不改预约、连接、后端、审计窗口或
+            # 下一 seq）：沿用 ett 的同 now 事件整组生效、淘汰前缀与区间
+            # 首时刻口径识别区间 (first,last] 内的净切换，first 时刻仅作初
+            # 态；RECOVER 不参与归因，淘汰前缀不得产生身份或切换。只统计
+            # ENTER/LEAVE/REPLACE 三类真实切换并把每次切换归入参与身份：
+            # ENTER 归入 after 身份，LEAVE 归入 before 身份，REPLACE 同时
+            # 归入 before 的 replace_out 与 after 的 replace_in。
+            #
+            # 各身份按自己的参与序列（参与时刻严格递增）用 gap 聚合突发：
+            # 第一条参与建立突发，之后与上一条参与时刻差不大于 gap 时并入
+            # 当前突发，否则另起突发。身份按首次参与时刻、digest 的 UTF-8
+            # 字节序、at 升序排列；只列至少参与一次切换的身份。
+            #
+            # summary 前五项 total/bursts/enter/leave/replace 与同参数 etu
+            # 逐值一致（bursts 为全局切换序列按相邻 time 差<=gap 划分的突
+            # 发数，REPLACE 计一次）；identities 为列出的身份数；
+            # max_changes 为各身份自身最大突发组大小的最大值。无切换时
+            # identities 为空数组、汇总全部为 0。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟，或时钟从未推进（last_now 为
+            # None），整项报 STATE（形状类 INPUT 已在解析期先行判过；
+            # INPUT 先于状态）。truncated 沿用 etu：区间与 UNKNOWN 淘汰前
+            # 缀相交即为 true，但淘汰前缀本身不产生身份或切换。
+            #
+            # 区域构造与切换识别同 ett/etu，全程只过一遍 O(A) 个区域与
+            # O(A) 条真实切换；身份排序 O(A log A)，REPLACE 扇出至多每条
+            # 切换两条参与记录，总记录数 O(A)。时间与额外空间均为
+            # O(A log A)（A≤64），不随区间跨度（可达 10^9）逐点扫描。
+            _, first, last, gap = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            # 区域元组 (lo, hi, seq, state, identity, is_group)：前缀区域
+            # is_group=False；每个同 now 事件组区域 is_group=True 且 seq
+            # 为组内最大事件序号。构造同 ett/etu。
+            regions = []
+            if not window:
+                # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY/seq0。
+                regions.append(
+                    (0, last_now, 0, "EMPTY", None, False)
+                )
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                prefix_evicted = oldest_seq > 1
+                # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，不入
+                # 列）：完整历史 EMPTY/seq0；前缀已淘汰则 UNKNOWN、seq
+                # 与身份均为 null。
+                if oldest_now >= 1:
+                    if prefix_evicted:
+                        regions.append(
+                            (0, oldest_now - 1, None, "UNKNOWN", None,
+                             False)
+                        )
+                    else:
+                        regions.append(
+                            (0, oldest_now - 1, 0, "EMPTY", None, False)
+                        )
+                # 同 now 事件整组为一个恒值区域：终态取组内最大 seq 事
+                # 件的 after（事件按 seq 升序，即组末事件）。
+                index = 0
+                event_count = len(window)
+                while index < event_count:
+                    group_now = window[index][1]
+                    group_seq = window[index][0]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_seq = window[index][0]
+                        group_identity = window[index][4]
+                        index += 1
+                    group_end = (
+                        window[index][1] - 1
+                        if index < event_count
+                        else last_now
+                    )
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    regions.append(
+                        (
+                            group_now,
+                            group_end,
+                            group_seq,
+                            group_state,
+                            group_identity,
+                            True,
+                        )
+                    )
+
+            truncated = False
+            counts = {"ENTER": 0, "LEAVE": 0, "REPLACE": 0}
+            # 全局真实切换时刻（每条切换一次，REPLACE 不翻倍）：按时间严
+            # 格递增，用于与同参数 etu 一致的全局突发数。
+            global_times = []
+            # 身份 (digest,at) -> 参与记录 (time, kind) 列表，按扫描顺序
+            # 即该身份参与时刻严格递增。kind 仅为
+            # ENTER/LEAVE/REPLACE_IN/REPLACE_OUT。
+            KIND_ENTER = "ENTER"
+            KIND_LEAVE = "LEAVE"
+            KIND_REPLACE_IN = "REPLACE_IN"
+            KIND_REPLACE_OUT = "REPLACE_OUT"
+            records_by_identity = {}
+            # 前一恒值区域（完整时间轴上）的状态与身份：口径同 ett/etu，
+            # RECOVER 只用于前后状态比较，不产生任何身份与参与记录。
+            prev_state = "EMPTY"
+            prev_identity = None
+            for (
+                region_lo, region_hi, region_seq, state, identity, is_group
+            ) in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first <= overlap_last:
+                    if state == "UNKNOWN":
+                        truncated = True
+                    # 切换边界判定同 ett/etu：组时刻落入 (first,last] 且
+                    # 区域自左缘完整相交。first 时刻的组后状态即初态，不
+                    # 另造切换；UNKNOWN 前缀结束的 RECOVER 不参与归因。
+                    if (
+                        is_group
+                        and overlap_first == region_lo
+                        and region_lo > first
+                    ):
+                        kind = None
+                        if prev_state == "EMPTY" and state == "ACTIVE":
+                            kind = "ENTER"
+                        elif prev_state == "ACTIVE" and state == "EMPTY":
+                            kind = "LEAVE"
+                        elif (
+                            prev_state == "ACTIVE"
+                            and state == "ACTIVE"
+                            and prev_identity != identity
+                        ):
+                            kind = "REPLACE"
+                        if kind is not None:
+                            counts[kind] += 1
+                            global_times.append(region_lo)
+                            if kind == "ENTER":
+                                # ENTER 归入 after 身份。
+                                records_by_identity.setdefault(
+                                    identity, []
+                                ).append((region_lo, KIND_ENTER))
+                            elif kind == "LEAVE":
+                                # LEAVE 归入 before 身份。
+                                records_by_identity.setdefault(
+                                    prev_identity, []
+                                ).append((region_lo, KIND_LEAVE))
+                            else:
+                                # REPLACE 同时归入 before 的 replace_out
+                                # 与 after 的 replace_in（两身份不同）。
+                                records_by_identity.setdefault(
+                                    prev_identity, []
+                                ).append(
+                                    (region_lo, KIND_REPLACE_OUT)
+                                )
+                                records_by_identity.setdefault(
+                                    identity, []
+                                ).append(
+                                    (region_lo, KIND_REPLACE_IN)
+                                )
+                prev_state = state
+                prev_identity = identity
+            # 每行：(首次参与时刻, digest, at, 末次参与时刻, 参与总数,
+            # enter, leave, replace_in, replace_out, 突发组数, 最大组大小)。
+            rows = []
+            overall_max_changes = 0
+            for (row_digest, row_at), records in (
+                records_by_identity.items()
+            ):
+                enter_count = 0
+                leave_count = 0
+                replace_in_count = 0
+                replace_out_count = 0
+                bursts_count = 0
+                max_changes = 0
+                previous_time = None
+                current_size = 0
+                for record_time, record_kind in records:
+                    if record_kind == KIND_ENTER:
+                        enter_count += 1
+                    elif record_kind == KIND_LEAVE:
+                        leave_count += 1
+                    elif record_kind == KIND_REPLACE_IN:
+                        replace_in_count += 1
+                    else:
+                        replace_out_count += 1
+                    # 相邻两次参与时间差不大于 gap 并入同一突发，否则另
+                    # 起一组；首条参与自成一组。
+                    if (
+                        previous_time is None
+                        or record_time - previous_time > gap
+                    ):
+                        bursts_count += 1
+                        current_size = 1
+                    else:
+                        current_size += 1
+                    if current_size > max_changes:
+                        max_changes = current_size
+                    previous_time = record_time
+                if max_changes > overall_max_changes:
+                    overall_max_changes = max_changes
+                rows.append(
+                    (
+                        records[0][0],
+                        row_digest,
+                        row_at,
+                        records[-1][0],
+                        len(records),
+                        enter_count,
+                        leave_count,
+                        replace_in_count,
+                        replace_out_count,
+                        bursts_count,
+                        max_changes,
+                    )
+                )
+            # 身份排序：首次参与时刻升序，再按 digest 的 UTF-8 字节序，
+            # 再按 at 升序（(digest,at) 唯一标识身份，次序全序）。
+            rows.sort(
+                key=lambda row: (
+                    row[0], row[1].encode("utf-8"), row[2]
+                )
+            )
+            identities = [
+                {
+                    "digest": row_digest,
+                    "at": row_at,
+                    "first": row_first_time,
+                    "last": row_last_time,
+                    "transitions": row_transitions,
+                    "enter": row_enter,
+                    "leave": row_leave,
+                    "replace_in": row_replace_in,
+                    "replace_out": row_replace_out,
+                    "bursts": row_bursts,
+                    "max_changes": row_max_changes,
+                }
+                for (
+                    row_first_time, row_digest, row_at, row_last_time,
+                    row_transitions, row_enter, row_leave,
+                    row_replace_in, row_replace_out, row_bursts,
+                    row_max_changes,
+                ) in rows
+            ]
+            # 全局突发划分与同参数 etu 一致：切换时刻严格递增，第一条建
+            # 立突发，其后相邻差不大于 gap 并入，否则另起。
+            global_bursts = 0
+            previous_global_time = None
+            for global_time in global_times:
+                if (
+                    previous_global_time is None
+                    or global_time - previous_global_time > gap
+                ):
+                    global_bursts += 1
+                previous_global_time = global_time
+            total = len(global_times)
+            results.append(
+                {
+                    "op": "etx",
+                    "first": first,
+                    "last": last,
+                    "gap": gap,
+                    "latest": latest,
+                    "truncated": truncated,
+                    "identities": identities,
+                    "summary": {
+                        "total": total,
+                        "bursts": global_bursts,
+                        "enter": counts["ENTER"],
+                        "leave": counts["LEAVE"],
+                        "replace": counts["REPLACE"],
+                        "identities": len(identities),
+                        "max_changes": overall_max_changes,
                     },
                 }
             )
