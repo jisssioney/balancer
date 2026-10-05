@@ -34986,5 +34986,662 @@ class EpSwitchAuditTimeRelationsTest(unittest.TestCase):
         self.assert_shape(result)
 
 
+class EpSwitchAuditTimePathTest(unittest.TestCase):
+    """etp op,first,last,source,target（只读）——在 etr 同口径合并的净切换
+    有向关系图上求两身份（含 EMPTY）间跳数最少、再按各边 first 序列字典
+    序最小的迁移链。返回固定键序
+    op,first,last,latest,truncated,found,hops,nodes,edges；可达时 nodes
+    按路径输出 state,digest,at，edges 与相邻节点对应并保持 etr 的
+    kind,before,after,count,first,last；source==target 为 hops=0 单节
+    点空边；不可达 found=false、hops=null、空节点与边。first 仅作初态、
+    UNKNOWN/RECOVER 不建边。last 超时钟或时钟从未推进报 STATE/4，形状
+    与身份结构类错误 INPUT/2 且优先；不逐点扫描、不推进时钟、不写审
+    计；se/si 与 record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def eu(self, identity, now):
+        digest, at = identity
+        return {"op": "eu", "digest": digest, "at": at, "now": now}
+
+    def etp(self, source, target, first=0, last=11):
+        return {
+            "op": "etp", "first": first, "last": last,
+            "source": self.side(source), "target": self.side(target),
+        }
+
+    def fold(self, results):
+        return [r for r in results if r["op"] == "etp"][-1]
+
+    def side(self, identity):
+        if identity is None:
+            return {"state": "EMPTY", "digest": None, "at": None}
+        digest, at = identity
+        return {"state": "ACTIVE", "digest": digest, "at": at}
+
+    def node_id(self, node):
+        self.assertEqual(list(node), ["state", "digest", "at"])
+        if node["state"] == "EMPTY":
+            self.assertIsNone(node["digest"])
+            self.assertIsNone(node["at"])
+            return None
+        self.assertEqual(node["state"], "ACTIVE")
+        self.assertEqual(len(node["digest"]), 64)
+        self.assertIsInstance(node["at"], int)
+        self.assertNotIsInstance(node["at"], bool)
+        return (node["digest"], node["at"])
+
+    def timeline_ops(self):
+        """同 etr 七事件三身份时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def replace_chain_ops(self, count):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            target = items1 if i % 2 == 0 else items2
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    def assert_shape(self, result, found, hops, node_count):
+        self.assertEqual(
+            list(result),
+            ["op", "first", "last", "latest", "truncated",
+             "found", "hops", "nodes", "edges"],
+        )
+        self.assertEqual(result["op"], "etp")
+        self.assertEqual(result["found"], found)
+        self.assertEqual(result["hops"], hops)
+        self.assertEqual(len(result["nodes"]), node_count)
+        if found:
+            self.assertEqual(len(result["edges"]), hops)
+            self.assertEqual(node_count, hops + 1)
+            previous_first = None
+            for edge in result["edges"]:
+                self.assertEqual(
+                    list(edge),
+                    ["kind", "before", "after", "count", "first", "last"],
+                )
+                self.assertIn(edge["kind"],
+                              ("ENTER", "LEAVE", "REPLACE"))
+                self.assertGreaterEqual(edge["count"], 1)
+                self.assertLessEqual(edge["first"], edge["last"])
+                self.assertGreater(edge["first"], result["first"])
+                self.assertLessEqual(edge["last"], result["last"])
+                self.node_id(edge["before"])
+                self.node_id(edge["after"])
+            # edges 与相邻节点一一对应。
+            path_nodes = [self.node_id(n) for n in result["nodes"]]
+            for i, edge in enumerate(result["edges"]):
+                self.assertEqual(
+                    self.node_id(edge["before"]), path_nodes[i]
+                )
+                self.assertEqual(
+                    self.node_id(edge["after"]), path_nodes[i + 1]
+                )
+        else:
+            self.assertIsNone(hops)
+            self.assertEqual(result["nodes"], [])
+            self.assertEqual(result["edges"], [])
+
+    # ---- 空历史与自路径 ----
+
+    def test_empty_history_self_and_unreachable(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+        ]
+        result = self.fold(self.run_ops(
+            ops + [self.etp(None, None, 0, 5)]
+        ))
+        self.assertEqual(result["latest"], 0)
+        self.assertFalse(result["truncated"])
+        self.assert_shape(result, True, 0, 1)
+        self.assertEqual(
+            result["nodes"],
+            [{"state": "EMPTY", "digest": None, "at": None}],
+        )
+        identity = ("a" * 64, 1)
+        result = self.fold(self.run_ops(
+            ops + [self.etp(None, identity, 0, 5)]
+        ))
+        self.assert_shape(result, False, None, 0)
+        self.assertFalse(result["truncated"])
+
+    def test_empty_history_compact_bytes(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etp(None, None, 0, 5),
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"add","ok":true},{"op":"etp",'
+            b'"first":0,"last":5,"latest":0,"truncated":false,'
+            b'"found":true,"hops":0,'
+            b'"nodes":[{"state":"EMPTY","digest":null,"at":null}],'
+            b'"edges":[]}],'
+            b'"backends":[{"id":"a","weight":100}]}\n',
+        )
+        self.assertEqual(out.count(b"\n"), 1)
+
+    def test_clock_never_advanced_is_state(self):
+        self.failure([self.etp(None, None, 0, 0)], 4, "STATE")
+        self.failure([self.etp(None, None, 0, 10 ** 9)], 4, "STATE")
+
+    # ---- 完整时间线最短路径 ----
+
+    def test_full_timeline_paths(self):
+        ops, ids = self.timeline_ops()
+        A, B, C = ids["A"], ids["B"], ids["C"]
+
+        result = self.fold(self.run_ops(ops + [self.etp(None, B)]))
+        self.assert_shape(result, True, 2, 3)
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]],
+            [None, A, B],
+        )
+        self.assertEqual(
+            [(e["kind"], e["first"]) for e in result["edges"]],
+            [("ENTER", 5), ("REPLACE", 6)],
+        )
+
+        result = self.fold(self.run_ops(ops + [self.etp(A, None)]))
+        self.assert_shape(result, True, 1, 2)
+        self.assertEqual(
+            [(e["kind"], e["first"]) for e in result["edges"]],
+            [("LEAVE", 9)],
+        )
+
+        # B -> A：B 先 LEAVE 到 EMPTY 再 ENTER A，两跳；EMPTY->A 为
+        # etr 合并边（first=5、count=2），路径边保留其合并首刻 5。
+        result = self.fold(self.run_ops(ops + [self.etp(B, A)]))
+        self.assert_shape(result, True, 2, 3)
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]],
+            [B, None, A],
+        )
+        path_edges = result["edges"]
+        self.assertEqual(
+            [(e["kind"], e["first"]) for e in path_edges],
+            [("LEAVE", 7), ("ENTER", 5)],
+        )
+        self.assertEqual(
+            (path_edges[1]["count"],
+             path_edges[1]["first"], path_edges[1]["last"]),
+            (2, 5, 8),
+        )
+
+        # C -> B：三跳，路径沿时间回溯使用更早的边；first 序列
+        # [11,5,6]（ENTER EMPTY->A 已合并，first=5、count=2）。
+        result = self.fold(self.run_ops(ops + [self.etp(C, B)]))
+        self.assert_shape(result, True, 3, 4)
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]],
+            [C, None, A, B],
+        )
+        path_edges = result["edges"]
+        self.assertEqual(
+            [(e["kind"], e["first"]) for e in path_edges],
+            [("LEAVE", 11), ("ENTER", 5), ("REPLACE", 6)],
+        )
+        # 路径上的 ENTER 为 etr 合并边：count=2、first=5、last=8。
+        self.assertEqual(
+            (path_edges[1]["count"],
+             path_edges[1]["first"], path_edges[1]["last"]),
+            (2, 5, 8),
+        )
+
+        result = self.fold(self.run_ops(ops + [self.etp(None, C)]))
+        self.assert_shape(result, True, 1, 2)
+        self.assertEqual(
+            [(e["kind"], e["first"]) for e in result["edges"]],
+            [("ENTER", 10)],
+        )
+
+    def test_unreachable_identity(self):
+        ops, ids = self.timeline_ops()
+        ghost = ("0" * 64, 42)
+        result = self.fold(self.run_ops(ops + [self.etp(None, ghost)]))
+        self.assert_shape(result, False, None, 0)
+        result = self.fold(self.run_ops(ops + [self.etp(ids["C"], ghost)]))
+        self.assert_shape(result, False, None, 0)
+        # C 经 EMPTY 可回到 A（LEAVE@11 后用合并 ENTER，first=5）：两
+        # 跳可达；真正不可达的只有图中不存在的身份。
+        result = self.fold(self.run_ops(
+            ops + [self.etp(ids["C"], ids["A"])]
+        ))
+        self.assert_shape(result, True, 2, 3)
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]],
+            [ids["C"], None, ids["A"]],
+        )
+
+    def test_self_is_zero_hops_regardless_of_history(self):
+        ops, ids = self.timeline_ops()
+        for identity in (None, ids["A"], ids["B"], ids["C"],
+                         ("f" * 64, 1)):
+            result = self.fold(
+                self.run_ops(ops + [self.etp(identity, identity)])
+            )
+            self.assert_shape(result, True, 0, 1)
+            self.assertEqual(self.node_id(result["nodes"][0]), identity)
+
+    def test_first_boundary_is_initial_only(self):
+        ops, ids = self.timeline_ops()
+        A, B, C = ids["A"], ids["B"], ids["C"]
+        # [6,11]：t6 的 REPLACE 后状态即初态，不建边。
+        result = self.fold(self.run_ops(
+            ops + [self.etp(B, A, first=6, last=11)]
+        ))
+        self.assert_shape(result, True, 2, 3)
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]],
+            [B, None, A],
+        )
+        self.assertEqual(
+            [(e["kind"], e["first"]) for e in result["edges"]],
+            [("LEAVE", 7), ("ENTER", 8)],
+        )
+        # [8,11] 内 EMPTY 无法到达 B（B 相关边均在 first 之前）。
+        result = self.fold(self.run_ops(
+            ops + [self.etp(None, B, first=8, last=11)]
+        ))
+        self.assert_shape(result, False, None, 0)
+        # [8,11] 内 EMPTY 仍可直达 C。
+        result = self.fold(self.run_ops(
+            ops + [self.etp(None, C, first=8, last=11)]
+        ))
+        self.assert_shape(result, True, 1, 2)
+        self.assertEqual(
+            [(e["kind"], e["first"]) for e in result["edges"]],
+            [("ENTER", 10)],
+        )
+
+    # ---- 跳数优先与等长字典序 ----
+
+    def test_lexicographic_tie_prefers_smaller_first_sequence(self):
+        # 两条等长（两跳）EMPTY->T 路径：
+        # 经 A：ENTER first=4（t10 重入后合并，count=2、last=10）
+        #        + REPLACE A->T first=11，first 序列 [4,11]；
+        # 经 C：ENTER first=7 + REPLACE C->T first=8，序列 [7,8]。
+        # 取字典序更小的 [4,11]。
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        A = (d1, 100)
+        B = (d2, 200)
+        C = (d1, 300)
+        T = (d2, 400)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 4),
+            self.es(items2, 0, 200, 5),
+            self.eu(B, 6),
+            self.es(items1, 0, 300, 7),
+            self.es(items2, 0, 400, 8),
+            self.eu(T, 9),
+            self.es(items1, 0, 100, 10),
+            self.es(items2, 0, 400, 11),
+        ]
+        result = self.fold(self.run_ops(ops + [self.etp(None, T, 0, 11)]))
+        self.assert_shape(result, True, 2, 3)
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]],
+            [None, A, T],
+        )
+        edges = result["edges"]
+        self.assertEqual(
+            [(e["kind"], e["first"]) for e in edges],
+            [("ENTER", 4), ("REPLACE", 11)],
+        )
+        self.assertEqual((edges[0]["count"], edges[0]["last"]), (2, 10))
+
+    def test_hop_count_beats_lexicographic_order(self):
+        # 两跳路径 first 序列 [5,6] 更小，但一跳直达边 first=20：跳数优
+        # 先，选 [20]。
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        X = (d1, 100)
+        T = (d2, 200)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 200, 6),
+            self.eu(T, 7),
+            self.es(items2, 0, 200, 20),
+        ]
+        result = self.fold(self.run_ops(ops + [self.etp(None, T, 0, 20)]))
+        self.assert_shape(result, True, 1, 2)
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]], [None, T]
+        )
+        edge = result["edges"][0]
+        self.assertEqual(edge["kind"], "ENTER")
+        self.assertEqual((edge["first"], edge["last"]), (20, 20))
+
+    # ---- 与 etr 的边集交叉验证 ----
+
+    def test_path_edges_are_etr_edges(self):
+        ops, ids = self.timeline_ops()
+        A, B, C = ids["A"], ids["B"], ids["C"]
+        cases = [(None, B), (B, A), (C, B), (None, C), (A, None)]
+        for source, target in cases:
+            outcomes = self.run_ops(
+                ops + [
+                    {"op": "etr", "first": 0, "last": 11},
+                    self.etp(source, target),
+                ]
+            )
+            etr_result = next(r for r in outcomes if r["op"] == "etr")
+            etp_result = next(r for r in outcomes if r["op"] == "etp")
+            etr_keys = {
+                (
+                    e["kind"],
+                    json.dumps(e["before"], sort_keys=True),
+                    json.dumps(e["after"], sort_keys=True),
+                ): e
+                for e in etr_result["edges"]
+            }
+            for edge in etp_result["edges"]:
+                key = (
+                    edge["kind"],
+                    json.dumps(edge["before"], sort_keys=True),
+                    json.dumps(edge["after"], sort_keys=True),
+                )
+                self.assertIn(key, etr_keys)
+                # count/first/last 与 etr 合并边逐值一致。
+                merged = etr_keys[key]
+                self.assertEqual(edge["count"], merged["count"])
+                self.assertEqual(edge["first"], merged["first"])
+                self.assertEqual(edge["last"], merged["last"])
+
+    # ---- 淘汰前缀与 truncated ----
+
+    def test_evicted_prefix_truncation(self):
+        ops, identities = self.replace_chain_ops(70)
+        result = self.fold(self.run_ops(
+            ops + [self.etp(identities[6], identities[9], 0, 79)]
+        ))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["latest"], 70)
+        self.assert_shape(result, True, 3, 4)
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]],
+            [identities[i] for i in (6, 7, 8, 9)],
+        )
+
+    def test_evicted_prefix_identity_unreachable(self):
+        ops, identities = self.replace_chain_ops(70)
+        # ids[0] 已随窗口淘汰：图中无该节点，不可达且 truncated=true，
+        # 不用 UNKNOWN 状态补路径。
+        result = self.fold(self.run_ops(
+            ops + [self.etp(identities[0], identities[9], 0, 79)]
+        ))
+        self.assert_shape(result, False, None, 0)
+        self.assertTrue(result["truncated"])
+        # 区间从窗口内开始则不 truncated。
+        result = self.fold(self.run_ops(
+            ops + [self.etp(identities[6], identities[9], 16, 79)]
+        ))
+        self.assert_shape(result, True, 3, 4)
+        self.assertFalse(result["truncated"])
+        # 淘汰身份的自路径仍为 hops=0，同时如实报告 truncated。
+        result = self.fold(self.run_ops(
+            ops + [self.etp(identities[0], identities[0], 0, 79)]
+        ))
+        self.assert_shape(result, True, 0, 1)
+        self.assertTrue(result["truncated"])
+
+    # ---- INPUT/STATE 校验 ----
+
+    def test_input_validation(self):
+        clock = [{"op": "ci", "config": config_v11(1), "now": 5}]
+        empty = {"state": "EMPTY", "digest": None, "at": None}
+        active = {"state": "ACTIVE", "digest": "a" * 64, "at": 1}
+
+        def raw(**overrides):
+            value = {
+                "op": "etp", "first": 0, "last": 5,
+                "source": empty, "target": active,
+            }
+            value.update(overrides)
+            return value
+
+        bad = [
+            {},
+            {"op": "etp"},
+            {"op": "etp", "first": 0, "last": 5},
+            {"op": "etp", "first": 0, "last": 5,
+             "target": active, "source": empty},
+            raw(first=-1), raw(first=10 ** 9 + 1),
+            raw(first=True), raw(first=False), raw(last=5.0),
+            raw(first="0"), raw(first=None), raw(first=5, last=4),
+            raw(now=5),
+            raw(source={"state": "UNKNOWN", "digest": None, "at": None}),
+            raw(source={"state": "ACTIVE", "digest": "A" * 64, "at": 1}),
+            raw(source={"state": "ACTIVE", "digest": "z" * 64, "at": 1}),
+            raw(source={"state": "ACTIVE", "digest": "a" * 63,
+                        "at": 1}),
+            raw(source={"state": "ACTIVE", "digest": "a" * 64,
+                        "at": -1}),
+            raw(source={"state": "ACTIVE", "digest": "a" * 64,
+                        "at": 10 ** 9 + 1}),
+            raw(source={"state": "ACTIVE", "digest": "a" * 64,
+                        "at": True}),
+            raw(source={"state": "ACTIVE", "digest": "a" * 64}),
+            raw(source={"state": "EMPTY", "digest": "a" * 64,
+                        "at": None}),
+            raw(source={"state": "EMPTY", "digest": None, "at": 0}),
+            raw(source={"at": 1, "digest": "a" * 64, "state": "ACTIVE"}),
+            raw(source="EMPTY"),
+            raw(source=[]),
+            raw(source={"state": "EMPTY", "digest": None, "at": None,
+                        "extra": 1}),
+            raw(target={"state": "active", "digest": "a" * 64,
+                        "at": 1}),
+        ]
+        for request in bad:
+            self.failure(clock + [request], 2, "INPUT")
+
+    def test_input_precedence_over_state(self):
+        clock = [{"op": "ci", "config": config_v11(1), "now": 5}]
+        active = {"state": "ACTIVE", "digest": "a" * 64, "at": 1}
+        self.failure(
+            clock + [{
+                "op": "etp", "first": True, "last": 10 ** 9,
+                "source": {"state": "EMPTY", "digest": None, "at": None},
+                "target": active,
+            }],
+            2, "INPUT",
+        )
+        self.failure(
+            clock + [self.etp(None, ("a" * 64, 1), first=6, last=5)],
+            2, "INPUT",
+        )
+        self.failure(
+            clock + [self.etp(None, ("a" * 64, 1), 0, 6)], 4, "STATE"
+        )
+
+    def test_future_range_state_no_stdout(self):
+        ops, _ = self.timeline_ops()
+        self.failure(
+            ops + [self.etp(None, None, 0, 12)], 4, "STATE"
+        )
+        self.failure(
+            ops + [self.etp(None, None, 12, 12)], 4, "STATE"
+        )
+        self.failure(
+            ops + [self.etp(None, None, 0, 10 ** 9)], 4, "STATE"
+        )
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.etp(None, None, 0, 6),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    # ---- 只读、se/si 与 record/replay ----
+
+    def test_does_not_advance_clock_or_write_audit(self):
+        ops, ids = self.timeline_ops()
+        query = self.etp(ids["C"], ids["A"])
+        without = self.run_ops(ops + [{"op": "se"}])
+        with_query = self.run_ops(ops + [query, {"op": "se"}])
+        se_without = [r for r in without if r["op"] == "se"][-1]
+        se_with = [r for r in with_query if r["op"] == "se"][-1]
+        self.assertEqual(se_with, se_without)
+        results = self.run_ops(
+            ops + [query, {"op": "ek", "after": 0, "limit": 64}]
+        )
+        ek = [r for r in results if r["op"] == "ek"][-1]
+        self.assertEqual(
+            [e["seq"] for e in ek["events"]], list(range(1, 8))
+        )
+
+    def test_repeated_query_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        query = self.etp(ids["C"], ids["B"], 3, 11)
+        first = self.run_ops(ops + [query, query])
+        first_results = [r for r in first if r["op"] == "etp"]
+        self.assertEqual(first_results[0], first_results[1])
+        second = self.fold(self.run_ops(ops + [query]))
+        self.assertEqual(first_results[0], second)
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        for base, last_clock in (
+            (self.timeline_ops()[0], 11),
+            (self.replace_chain_ops(70)[0], 79),
+        ):
+            query = {
+                "op": "etp", "first": 0, "last": last_clock,
+                "source": self.side(None),
+                "target": self.side(("a" * 64, 1)),
+            }
+            results = self.run_ops(base + [{"op": "se"}, query])
+            se = next(r for r in results if r["op"] == "se")
+            before = self.fold(results)
+            results = self.run_ops([
+                {"op": "si", "version": se["version"],
+                 "digest": se["digest"], "state": se["state"]},
+                query,
+            ])
+            after = self.fold(results)
+            self.assertEqual(after, before)
+
+    def test_record_replay_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        chain_ops, chain_ids = self.replace_chain_ops(70)
+        cases = [
+            ops + [self.etp(ids["C"], ids["B"])],
+            ops + [self.etp(None, ids["A"], 5, 9)],
+            ops + [self.etp(None, ("a" * 64, 1))],
+            chain_ops + [
+                self.etp(chain_ids[6], chain_ids[9], 0, 79)
+            ],
+        ]
+        for case_ops in cases:
+            raw = encode_ops(case_ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual((rec_code, rec_err), (0, b""))
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual(
+                (rep_code, rep_out, rep_err),
+                (run_code, run_out, run_err),
+            )
+
+    def test_span_up_to_1e9_without_point_scan(self):
+        items1 = [("a", None, self.EP1)]
+        identity = (self.switch_digest(items1, 0), 100)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 0),
+            self.eu(identity, 1),
+            {"op": "add", "id": "b", "weight": 100, "d": 0,
+             "now": 10 ** 9},
+            self.etp(identity, None, 0, 10 ** 9),
+        ]
+        result = self.fold(self.run_ops(ops))
+        self.assert_shape(result, True, 1, 2)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(
+            [self.node_id(n) for n in result["nodes"]], [identity, None]
+        )
+        edge = result["edges"][0]
+        self.assertEqual(
+            (edge["kind"], edge["first"], edge["last"], edge["count"]),
+            ("LEAVE", 1, 1, 1),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
