@@ -527,6 +527,19 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。请求字段、键序、身份结构、编码、数值类型、范围或区间关系非法时返回 INPUT/2，输入错误先于状态判断。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
 - 恒值区域、真实切换与图搜索各只过一遍，单次时间 O(A log A)、额外空间 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描；仅使用 Python 标准库，重复查询及 `se` 导出、`si` 恢复后的结果逐字节一致，`run`、`record`、`replay`、`se`、`si` 的逐字节一致性及现有公开入口行为保持不变。
 
+## 端点切换预约审计业务时间净切换可达影响面查询：etv
+
+在 `et`/`ett`/`etu`/`etx`/`etr`/`etp` 的六十四条保留窗口与逐时刻口径之上新增只读入口，在与 `etr` 同口径聚合出的有向关系图上返回某个预约身份在指定业务时间闭区间内不超过给定跳数可达的全部身份与最短路径。沿用 `ett` 的同 `now` 事件整组生效规则取得净变化，`first` 时刻仅作初态，`UNKNOWN` 与 `RECOVER` 不建边，只以 `ENTER`、`LEAVE`、`REPLACE` 的 `before` 到 `after` 构成有向图，相同 `kind` 和两端仍按 `etr` 合并。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `etv`：字段严格按 `op,first,last,source,max_hops` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 均为 0..10¹⁸ 的非 bool 整数且 `first≤last`，共同给出业务时间闭区间 `[first,last]`，区间包含两端。`source` 沿用 `etp` 的 `state,digest,at` 身份结构：`ACTIVE` 要求六十四位小写十六进制 SHA-256 `digest` 与 0..10⁹ 的非 bool `at`，`EMPTY` 要求 `digest`、`at` 均为 null。`max_hops` 为 0..64 的非 bool 整数。
+- 返回固定键序 `op,first,last,latest,truncated,source,max_hops,items,summary`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`；`source` 原样回显请求身份。
+- `source` 始终作为 `hops=0` 的首项（单节点 `nodes`、空 `edges`，身份无需在历史中出现）；其余 items 仅收录不超过 `max_hops` 跳可达且不同于 `source` 的身份。每个目标先取跳数（边数）最少的路径，多条等长路径沿用 `etp` 的并列选择规则（沿途各边 `first` 序列的字典序最小者）；各项的 `nodes` 按路径顺序输出身份，`edges` 与相邻节点一一对应，路径的节点与边结构、合并后的 `count` 与首末时刻均与相同参数 `etp` 逐值一致。
+- 其余项按 `hops` 升序排列，`hops` 相同再按 `target` 的 EMPTY 先于 ACTIVE、`digest` 的 UTF-8 字节序、`at` 升序排列。每项固定键序 `target,hops,nodes,edges`；`target` 固定键序 `state,digest,at`，`nodes` 各项同构。
+- `summary` 固定键序 `reachable,depth,edges`：`reachable` 为 items 数量（含首项）；`depth` 为已返回项的最大 `hops`；`edges` 为各项路径边数之和（即各项 hops 之和）。只有首项时后两值均为 0。
+- `truncated` 与同区间 `etr`、`etp` 逐值一致，仅表示区间含保留窗口无法判定的 `UNKNOWN` 淘汰前缀；淘汰前缀不以未知状态补边或推断关系。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、身份结构、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批此前变化；成功不推进时钟、不写审计或改变运行态。
+- 恒值区域、真实切换与图搜索各只过一遍，路径重建与身份排序合计 O(A²)，A 为最多六十四条保留审计事件，时间与结果额外空间均为 O(A²)，不按时间数值跨度（可达 10¹⁸）逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及 `se`、`si` 与现有公开入口行为不变。
+
 ## 测试
 
     python -m unittest discover
