@@ -35828,5 +35828,835 @@ class EpSwitchAuditTimePathTest(unittest.TestCase):
         self.assert_path_coherent(result)
 
 
+class EpSwitchAuditTimeReachabilityTest(unittest.TestCase):
+    """etv op,first,last,source,max_hops（只读）——业务时间闭区间净切换
+    关系图上自 source 出发的可达影响面。沿用 ett/etr/etp 的同 now 整组
+    生效与 first 仅作初态口径，UNKNOWN 与 RECOVER 不建边，只以 ENTER、
+    LEAVE、REPLACE 的 before 到 after 构成有向图，相同 kind 和两端按
+    etr 合并。返回固定键序
+    op,first,last,latest,truncated,source,max_hops,items,summary；
+    source 始终为 hops=0 首项，其余项为不超过 max_hops 跳可达的异源
+    身份，target,hops,nodes,edges 路径与 etp 逐值一致；排序为 hops 升
+    序、EMPTY 先于 ACTIVE、digest UTF-8 字节序、at 升序；summary 为
+    reachable,depth,edges。first/last 域 0..10^18，max_hops 0..64。
+    last 晚于操作开始时钟或时钟从未推进报 STATE/4，形状类错误
+    INPUT/2 且优先；truncated 与同区间 etr/etp 一致；不逐点扫描、不
+    推进时钟、不写审计；se/si 与 record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def side(self, identity):
+        if identity is None:
+            return {"state": "EMPTY", "digest": None, "at": None}
+        digest, at = identity
+        return {"state": "ACTIVE", "digest": digest, "at": at}
+
+    def etv(self, first, last, source, max_hops):
+        return {
+            "op": "etv", "first": first, "last": last,
+            "source": self.side(source), "max_hops": max_hops,
+        }
+
+    def etp(self, first, last, source, target):
+        return {
+            "op": "etp", "first": first, "last": last,
+            "source": self.side(source), "target": self.side(target),
+        }
+
+    def raw_etv(self, first, last, source, max_hops):
+        return {
+            "op": "etv", "first": first, "last": last,
+            "source": source, "max_hops": max_hops,
+        }
+
+    def fold(self, results):
+        return [r for r in results if r["op"] == "etv"][-1]
+
+    def timeline_ops(self):
+        """七事件三身份时间线（同 etr/etp 用例）：
+        seq1 SET@5 null->A(d1,100)、seq2 REPLACE@6 A->B(d2,101)、
+        seq3 CANCEL@7 B->null、seq4 SET@8 null->A、seq5 CLEAR@9
+        A->null、seq6 SET@10 null->C(d2,11)、seq7 APPLY@11 C->null。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def replace_chain_ops(self, count):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            target = items1 if i % 2 == 0 else items2
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    def target_key(self, target):
+        if target["state"] == "EMPTY":
+            return None
+        return (target["digest"], target["at"])
+
+    def assert_item_coherent(self, item, first, last, source_key):
+        self.assertEqual(
+            list(item), ["target", "hops", "nodes", "edges"]
+        )
+        hops = item["hops"]
+        nodes = item["nodes"]
+        edges = item["edges"]
+        self.assertEqual(len(nodes), len(edges) + 1)
+        self.assertEqual(hops, len(edges))
+        self.assertEqual(nodes[-1], item["target"])
+        for index, node in enumerate(nodes):
+            self.assertEqual(list(node), ["state", "digest", "at"])
+            if node["state"] == "EMPTY":
+                self.assertIsNone(node["digest"])
+                self.assertIsNone(node["at"])
+            else:
+                self.assertEqual(len(node["digest"]), 64)
+                self.assertIsInstance(node["at"], int)
+                self.assertNotIsInstance(node["at"], bool)
+        for index, edge in enumerate(edges):
+            self.assertEqual(
+                list(edge),
+                ["kind", "before", "after", "count", "first", "last"],
+            )
+            self.assertEqual(edge["before"], nodes[index])
+            self.assertEqual(edge["after"], nodes[index + 1])
+            self.assertGreaterEqual(edge["first"], first)
+            self.assertLessEqual(edge["last"], last)
+            self.assertLessEqual(edge["first"], edge["last"])
+            self.assertGreaterEqual(edge["count"], 1)
+
+    def assert_result_shape(self, result, first, last):
+        self.assertEqual(
+            list(result),
+            ["op", "first", "last", "latest", "truncated", "source",
+             "max_hops", "items", "summary"],
+        )
+        self.assertEqual(result["op"], "etv")
+        self.assertEqual(result["first"], first)
+        self.assertEqual(result["last"], last)
+        self.assertEqual(list(result["source"]), ["state", "digest", "at"])
+        self.assertEqual(list(result["summary"]),
+                         ["reachable", "depth", "edges"])
+        items = result["items"]
+        self.assertTrue(items)
+        # 首项恒为 source 自身：hops=0、单节点、空边。
+        self.assertEqual(
+            list(items[0]), ["target", "hops", "nodes", "edges"]
+        )
+        self.assertEqual(items[0]["target"], result["source"])
+        self.assertEqual(items[0]["hops"], 0)
+        self.assertEqual(items[0]["nodes"], [result["source"]])
+        self.assertEqual(items[0]["edges"], [])
+        for item in items:
+            self.assert_item_coherent(item, first, last, None)
+            self.assertLessEqual(item["hops"], result["max_hops"])
+        # summary 与各项一致。
+        self.assertEqual(
+            result["summary"]["reachable"], len(items)
+        )
+        self.assertEqual(
+            result["summary"]["depth"],
+            max((item["hops"] for item in items), default=0),
+        )
+        self.assertEqual(
+            result["summary"]["edges"],
+            sum(len(item["edges"]) for item in items),
+        )
+        if len(items) == 1:
+            self.assertEqual(result["summary"]["depth"], 0)
+            self.assertEqual(result["summary"]["edges"], 0)
+        # 其余项排序：hops 升序，EMPTY 先于 ACTIVE，digest 字节序、at。
+        sort_keys = [
+            (
+                item["hops"],
+                0 if item["target"]["state"] == "EMPTY" else 1,
+                (item["target"]["digest"] or "").encode("utf-8"),
+                item["target"]["at"] if item["target"]["at"] is not None
+                else 0,
+            )
+            for item in items[1:]
+        ]
+        self.assertEqual(sort_keys, sorted(sort_keys))
+
+    def assert_matches_etp(self, base, first, last, source, max_hops):
+        """etv 每个收录目标与同参数 etp 命中结果逐值一致，且可达集合
+        恰好为跳数不超过 max_hops 的 etp 可达目标。"""
+        result = self.fold(
+            self.run_ops(base + [self.etv(first, last, source, max_hops)])
+        )
+        targets = [
+            None,
+            ("0" * 64, 1),
+            ("f" * 64, 999999999),
+        ]
+        etp_outcomes = self.run_ops(
+            base + [
+                self.etp(first, last, source, target)
+                for target in targets
+            ]
+        )
+        etp_by_target = {}
+        for outcome, target in zip(
+            [r for r in etp_outcomes if r["op"] == "etp"], targets
+        ):
+            etp_by_target[target] = outcome
+        seen = set()
+        for item in result["items"]:
+            target = self.target_key(item["target"])
+            seen.add(target)
+            etp_result = etp_by_target.get(target)
+            if etp_result is None:
+                # 目标不在探针集合时，按 nodes 终点直接请求一次 etp。
+                etp_result = [
+                    r for r in self.run_ops(
+                        base
+                        + [self.etp(first, last, source, target)]
+                    ) if r["op"] == "etp"
+                ][-1]
+            self.assertTrue(etp_result["found"], target)
+            self.assertEqual(etp_result["hops"], item["hops"])
+            self.assertEqual(etp_result["nodes"], item["nodes"])
+            self.assertEqual(etp_result["edges"], item["edges"])
+            self.assertLessEqual(item["hops"], max_hops)
+        return result, seen
+
+    # ---- 空历史与紧凑字节 ----
+
+    def test_empty_history_single_source_zero_hop_bytes(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etv(0, 5, None, 0),
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"add","ok":true},{"op":"etv",'
+            b'"first":0,"last":5,"latest":0,"truncated":false,'
+            b'"source":{"state":"EMPTY","digest":null,"at":null},'
+            b'"max_hops":0,"items":[{"target":'
+            b'{"state":"EMPTY","digest":null,"at":null},"hops":0,'
+            b'"nodes":[{"state":"EMPTY","digest":null,"at":null}],'
+            b'"edges":[]}],'
+            b'"summary":{"reachable":1,"depth":0,"edges":0}}],'
+            b'"backends":[{"id":"a","weight":100}]}\n',
+        )
+        self.assertEqual(out.count(b"\n"), 1)
+
+    def test_empty_history_unseen_active_source_only_item(self):
+        identity = ("a" * 64, 3)
+        result = self.fold(self.run_ops([
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etv(2, 4, identity, 64),
+        ]))
+        self.assertEqual(result["latest"], 0)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["target"], self.side(identity))
+        self.assertEqual(
+            result["summary"],
+            {"reachable": 1, "depth": 0, "edges": 0},
+        )
+        self.assert_result_shape(result, 2, 4)
+
+    def test_clock_never_advanced_is_state(self):
+        self.failure([self.etv(0, 0, None, 0)], 4, "STATE")
+        self.failure(
+            [self.etv(0, 10 ** 18, None, 64)], 4, "STATE"
+        )
+
+    # ---- 完整时间线：内容、排序与 etp 逐值一致 ----
+
+    def test_full_timeline_matches_etp_for_every_source(self):
+        ops, ids = self.timeline_ops()
+        A, B, C = ids["A"], ids["B"], ids["C"]
+        # EMPTY：h1 为 C(d2,11)、A(d1,100)（d2 字节序先于 d1），h2 为
+        # B(d2,101)；summary edges = 0+1(C)+1(A)+2(B) = 4。
+        result, seen = self.assert_matches_etp(
+            ops, 0, 11, None, 64
+        )
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["latest"], 7)
+        self.assertEqual(seen, {None, A, B, C})
+        self.assertEqual(
+            [(item["hops"], self.target_key(item["target"]))
+             for item in result["items"]],
+            [(0, None), (1, C), (1, A), (2, B)],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"reachable": 4, "depth": 2, "edges": 4},
+        )
+        self.assert_result_shape(result, 0, 11)
+        # A：h1 为 EMPTY（LEAVE@9）先于 ACTIVE B（REPLACE@6）——排序
+        # 与 BFS 展开顺序无关，EMPTY 恒在 ACTIVE 前；h2 为 C。
+        result, seen = self.assert_matches_etp(ops, 0, 11, A, 64)
+        self.assertEqual(seen, {A, None, B, C})
+        self.assertEqual(
+            [(item["hops"], self.target_key(item["target"]))
+             for item in result["items"]],
+            [(0, A), (1, None), (1, B), (2, C)],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"reachable": 4, "depth": 2, "edges": 4},
+        )
+        # B：h1 EMPTY；h2 C(d2,11) 先于 A(d1,100)。
+        result, seen = self.assert_matches_etp(ops, 0, 11, B, 64)
+        self.assertEqual(seen, {B, None, C, A})
+        self.assertEqual(
+            [(item["hops"], self.target_key(item["target"]))
+             for item in result["items"]],
+            [(0, B), (1, None), (2, C), (2, A)],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"reachable": 4, "depth": 2, "edges": 5},
+        )
+        # C：h1 EMPTY、h2 A、h3 B。
+        result, seen = self.assert_matches_etp(ops, 0, 11, C, 64)
+        self.assertEqual(seen, {C, None, A, B})
+        self.assertEqual(
+            [(item["hops"], self.target_key(item["target"]))
+             for item in result["items"]],
+            [(0, C), (1, None), (2, A), (3, B)],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"reachable": 4, "depth": 3, "edges": 6},
+        )
+
+    def test_path_payloads_identical_to_etp(self):
+        ops, ids = self.timeline_ops()
+        result = self.fold(
+            self.run_ops(ops + [self.etv(0, 11, ids["B"], 64)])
+        )
+        by_target = {
+            self.target_key(item["target"]): item
+            for item in result["items"]
+        }
+        # B -> A 与 etp 同为 [LEAVE@7, ENTER(first=5,count=2)]。
+        item = by_target[ids["A"]]
+        self.assertEqual(item["hops"], 2)
+        self.assertEqual(
+            [edge["first"] for edge in item["edges"]], [7, 5]
+        )
+        self.assertEqual(item["edges"][1]["count"], 2)
+        self.assertEqual(item["edges"][1]["last"], 8)
+
+    def test_first_boundary_group_is_initial_not_edge(self):
+        ops, ids = self.timeline_ops()
+        A, B, C = ids["A"], ids["B"], ids["C"]
+        # 自 t6 起：t6 的 A->B 不建边（after 即 first 状态），图上 A
+        # 的出边仅剩 t9 的 LEAVE；故 A 出发 1 跳为 EMPTY（经 t9），
+        # 2 跳为 C（经 t10），B 不可达。
+        result, seen = self.assert_matches_etp(ops, 6, 11, A, 64)
+        self.assertEqual(seen, {A, None, C})
+        self.assertEqual(
+            [(item["hops"], self.target_key(item["target"]))
+             for item in result["items"]],
+            [(0, A), (1, None), (2, C)],
+        )
+        self.assert_result_shape(result, 6, 11)
+
+    # ---- max_hops 限深 ----
+
+    def test_max_hops_zero_only_source(self):
+        ops, ids = self.timeline_ops()
+        for source in (None, ids["A"], ids["B"], ids["C"]):
+            result = self.fold(
+                self.run_ops(ops + [self.etv(0, 11, source, 0)])
+            )
+            self.assertEqual(len(result["items"]), 1)
+            self.assertEqual(
+                result["items"][0]["target"], self.side(source)
+            )
+            self.assertEqual(
+                result["summary"],
+                {"reachable": 1, "depth": 0, "edges": 0},
+            )
+
+    def test_max_hops_caps_reachable_depth(self):
+        ops, ids = self.timeline_ops()
+        # EMPTY 出发：限 1 跳仅 C、A，B（2 跳）不收录。
+        result = self.fold(
+            self.run_ops(ops + [self.etv(0, 11, None, 1)])
+        )
+        self.assertEqual(
+            [self.target_key(item["target"]) for item in result["items"]],
+            [None, ids["C"], ids["A"]],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"reachable": 3, "depth": 1, "edges": 2},
+        )
+        # 限 2 跳与不限一致（本图自 EMPTY 最深 2 跳）；max_hops 仅限
+        # 界、不改变路径内容，但仍按请求回显。
+        capped = self.fold(
+            self.run_ops(ops + [self.etv(0, 11, None, 2)])
+        )
+        full = self.fold(
+            self.run_ops(ops + [self.etv(0, 11, None, 64)])
+        )
+        self.assertEqual(capped["items"], full["items"])
+        self.assertEqual(capped["summary"], full["summary"])
+        self.assertEqual(capped["max_hops"], 2)
+        self.assertEqual(full["max_hops"], 64)
+
+    def test_max_hops_on_long_chain(self):
+        ops, identities = self.replace_chain_ops(70)
+        # 保留 seq7..70（now16..79，身份 identities[6..69]）；限 10 跳
+        # 只收录链上前十一个身份。
+        result = self.fold(
+            self.run_ops(ops + [self.etv(0, 79, identities[6], 10)])
+        )
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["latest"], 70)
+        self.assertEqual(len(result["items"]), 11)
+        self.assertEqual(result["summary"]["depth"], 10)
+        self.assertEqual(
+            result["summary"]["edges"], sum(range(11))
+        )
+        self.assertEqual(
+            [self.target_key(item["target"]) for item in result["items"]],
+            identities[6:17],
+        )
+        last_item = result["items"][-1]
+        self.assertEqual(last_item["hops"], 10)
+        self.assertEqual(
+            [edge["first"] for edge in last_item["edges"]],
+            list(range(17, 27)),
+        )
+        # 限 64 跳恰好覆盖全部 64 个保留身份（63 跳）。
+        result = self.fold(
+            self.run_ops(ops + [self.etv(0, 79, identities[6], 64)])
+        )
+        self.assertEqual(len(result["items"]), 64)
+        self.assertEqual(result["summary"]["depth"], 63)
+        self.assertEqual(
+            result["summary"]["edges"], sum(range(64))
+        )
+
+    # ---- 等长 first 字典序（与 etp 同规则）----
+
+    def tie_ops(self, first_id, second_id):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        X = (d1, first_id)
+        Y = (d1, second_id)
+        T = (d2, 303)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, first_id, 1),
+            {"op": "eu", "digest": d1, "at": first_id, "now": 2},
+            self.es(items1, 0, second_id, 3),
+            self.es(items2, 0, 303, 4),
+            self.es(items1, 0, first_id, 5),
+            self.es(items2, 0, 303, 6),
+        ]
+        return ops, X, Y, T
+
+    def test_equal_hops_path_uses_lex_first_sequence(self):
+        ops, X, Y, T = self.tie_ops(101, 102)
+        # EMPTY 到 T 的 2 跳候选为经 X 的 [1,6] 与经 Y 的 [3,4]，取
+        # [1,6]；etv 收录的 T 项必须与 etp 同路径。
+        result = self.fold(
+            self.run_ops(ops + [self.etv(0, 6, None, 64)])
+        )
+        by_target = {
+            self.target_key(item["target"]): item
+            for item in result["items"]
+        }
+        self.assertEqual(
+            [edge["first"] for edge in by_target[T]["edges"]],
+            [1, 6],
+        )
+        self.assert_matches_etp(ops, 0, 6, None, 64)
+
+    # ---- 淘汰前缀与 truncated ----
+
+    def test_evicted_prefix_truncated_and_no_inferred_edges(self):
+        ops, identities = self.replace_chain_ops(70)
+        # [0,15] 全部落在 UNKNOWN 淘汰前缀：不补边、不推断关系，仅有
+        # source 首项，truncated=true。
+        result = self.fold(
+            self.run_ops(
+                ops + [self.etv(0, 15, identities[6], 64)]
+            )
+        )
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(
+            result["items"][0]["target"], self.side(identities[6])
+        )
+        # 全区间与同区间 etr/etp 的 truncated 一致。
+        outcomes = self.run_ops(
+            ops
+            + [
+                self.etv(0, 79, identities[6], 64),
+                {"op": "etr", "first": 0, "last": 79},
+            ]
+        )
+        etv_result = next(r for r in outcomes if r["op"] == "etv")
+        etr_result = next(r for r in outcomes if r["op"] == "etr")
+        self.assertEqual(
+            etv_result["truncated"], etr_result["truncated"]
+        )
+        self.assertTrue(etv_result["truncated"])
+        # 淘汰前缀不产生边：所有路径边 first>=17（首条保留区间内边）。
+        for item in etv_result["items"][1:]:
+            self.assertTrue(item["edges"])
+            self.assertGreaterEqual(item["edges"][0]["first"], 17)
+
+    def test_range_starting_at_oldest_event_not_truncated(self):
+        ops, identities = self.replace_chain_ops(70)
+        result = self.fold(
+            self.run_ops(
+                ops + [self.etv(16, 79, identities[6], 64)]
+            )
+        )
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["summary"]["depth"], 63)
+        self.assert_result_shape(result, 16, 79)
+
+    # ---- INPUT 校验 ----
+
+    def test_input_validation(self):
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        digest = "a" * 64
+        active = {"state": "ACTIVE", "digest": digest, "at": 3}
+        empty = {"state": "EMPTY", "digest": None, "at": None}
+
+        def raw(**overrides):
+            value = {
+                "op": "etv", "first": 0, "last": 5,
+                "source": empty, "max_hops": 0,
+            }
+            value.update(overrides)
+            return value
+
+        bad = [
+            {},
+            {"op": "etv"},
+            {"op": "etv", "first": 0, "last": 5},
+            {"op": "etv", "first": 0, "last": 5, "source": empty},
+            raw(now=5),
+            # 顶层乱序。
+            {"op": "etv", "last": 5, "first": 0,
+             "source": empty, "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "max_hops": 0, "source": empty},
+            {"op": "etv", "source": empty, "max_hops": 0,
+             "first": 0, "last": 5},
+            # 多余/重复（JSON 去重后为缺键）键由集合校验拒绝。
+            raw(extra=1),
+            # first/last 类型、范围、区间关系（域为 0..10^18）。
+            raw(first=True),
+            raw(first=False),
+            raw(last=True),
+            raw(first=-1),
+            raw(first=10 ** 18 + 1),
+            raw(last=10 ** 18 + 1),
+            raw(first="3"),
+            raw(first=3.0),
+            raw(last=None),
+            raw(first=6, last=5),
+            # max_hops 类型与范围 0..64。
+            raw(max_hops=True),
+            raw(max_hops=False),
+            raw(max_hops=-1),
+            raw(max_hops=65),
+            raw(max_hops="1"),
+            raw(max_hops=1.0),
+            raw(max_hops=None),
+            # source 身份结构。
+            {"op": "etv", "first": 0, "last": 5,
+             "source": None, "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": "EMPTY", "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": [], "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE", "digest": digest},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE", "digest": digest,
+                        "at": 3, "x": 1},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE",
+                        "digest": "A" * 64, "at": 3},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE",
+                        "digest": digest + " ", "at": 3},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE", "digest": "", "at": 3},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE",
+                        "digest": digest, "at": -1},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE",
+                        "digest": digest, "at": 10 ** 9 + 1},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE",
+                        "digest": digest, "at": True},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "ACTIVE",
+                        "digest": None, "at": 3},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "EMPTY",
+                        "digest": digest, "at": None},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "EMPTY",
+                        "digest": None, "at": 0},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"digest": None, "state": "EMPTY", "at": None},
+             "max_hops": 0},
+            {"op": "etv", "first": 0, "last": 5,
+             "source": {"state": "BOGUS",
+                        "digest": None, "at": None},
+             "max_hops": 0},
+        ]
+        for request in bad:
+            self.failure(clock + [request], 2, "INPUT")
+
+    def test_input_precedence_over_state(self):
+        empty = {"state": "EMPTY", "digest": None, "at": None}
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        # 已推进时钟但形状非法：INPUT 先于 STATE（即便 last 超时钟）。
+        self.failure(
+            clock
+            + [self.raw_etv(0, 6, None, 0)],
+            2, "INPUT",
+        )
+        self.failure(
+            clock
+            + [self.raw_etv(True, 5, empty, 0)],
+            2, "INPUT",
+        )
+        self.failure(
+            clock
+            + [self.raw_etv(0, 5, empty, 65)],
+            2, "INPUT",
+        )
+        # 时钟从未推进时形状错误仍先判 INPUT。
+        self.failure(
+            [self.raw_etv(True, 0, empty, 0)], 2, "INPUT"
+        )
+        # 形状合法而超时钟才是 STATE。
+        self.failure(
+            clock + [self.raw_etv(0, 6, empty, 0)], 4, "STATE"
+        )
+
+    # ---- STATE 失败与回滚 ----
+
+    def test_future_range_state_no_stdout(self):
+        ops, _ = self.timeline_ops()
+        self.failure(
+            ops + [self.etv(0, 12, None, 64)], 4, "STATE"
+        )
+        self.failure(
+            ops + [self.etv(12, 12, None, 64)], 4, "STATE"
+        )
+        self.failure(
+            ops + [self.etv(0, 10 ** 18, None, 64)], 4, "STATE"
+        )
+        # first/last 取 10^18 本身合法，但晚于逻辑时钟仍是 STATE 而
+        # 非 INPUT。
+        code, stdout, stderr = run_balancer(
+            "run",
+            encode_ops(
+                self.timeline_ops()[0]
+                + [self.etv(10 ** 18, 10 ** 18, None, 0)]
+            ),
+        )
+        self.assertEqual(
+            (code, stdout, stderr),
+            (4, b"", b'{"error":"STATE"}\n'),
+        )
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.etv(0, 6, None, 0),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    # ---- 只读、确定性、se/si 与 record/replay ----
+
+    def test_does_not_advance_clock_or_write_audit(self):
+        ops, ids = self.timeline_ops()
+        query = self.etv(0, 11, None, 64)
+        without = self.run_ops(ops + [{"op": "se"}])
+        with_query = self.run_ops(ops + [query, {"op": "se"}])
+        se_without = [r for r in without if r["op"] == "se"][-1]
+        se_with = [r for r in with_query if r["op"] == "se"][-1]
+        self.assertEqual(se_with, se_without)
+        results = self.run_ops(
+            ops + [query, {"op": "ek", "after": 0, "limit": 64}]
+        )
+        ek = [r for r in results if r["op"] == "ek"][-1]
+        self.assertEqual(
+            [e["seq"] for e in ek["events"]], list(range(1, 8))
+        )
+
+    def test_repeated_query_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        chain, chain_ids = self.replace_chain_ops(70)
+        queries = [
+            self.etv(0, 11, None, 64),
+            self.etv(0, 11, ids["B"], 64),
+            self.etv(3, 9, ids["A"], 2),
+            self.etv(0, 11, ("9" * 64, 1), 64),
+            self.etv(0, 79, chain_ids[6], 10),
+            self.etv(0, 79, chain_ids[6], 64),
+        ]
+        for query in queries:
+            base = chain if "79" in json.dumps(query) else ops
+            first = self.run_ops(base + [query, query])
+            answers = [r for r in first if r["op"] == "etv"]
+            self.assertEqual(answers[0], answers[1])
+            second = self.fold(self.run_ops(base + [query]))
+            self.assertEqual(answers[0], second)
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        cases = [
+            (self.timeline_ops()[0], 11, None, 64),
+            (self.timeline_ops()[0], 11,
+             self.timeline_ops()[1]["B"], 64),
+            (self.replace_chain_ops(70)[0], 79,
+             self.replace_chain_ops(70)[1][6], 10),
+        ]
+        for base, last_clock, source, max_hops in cases:
+            query = self.etv(0, last_clock, source, max_hops)
+            results = self.run_ops(base + [{"op": "se"}, query])
+            se = next(r for r in results if r["op"] == "se")
+            before = self.fold(results)
+            results = self.run_ops([
+                {"op": "si", "version": se["version"],
+                 "digest": se["digest"], "state": se["state"]},
+                query,
+            ])
+            after = self.fold(results)
+            self.assertEqual(after, before)
+
+    def test_record_replay_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        chain_ops, chain_ids = self.replace_chain_ops(70)
+        cases = [
+            ops + [self.etv(0, 11, None, 64)],
+            ops + [self.etv(0, 11, ids["B"], 1)],
+            ops + [self.etv(6, 11, ids["A"], 0)],
+            chain_ops + [self.etv(0, 79, chain_ids[6], 64)],
+            chain_ops + [self.etv(0, 79, chain_ids[6], 10)],
+            ops + [self.etv(0, 12, None, 64)],
+        ]
+        for case_ops in cases:
+            raw = encode_ops(case_ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual(rec_err, b"")
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual(
+                (rep_code, rep_out, rep_err),
+                (run_code, run_out, run_err),
+            )
+
+    def test_span_without_point_scan(self):
+        items1 = [("a", None, self.EP1)]
+        identity = (self.switch_digest(items1, 0), 100)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 0),
+            {"op": "eu", "digest": identity[0], "at": 100, "now": 1},
+            {"op": "add", "id": "b", "weight": 100, "d": 0,
+             "now": 10 ** 9},
+            self.etv(0, 10 ** 9, identity, 64),
+        ]
+        result = self.fold(self.run_ops(ops))
+        # t0 的 SET 即 first 状态（不产生边）；图上仅 t1 一条 LEAVE
+        # identity->EMPTY：影响面为 identity 与 EMPTY。
+        self.assertFalse(result["truncated"])
+        self.assertEqual(
+            [self.target_key(item["target"]) for item in result["items"]],
+            [identity, None],
+        )
+        self.assertEqual(
+            result["summary"],
+            {"reachable": 2, "depth": 1, "edges": 1},
+        )
+        self.assert_result_shape(result, 0, 10 ** 9)
+
+
 if __name__ == "__main__":
     unittest.main()

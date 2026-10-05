@@ -527,6 +527,19 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。请求字段、键序、身份结构、编码、数值类型、范围或区间关系非法时返回 INPUT/2，输入错误先于状态判断。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
 - 恒值区域、真实切换与图搜索各只过一遍，单次时间 O(A log A)、额外空间 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描；仅使用 Python 标准库，重复查询及 `se` 导出、`si` 恢复后的结果逐字节一致，`run`、`record`、`replay`、`se`、`si` 的逐字节一致性及现有公开入口行为保持不变。
 
+## 端点切换预约审计业务时间净切换关系可达影响面：etv
+
+在 `et`/`ett`/`etu`/`etx`/`etr`/`etp` 的六十四条保留窗口与逐时刻口径之上新增只读入口，在与 `etr` 同口径聚合出的有向关系图上，一次返回某个预约身份（`source`）在业务时间闭区间内沿迁移链可达的全部身份及其最短路径。沿用 `ett` 的同 `now` 事件整组生效规则取得净变化，`first` 时刻仅作初态，`UNKNOWN` 与 `RECOVER` 不建边，只以 `ENTER`、`LEAVE`、`REPLACE` 的 `before` 到 `after` 构成有向图，相同 `kind` 和两端仍按 `etr` 合并；每个目标的路径与同参数 `etp` 逐值一致。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `etv`：字段严格按 `op,first,last,source,max_hops` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 均为 0..10¹⁸ 的非 bool 整数且 `first≤last`，共同给出业务时间闭区间 `[first,last]`。`source` 为精确键序 `state,digest,at` 的预约身份，结构同 `etp`：`ACTIVE` 要求六十四位小写十六进制 SHA-256 `digest` 与 0..10⁹ 的非 bool `at`；`EMPTY` 要求 `digest`、`at` 均为 null（其余结构非法）。`max_hops` 为 0..64 的非 bool 整数，为收录目标允许的最大跳数。
+- 返回固定键序 `op,first,last,latest,truncated,source,max_hops,items,summary`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`；`source` 回显请求身份（键序 `state,digest,at`，结构与请求身份一致）。
+- `items` 首项始终为 `source` 自身：`hops=0`、`nodes` 为单节点身份、`edges=[]`（身份无需在历史中出现）。其余项仅收录沿有向图不超过 `max_hops` 跳可达且不同于 `source` 的身份，每项固定键序 `target,hops,nodes,edges`：`target` 键序 `state,digest,at`，`hops` 为边数；`nodes`、`edges` 与同参数 `etp` 命中结果逐值一致——`nodes` 按路径顺序输出各节点身份，`edges[i]` 的 `before`/`after` 分别等于 `nodes[i]`/`nodes[i+1]`，并保持 `etr` 的 `kind,before,after,count,first,last` 结构（含同区间合并后的 `count` 与首末时刻）。
+- 路径选择：每个目标先取跳数（边数）最少的路径；多条等长路径按沿途各边 `first`（即合并边的首次发生时刻）序列的字典序取最小者，规则与 `etp` 完全一致。`items` 的其余项按 `hops` 升序排列，`hops` 相同再按 `target` 排序：`EMPTY` 先于 `ACTIVE`，`ACTIVE` 之间按 `digest` 的 UTF-8 字节序、再按 `at` 升序。
+- `summary` 固定键序 `reachable,depth,edges`：`reachable` 为 `items` 数量（含 `source` 首项）；`depth` 为已返回项的最大 `hops`；`edges` 为各项路径边数之和。只有 `source` 首项（无可达其他身份或 `max_hops=0`）时 `depth` 与 `edges` 均为 0。
+- `truncated` 与同区间 `etr`、`etp` 一致，仅表示区间含保留窗口无法判定的 `UNKNOWN` 淘汰前缀；淘汰前缀不以未知状态补边、补路径或推断关系。空历史但时钟已推进时返回仅含 `source` 首项的确定结果、`truncated=false`。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、身份结构、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批此前变化；成功不推进时钟、不写审计或改变运行态。
+- 恒值区域、真实切换与定序图搜索各只过一遍，路径回溯总代价为可达节点数乘以路径长度；A 为最多六十四条保留审计事件时，单次时间与结果额外空间均为 O(A²)，不按时间数值跨度（可达 10¹⁸）扫描。仅使用 Python 标准库，重复查询及 `se` 导出、`si` 恢复后的结果逐字节一致，`run`、`record`、`replay`、`se`、`si` 的逐字节一致性及 `et`、`ett`、`etu`、`etx`、`etr`、`etp` 与其他公开入口行为保持不变。
+
 ## 测试
 
     python -m unittest discover
