@@ -34986,5 +34986,847 @@ class EpSwitchAuditTimeRelationsTest(unittest.TestCase):
         self.assert_shape(result)
 
 
+class EpSwitchAuditTimePathTest(unittest.TestCase):
+    """etp op,first,last,source,target（只读）——业务时间闭区间净切换
+    关系图上的最短迁移链。沿用 ett/etr 的同 now 整组生效与 first 仅作
+    初态口径，UNKNOWN 与 RECOVER 不建边，只以 ENTER、LEAVE、REPLACE
+    的 before 到 after 构成有向图，相同 kind 和两端按 etr 合并。返回固
+    定键序 op,first,last,latest,truncated,found,hops,nodes,edges；
+    可达时 hops 为边数、nodes 按路径输出 state,digest,at，edges 与相邻
+    节点对应并保持 etr 的 kind,before,after,count,first,last 结构；
+    source==target 时 found=true、hops=0、单节点空边；不可达时
+    found=false、hops=null、nodes=[]、edges=[]。等长路径按沿途各边
+    first 序列的字典序取最小。truncated 仅表示区间含无法判定的淘汰前
+    缀。last 晚于操作开始时钟或时钟从未推进报 STATE/4，形状类错误
+    INPUT/2 且优先；不逐点扫描、不推进时钟、不写审计；se/si 与
+    record/replay 逐字节契约。"""
+
+    EP1 = {"host": "10.0.0.1", "port": 80}
+    EP2 = {"host": "10.0.0.2", "port": 81}
+
+    def run_ops(self, ops):
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        return json.loads(out.decode("utf-8"))["results"]
+
+    def failure(self, ops, exit_code, label):
+        code, stdout, stderr = run_balancer("run", encode_ops(ops))
+        self.assertEqual(code, exit_code)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            stderr, ('{"error":"%s"}\n' % label).encode("utf-8")
+        )
+
+    def switch_digest(self, items, before):
+        canonical = {
+            "items": [
+                {"id": backend_id, "base": base, "target": target}
+                for backend_id, base, target in items
+            ],
+            "before": before,
+        }
+        return hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def es(self, items, before, at, now):
+        return {"op": "es", "items": [
+            {"id": backend_id, "base": base, "target": target}
+            for backend_id, base, target in items
+        ], "before": before, "at": at, "now": now}
+
+    def etp(self, first, last, source, target):
+        return {
+            "op": "etp", "first": first, "last": last,
+            "source": self.side(source), "target": self.side(target),
+        }
+
+    def side(self, identity):
+        if identity is None:
+            return {"state": "EMPTY", "digest": None, "at": None}
+        digest, at = identity
+        return {"state": "ACTIVE", "digest": digest, "at": at}
+
+    def raw_etp(self, first, last, source, target):
+        return {
+            "op": "etp", "first": first, "last": last,
+            "source": source, "target": target,
+        }
+
+    def fold(self, results):
+        return [r for r in results if r["op"] == "etp"][-1]
+
+    def timeline_ops(self):
+        """同 etr 用例的七事件三身份时间线：
+        seq1 SET@5     null  -> A=(d1,100)
+        seq2 REPLACE@6 A     -> B=(d2,101)
+        seq3 CANCEL@7  B     -> null
+        seq4 SET@8     null  -> A
+        seq5 CLEAR@9   A     -> null
+        seq6 SET@10    null  -> C=(d2,11)
+        seq7 APPLY@11  C     -> null。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 100, 5),
+            self.es(items2, 0, 101, 6),
+            {"op": "eu", "digest": d2, "at": 101, "now": 7},
+            self.es(items1, 0, 100, 8),
+            {"op": "ci", "config": config_v11(1), "now": 9},
+            self.es(items2, 0, 11, 10),
+            {"op": "ei", "digest": d2, "at": 11, "now": 11},
+        ]
+        identities = {"A": (d1, 100), "B": (d2, 101), "C": (d2, 11)}
+        return ops, identities
+
+    def replace_chain_ops(self, count):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        ops = [{"op": "ci", "config": config_v11(1), "now": 0}]
+        identities = []
+        for i in range(count):
+            target = items1 if i % 2 == 0 else items2
+            ops.append(self.es(target, 0, 1000 + i, 10 + i))
+            identities.append((self.switch_digest(target, 0), 1000 + i))
+        return ops, identities
+
+    def edge_tuple(self, edge):
+        before = edge["before"]
+        after = edge["after"]
+        before_id = (
+            (before["digest"], before["at"])
+            if before["state"] == "ACTIVE" else None
+        )
+        after_id = (
+            (after["digest"], after["at"])
+            if after["state"] == "ACTIVE" else None
+        )
+        return (
+            edge["kind"], before_id, after_id,
+            edge["count"], edge["first"], edge["last"],
+        )
+
+    def assert_path_coherent(self, result):
+        self.assertEqual(
+            list(result),
+            ["op", "first", "last", "latest", "truncated",
+             "found", "hops", "nodes", "edges"],
+        )
+        if not result["found"]:
+            self.assertIsNone(result["hops"])
+            self.assertEqual(result["nodes"], [])
+            self.assertEqual(result["edges"], [])
+            return
+        nodes = result["nodes"]
+        edges = result["edges"]
+        self.assertEqual(result["hops"], len(edges))
+        self.assertEqual(len(nodes), len(edges) + 1)
+        for index, edge in enumerate(edges):
+            self.assertEqual(
+                list(edge),
+                ["kind", "before", "after", "count", "first", "last"],
+            )
+            self.assertEqual(edge["before"], nodes[index])
+            self.assertEqual(edge["after"], nodes[index + 1])
+            self.assertEqual(
+                list(nodes[index]), ["state", "digest", "at"]
+            )
+            for side in (edge["before"], edge["after"]):
+                self.assertIn(side["state"], ("EMPTY", "ACTIVE"))
+                if side["state"] == "EMPTY":
+                    self.assertIsNone(side["digest"])
+                    self.assertIsNone(side["at"])
+                else:
+                    self.assertEqual(len(side["digest"]), 64)
+                    self.assertIsInstance(side["at"], int)
+                    self.assertNotIsInstance(side["at"], bool)
+            self.assertGreaterEqual(edge["first"], result["first"])
+            self.assertLessEqual(edge["last"], result["last"])
+            self.assertLessEqual(edge["first"], edge["last"])
+            self.assertGreaterEqual(edge["count"], 1)
+        self.assertEqual(list(nodes[-1]), ["state", "digest", "at"])
+
+    # ---- 空历史与紧凑字节 ----
+
+    def test_empty_history_empty_to_empty_zero_hop_bytes(self):
+        ops = [
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etp(0, 5, None, None),
+        ]
+        code, out, err = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(
+            out,
+            b'{"results":[{"op":"add","ok":true},{"op":"etp",'
+            b'"first":0,"last":5,"latest":0,"truncated":false,'
+            b'"found":true,"hops":0,'
+            b'"nodes":[{"state":"EMPTY","digest":null,"at":null}],'
+            b'"edges":[]}],'
+            b'"backends":[{"id":"a","weight":100}]}\n',
+        )
+        self.assertEqual(out.count(b"\n"), 1)
+
+    def test_empty_history_unreachable_active(self):
+        result = self.fold(self.run_ops([
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etp(0, 5, None, ("a" * 64, 3)),
+        ]))
+        self.assertEqual(result["latest"], 0)
+        self.assertFalse(result["truncated"])
+        self.assertFalse(result["found"])
+        self.assertIsNone(result["hops"])
+        self.assertEqual(result["nodes"], [])
+        self.assertEqual(result["edges"], [])
+        self.assert_path_coherent(result)
+
+    def test_empty_history_source_equals_unseen_active_target(self):
+        identity = ("a" * 64, 3)
+        result = self.fold(self.run_ops([
+            {"op": "add", "id": "a", "weight": 100, "d": 0, "now": 5},
+            self.etp(2, 4, identity, identity),
+        ]))
+        self.assertTrue(result["found"])
+        self.assertEqual(result["hops"], 0)
+        self.assertEqual(result["nodes"], [self.side(identity)])
+        self.assertEqual(result["edges"], [])
+        self.assert_path_coherent(result)
+
+    def test_clock_never_advanced_is_state(self):
+        self.failure([self.etp(0, 0, None, None)], 4, "STATE")
+        self.failure(
+            [self.etp(0, 10 ** 9, None, None)], 4, "STATE"
+        )
+
+    # ---- 完整时间线 ----
+
+    def test_full_timeline_paths(self):
+        ops, ids = self.timeline_ops()
+        A, B, C = ids["A"], ids["B"], ids["C"]
+
+        # EMPTY -> A：一条 ENTER 合并边（count=2，first=5，last=8）。
+        result = self.fold(self.run_ops(ops + [self.etp(0, 11, None, A)]))
+        self.assertTrue(result["found"])
+        self.assertEqual(result["hops"], 1)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [("ENTER", None, A, 2, 5, 8)],
+        )
+        self.assert_path_coherent(result)
+
+        # A -> B：t6 的 REPLACE 直达。
+        result = self.fold(self.run_ops(ops + [self.etp(0, 11, A, B)]))
+        self.assertEqual(result["hops"], 1)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [("REPLACE", A, B, 1, 6, 6)],
+        )
+
+        # B -> A：B->EMPTY@7 再 EMPTY->A（合并边 first=5），2 跳；
+        # 沿途 first 序列为 [7,5]，图路径不要求边时刻单调。
+        result = self.fold(self.run_ops(ops + [self.etp(0, 11, B, A)]))
+        self.assertEqual(result["found"], True)
+        self.assertEqual(result["hops"], 2)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [
+                ("LEAVE", B, None, 1, 7, 7),
+                ("ENTER", None, A, 2, 5, 8),
+            ],
+        )
+        self.assertEqual(
+            [self.side_tuple(n) for n in result["nodes"]],
+            [B, None, A],
+        )
+        self.assert_path_coherent(result)
+
+        # EMPTY -> C：t10 一条 ENTER 直达。
+        result = self.fold(self.run_ops(ops + [self.etp(0, 11, None, C)]))
+        self.assertEqual(result["hops"], 1)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [("ENTER", None, C, 1, 10, 10)],
+        )
+
+        # B -> C：B->EMPTY@7、EMPTY->C@10，2 跳。
+        result = self.fold(self.run_ops(ops + [self.etp(0, 11, B, C)]))
+        self.assertEqual(result["hops"], 2)
+        self.assertEqual(
+            [e["first"] for e in result["edges"]], [7, 10]
+        )
+
+        # A -> C：直达候选为 A->EMPTY@9 再 EMPTY->C@10 的 2 跳
+        # [9,10]，优于绕 B 的 3 跳 [6,7,10]。
+        result = self.fold(self.run_ops(ops + [self.etp(0, 11, A, C)]))
+        self.assertEqual(result["hops"], 2)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [
+                ("LEAVE", A, None, 1, 9, 9),
+                ("ENTER", None, C, 1, 10, 10),
+            ],
+        )
+        self.assert_path_coherent(result)
+
+    def side_tuple(self, node):
+        if node["state"] == "EMPTY":
+            return None
+        return (node["digest"], node["at"])
+
+    def test_source_equals_target_single_node(self):
+        ops, ids = self.timeline_ops()
+        for source in (None, ids["A"], ids["B"], ids["C"]):
+            result = self.fold(
+                self.run_ops(ops + [self.etp(0, 11, source, source)])
+            )
+            self.assertTrue(result["found"])
+            self.assertEqual(result["hops"], 0)
+            self.assertEqual(result["nodes"], [self.side(source)])
+            self.assertEqual(result["edges"], [])
+            self.assert_path_coherent(result)
+
+    def test_first_boundary_group_is_initial_not_edge(self):
+        ops, ids = self.timeline_ops()
+        A, B = ids["A"], ids["B"]
+        # 自 t6 起：t6 的 A->B 不建边（其 after 即 first 状态），故
+        # A 在此区间图上无任何出边：A->B 不可达；以 B 为起点仍可达 A。
+        result = self.fold(self.run_ops(ops + [self.etp(6, 11, A, B)]))
+        self.assertFalse(result["found"])
+        self.assertIsNone(result["hops"])
+        result = self.fold(self.run_ops(ops + [self.etp(6, 11, B, A)]))
+        self.assertTrue(result["found"])
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [
+                ("LEAVE", B, None, 1, 7, 7),
+                # t5 的 ENTER 位于 first 之前，不并入区间边，故 EMPTY->A
+                # 在本图上仅 t8 一次：count=1、first=last=8。
+                ("ENTER", None, A, 1, 8, 8),
+            ],
+        )
+        self.assert_path_coherent(result)
+
+    def test_unreachable_when_disconnected(self):
+        ops, ids = self.timeline_ops()
+        # 区间只含 t5..t7 的图：节点 EMPTY、A、B；从未出现的 ghost 作为
+        # 源点时无出边，作为终点时无入边。
+        ghost = ("f" * 64, 4242)
+        result = self.fold(self.run_ops(ops + [self.etp(0, 11, ghost, ghost)]))
+        self.assertEqual(result["hops"], 0)
+        result = self.fold(
+            self.run_ops(ops + [self.etp(0, 11, ghost, None)])
+        )
+        self.assertFalse(result["found"])
+        # t11 后 C 仅留 C->EMPTY 一条边：C->A 需要的 EMPTY->A 合并边
+        # 存在（first=5），故可达；但 [10,11] 小区间内只有 EMPTY->C
+        # 与 C->EMPTY：A 在该图中无入边。
+        A = ids["A"]
+        result = self.fold(self.run_ops(ops + [self.etp(10, 11, None, A)]))
+        self.assertFalse(result["found"])
+        self.assertEqual(result["edges"], [])
+        self.assertEqual(result["nodes"], [])
+
+    # ---- 跳数优先与等长 first 字典序 ----
+
+    def test_hops_take_priority_over_earlier_first(self):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        X = (d1, 101)
+        T = (d2, 102)
+        # t1 EMPTY->X，t2 X->T，t3 T->EMPTY，t4 EMPTY->T：直达 1 跳
+        # [4] 优于 2 跳 [1,2]。
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 101, 1),
+            self.es(items2, 0, 102, 2),
+            {"op": "ci", "config": config_v11(1), "now": 3},
+            self.es(items2, 0, 102, 4),
+        ]
+        result = self.fold(self.run_ops(ops + [self.etp(0, 4, None, T)]))
+        self.assertEqual(result["found"], True)
+        self.assertEqual(result["hops"], 1)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [("ENTER", None, T, 1, 4, 4)],
+        )
+        self.assert_path_coherent(result)
+
+    def tie_ops(self, first_id, second_id):
+        """t1 E->X(first)、t2 X->EMPTY、t3 EMPTY->Y(second)、t4 Y->T、
+        t5 T->X(first)、t6 X->T；EMPTY 到 T 的 2 跳路径为经 first 的
+        [1,6] 与经 second 的 [3,4]。"""
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        X = (d1, first_id)
+        Y = (d1, second_id)
+        T = (d2, 303)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, first_id, 1),
+            {"op": "eu", "digest": d1, "at": first_id, "now": 2},
+            self.es(items1, 0, second_id, 3),
+            self.es(items2, 0, 303, 4),
+            self.es(items1, 0, first_id, 5),
+            self.es(items2, 0, 303, 6),
+        ]
+        return ops, X, Y, T
+
+    def test_equal_hops_lex_first_sequence_picks_x(self):
+        ops, X, Y, T = self.tie_ops(101, 102)
+        result = self.fold(self.run_ops(ops + [self.etp(0, 6, None, T)]))
+        self.assertEqual(result["hops"], 2)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [
+                ("ENTER", None, X, 1, 1, 1),
+                ("REPLACE", X, T, 1, 6, 6),
+            ],
+        )
+        self.assert_path_coherent(result)
+
+    def test_equal_hops_lex_first_sequence_picks_y(self):
+        # 翻转建立次序：second_id=201 先建立（即 X 角色），first_id=202
+        # 后建立（Y 角色）；字典序首选先建立的身份 201。
+        ops, X, Y, T = self.tie_ops(201, 202)
+        result = self.fold(self.run_ops(ops + [self.etp(0, 6, None, T)]))
+        self.assertEqual(result["hops"], 2)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [
+                ("ENTER", None, X, 1, 1, 1),
+                ("REPLACE", X, T, 1, 6, 6),
+            ],
+        )
+        self.assert_path_coherent(result)
+
+    def test_equal_hops_lex_compares_second_element(self):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        X, Y, Z = (d1, 101), (d1, 102), (d1, 199)
+        T = (d2, 103)
+        # E->X@1, X->Z@2, Z->X@3, X->Y@4, Y->T@5, T->Z@6, Z->T@7：
+        # 3 跳候选经 Z=[1,2,7] 与经 Y=[1,4,5]，第二元素 2<4 取经 Z。
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 101, 1),
+            self.es(items1, 0, 199, 2),
+            self.es(items1, 0, 101, 3),
+            self.es(items1, 0, 102, 4),
+            self.es(items2, 0, 103, 5),
+            self.es(items1, 0, 199, 6),
+            self.es(items2, 0, 103, 7),
+        ]
+        result = self.fold(self.run_ops(ops + [self.etp(0, 7, None, T)]))
+        self.assertEqual(result["found"], True)
+        self.assertEqual(result["hops"], 3)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [
+                ("ENTER", None, X, 1, 1, 1),
+                ("REPLACE", X, Z, 1, 2, 2),
+                ("REPLACE", Z, T, 1, 7, 7),
+            ],
+        )
+        self.assert_path_coherent(result)
+
+    def test_cyclic_graph_terminates_and_reuses_merged_edge(self):
+        items1 = [("a", None, self.EP1)]
+        items2 = [("a", None, self.EP2)]
+        d1 = self.switch_digest(items1, 0)
+        d2 = self.switch_digest(items2, 0)
+        A, B = (d1, 101), (d2, 102)
+        # A->B、B->A 反复交替；A->B 与 B->A 各合并为一条边（count 累
+        # 加），最短链恒为 1 跳，路径边回显合并后的 count/first/last。
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es(items1, 0, 101, 1),
+            self.es(items2, 0, 102, 2),
+            self.es(items1, 0, 101, 3),
+            self.es(items2, 0, 102, 4),
+            self.es(items1, 0, 101, 5),
+            self.es(items2, 0, 102, 6),
+        ]
+        result = self.fold(self.run_ops(ops + [self.etp(0, 6, A, B)]))
+        self.assertEqual(result["hops"], 1)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [("REPLACE", A, B, 3, 2, 6)],
+        )
+        result = self.fold(self.run_ops(ops + [self.etp(0, 6, B, A)]))
+        self.assertEqual(result["hops"], 1)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [("REPLACE", B, A, 2, 3, 5)],
+        )
+        self.assert_path_coherent(result)
+
+    # ---- 淘汰前缀与 truncated ----
+
+    def test_evicted_prefix_longest_chain(self):
+        ops, identities = self.replace_chain_ops(70)
+        # 保留 seq7..70（now16..79，身份 identities[6..69]），相邻替换
+        # 边 63 条；沿链 63 跳可达，truncated=true。
+        result = self.fold(
+            self.run_ops(
+                ops + [self.etp(0, 79, identities[6], identities[69])]
+            )
+        )
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["latest"], 70)
+        self.assertTrue(result["found"])
+        self.assertEqual(result["hops"], 63)
+        self.assertEqual(len(result["nodes"]), 64)
+        self.assertEqual(
+            [e["first"] for e in result["edges"]],
+            list(range(17, 80)),
+        )
+        self.assertEqual(
+            [self.side_tuple(n) for n in result["nodes"]],
+            identities[6:70],
+        )
+        self.assert_path_coherent(result)
+
+    def test_evicted_prefix_range_starting_at_oldest_event(self):
+        ops, identities = self.replace_chain_ops(70)
+        # first=16：t16 的组仅作初态，不含淘汰前缀，truncated=false，
+        # 链自 t17 起仍为 63 跳。
+        result = self.fold(
+            self.run_ops(
+                ops + [self.etp(16, 79, identities[6], identities[69])]
+            )
+        )
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["hops"], 63)
+        self.assert_path_coherent(result)
+
+    def test_unknown_only_range_has_no_edges(self):
+        ops, identities = self.replace_chain_ops(70)
+        result = self.fold(
+            self.run_ops(
+                ops + [self.etp(0, 15, identities[6], identities[69])]
+            )
+        )
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["found"])
+        self.assertIsNone(result["hops"])
+        self.assertEqual(result["nodes"], [])
+        self.assertEqual(result["edges"], [])
+        # 同源同目标仍为 0 跳，且不以未知状态补节点。
+        result = self.fold(
+            self.run_ops(
+                ops + [self.etp(0, 15, identities[6], identities[6])]
+            )
+        )
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["hops"], 0)
+        self.assertEqual(
+            result["nodes"], [self.side(identities[6])]
+        )
+
+    # ---- 与 etr 的边口径交叉验证 ----
+
+    def test_path_edges_match_etr_rows(self):
+        timeline, ids = self.timeline_ops()
+        chain, chain_ids = self.replace_chain_ops(70)
+        cases = [
+            (timeline, 11, None, ids["A"]),
+            (timeline, 11, ids["B"], ids["A"]),
+            (timeline, 11, ids["A"], ids["C"]),
+            (timeline, 11, ids["B"], ids["C"]),
+            (chain, 79, chain_ids[6], chain_ids[69]),
+            (chain, 79, chain_ids[30], chain_ids[40]),
+        ]
+        for base, last_clock, source, target in cases:
+            outcomes = self.run_ops(
+                base
+                + [self.etp(0, last_clock, source, target),
+                   {"op": "etr", "first": 0, "last": last_clock}]
+            )
+            etp_result = next(r for r in outcomes if r["op"] == "etp")
+            etr_result = next(r for r in outcomes if r["op"] == "etr")
+            self.assertEqual(
+                etp_result["truncated"], etr_result["truncated"]
+            )
+            rows = {
+                (
+                    e["kind"],
+                    self.edge_tuple(e)[1],
+                    self.edge_tuple(e)[2],
+                ): e
+                for e in etr_result["edges"]
+            }
+            self.assertTrue(etp_result["found"])
+            previous_first = None
+            for edge in etp_result["edges"]:
+                key = (
+                    edge["kind"],
+                    self.edge_tuple(edge)[1],
+                    self.edge_tuple(edge)[2],
+                )
+                self.assertIn(key, rows)
+                matching = rows[key]
+                self.assertEqual(edge["count"], matching["count"])
+                self.assertEqual(edge["first"], matching["first"])
+                self.assertEqual(edge["last"], matching["last"])
+            self.assert_path_coherent(etp_result)
+
+    # ---- INPUT 校验 ----
+
+    def test_input_validation(self):
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        digest = "a" * 64
+        active = {"state": "ACTIVE", "digest": digest, "at": 3}
+        empty = {"state": "EMPTY", "digest": None, "at": None}
+
+        def raw(**overrides):
+            value = {
+                "op": "etp", "first": 0, "last": 5,
+                "source": empty, "target": active,
+            }
+            value.update(overrides)
+            return value
+
+        bad = [
+            {},
+            {"op": "etp"},
+            {"op": "etp", "first": 0, "last": 5},
+            {"op": "etp", "first": 0, "last": 5, "source": empty},
+            raw(now=5),
+            # 顶层乱序。
+            {"op": "etp", "last": 5, "first": 0,
+             "source": empty, "target": active},
+            {"op": "etp", "first": 0, "last": 5,
+             "target": active, "source": empty},
+            {"op": "etp", "source": empty, "target": active,
+             "first": 0, "last": 5},
+            # first/last 类型、范围、区间关系。
+            raw(first=True),
+            raw(first=False),
+            raw(last=True),
+            raw(first=-1),
+            raw(first=10 ** 9 + 1),
+            raw(last=10 ** 9 + 1),
+            raw(first="0"),
+            raw(last=5.0),
+            raw(first=None),
+            raw(first=5, last=4),
+            # source/target 结构。
+            raw(source=None),
+            raw(source=[]),
+            raw(source="EMPTY"),
+            raw(source={"state": "EMPTY", "digest": None}),
+            raw(source={"state": "EMPTY", "digest": None,
+                        "at": None, "x": 1}),
+            raw(source={"digest": None, "at": None,
+                        "state": "EMPTY"}),
+            raw(target={"state": "ACTIVE", "digest": digest}),
+            raw(target={"state": "ACTIVE", "digest": digest,
+                        "at": 3, "x": 1}),
+            raw(target={"state": "active", "digest": digest, "at": 3}),
+            raw(target={"state": "UNKNOWN", "digest": None, "at": None}),
+            raw(target={"state": None, "digest": None, "at": None}),
+            raw(target={"state": 0, "digest": digest, "at": 3}),
+            # ACTIVE 摘要与 at。
+            raw(target={"state": "ACTIVE", "digest": "A" * 64,
+                        "at": 3}),
+            raw(target={"state": "ACTIVE", "digest": "a" * 63,
+                        "at": 3}),
+            raw(target={"state": "ACTIVE", "digest": 64, "at": 3}),
+            raw(target={"state": "ACTIVE", "digest": None, "at": 3}),
+            raw(target={"state": "ACTIVE", "digest": digest,
+                        "at": True}),
+            raw(target={"state": "ACTIVE", "digest": digest,
+                        "at": -1}),
+            raw(target={"state": "ACTIVE", "digest": digest,
+                        "at": 10 ** 9 + 1}),
+            raw(target={"state": "ACTIVE", "digest": digest,
+                        "at": "3"}),
+            raw(target={"state": "ACTIVE", "digest": digest,
+                        "at": 3.0}),
+            raw(target={"state": "ACTIVE", "digest": digest,
+                        "at": None}),
+            # EMPTY 两端必须皆 null。
+            raw(source={"state": "EMPTY", "digest": digest,
+                        "at": None}),
+            raw(source={"state": "EMPTY", "digest": None, "at": 0}),
+            raw(source={"state": "EMPTY", "digest": "", "at": None}),
+        ]
+        for request in bad:
+            self.failure(clock + [request], 2, "INPUT")
+
+    def test_input_precedence_over_state(self):
+        digest = "a" * 64
+        active = {"state": "ACTIVE", "digest": digest, "at": 3}
+        empty = {"state": "EMPTY", "digest": None, "at": None}
+        clock = [
+            {"op": "ci", "config": config_v11(1), "now": 5},
+        ]
+        # 形状类错误先于 last 超时钟。
+        self.failure(
+            clock + [self.raw_etp(
+                True, 10 ** 9, empty, active)],
+            2, "INPUT",
+        )
+        self.failure(
+            clock + [self.raw_etp(6, 5, empty, active)],
+            2, "INPUT",
+        )
+        self.failure(
+            clock + [self.raw_etp(
+                0, 6, empty,
+                {"state": "ACTIVE", "digest": "A" * 64, "at": 3})],
+            2, "INPUT",
+        )
+        # 时钟从未推进时形状错误仍先判 INPUT。
+        self.failure(
+            [self.raw_etp(True, 0, empty, active)], 2, "INPUT"
+        )
+        # 形状合法而超时钟才是 STATE。
+        self.failure(
+            clock + [self.raw_etp(0, 6, empty, active)], 4, "STATE"
+        )
+
+    # ---- STATE 失败与回滚 ----
+
+    def test_future_range_state_no_stdout(self):
+        ops, _ = self.timeline_ops()
+        self.failure(
+            ops + [self.etp(0, 12, None, None)], 4, "STATE"
+        )
+        self.failure(
+            ops + [self.etp(12, 12, None, None)], 4, "STATE"
+        )
+        self.failure(
+            ops + [self.etp(0, 10 ** 9, None, None)], 4, "STATE"
+        )
+
+    def test_failed_batch_rolls_back_prior_changes(self):
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 1},
+            self.es([("a", None, self.EP1)], 0, 10, 5),
+            self.etp(0, 6, None, None),
+        ]
+        code, stdout, _ = run_balancer("run", encode_ops(ops))
+        self.assertEqual((code, stdout), (4, b""))
+        code, out, err = run_balancer(
+            "run", encode_ops([{"op": "ek", "after": 0, "limit": 64}])
+        )
+        self.assertEqual((code, err), (0, b""))
+        self.assertEqual(json.loads(out)["results"][0]["events"], [])
+
+    # ---- 只读、确定性、se/si 与 record/replay ----
+
+    def test_does_not_advance_clock_or_write_audit(self):
+        ops, ids = self.timeline_ops()
+        query = self.etp(0, 11, None, ids["A"])
+        without = self.run_ops(ops + [{"op": "se"}])
+        with_query = self.run_ops(ops + [query, {"op": "se"}])
+        se_without = [r for r in without if r["op"] == "se"][-1]
+        se_with = [r for r in with_query if r["op"] == "se"][-1]
+        self.assertEqual(se_with, se_without)
+        results = self.run_ops(
+            ops + [query, {"op": "ek", "after": 0, "limit": 64}]
+        )
+        ek = [r for r in results if r["op"] == "ek"][-1]
+        self.assertEqual(
+            [e["seq"] for e in ek["events"]], list(range(1, 8))
+        )
+
+    def test_repeated_query_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        queries = [
+            self.etp(0, 11, None, ids["A"]),
+            self.etp(0, 11, ids["B"], ids["A"]),
+            self.etp(3, 9, ids["A"], ids["C"]),
+            self.etp(0, 11, ("9" * 64, 1), ids["C"]),
+        ]
+        for query in queries:
+            first = self.run_ops(ops + [query, query])
+            answers = [r for r in first if r["op"] == "etp"]
+            self.assertEqual(answers[0], answers[1])
+            second = self.fold(self.run_ops(ops + [query]))
+            self.assertEqual(answers[0], second)
+
+    def test_checkpoint_roundtrip_byte_identical(self):
+        for base, last_clock, source, target in (
+            (self.timeline_ops()[0], 11, None,
+             self.timeline_ops()[1]["A"]),
+            (self.timeline_ops()[0], 11,
+             self.timeline_ops()[1]["B"],
+             self.timeline_ops()[1]["C"]),
+            (self.replace_chain_ops(70)[0], 79,
+             self.replace_chain_ops(70)[1][6],
+             self.replace_chain_ops(70)[1][69]),
+        ):
+            query = self.etp(0, last_clock, source, target)
+            results = self.run_ops(base + [{"op": "se"}, query])
+            se = next(r for r in results if r["op"] == "se")
+            before = self.fold(results)
+            results = self.run_ops([
+                {"op": "si", "version": se["version"],
+                 "digest": se["digest"], "state": se["state"]},
+                query,
+            ])
+            after = self.fold(results)
+            self.assertEqual(after, before)
+
+    def test_record_replay_byte_identical(self):
+        ops, ids = self.timeline_ops()
+        chain_ops, chain_ids = self.replace_chain_ops(70)
+        cases = [
+            ops + [self.etp(0, 11, None, ids["A"])],
+            ops + [self.etp(0, 11, ids["B"], ids["C"])],
+            ops + [self.etp(6, 11, ids["A"], ids["B"])],
+            chain_ops + [
+                self.etp(0, 79, chain_ids[6], chain_ids[69])],
+            chain_ops + [
+                self.etp(0, 15, chain_ids[6], chain_ids[69])],
+            ops + [self.etp(0, 12, None, None)],
+        ]
+        for case_ops in cases:
+            raw = encode_ops(case_ops)
+            run_code, run_out, run_err = run_balancer("run", raw)
+            rec_code, rec_out, rec_err = run_balancer("record", raw)
+            self.assertEqual(rec_err, b"")
+            rep_code, rep_out, rep_err = run_balancer("replay", rec_out)
+            self.assertEqual(
+                (rep_code, rep_out, rep_err),
+                (run_code, run_out, run_err),
+            )
+
+    def test_span_up_to_1e9_without_point_scan(self):
+        items1 = [("a", None, self.EP1)]
+        identity = (self.switch_digest(items1, 0), 100)
+        ops = [
+            {"op": "ci", "config": config_v11(1), "now": 0},
+            self.es(items1, 0, 100, 0),
+            {"op": "eu", "digest": identity[0], "at": 100, "now": 1},
+            {"op": "add", "id": "b", "weight": 100, "d": 0,
+             "now": 10 ** 9},
+            self.etp(0, 10 ** 9, identity, None),
+        ]
+        result = self.fold(self.run_ops(ops))
+        # t0 的 SET 即 first 状态（不产生边）；图上仅 t1 一条
+        # LEAVE identity->EMPTY，identity 到 EMPTY 1 跳。
+        self.assertFalse(result["truncated"])
+        self.assertTrue(result["found"])
+        self.assertEqual(result["hops"], 1)
+        self.assertEqual(
+            [self.edge_tuple(e) for e in result["edges"]],
+            [("LEAVE", identity, None, 1, 1, 1)],
+        )
+        self.assert_path_coherent(result)
+
+
 if __name__ == "__main__":
     unittest.main()

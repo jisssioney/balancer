@@ -516,6 +516,17 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段、键序、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
 - 恒值区域与真实切换各只过一遍，边按首次发生时刻排序，单次时间与额外空间均为 O(A log A)，A 至多六十四条保留事件，不按时间跨度逐点扫描；仅使用 Python 标准库，重复查询及 `se` 导出、`si` 恢复后的结果逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及 `et`、`ett`、`etu`、`etx` 与其他公开入口行为不变。
 
+## 端点切换预约审计业务时间净切换关系最短迁移链查询：etp
+
+在 `et`/`ett`/`etu`/`etx`/`etr` 的六十四条保留窗口与逐时刻口径之上新增只读入口，在与 `etr` 同口径聚合出的有向关系图上判断两个预约身份之间是否存在迁移链，并返回跳数最少的路径。沿用 `ett` 的同 `now` 事件整组生效规则取得净变化，`first` 时刻仅作初态，`UNKNOWN` 与 `RECOVER` 不建边，只以 `ENTER`、`LEAVE`、`REPLACE` 的 `before` 到 `after` 构成有向图，相同 `kind` 和两端仍按 `etr` 合并。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `etp`：字段严格按 `op,first,last,source,target` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 均为 0..10⁹ 的非 bool 整数且 `first≤last`，共同给出业务时间闭区间 `[first,last]`。`source`、`target` 均为精确键序 `state,digest,at` 的预约身份：`ACTIVE` 要求六十四位小写十六进制 SHA-256 `digest` 与 0..10⁹ 的非 bool `at`；`EMPTY` 要求 `digest`、`at` 均为 null（其余结构非法）。
+- 返回固定键序 `op,first,last,latest,truncated,found,hops,nodes,edges`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`。
+- 路径选择：先取跳数（边数）最少的路径；多条等长路径按沿途各边 `first`（即合并边的首次发生时刻）序列的字典序取最小者。可达时 `found=true`、`hops` 为边数；`nodes` 按路径顺序输出各节点身份（键序 `state,digest,at`，结构与请求身份一致），`edges` 与相邻节点一一对应（`edges[i]` 的 `before`/after 分别等于 `nodes[i]`/`nodes[i+1]`）并保持 `etr` 的 `kind,before,after,count,first,last` 结构（含同区间合并后的 `count` 与首末时刻）。`source` 等于 `target` 时返回 `found=true`、`hops=0`、单节点 `nodes` 与空 `edges`（身份无需在历史中出现）。不可达时 `found=false`、`hops=null`、`nodes=[]`、`edges=[]`。
+- `truncated` 仅表示区间含保留窗口无法判定的 `UNKNOWN` 淘汰前缀；淘汰前缀不以未知状态补边或补路径。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。请求字段、键序、身份结构、编码、数值类型、范围或区间关系非法时返回 INPUT/2，输入错误先于状态判断。失败无 stdout 并回滚同批变化；成功不推进时钟、不写审计或改变运行态。
+- 恒值区域、真实切换与图搜索各只过一遍，单次时间 O(A log A)、额外空间 O(A)，A 至多六十四条保留事件，不按时间跨度逐点扫描；仅使用 Python 标准库，重复查询及 `se` 导出、`si` 恢复后的结果逐字节一致，`run`、`record`、`replay`、`se`、`si` 的逐字节一致性及现有公开入口行为保持不变。
+
 ## 测试
 
     python -m unittest discover

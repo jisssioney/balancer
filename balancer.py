@@ -2564,7 +2564,7 @@ def parse_op(raw_op):
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
         "eg", "ee", "ef", "et", "etg", "eti", "etm", "ett", "etu",
-        "etx", "etr",
+        "etx", "etr", "etp",
         "ru",
         "ua",
         "mu",
@@ -5087,6 +5087,68 @@ def parse_op(raw_op):
         if first > last:
             fail(EXIT_INPUT, "INPUT")
         return ("etr", first, last)
+
+    if name == "etp":
+        # 端点切换预约审计业务时间净切换关系最短迁移链查询（只读）：精确
+        # 键序 op,first,last,source,target（键须按此序出现，乱序报
+        # INPUT）。first、last 为 0..10^9 的非 bool 整数且 first<=last，
+        # 共同给出业务时间闭区间 [first,last]。source、target 均为精确
+        # 键序 state,digest,at 的预约身份：ACTIVE 要求六十四位小写十六
+        # 进制 SHA-256 摘要与 0..10^9 的非 bool at；EMPTY 要求 digest、
+        # at 均为 null。不接受 now、不推进显式时钟。字段集合、键序、身
+        # 份结构、编码、整数类型（排除 bool）、范围或区间关系非法统一判
+        # INPUT；last 晚于操作开始时的全局逻辑时钟，或时钟从未推进，留
+        # 执行期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) != [
+            "op", "first", "last", "source", "target"
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 9
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+
+        def parse_etp_endpoint(raw_endpoint):
+            if (
+                not isinstance(raw_endpoint, dict)
+                or list(raw_endpoint) != ["state", "digest", "at"]
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            endpoint_state = raw_endpoint["state"]
+            endpoint_digest = raw_endpoint["digest"]
+            endpoint_at = raw_endpoint["at"]
+            if endpoint_state == "ACTIVE":
+                endpoint_digest = cp_hex_digest(endpoint_digest)
+                if (
+                    not isinstance(endpoint_at, int)
+                    or isinstance(endpoint_at, bool)
+                    or not 0 <= endpoint_at <= 10 ** 9
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                return (
+                    "ACTIVE", endpoint_digest, endpoint_at
+                )
+            if endpoint_state == "EMPTY":
+                if endpoint_digest is not None or endpoint_at is not None:
+                    fail(EXIT_INPUT, "INPUT")
+                return ("EMPTY",)
+            fail(EXIT_INPUT, "INPUT")
+
+        source_key = parse_etp_endpoint(raw_op["source"])
+        target_key = parse_etp_endpoint(raw_op["target"])
+        return ("etp", first, last, source_key, target_key)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -17636,6 +17698,247 @@ def run(raw):
                         "edges": len(edges),
                         "identities": len(active_identities),
                     },
+                }
+            )
+
+        elif op[0] == "etp":
+            # 端点切换预约审计业务时间净切换关系最短迁移链查询（只读，不
+            # 接受 now、不推进时钟、不产生审计事件，不改预约、连接、后端、
+            # 审计窗口或下一 seq）：沿用 etr 的同 now 事件整组生效、淘汰
+            # 前缀与区间首时刻口径，在区间 (first,last] 内以 ENTER、
+            # LEAVE、REPLACE 的 before 到 after 构成有向图（UNKNOWN 与
+            # RECOVER 不建边），相同 kind 与两端仍按 etr 合并为一条边；
+            # 判断 source 到 target 是否存在迁移链并返回跳数最少的路径，
+            # 多条等长路径按沿途各边 first 序列的字典序取最小者。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟，或时钟从未推进（last_now 为
+            # None），整项报 STATE（形状类 INPUT 已在解析期先行判过；
+            # INPUT 先于状态）。truncated 仅表示区间含保留窗口无法判定的
+            # UNKNOWN 淘汰前缀；淘汰前缀不以未知状态补边或补路径。
+            #
+            # 区域构造与切换识别同 ett/etu/etx/etr，全程只过一遍 O(A)
+            # 个区域与 O(A) 条真实切换；邻接表按边的首次发生时刻排列，
+            # BFS 按该序展开并在首次到达目标时定父，等长路径的选择即为
+            # first 序列字典序最小者。时间 O(A log A)、额外空间 O(A)
+            # （A≤64），不随区间跨度（可达 10^9）逐点扫描。
+            _, first, last, source_key, target_key = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            # 区域元组 (lo, hi, seq, state, identity, is_group)：构造同
+            # ett/etr。
+            regions = []
+            if not window:
+                # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY/seq0。
+                regions.append(
+                    (0, last_now, 0, "EMPTY", None, False)
+                )
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                prefix_evicted = oldest_seq > 1
+                # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，不入
+                # 列）：完整历史 EMPTY/seq0；前缀已淘汰则 UNKNOWN、seq
+                # 与身份均为 null。
+                if oldest_now >= 1:
+                    if prefix_evicted:
+                        regions.append(
+                            (0, oldest_now - 1, None, "UNKNOWN", None,
+                             False)
+                        )
+                    else:
+                        regions.append(
+                            (0, oldest_now - 1, 0, "EMPTY", None, False)
+                        )
+                # 同 now 事件整组为一个恒值区域：终态取组内最大 seq 事
+                # 件的 after（事件按 seq 升序，即组末事件）。
+                index = 0
+                event_count = len(window)
+                while index < event_count:
+                    group_now = window[index][1]
+                    group_seq = window[index][0]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_seq = window[index][0]
+                        group_identity = window[index][4]
+                        index += 1
+                    group_end = (
+                        window[index][1] - 1
+                        if index < event_count
+                        else last_now
+                    )
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    regions.append(
+                        (
+                            group_now,
+                            group_end,
+                            group_seq,
+                            group_state,
+                            group_identity,
+                            True,
+                        )
+                    )
+
+            truncated = False
+            # edge_rows：关系键 (kind, before_key, after_key) ->
+            # [count, first, last]，同 etr。
+            edge_rows = {}
+            # adjacency：before_key -> [(after_key, edge_key), ...]，按
+            # 边的首次发生时刻排列（边随区域时间序首次出现即追加）。
+            # kind 由两端状态唯一确定，同一对节点间至多一条合并边。
+            adjacency = {}
+            # 前一恒值区域（完整时间轴上）的状态与身份：口径同 etr，
+            # RECOVER 只用于前后状态比较，不产生任何边。
+            prev_state = "EMPTY"
+            prev_identity = None
+            for (
+                region_lo, region_hi, region_seq, state, identity, is_group
+            ) in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first <= overlap_last:
+                    if state == "UNKNOWN":
+                        truncated = True
+                    # 切换边界判定同 etr：组时刻落入 (first,last] 且区域
+                    # 自左缘完整相交。first 时刻的组后状态即初态，不另造
+                    # 切换；UNKNOWN 前缀结束的 RECOVER 不建边。
+                    if (
+                        is_group
+                        and overlap_first == region_lo
+                        and region_lo > first
+                    ):
+                        kind = None
+                        if prev_state == "EMPTY" and state == "ACTIVE":
+                            kind = "ENTER"
+                        elif prev_state == "ACTIVE" and state == "EMPTY":
+                            kind = "LEAVE"
+                        elif (
+                            prev_state == "ACTIVE"
+                            and state == "ACTIVE"
+                            and prev_identity != identity
+                        ):
+                            kind = "REPLACE"
+                        if kind is not None:
+                            if prev_state == "ACTIVE":
+                                before_key = (
+                                    "ACTIVE", prev_identity[0],
+                                    prev_identity[1],
+                                )
+                            else:
+                                before_key = ("EMPTY",)
+                            if state == "ACTIVE":
+                                after_key = (
+                                    "ACTIVE", identity[0], identity[1],
+                                )
+                            else:
+                                after_key = ("EMPTY",)
+                            edge_key = (kind, before_key, after_key)
+                            row = edge_rows.get(edge_key)
+                            if row is None:
+                                edge_rows[edge_key] = [
+                                    1, region_lo, region_lo
+                                ]
+                                adjacency.setdefault(
+                                    before_key, []
+                                ).append((after_key, edge_key))
+                            else:
+                                row[0] += 1
+                                row[2] = region_lo
+                prev_state = state
+                prev_identity = identity
+
+            # 定序 BFS：每条边的 first 为其组时刻，组时刻严格递增、每刻
+            # 至多一条净切换，故各边 first 全局互异；邻接表已按 first 升
+            # 序。按层展开、同层节点以首次定父顺序处理，首次到达 target
+            # 的路径即跳数最少且沿途 first 序列字典序最小者。
+            # parent：node -> (prev_node, edge_key)，source 记 None。
+            parent = {source_key: None}
+            frontier = [(source_key, 0)]
+            head = 0
+            target_depth = None
+            while head < len(frontier):
+                node, depth = frontier[head]
+                head += 1
+                # target 首次定父后仍处理完当前层，下一层不再展开。
+                if target_depth is not None and depth >= target_depth:
+                    break
+                for next_key, edge_key in adjacency.get(node, ()):
+                    if next_key not in parent:
+                        parent[next_key] = (node, edge_key)
+                        frontier.append((next_key, depth + 1))
+                        if (
+                            next_key == target_key
+                            and target_depth is None
+                        ):
+                            target_depth = depth + 1
+
+            def etp_side_json(side_key):
+                if side_key[0] == "ACTIVE":
+                    return {
+                        "state": "ACTIVE",
+                        "digest": side_key[1],
+                        "at": side_key[2],
+                    }
+                return {"state": "EMPTY", "digest": None, "at": None}
+
+            if target_key in parent:
+                found = True
+                reversed_nodes = []
+                reversed_edges = []
+                current = target_key
+                while current != source_key:
+                    previous_node, edge_key = parent[current]
+                    reversed_nodes.append(current)
+                    reversed_edges.append(edge_key)
+                    current = previous_node
+                reversed_nodes.append(source_key)
+                reversed_nodes.reverse()
+                reversed_edges.reverse()
+                node_keys = reversed_nodes
+                path_edge_keys = reversed_edges
+                nodes = [
+                    etp_side_json(node_key) for node_key in node_keys
+                ]
+                edges = []
+                for edge_key in path_edge_keys:
+                    edge_kind, edge_before, edge_after = edge_key
+                    edge_count, edge_first, edge_last = edge_rows[edge_key]
+                    edges.append(
+                        {
+                            "kind": edge_kind,
+                            "before": etp_side_json(edge_before),
+                            "after": etp_side_json(edge_after),
+                            "count": edge_count,
+                            "first": edge_first,
+                            "last": edge_last,
+                        }
+                    )
+                hops = len(edges)
+            else:
+                found = False
+                hops = None
+                nodes = []
+                edges = []
+            results.append(
+                {
+                    "op": "etp",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": truncated,
+                    "found": found,
+                    "hops": hops,
+                    "nodes": nodes,
+                    "edges": edges,
                 }
             )
 
