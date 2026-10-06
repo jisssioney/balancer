@@ -2564,7 +2564,7 @@ def parse_op(raw_op):
         "ej",
         "es", "en", "eu", "ei", "ed", "eo", "ev", "ew", "ek", "el", "em",
         "eg", "ee", "ef", "et", "etg", "eti", "etm", "ett", "etu",
-        "etx", "etr", "etp", "etv",
+        "etx", "etr", "etp", "etv", "ety",
         "ru",
         "ua",
         "mu",
@@ -5216,6 +5216,74 @@ def parse_op(raw_op):
         ):
             fail(EXIT_INPUT, "INPUT")
         return ("etv", first, last, source_key, max_hops)
+
+    if name == "ety":
+        # 端点切换预约审计业务时间反向可达来源查询（只读）：精确键序
+        # op,first,last,target,max_hops（键须按此序出现，乱序报 INPUT）。
+        # first、last 为 0..10^18 的非 bool 整数且 first<=last，共同给出
+        # 业务时间闭区间 [first,last]（区间为业务时间语义，尽管逻辑时钟仅
+        # 至 10^9）。target 沿用 etp 的 state,digest,at 身份结构。
+        # max_hops 为 0..64 的非 bool 整数。在与 etr 相同的关系图上反向
+        # 查询沿边到达 target 的来源；不接受 now、不推进显式时钟。字段集
+        # 合、键序、身份结构、编码、整数类型（排除 bool）、范围或区间关
+        # 系非法统一判 INPUT；last 晚于操作开始时的全局逻辑时钟，或时钟
+        # 从未推进，留执行期判 STATE（INPUT 判定先于状态）。
+        if list(raw_op) != [
+            "op", "first", "last", "target", "max_hops"
+        ]:
+            fail(EXIT_INPUT, "INPUT")
+        first = raw_op["first"]
+        if (
+            not isinstance(first, int)
+            or isinstance(first, bool)
+            or not 0 <= first <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        last = raw_op["last"]
+        if (
+            not isinstance(last, int)
+            or isinstance(last, bool)
+            or not 0 <= last <= 10 ** 18
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        if first > last:
+            fail(EXIT_INPUT, "INPUT")
+
+        def parse_ety_endpoint(raw_endpoint):
+            if (
+                not isinstance(raw_endpoint, dict)
+                or list(raw_endpoint) != ["state", "digest", "at"]
+            ):
+                fail(EXIT_INPUT, "INPUT")
+            endpoint_state = raw_endpoint["state"]
+            endpoint_digest = raw_endpoint["digest"]
+            endpoint_at = raw_endpoint["at"]
+            if endpoint_state == "ACTIVE":
+                endpoint_digest = cp_hex_digest(endpoint_digest)
+                if (
+                    not isinstance(endpoint_at, int)
+                    or isinstance(endpoint_at, bool)
+                    or not 0 <= endpoint_at <= 10 ** 9
+                ):
+                    fail(EXIT_INPUT, "INPUT")
+                return (
+                    "ACTIVE", endpoint_digest, endpoint_at
+                )
+            if endpoint_state == "EMPTY":
+                if endpoint_digest is not None or endpoint_at is not None:
+                    fail(EXIT_INPUT, "INPUT")
+                return ("EMPTY",)
+            fail(EXIT_INPUT, "INPUT")
+
+        target_key = parse_ety_endpoint(raw_op["target"])
+        max_hops = raw_op["max_hops"]
+        if (
+            not isinstance(max_hops, int)
+            or isinstance(max_hops, bool)
+            or not 0 <= max_hops <= 64
+        ):
+            fail(EXIT_INPUT, "INPUT")
+        return ("ety", first, last, target_key, max_hops)
 
     if name == "se":
         # 运行态检查点导出：精确键序仅 op，不推进时钟、不改状态；执行期
@@ -18272,6 +18340,310 @@ def run(raw):
                     "latest": latest,
                     "truncated": truncated,
                     "source": source_json,
+                    "max_hops": max_hops,
+                    "items": items,
+                    "summary": {
+                        "reachable": len(items),
+                        "depth": max_depth,
+                        "edges": total_edge_count,
+                    },
+                }
+            )
+
+        elif op[0] == "ety":
+            # 端点切换预约审计业务时间反向可达来源查询（只读，不接受 now、
+            # 不推进时钟、不产生审计事件，不改预约、连接、后端、审计窗口
+            # 或下一 seq）：在与 etr/etp/etv 同口径聚合出的有向关系图
+            # 上，反向查询沿边到达 target 的全部来源身份，即 target 的反向
+            # 可达集合（限制 max_hops 跳）。区域构造、同 now 事件整组生
+            # 效、淘汰前缀与区间首时刻口径、UNKNOWN/RECOVER 不建边、相同
+            # kind 与两端按 etr 合并等全部同 etp/etv。
+            #
+            # target 自身始终作为 hops=0 的首项；其余 items 列出 hops<=
+            # max_hops 内可沿边到达 target 的来源。每个来源先取跳数最少的
+            # 路径，并列时沿用 etp 的沿途各边 first 序列字典序最小规则：
+            # 先在反向邻接表上做定序 BFS 取得最小跳数可达集合，再对每个来
+            # 源在正向邻接表上按 etp 的同款定序 BFS（首次到达 target 即
+            # 定）重建与同区间 etp(source,target) 逐值一致的路径。其余项
+            # 按 hops 升序，再按 source 的 EMPTY 先于 ACTIVE、digest 的
+            # UTF-8 字节序、at 升序排列。summary 为 reachable（items 总
+            # 数，含目标自身）、depth（已返回项最大 hops，仅首项时为
+            # 0）、edges（各项路径边数之和，即 hops 之和）。
+            #
+            # latest 为已分配最大 seq（ep_audit_seq-1，初始 0）。last 晚
+            # 于操作开始时的全局逻辑时钟，或时钟从未推进（last_now 为
+            # None），整项报 STATE（形状类 INPUT 已在解析期先行判过；
+            # INPUT 先于状态）。truncated 与同区间 etr/etp/etv 逐值一
+            # 致，淘汰前缀不以未知状态补边或推断来源。
+            #
+            # 区域与真实切换各只过一遍 O(A) 个；反向 BFS 为 O(A)，逐来
+            # 源路径重建合计 O(A^2)，A≤64，时间与结果额外空间均为
+            # O(A^2)，不随区间跨度（可达 10^18）逐点扫描。
+            _, first, last, target_key, max_hops = op
+            if last_now is None or last > last_now:
+                fail(EXIT_STATE, "STATE")
+            latest = ep_audit_seq - 1
+            window = list(ep_audit_events)
+            # 区域元组 (lo, hi, seq, state, identity, is_group)：构造同
+            # ett/etr/etp/etv。
+            regions = []
+            if not window:
+                # 空历史且时钟已推进：[0,last_now] 恒为 EMPTY/seq0。
+                regions.append(
+                    (0, last_now, 0, "EMPTY", None, False)
+                )
+            else:
+                oldest_seq = window[0][0]
+                oldest_now = window[0][1]
+                prefix_evicted = oldest_seq > 1
+                # 最旧事件 now 之前的前缀区域（oldest_now=0 时为空，不入
+                # 列）：完整历史 EMPTY/seq0；前缀已淘汰则 UNKNOWN、seq
+                # 与身份均为 null。
+                if oldest_now >= 1:
+                    if prefix_evicted:
+                        regions.append(
+                            (0, oldest_now - 1, None, "UNKNOWN", None,
+                             False)
+                        )
+                    else:
+                        regions.append(
+                            (0, oldest_now - 1, 0, "EMPTY", None, False)
+                        )
+                # 同 now 事件整组为一个恒值区域：终态取组内最大 seq 事
+                # 件的 after（事件按 seq 升序，即组末事件）。
+                index = 0
+                event_count = len(window)
+                while index < event_count:
+                    group_now = window[index][1]
+                    group_seq = window[index][0]
+                    group_identity = window[index][4]
+                    index += 1
+                    while (
+                        index < event_count
+                        and window[index][1] == group_now
+                    ):
+                        group_seq = window[index][0]
+                        group_identity = window[index][4]
+                        index += 1
+                    group_end = (
+                        window[index][1] - 1
+                        if index < event_count
+                        else last_now
+                    )
+                    group_state = (
+                        "ACTIVE" if group_identity is not None
+                        else "EMPTY"
+                    )
+                    regions.append(
+                        (
+                            group_now,
+                            group_end,
+                            group_seq,
+                            group_state,
+                            group_identity,
+                            True,
+                        )
+                    )
+
+            truncated = False
+            # edge_rows：关系键 (kind, before_key, after_key) ->
+            # [count, first, last]；adjacency 为正向邻接（before ->
+            # after），rev_adjacency 为反向邻接（after -> before），均按
+            # 边首次发生时刻排列。构造全同 etp/etv。
+            edge_rows = {}
+            adjacency = {}
+            rev_adjacency = {}
+            prev_state = "EMPTY"
+            prev_identity = None
+            for (
+                region_lo, region_hi, region_seq, state, identity, is_group
+            ) in regions:
+                overlap_first = max(first, region_lo)
+                overlap_last = min(last, region_hi)
+                if overlap_first <= overlap_last:
+                    if state == "UNKNOWN":
+                        truncated = True
+                    if (
+                        is_group
+                        and overlap_first == region_lo
+                        and region_lo > first
+                    ):
+                        kind = None
+                        if prev_state == "EMPTY" and state == "ACTIVE":
+                            kind = "ENTER"
+                        elif prev_state == "ACTIVE" and state == "EMPTY":
+                            kind = "LEAVE"
+                        elif (
+                            prev_state == "ACTIVE"
+                            and state == "ACTIVE"
+                            and prev_identity != identity
+                        ):
+                            kind = "REPLACE"
+                        if kind is not None:
+                            if prev_state == "ACTIVE":
+                                before_key = (
+                                    "ACTIVE", prev_identity[0],
+                                    prev_identity[1],
+                                )
+                            else:
+                                before_key = ("EMPTY",)
+                            if state == "ACTIVE":
+                                after_key = (
+                                    "ACTIVE", identity[0], identity[1],
+                                )
+                            else:
+                                after_key = ("EMPTY",)
+                            edge_key = (kind, before_key, after_key)
+                            row = edge_rows.get(edge_key)
+                            if row is None:
+                                edge_rows[edge_key] = [
+                                    1, region_lo, region_lo
+                                ]
+                                adjacency.setdefault(
+                                    before_key, []
+                                ).append((after_key, edge_key))
+                                rev_adjacency.setdefault(
+                                    after_key, []
+                                ).append((before_key, edge_key))
+                            else:
+                                row[0] += 1
+                                row[2] = region_lo
+                prev_state = state
+                prev_identity = identity
+
+            def ety_side_json(side_key):
+                if side_key[0] == "ACTIVE":
+                    return {
+                        "state": "ACTIVE",
+                        "digest": side_key[1],
+                        "at": side_key[2],
+                    }
+                return {"state": "EMPTY", "digest": None, "at": None}
+
+            # 反向定序 BFS：自 target 沿反向邻接展开，取得 hops<=
+            # max_hops 的全部来源与最小跳数。深度达 max_hops 的节点不再
+            # 展开。target 无需出现在图中（零跳首项口径同 etv）。
+            rev_parent = {target_key: None}
+            rev_depth = {target_key: 0}
+            rev_frontier = [(target_key, 0)]
+            rev_head = 0
+            while rev_head < len(rev_frontier):
+                node_key, node_depth = rev_frontier[rev_head]
+                rev_head += 1
+                if node_depth >= max_hops:
+                    continue
+                for prev_key, _edge_key in rev_adjacency.get(
+                    node_key, ()
+                ):
+                    if prev_key not in rev_parent:
+                        rev_parent[prev_key] = (node_key, _edge_key)
+                        rev_depth[prev_key] = node_depth + 1
+                        rev_frontier.append((prev_key, node_depth + 1))
+
+            def ety_source_sort_key(node_key):
+                # EMPTY 先于 ACTIVE；ACTIVE 再按 digest 的 UTF-8 字节序、
+                # at 升序。
+                if node_key[0] == "EMPTY":
+                    return (0,)
+                return (
+                    1, node_key[1].encode("utf-8"), node_key[2]
+                )
+
+            other_entries = []
+            for node_key in rev_parent:
+                if node_key == target_key:
+                    continue
+                other_entries.append(
+                    (
+                        rev_depth[node_key],
+                        ety_source_sort_key(node_key),
+                        node_key,
+                    )
+                )
+            other_entries.sort(key=lambda entry: (entry[0], entry[1]))
+
+            target_json = ety_side_json(target_key)
+            items = [
+                {
+                    "source": target_json,
+                    "hops": 0,
+                    "nodes": [target_json],
+                    "edges": [],
+                }
+            ]
+            total_edge_count = 0
+            max_depth = 0
+            for hops, _sort_key, source_key in other_entries:
+                # 正向定序 BFS（同 etp）：邻接表各边 first 全局互异且按首
+                # 次发生时刻升序，首次到达 target 的路径即跳数最少且沿途
+                # first 序列字典序最小者，与同区间 etp(source,target) 逐
+                # 值一致。来源已由反向 BFS 保证在 hops 跳内可达。
+                parent = {source_key: None}
+                frontier = [(source_key, 0)]
+                head = 0
+                target_depth = None
+                while head < len(frontier):
+                    node_key, depth = frontier[head]
+                    head += 1
+                    if target_depth is not None and depth >= target_depth:
+                        break
+                    for next_key, edge_key in adjacency.get(node_key, ()):
+                        if next_key not in parent:
+                            parent[next_key] = (node_key, edge_key)
+                            frontier.append((next_key, depth + 1))
+                            if (
+                                next_key == target_key
+                                and target_depth is None
+                            ):
+                                target_depth = depth + 1
+                reversed_nodes = []
+                reversed_edges = []
+                current = target_key
+                while current != source_key:
+                    previous_node, edge_key = parent[current]
+                    reversed_nodes.append(current)
+                    reversed_edges.append(edge_key)
+                    current = previous_node
+                reversed_nodes.append(source_key)
+                reversed_nodes.reverse()
+                reversed_edges.reverse()
+                path_nodes = [
+                    ety_side_json(path_node)
+                    for path_node in reversed_nodes
+                ]
+                path_edges = []
+                for edge_key in reversed_edges:
+                    edge_kind, edge_before, edge_after = edge_key
+                    edge_count, edge_first, edge_last = edge_rows[edge_key]
+                    path_edges.append(
+                        {
+                            "kind": edge_kind,
+                            "before": ety_side_json(edge_before),
+                            "after": ety_side_json(edge_after),
+                            "count": edge_count,
+                            "first": edge_first,
+                            "last": edge_last,
+                        }
+                    )
+                items.append(
+                    {
+                        "source": ety_side_json(source_key),
+                        "hops": hops,
+                        "nodes": path_nodes,
+                        "edges": path_edges,
+                    }
+                )
+                total_edge_count += hops
+                if hops > max_depth:
+                    max_depth = hops
+            results.append(
+                {
+                    "op": "ety",
+                    "first": first,
+                    "last": last,
+                    "latest": latest,
+                    "truncated": truncated,
+                    "target": target_json,
                     "max_hops": max_hops,
                     "items": items,
                     "summary": {

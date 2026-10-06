@@ -540,6 +540,19 @@
 - `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、身份结构、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批此前变化；成功不推进时钟、不写审计或改变运行态。
 - 恒值区域、真实切换与图搜索各只过一遍，路径重建与身份排序合计 O(A²)，A 为最多六十四条保留审计事件，时间与结果额外空间均为 O(A²)，不按时间数值跨度（可达 10¹⁸）逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及 `se`、`si` 与现有公开入口行为不变。
 
+## 端点切换预约审计业务时间净切换关系反向可达来源查询：ety
+
+在 `et`/`ett`/`etu`/`etx`/`etr`/`etp`/`etv` 的六十四条保留窗口与逐时刻口径之上新增只读入口，在与 `etr` 同口径聚合出的有向关系图上返回能沿边到达指定预约身份的全部来源身份（即目标身份的反向可达集合）及其最短路径。沿用 `ett` 的同 `now` 事件整组生效规则取得净变化，`first` 时刻仅作初态，`UNKNOWN` 与 `RECOVER` 不建边，只以 `ENTER`、`LEAVE`、`REPLACE` 的 `before` 到 `after` 构成有向图，相同 `kind` 和两端仍按 `etr` 合并。不接受 `now`，不推进显式时钟，不写审计，不改变预约、连接、后端、审计窗口或下一 seq；相同初态和输入产生逐字节一致的结果。
+
+- `ety`：字段严格按 `op,first,last,target,max_hops` 排列（键须按此序出现，乱序报 INPUT）。`first`、`last` 均为 0..10¹⁸ 的非 bool 整数且 `first≤last`，共同给出业务时间闭区间 `[first,last]`，区间包含两端。`target` 沿用 `etp` 的 `state,digest,at` 身份结构：`ACTIVE` 要求六十四位小写十六进制 SHA-256 `digest` 与 0..10⁹ 的非 bool `at`，`EMPTY` 要求 `digest`、`at` 均为 null。`max_hops` 为 0..64 的非 bool 整数。
+- 返回固定键序 `op,first,last,latest,truncated,target,max_hops,items,summary`；`latest` 为已分配最大审计 seq（初始 0），口径同 `et`；`target` 原样回显请求身份。
+- `target` 自身始终作为 `hops=0` 的第一项（单节点 `nodes`、空 `edges`，身份无需在历史中出现）；其余 items 列出在不超过 `max_hops` 跳内能沿边到达 `target` 的全部来源且不同于 `target`。每个来源先取跳数（边数）最少的路径，多条等长路径沿用 `etp` 的并列选择规则（沿途各边 `first` 序列的字典序最小者，与相同参数 `etp(source,target)` 的 `hops`/`nodes`/`edges` 逐值一致）；路径 `nodes` 从 `source` 排到 `target`，`edges` 与相邻节点一一对应并保持 `etr` 的 `kind,before,after,count,first,last` 结构（含合并后的 `count` 与首末时刻）。
+- 其余项按 `hops` 升序排列，`hops` 相同再按 `source` 的 EMPTY 先于 ACTIVE、`digest` 的 UTF-8 字节序、`at` 升序排列。每项固定键序 `source,hops,nodes,edges`；`source` 固定键序 `state,digest,at`，`nodes` 各项同构。
+- `summary` 固定键序 `reachable,depth,edges`：`reachable` 为 items 数量（含目标自身）；`depth` 为已返回项的最大 `hops`；`edges` 为全部路径边数之和（即各项 hops 之和）。只有首项时后两值均为 0。
+- `truncated` 与同区间 `etr`、`etp`、`etv` 逐值一致，仅表示区间含保留窗口无法判定的 `UNKNOWN` 淘汰前缀；淘汰前缀不以未知状态补边或推断来源。
+- `last` 晚于操作开始时的全局逻辑时钟，或时钟从未推进，返回 STATE/4。字段集合、键序、身份结构、UTF-8 编码、整数类型（排除 bool）、范围或区间关系非法时返回 INPUT/2，输入错误优先于状态错误。失败无 stdout 并回滚同批此前变化；成功不推进时钟、不写审计或改变运行态。
+- 恒值区域、真实切换各只过一遍，先以反向定序 BFS 取得最小跳数来源集合，再逐来源以与 `etp` 同款的正向定序 BFS 重建路径，路径重建与身份排序合计 O(A²)，A 为最多六十四条保留审计事件，单次时间与结果额外空间均为 O(A²)，不按时间数值跨度（可达 10¹⁸）逐点扫描；仅使用 Python 标准库，重复查询以及 `se` 导出、`si` 恢复后的查询逐字节一致，`run`、`record`、`replay` 保持固定键序紧凑 UTF-8 JSON、单末尾换行及现有公开入口行为不变。
+
 ## 测试
 
     python -m unittest discover
